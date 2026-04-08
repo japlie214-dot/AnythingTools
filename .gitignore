@@ -1,0 +1,117 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.env
+.env*
+!.env.example
+
+# Database
+data/
+*.db
+*.sqlite
+*.sqlite3
+database/
+
+# Reports and generated files
+reports/
+*.pdf
+*.checkpoint.json
+
+# Logs
+logs/
+*.log
+*.jsonl
+/log_*.txt
+
+# Artifacts and outputs
+artifacts/
+artifacts/**
+
+# Chrome profile and browser state
+chrome_profile/
+chrome_download/
+chrome_profile/**
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# API keys and secrets
+.env*
+!.env.example
+config_local.py
+
+# Cache
+.mypy_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# Research artifacts
+*.checkpoint
+checkpoints/
+/test_results.json
+
+# Session files
+session_*.jsonl
+
+# Misc
+*.log.*
+*.bak
+*.old
+
+# Python packaging
+pip-wheel-metadata/
+*.dist-info/
+
+# Worker / runtime
+worker/
+
+# Keep local environment files out
+local_settings.py
+
+# End of .gitignore

@@ -1,0 +1,44 @@
+# AnythingTools requirements
+# Core web framework
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pydantic>=1.10.7
+
+# HTTP client
+httpx>=0.25.0
+
+# Browser automation
+botasaurus>=1.0.0
+
+# PDF generation
+reportlab>=4.0.0
+pypdf>=3.9.0
+pdfplumber>=0.7.5
+
+# HTML parsing
+beautifulsoup4>=4.12.0
+
+# Data analysis
+pandas>=2.0.0
+
+# Yahoo Finance and EDGAR
+yfinance>=0.2.18
+edgartools>=2.0.0
+sec-edgar-downloader>=4.0.0
+
+# Utilities
+colorama>=0.4.6
+python-dotenv>=1.1.0
+
+# vec0 sqlite extension helper (binary required separately)
+sqlite-vec>=0.1.0
+
+# System utilities
+psutil==5.9.5
+
+# LLM / OpenAI
+openai>=1.0.0
+
+# Note: python-telegram-bot removed from AnythingTools requirements as the
+# system now pushes notifications via API-based notifier modules instead of
+# running a Telegram long-poll bot.

@@ -1,0 +1,165 @@
+# tools/scraper/persistence.py
+"""Article result parsing, database persistence, and AI curation helpers."""
+
+import re
+import json
+import struct
+import config
+from utils.id_generator import ULID
+from utils.text_processing import normalize_url
+from utils.logger import get_dual_logger
+
+log = get_dual_logger(__name__)
+
+
+def _parse_article_result(raw_result: dict, url: str) -> dict:
+    """Parse SUMMARIZATION_PROMPT output into structured fields."""
+    if raw_result.get("status") != "SUCCESS":
+        return raw_result
+
+    summary_content = raw_result.get("summary", "")
+    if not summary_content:
+        # Guard: propagate failure rather than returning an empty SUCCESS record.
+        return {"status": "FAILED", "reason": "Empty summary content"}
+
+    title_match      = re.search(r"### Title:\s*\n([^\n]+)",    summary_content, re.IGNORECASE)
+    conclusion_match = re.search(r"### Conclusion:\s*\n([^\n]+)", summary_content, re.IGNORECASE)
+    summary_match    = re.search(r"### Summary:\s*\n(.+)",       summary_content, re.IGNORECASE | re.DOTALL)
+
+    title      = title_match.group(1).strip()      if title_match      else ""
+    conclusion = conclusion_match.group(1).strip() if conclusion_match else ""
+    summary    = summary_match.group(1).strip()    if summary_match    else summary_content
+
+    # SUCCESS_NO_PARSE when either mandatory section is absent.
+    status = "SUCCESS" if (title and conclusion) else "SUCCESS_NO_PARSE"
+
+    ulid_str = ULID.generate()
+    _id = abs(hash(ulid_str)) % (2 ** 63)
+
+    return {
+        "status":         status,
+        "url":            url,
+        "normalized_url": normalize_url(url),
+        "id":             _id,
+        "ulid":           ulid_str,
+        "title":          title,
+        "conclusion":     conclusion,
+        "summary":        summary,
+        "raw_summary":    summary_content,  # preserved for full-fidelity JSON output
+    }
+
+
+def _persist_scraped_article(parsed_result: dict) -> None:
+    """Persist article metadata and embedding via paired fire-and-forget writes."""
+    # Lazy imports: avoid connection-pool initialisation at module load time.
+    from database.writer import enqueue_write
+    try:
+        enqueue_write(
+            """
+            INSERT OR REPLACE INTO scraped_articles (
+                id, normalized_url, url, title, conclusion, summary,
+                metadata_json, embedding_status, vec_rowid, scraped_at
+            ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, datetime('now'))
+            """,
+            (
+                parsed_result["ulid"],
+                parsed_result["normalized_url"],
+                parsed_result["url"],
+                parsed_result["title"],
+                parsed_result["conclusion"],
+                parsed_result["summary"],
+                "PENDING" if parsed_result["status"] == "SUCCESS" else "SKIPPED",
+                parsed_result["id"],
+            ),
+        )
+
+        if parsed_result["status"] == "SUCCESS":
+            from clients.snowflake_client import snowflake_client  # lazy: heavy singleton
+            _t = parsed_result["title"]
+            _c = parsed_result["conclusion"]
+            _s = parsed_result.get("summary", "")
+            _header = f"{_t}: {_c}: "
+            _avail = 8000 - len(_header)
+            if _avail <= 0:
+                log.dual_log(
+                    tag="Scraper:Embedding",
+                    message="Title+Conclusion exceed 8000-char embedding budget; Summary omitted.",
+                    level="WARNING",
+                    payload={"ulid": parsed_result["ulid"], "header_len": len(_header)},
+                )
+            content_for_embedding = _header + (_s[:_avail] if _avail > 0 else "")
+            try:
+                from utils.vector_search import generate_embedding_sync
+                embedding_bytes = generate_embedding_sync(content_for_embedding)
+
+                enqueue_write(
+                    "INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)",
+                    (parsed_result["id"], embedding_bytes),
+                )
+                enqueue_write(
+                    "UPDATE scraped_articles SET embedding_status = 'EMBEDDED' WHERE id = ?",
+                    (parsed_result["ulid"],),
+                )
+            except Exception as e:
+                log.dual_log(
+                    tag="Scraper:Embedding",
+                    message=f"Failed to generate embedding for article {parsed_result['ulid']}: {e}",
+                    level="WARNING",
+                    exc_info=e,
+                )
+
+        log.dual_log(
+            tag="Scraper:Persist",
+            message="Persisted article to database",
+            payload={"id": parsed_result["ulid"], "url": parsed_result["url"],
+                     "status": parsed_result["status"]},
+        )
+
+    except Exception as e:
+        log.dual_log(
+            tag="Scraper:Persist",
+            message=f"Failed to persist article: {e}",
+            level="ERROR",
+            exc_info=e,
+        )
+
+
+def _curate_articles_drip_feed(results: dict[str, dict]) -> dict:
+    """Trim article pool to 80 % of context budget; return curation payload."""
+    # Both title AND conclusion must be present; SUCCESS_NO_PARSE entries are excluded.
+    articles = [
+        r for r in results.values()
+        if r.get("status") == "SUCCESS" and r.get("title") and r.get("conclusion")
+    ]
+
+    if not articles:
+        return {"status": "NO_CONTENT", "articles": []}
+
+    sorted_articles = sorted(
+        articles,
+        key=lambda x: len(str(x.get("conclusion", ""))),
+        reverse=True,
+    )
+
+    budget_80 = int(getattr(config, "LLM_CONTEXT_CHAR_LIMIT", 40_000) * 0.8)
+    curated: list[dict] = []
+    current_len = 0
+
+    for art in sorted_articles:
+        entry = {
+            "title":      art.get("title", ""),
+            "conclusion": art.get("conclusion", ""),
+            "url":        art.get("url", ""),
+        }
+        item_len = len(json.dumps(entry))
+        if current_len + item_len <= budget_80:
+            curated.append(entry)
+            current_len += item_len
+        else:
+            break  # remaining articles exceed budget; stop packing
+
+    return {
+        "status":         "READY_FOR_CURATION",
+        "total_eligible": len(articles),
+        "articles":       curated,
+    }

@@ -1,0 +1,93 @@
+# utils/hitl.py
+"""Human-in-the-loop (HITL) helpers for browser-capable tools.
+
+This module standardizes how tools pause for human intervention and
+provides consistent cancellation semantics (typing "Stop" at the prompt).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from typing import Optional
+
+from utils.browser_lock import browser_lock
+from utils.logger import get_dual_logger
+
+log = get_dual_logger(__name__)
+
+
+def hitl_wait_for_operator(
+    cancellation_flag: threading.Event,
+    message: str = "Resolve the issue in the browser, then press ENTER to resume...\n",
+    timeout: Optional[float] = None,
+) -> bool:
+    """Synchronously wait for operator input while holding browser_lock.
+
+    Returns True if resumed by ENTER, False if the operator typed `Stop`.
+    The cancellation_flag will be set if the operator types `Stop`.
+    """
+    if not browser_lock.locked():
+        raise RuntimeError("hitl_wait_for_operator must be called with browser_lock held")
+
+    # Delegate blocking input() to a thread so the asyncio loop (if present) remains responsive.
+    try:
+        user_input = input(message)
+    except EOFError:
+        user_input = ""
+
+    if user_input.strip().lower() == "stop":
+        cancellation_flag.set()
+        log.dual_log(
+            tag="HITL:Cancel",
+            message="Operator typed 'Stop' — cancellation_flag set.",
+            status_state="CANCELLED",
+            notify_user=True,
+        )
+        return False
+
+    return True
+
+
+async def hitl_wait_for_operator_async(
+    cancellation_flag: threading.Event,
+    message: str = "Resolve the issue in the browser, then press ENTER to resume...\n",
+    timeout: Optional[float] = None,
+) -> bool:
+    """Async variant: same semantics, but uses asyncio.to_thread for input."""
+    if not browser_lock.locked():
+        raise RuntimeError("hitl_wait_for_operator_async must be called with browser_lock held")
+
+    # Async-friendly blocking input (non-blocking to event loop)
+    try:
+        user_input = await asyncio.to_thread(input, message)
+    except EOFError:
+        user_input = ""
+
+    if user_input.strip().lower() == "stop":
+        cancellation_flag.set()
+        log.dual_log(
+            tag="HITL:Cancel",
+            message="Operator typed 'Stop' — cancellation_flag set.",
+            status_state="CANCELLED",
+            notify_user=True,
+        )
+        return False
+
+    return True
+
+
+def mark_paused_for_hitl(
+    tag: str,
+    message: str,
+    payload: dict | None = None,
+) -> None:
+    """Centralized logging for PAUSED_FOR_HITL with user notification."""
+    log.dual_log(
+        tag=tag,
+        message=message,
+        status_state="PAUSED_FOR_HITL",
+        payload=payload,
+        level="WARNING",
+        notify_user=True,
+    )
