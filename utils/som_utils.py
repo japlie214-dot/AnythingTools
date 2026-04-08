@@ -38,7 +38,10 @@ def inject_ai_ids(driver: Driver) -> None:
                 while (walker.nextNode()) {
                     var el = walker.currentNode;
                     if (el && el.offsetParent !== null) {
-                        el.setAttribute('data-ai-id', String(id++));
+                        var style = window.getComputedStyle(el);
+                        if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
+                            el.setAttribute('data-ai-id', String(id++));
+                        }
                     }
                 }
                 window.__ai_ids_injected = true;
@@ -74,7 +77,7 @@ def remove_overlays(driver: Driver) -> None:
 def read_visible_html(driver: Driver) -> str:
     """Return cleaned visible HTML for LLM context width."""
     try:
-        raw = driver.run_js("return (document.body ? document.body.innerHTML : '')") or ""
+        raw = driver.page_html or ""
         return clean_html_for_agent(raw)
     except Exception as e:
         log.dual_log(tag="SoM:ReadHTML", message=f"Failed to read HTML: {e}", level="WARNING", exc_info=e)

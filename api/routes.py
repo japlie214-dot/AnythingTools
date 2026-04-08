@@ -1,3 +1,4 @@
+# api/routes.py
 from fastapi import APIRouter, HTTPException, status, Request, Depends
 from typing import Dict, Any
 import threading
@@ -69,6 +70,9 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, 
             args = validated_args.dict()
         else:
             args = req.args
+        
+        if req.client_metadata:
+            args["_client_metadata"] = req.client_metadata
     except ValidationError as e:
         # Return 422 with structured validation errors
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=e.errors())

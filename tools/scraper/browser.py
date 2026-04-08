@@ -69,93 +69,16 @@ def _build_multimodal_messages(
     ]
 
 
+from utils.browser_utils import extract_hybrid_html as centralized_extract
+
+
 def extract_hybrid_html(driver: Driver) -> tuple[str, int]:
     """
     Surgical extraction using Botasaurus driver.page_html.
-    Filters for granular elements > 40 chars while deduplicating
-    by selecting innermost content nodes only. Interactive elements
-    (data-ai-id) are always preserved for the Recovery agent.
-    Produces an audit payload describing kept elements and truncates
-    at element boundaries when exceeding budget.
     """
     try:
         html = driver.page_html or ""
-        if not html or not html.strip():
-            log.dual_log(tag="Scraper:Extract:EmptyHybrid", message="Hybrid extractor received empty driver.page_html", level="WARNING")
-            return "INSUFFICIENT_CONTENT", 0
-
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Remove obvious non-content nodes
-        for noise in soup(["script", "style", "link", "meta", "noscript", "svg", "iframe", "header", "footer", "nav"]):
-            try:
-                noise.decompose()
-            except Exception:
-                continue
-
-        captured_chunks: list[str] = []
-        kept_elements_audit: list[dict] = []
-
-        # Innermost-only selection: capture elements with >40 chars whose
-        # direct children do not themselves contain >40 chars. Always keep interactive elements
-        for element in soup.find_all(True):
-            is_interactive = element.has_attr("data-ai-id")
-            text = element.get_text(separator=" ", strip=True)
-
-            if not is_interactive and len(text) <= 40:
-                continue
-
-            # Deduplication: skip containers if they have content-heavy direct children
-            if not is_interactive:
-                has_content_child = False
-                for child in element.find_all(True, recursive=False):
-                    if len(child.get_text(separator=" ", strip=True)) > 40:
-                        has_content_child = True
-                        break
-                if has_content_child:
-                    continue
-
-            # Keep only safe attributes to reduce token cost
-            allowed_attrs = {"href", "data-ai-id"}
-            attrs = dict(element.attrs)
-            element.attrs = {k: v for k, v in attrs.items() if k in allowed_attrs}
-
-            # Normalize whitespace and append
-            chunk = str(element).replace("\n", " ")
-            captured_chunks.append(chunk)
-
-            kept_elements_audit.append({
-                "tag": element.name,
-                "text_len": len(text),
-                "is_interactive": is_interactive,
-                "snippet": text[:100] + ("..." if len(text) > 100 else "")
-            })
-
-        # Audit log for transparency (what we kept)
-        try:
-            log.dual_log(
-                tag="Scraper:SurgicalCapture",
-                message=f"Surgical extraction kept {len(captured_chunks)} elements.",
-                level="INFO",
-                payload={"elements_kept": kept_elements_audit},
-            )
-        except Exception:
-            # Non-fatal logging failure should not break extraction
-            pass
-
-        result_text = "\n".join(captured_chunks)
-
-        budget = getattr(config, "BROWSER_SOM_HTML_CHAR_BUDGET", 20000)
-        if len(result_text) > budget:
-            # Truncate at the last newline to avoid cutting in the middle of a tag
-            last_newline = result_text.rfind("\n", 0, budget)
-            cutoff = last_newline if last_newline > 0 else budget
-            result_text = result_text[:cutoff] + "\n...[TRUNCATED]"
-
-        if not result_text.strip():
-            log.dual_log(tag="Scraper:Extract:EmptyHybrid", message="Surgical extraction returned 0 chars from page_html", level="WARNING")
-            return "INSUFFICIENT_CONTENT", 0
-
+        result_text = centralized_extract(html)
         return result_text, len(result_text)
 
     except Exception as e:

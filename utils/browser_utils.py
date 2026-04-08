@@ -1,6 +1,7 @@
 # utils/browser_utils.py
 from botasaurus.browser import Driver
 from utils.logger import get_dual_logger
+from bs4 import BeautifulSoup
 
 _log = get_dual_logger(__name__)
 
@@ -40,3 +41,39 @@ def safe_google_get(driver: Driver, url: str, *, bypass_cloudflare: bool = True)
             payload={"url": url},
         )
         driver.google_get(url)
+
+
+def extract_hybrid_html(html_content: str, limit: int = 400000) -> str:
+    """Centralized Readability Engine."""
+    if not html_content:
+        return "INSUFFICIENT_CONTENT"
+    soup = BeautifulSoup(html_content, "html.parser")
+    for noise in soup(["script", "style", "link", "meta", "noscript", "svg", "iframe", "header", "footer", "nav"]):
+        try:
+            noise.decompose()
+        except Exception:
+            continue
+
+    captured_chunks = []
+    for element in soup.find_all(True):
+        is_interactive = element.has_attr("data-ai-id")
+        text = element.get_text(separator=" ", strip=True)
+        if not is_interactive and len(text) <= 40:
+            continue
+
+        if not is_interactive:
+            has_content_child = any(len(child.get_text(separator=" ", strip=True)) > 40 for child in element.find_all(True, recursive=False))
+            if has_content_child:
+                continue
+
+        # Strip attributes to minimize token usage
+        allowed_attrs = {"href", "data-ai-id"}
+        attrs = dict(element.attrs)
+        element.attrs = {k: v for k, v in attrs.items() if k in allowed_attrs}
+
+        captured_chunks.append(str(element).replace("\n", " "))
+
+    result = "\n".join(captured_chunks)
+    if len(result) > limit:
+        return result[:limit] + "\n[SYSTEM: Content truncated due to length.]"
+    return result or "INSUFFICIENT_CONTENT"
