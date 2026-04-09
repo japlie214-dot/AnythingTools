@@ -44,88 +44,105 @@ class ToolRegistry:
         self._tools.clear()
         package_dir = Path(__file__).parent
 
-        for module_info in pkgutil.iter_modules([str(package_dir)]):
-            name = module_info.name
-            if name in {"base", "registry", "__init__"}:
-                continue
-
-            module_path = package_dir / name
+        # 1. Legacy top-level discovery for library_query (public entry point)
+        if (package_dir / "library_query.py").exists():
             try:
-                if (module_path / "__init__.py").exists():
-                    # Prefer the canonical tool submodule when present.
-                    try:
-                        module = importlib.import_module(f"tools.{name}.tool")
-                    except Exception:
-                        module = importlib.import_module(f"tools.{name}")
-                else:
-                    module = importlib.import_module(f"tools.{name}")
+                module = importlib.import_module("tools.library_query")
+                self._register_module_tools(module)
             except Exception as e:
-                log.dual_log(tag="Registry:Load", message=f"Failed to import tools.{name}: {e}", level="WARNING", payload={"module": name})
+                log.dual_log(tag="Registry:Load", message=f"Failed to import tools.library_query: {e}", level="WARNING", payload={"module": "library_query"})
+
+        # 2. Agent-action discovery under tools/actions/<scope>/
+        actions_dir = package_dir / "actions"
+        if actions_dir.exists() and actions_dir.is_dir():
+            for scope in actions_dir.iterdir():
+                if not scope.is_dir() or scope.name.startswith("_"):
+                    continue
+                # Discover modules inside each scope folder
+                for module_info in pkgutil.iter_modules([str(scope)]):
+                    module_name = module_info.name
+                    module_path = scope / module_name
+                    try:
+                        # All action modules use tools.actions.<scope>.<module>
+                        module = importlib.import_module(f"tools.actions.{scope.name}.{module_name}")
+                    except Exception as e:
+                        log.dual_log(tag="Registry:Load", message=f"Failed to import actions.{scope.name}.{module_name}: {e}", level="WARNING", payload={"module": f"{scope.name}.{module_name}"})
+                        continue
+                    self._register_module_tools(module)
+
+    def _register_module_tools(self, module):
+        # Attempt to capture INPUT_MODEL.schema() if provided by the module.
+        input_schema: Optional[Dict[str, Any]] = None
+        try:
+            InputModel = getattr(module, "INPUT_MODEL", None)
+            if InputModel is not None and hasattr(InputModel, "schema"):
+                try:
+                    input_schema = InputModel.schema()
+                except Exception as e:
+                    log.dual_log(tag="Registry:Schema", message=f"Failed to serialize INPUT_MODEL for {module.__name__}: {e}", level="WARNING", payload={"module": module.__name__})
+        except Exception:
+            input_schema = None
+
+        # Attempt to read a human description from tools.<name>.Skill.desc (legacy)
+        # For new actions, description can come from module.__doc__ or left empty.
+        description: Optional[str] = None
+        try:
+            # Try to extract description from module docstring if no Skill module
+            description = module.__doc__
+        except Exception:
+            pass
+
+        # Register concrete BaseTool subclasses defined in the module.
+        for _, obj in inspect.getmembers(module, inspect.isclass):
+            # Only interested in concrete subclasses defined in this module.
+            if obj is BaseTool:
+                continue
+            try:
+                if not issubclass(obj, BaseTool):
+                    continue
+            except Exception:
+                continue
+            if obj.__module__ != module.__name__:
+                continue
+            if inspect.isabstract(obj):
                 continue
 
-            # Attempt to capture INPUT_MODEL.schema() if provided by the module.
-            input_schema: Optional[Dict[str, Any]] = None
-            try:
-                InputModel = getattr(module, "INPUT_MODEL", None)
-                if InputModel is not None and hasattr(InputModel, "schema"):
-                    try:
-                        input_schema = InputModel.schema()
-                    except Exception as e:
-                        log.dual_log(tag="Registry:Schema", message=f"Failed to serialize INPUT_MODEL for {name}: {e}", level="WARNING", payload={"module": name})
-            except Exception:
-                input_schema = None
-
-            # Attempt to read a human description from tools.<name>.Skill.desc
-            description: Optional[str] = None
-            try:
-                skill_mod = importlib.import_module(f"tools.{name}.Skill")
-                description = getattr(skill_mod, "desc", None)
-            except Exception:
-                # Fallback: read SKILL.md file if present (legacy)
-                skill_md = package_dir / name / "SKILL.md"
-                if skill_md.exists():
-                    try:
-                        description = skill_md.read_text(encoding='utf-8')
-                    except Exception:
-                        description = None
-
-            # Register concrete BaseTool subclasses defined in the module.
-            for _, obj in inspect.getmembers(module, inspect.isclass):
-                # Only interested in concrete subclasses defined in this module.
-                if obj is BaseTool:
-                    continue
+            # Derive the tool name. Prefer a class attribute 'name'. Fall back
+            # to instantiating the class (best-effort).
+            tool_name = getattr(obj, "name", None)
+            if not tool_name:
                 try:
-                    if not issubclass(obj, BaseTool):
-                        continue
-                except Exception:
-                    continue
-                if obj.__module__ != module.__name__:
-                    continue
-                if inspect.isabstract(obj):
+                    inst = obj()  # many tools have parameterless constructors
+                    tool_name = getattr(inst, "name", None)
+                except Exception as e:
+                    log.dual_log(tag="Registry:Register", message=f"Skipping tool class because name not found and instantiation failed: {obj}: {e}", level="WARNING", payload={"class": f"{obj}"})
                     continue
 
-                # Derive the tool name. Prefer a class attribute 'name'. Fall back
-                # to instantiating the class (best-effort).
-                tool_name = getattr(obj, "name", None)
-                if not tool_name:
-                    try:
-                        inst = obj()  # many tools have parameterless constructors
-                        tool_name = getattr(inst, "name", None)
-                    except Exception as e:
-                        log.dual_log(tag="Registry:Register", message=f"Skipping tool class because name not found and instantiation failed: {obj}: {e}", level="WARNING", payload={"class": f"{obj}"})
-                        continue
-
-                self._tools[tool_name] = {
-                    "cls": obj,
-                    "input_schema": input_schema,
-                    "module": module.__name__,
-                    "description": description,
-                }
-                log.dual_log(tag="Registry:Register", message=f"Registered tool: {tool_name}", level="DEBUG", payload={"module": module.__name__, "class": obj.__name__})
+            self._tools[tool_name] = {
+                "cls": obj,
+                "input_schema": input_schema,
+                "module": module.__name__,
+                "description": description,
+            }
+            log.dual_log(tag="Registry:Register", message=f"Registered tool: {tool_name}", level="DEBUG", payload={"module": module.__name__, "class": obj.__name__})
 
     def get_tool_class(self, name: str) -> Optional[Type[BaseTool]]:
         meta = self._tools.get(name)
         return meta.get("cls") if meta else None
+
+    def get_actions(self, scope: str) -> list[Dict[str, Any]]:
+        """Return tools filtered by namespace (e.g. scope='browser' matches tools.actions.browser.*)."""
+        entries = []
+        for name, meta in self._tools.items():
+            mod = meta.get("module", "")
+            if mod.startswith(f"tools.actions.{scope}") or mod.startswith(f"tools.{scope}"):
+                input_schema = meta.get("input_schema") or {"type": "object", "properties": {}, "required": []}
+                entries.append({
+                    "name": name,
+                    "description": meta.get("description", ""),
+                    "input_schema": input_schema
+                })
+        return entries
 
     def create_tool_instance(self, name: str, **kwargs) -> Optional[BaseTool]:
         """Instantiate a fresh tool for a job.

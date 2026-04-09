@@ -34,7 +34,6 @@ data/
 *.db
 *.sqlite
 *.sqlite3
-database/
 
 # Reports and generated files
 reports/
@@ -107,9 +106,6 @@ session_*.jsonl
 # Python packaging
 pip-wheel-metadata/
 *.dist-info/
-
-# Worker / runtime
-worker/
 
 # Keep local environment files out
 local_settings.py

@@ -89,10 +89,28 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, 
     created = now_iso()
 
     # Persist job record (writer will serialize DB writes)
+    # Log system: intent and pre-execution state
+    log.dual_log(
+        tag="API:JOB:CREATE",
+        message=f"Enqueueing job for tool '{tool_name}'",
+        payload={"tool": tool_name, "args": args, "job_id": job_id, "chat_id": 0, "status": "QUEUED"}
+    )
     enqueue_write(
-        "INSERT INTO jobs (job_id, tool_name, args_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO chats (chat_id) VALUES (0) ON CONFLICT(chat_id) DO NOTHING",
+        (),
+    )
+    enqueue_write(
+        "INSERT INTO jobs (job_id, chat_id, tool_name, args_json, status, created_at, updated_at) VALUES (?, 0, ?, ?, ?, ?, ?)",
         (job_id, tool_name, json.dumps(args), "QUEUED", created, created),
     )
+    # Write to execution_ledger as well (preparation for Phase 3)
+    # Store args in content as JSON to prevent token-heuristic misidentification as an attachment
+    ledger_content = json.dumps({"event": f"Enqueueing tool {tool_name}", "args": args})
+    enqueue_write(
+        "INSERT INTO execution_ledger (ledger_id, job_id, caller_id, role, content, attachment_metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (ULID.generate(), job_id, "0", "user", ledger_content, None, created),
+    )
+    log.dual_log(tag="API:JOB:CREATE:POST", message=f"Job {job_id} persisted", payload={"job_id": job_id})
 
     # Ensure background writer is running
     _ensure_writer_running()

@@ -29,7 +29,7 @@ def _mask_payload_if_large(serialized_str: str, original_payload: Any) -> str:
     Called exclusively from FileFormatter.format(); never from _serialize_payload
     or the _tool_log_buffer append path.
     """
-    limit = getattr(_log_config, 'LOGGER_TRUNCATION_LIMIT', 50_000) if _log_config else 50_000
+    limit = getattr(_log_config, 'LOGGER_TRUNCATION_LIMIT', 5_000_000) if _log_config else 5_000_000
     n = len(serialized_str)
     if n <= limit:
         return serialized_str
