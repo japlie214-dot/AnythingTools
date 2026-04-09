@@ -39,6 +39,10 @@ psutil==5.9.5
 # LLM / OpenAI
 openai>=1.0.0
 
-# Note: python-telegram-bot removed from AnythingTools requirements as the
-# system now pushes notifications via API-based notifier modules instead of
-# running a Telegram long-poll bot.
+# CPU-specific PaddlePaddle for OCR
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
+paddlepaddle==3.2.0
+
+# PDF processing and OCR
+paddleocr
+pymupdf

@@ -35,7 +35,7 @@ def _ensure_writer_running() -> None:
     try:
         start_writer()
     except Exception:
-        log.dual_log(tag="API:Writer", message="start_writer() failed (non-fatal)")
+        log.dual_log(tag="API:Writer:Start", message="start_writer() failed (non-fatal)")
 
 
 # Security dependency: require API key when configured
@@ -91,7 +91,7 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, 
     # Persist job record (writer will serialize DB writes)
     # Log system: intent and pre-execution state
     log.dual_log(
-        tag="API:JOB:CREATE",
+        tag="API:Job:Create",
         message=f"Enqueueing job for tool '{tool_name}'",
         payload={"tool": tool_name, "args": args, "job_id": job_id, "chat_id": 0, "status": "QUEUED"}
     )
@@ -110,7 +110,7 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, 
         "INSERT INTO execution_ledger (ledger_id, job_id, caller_id, role, content, attachment_metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (ULID.generate(), job_id, "0", "user", ledger_content, None, created),
     )
-    log.dual_log(tag="API:JOB:CREATE:POST", message=f"Job {job_id} persisted", payload={"job_id": job_id})
+    log.dual_log(tag="API:Job:Persist", message=f"Job {job_id} persisted", payload={"job_id": job_id})
 
     # Ensure background writer is running
     _ensure_writer_running()
@@ -120,7 +120,7 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, 
         mgr = get_manager()
         mgr.start()
     except Exception as e:
-        log.dual_log(tag="API:WorkerMgr", message=f"Failed to start worker manager: {e}", level="WARNING", exc_info=e)
+        log.dual_log(tag="API:Worker:Start", message=f"Failed to start worker manager: {e}", level="WARNING", exc_info=e)
 
     # Local cache for quick reads
     JOBS[job_id] = {"status": "QUEUED", "created_at": created, "tool_name": tool_name}

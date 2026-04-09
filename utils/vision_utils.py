@@ -119,10 +119,13 @@ def capture_and_optimize(driver: Driver, step_index: int) -> list[dict]:
         try:
             results: list[dict] = []
 
+            from utils.budget import calculate_image_cost
             with Image.open(raw_path) as img:
                 if img.mode != "RGB":
                     img = img.convert("RGB")
                 w, h = img.size
+                
+                total_char_cost = calculate_image_cost(w, h)
 
                 if w <= 2048 and h <= 2048:
                     # ── Single-slice path (small screenshot) ─────────────────
@@ -155,7 +158,7 @@ def capture_and_optimize(driver: Driver, step_index: int) -> list[dict]:
                                  "event_id": event_id}]
                     b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
                     return [{"b64": b64, "path": jpg_path, "mime": "image/jpeg",
-                             "status": "OK", "event_id": event_id}]
+                             "status": "OK", "event_id": event_id, "total_char_cost": total_char_cost}]
 
                 # ── Multi-slice path (large screenshot) ───────────────────────
                 # Orientation: slice along the longer dimension.
@@ -220,12 +223,14 @@ def capture_and_optimize(driver: Driver, step_index: int) -> list[dict]:
                     with open(slice_path, "wb") as fh:
                         fh.write(slice_bytes)
                     b64_slice = base64.b64encode(slice_bytes).decode("utf-8")
+                    slice_cost = calculate_image_cost(slice_img.width, slice_img.height)
                     results.append({
                         "b64":      b64_slice,
                         "path":     slice_path,
                         "mime":     "image/jpeg",
                         "status":   "OK",
                         "event_id": event_id,
+                        "total_char_cost": slice_cost,
                     })
 
             if os.path.exists(raw_path):

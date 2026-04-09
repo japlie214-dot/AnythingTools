@@ -10,6 +10,14 @@ import config
 
 async def process_pdf(file_path: str, file_name: str, chat_id: int):
     """Extracts text, generates embeddings, and stores in DB."""
+    import asyncio
+    from utils.budget import calculate_pdf_cost
+    cost_data = await asyncio.to_thread(calculate_pdf_cost, file_path)
+    
+    if cost_data.get("status") != "OK":
+        reason = cost_data.get("reason", "Corrupted or password protected")
+        return f"PDF Processing Rejected: {reason}", None
+
     try:
         reader = PdfReader(file_path)
         pages = []

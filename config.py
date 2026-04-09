@@ -33,3 +33,9 @@ LOGGER_AGENT_MAX_CONTEXT: int = int(os.getenv("LOGGER_AGENT_MAX_CONTEXT", "10000
 DEBUGGER_AGENT_TRIGGER_ON_WARNING: bool = os.getenv("DEBUGGER_AGENT_TRIGGER_ON_WARNING", "true").lower() in ("true", "1", "yes")
 # Full‑fidelity payload logging limit (bytes). Aligns with plan to allow up to 5 MB per log entry.
 LOGGER_TRUNCATION_LIMIT: int = int(os.getenv("LOGGER_TRUNCATION_LIMIT", "5000000"))
+
+# --- Debugger Agent Context Limits ---
+MODEL_MAX_CONTEXT_CHARS: int = int(os.getenv("MODEL_MAX_CONTEXT_CHARS", "800000"))
+DEBUGGER_CONTEXT_RATIO: float = float(os.getenv("DEBUGGER_CONTEXT_RATIO", "0.85"))
+DEBUGGER_LOG_FRACTION: float = float(os.getenv("DEBUGGER_LOG_FRACTION", "0.60"))
+DEBUGGER_AGENT_CONTEXT_CHAR_LIMIT: int = int(MODEL_MAX_CONTEXT_CHARS * DEBUGGER_CONTEXT_RATIO)

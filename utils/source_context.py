@@ -39,6 +39,10 @@ class SourceContextManager:
         # ── Scraper ──
         "scraper:run":       ("tools.scraper.tool", "ScraperTool.run"),
         "scraper:scrape":    ("tools.scraper.tool", "_run_botasaurus_scraper"),
+        # ── Infrastructure ──
+        "infra:worker":      ("worker.manager", "WorkerManager._run_job"),
+        "infra:writer":      ("database.writer", "db_writer_worker"),
+        "infra:api":         ("api.routes", "enqueue_tool"),
     }
 
     @classmethod

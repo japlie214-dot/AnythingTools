@@ -36,7 +36,7 @@ def db_writer_worker() -> None:
       - (EXEC_SCRIPT, (script_text,)) -> executed via conn.executescript(script_text)
     """
     conn = DatabaseManager.create_write_connection()
-    log.dual_log(tag="DB:Writer", message="DB writer thread started.")
+    log.dual_log(tag="DB:Writer:Start", message="DB writer thread started.")
     while True:
         try:
             task = write_queue.get(timeout=1.0)
@@ -56,8 +56,8 @@ def db_writer_worker() -> None:
                             _write_generation += 1
                     except Exception as e:
                         log.dual_log(
-                            tag="DB:Writer",
-                            message="Database execscript failed.",
+                                tag="DB:Writer:Error",
+                                message="Database execscript failed.",
                             level="ERROR",
                             payload={"script_head": script_text[:200]},
                             exc_info=e,
@@ -71,7 +71,7 @@ def db_writer_worker() -> None:
                         _write_generation += 1
             except Exception as e:
                 log.dual_log(
-                    tag="DB:Writer",
+                    tag="DB:Writer:Error",
                     message="Database write failed.",
                     level="ERROR",
                     payload={"sql": sql, "params": str(params)},
@@ -84,7 +84,7 @@ def db_writer_worker() -> None:
             if shutdown_event.is_set() and write_queue.empty():
                 break
     conn.close()
-    log.dual_log(tag="DB:Writer", message="DB writer thread stopped.")
+    log.dual_log(tag="DB:Writer:Stop", message="DB writer thread stopped.")
 
 
 def enqueue_write(sql: str, params: tuple = ()) -> None:

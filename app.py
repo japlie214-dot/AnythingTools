@@ -21,6 +21,19 @@ from pathlib import Path
 
 import config as config_module
 
+
+async def prefetch_paddleocr():
+    try:
+        def _init_ocr():
+            from paddleocr import PaddleOCR
+            PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)
+        await asyncio.to_thread(_init_ocr)
+        from utils.logger.core import get_dual_logger
+        get_dual_logger(__name__).dual_log(tag="Sys:Startup:OCR", message="PaddleOCR models pre-fetched successfully.")
+    except Exception as e:
+        from utils.logger.core import get_dual_logger
+        get_dual_logger(__name__).dual_log(tag="Sys:Startup:OCR", message=f"Failed to pre-fetch PaddleOCR: {e}", level="WARNING")
+
 try:
     import psutil
 except Exception:
@@ -308,6 +321,12 @@ async def lifespan(app: FastAPI):
         log.dual_log(tag="Sys:Registry", message="Tool registry loaded.")
     except Exception as e:
         log.dual_log(tag="Sys:Registry", message="Tool registry load failed.", level="WARNING", exc_info=e)
+
+    # 7) Pre-fetch PaddleOCR models
+    try:
+        asyncio.create_task(prefetch_paddleocr())
+    except Exception:
+        pass
 
     # 8) Background: reconcile any pending embeddings
     try:

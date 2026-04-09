@@ -67,7 +67,7 @@ class WorkerManager:
         # Start watchdog thread
         self._watch_thread = threading.Thread(target=self._watchdog_loop, name="anythingtools-worker-watchdog", daemon=True)
         self._watch_thread.start()
-        log.dual_log(tag="WorkerManager", message="WorkerManager started.")
+        log.dual_log(tag="Worker:Manager:Start", message="WorkerManager started.")
 
     def stop(self, timeout: float | None = 5.0) -> None:
         self._stop_event.set()
@@ -75,7 +75,7 @@ class WorkerManager:
             self._thread.join(timeout=timeout)
         if self._watch_thread is not None:
             self._watch_thread.join(timeout=timeout)
-        log.dual_log(tag="WorkerManager", message="WorkerManager stopped.")
+        log.dual_log(tag="Worker:Manager:Stop", message="WorkerManager stopped.")
 
     def _run_loop(self) -> None:
         last_heartbeat = time.time()
@@ -92,7 +92,7 @@ class WorkerManager:
                     "SELECT job_id, tool_name, args_json FROM jobs WHERE status = 'QUEUED' ORDER BY created_at LIMIT 2"
                 ).fetchall()
             except Exception as e:
-                log.dual_log(tag="WorkerManager:Poll", message=f"DB poll failed: {e}", level="WARNING", exc_info=e)
+                log.dual_log(tag="Worker:Manager:Poll", message=f"DB poll failed: {e}", level="WARNING", exc_info=e)
                 time.sleep(self.poll_interval)
                 continue
 
@@ -151,7 +151,7 @@ class WorkerManager:
                     )
                 except Exception:
                     try:
-                        log.dual_log(tag="Worker:Telemetry", message="Failed to persist telemetry entry", level="WARNING")
+                        log.dual_log(tag="Worker:Job:Telemetry", message="Failed to persist telemetry entry", level="WARNING")
                     except Exception:
                         pass
 
@@ -216,10 +216,10 @@ class WorkerManager:
 
             except Exception as e:
                 # Best-effort: log and continue
-                log.dual_log(tag="WorkerManager:Job:Persist", message=f"Failed to persist final payload for {job_id}: {e}", level="WARNING", exc_info=e)
+                log.dual_log(tag="Worker:Job:Persist", message=f"Failed to persist final payload for {job_id}: {e}", level="WARNING", exc_info=e)
 
         except Exception as e:
-            log.dual_log(tag="WorkerManager:Job", message=f"Job {job_id} crashed: {e}", level="ERROR", exc_info=e)
+            log.dual_log(tag="Worker:Job:Crashed", message=f"Job {job_id} crashed: {e}", level="ERROR", exc_info=e)
             enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("FAILED", now_iso(), job_id))
         finally:
             # Clean up runtime maps

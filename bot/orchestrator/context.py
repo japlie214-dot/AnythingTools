@@ -60,17 +60,22 @@ def build_context(job_id: str, max_budget: int) -> List[Dict[str, Any]]:
         from clients.llm.types import MIME_TYPE_MAP
         import os
         
-        actual_attachments = {
-            k: v for k, v in meta.items()
-            if isinstance(v, str) and os.path.splitext(v)[1].lower() in MIME_TYPE_MAP
-        }
+        actual_attachments = {}
+        for k, v in meta.items():
+            path_str = v.get("path") if isinstance(v, dict) else v
+            if isinstance(path_str, str) and os.path.splitext(path_str)[1].lower() in MIME_TYPE_MAP:
+                actual_attachments[k] = v
+
+        att_cost = 0
+        for v in actual_attachments.values():
+            att_cost += v.get("total_char_cost", 50000) if isinstance(v, dict) else 50000
 
         raw_messages.append({
             "role": row["role"],
             "content": row["content"],
             "attachment_metadata": actual_attachments,
             "char_count": len(row["content"]),
-            "attachment_char_count": sum(50000 for _ in actual_attachments.keys()),
+            "attachment_char_count": att_cost,
         })
 
     # User-Proxy rule: wrap attachments in a User message
