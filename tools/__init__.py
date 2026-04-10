@@ -9,6 +9,9 @@ ARCHITECTURE DEFINITION:
    exclusively by sub-agents (e.g., `browser:click`, `system:read_file`).
    These are strictly namespaced to prevent tool confusion and are invisible
    to the external API.
+3. The Execution Ledger is the Single Source of Truth. Agents and Tools must
+   never maintain isolated LLM histories. Mode transitions and results MUST
+   be appended to the execution_ledger.
 
 Public tool: library_query
 - A public tool available to the API.

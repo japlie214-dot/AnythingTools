@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS execution_ledger (
     role TEXT NOT NULL CHECK(role IN ('system','user','assistant','tool')),
     content TEXT NOT NULL,
     attachment_metadata TEXT,
+    char_count INTEGER NOT NULL DEFAULT 0,
+    attachment_char_count INTEGER NOT NULL DEFAULT 0,
     timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
 );

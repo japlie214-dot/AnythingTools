@@ -7,6 +7,8 @@ import fitz
 
 def calculate_image_cost(width: int, height: int) -> int:
     """OpenAI high-res tile logic mapped to character cost (* 4)."""
+    if width == 0 or height == 0:
+        return 0
     if max(width, height) > 2048:
         scale = 2048 / max(width, height)
         width, height = int(width * scale), int(height * scale)

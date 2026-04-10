@@ -5,11 +5,9 @@ AnythingTools FastAPI application entrypoint with lifespan hooks:
 - runs zombie-chrome cleanup
 - starts DB writer thread
 - applies SQL migrations found under database/migrations/
-- integrates legacy startup tasks: validate_vec0, reconcile_pending_embeddings, browser warmup,
-  startup recovery and stale-job cleanup (extracted from the original sumfind_main.py)
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.security.api_key import APIKeyHeader
 from fastapi import Security, HTTPException
@@ -311,7 +309,10 @@ async def lifespan(app: FastAPI):
         ).fetchall():
             enqueue_write("UPDATE jobs SET status = 'FAILED' WHERE job_id = ?", (row['job_id'],))
             enqueue_write("DELETE FROM job_items WHERE job_id = ?", (row['job_id'],))
-        log.dual_log(tag="DB:Cleanup", message="Stale job cleanup complete.")
+        
+        from database.writer import purge_stale_sessions
+        purge_stale_sessions(7)
+        log.dual_log(tag="DB:Cleanup", message="Stale job and session cleanup complete.")
     except Exception as e:
         log.dual_log(tag="DB:Cleanup", message="Cleanup error.", level="ERROR", exc_info=e)
 

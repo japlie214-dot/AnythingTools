@@ -260,6 +260,24 @@ async def wait_for_writes(timeout: float | None = None) -> bool:
         return False
 
 
+def purge_stale_sessions(stale_days: int = 7) -> None:
+    """Physically delete files and purge DB rows for sessions inactive > 7 days (Golden Rule 4)."""
+    import sqlite3 as _sqlite3
+    from database.connection import DatabaseManager
+    conn = DatabaseManager.get_read_connection()
+    conn.row_factory = _sqlite3.Row
+    try:
+        rows = conn.execute(
+            f"SELECT caller_id FROM execution_ledger GROUP BY caller_id HAVING MAX(timestamp) < datetime('now', '-{stale_days} days')"
+        ).fetchall()
+        for r in rows:
+            caller_id = r['caller_id']
+            if caller_id:
+                delete_messages_with_files(conn, "caller_id = ?", (caller_id,))
+    except Exception as e:
+        log.dual_log(tag="DB:Cleanup", message=f"Failed to purge stale sessions: {e}", level="WARNING")
+
+
 def shutdown_writer() -> None:
     if _writer_thread is None:
         return
