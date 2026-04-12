@@ -15,7 +15,7 @@ from utils.id_generator import ULID
 from database.writer import start_writer, enqueue_write
 from database.connection import DatabaseManager
 from utils.artifacts import artifact_url_from_request
-from worker.manager import get_manager
+from bot.engine.worker import get_manager
 from utils.security import scan_args_for_urls
 from pydantic import ValidationError
 

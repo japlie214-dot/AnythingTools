@@ -24,7 +24,11 @@ async def prefetch_paddleocr():
     try:
         def _init_ocr():
             from paddleocr import PaddleOCR
-            PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)
+            PaddleOCR(
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False
+            )
         await asyncio.to_thread(_init_ocr)
         from utils.logger.core import get_dual_logger
         get_dual_logger(__name__).dual_log(tag="Sys:Startup:OCR", message="PaddleOCR models pre-fetched successfully.")
@@ -365,7 +369,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
+ARTIFACTS_DIR = Path(__file__).parent / config_module.ARTIFACTS_ROOT
+try:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+except Exception as e:
+    try:
+        log.dual_log(tag="Sys:Artifacts", message=f"Failed to create artifacts dir {ARTIFACTS_DIR}: {e}", level="WARNING", exc_info=e)
+    except Exception:
+        pass
 app.mount("/artifacts", StaticFiles(directory=str(ARTIFACTS_DIR)), name="artifacts")
 
 # Include API routes if available

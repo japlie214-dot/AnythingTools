@@ -31,8 +31,8 @@ DEBUGGER_FILE_MAP: dict[str, list[str]] = {
     "DB:Writer": ["database/writer.py", "database/connection.py", "config.py"],
     "DB:Reader": ["database/reader.py", "database/connection.py"],
     "API:Job": ["api/routes.py", "database/job_queue.py", "api/schemas.py", "utils/id_generator.py"],
-    "Worker:Manager": ["worker/manager.py", "database/connection.py", "database/job_queue.py", "config.py"],
-    "Worker:Job": ["worker/manager.py", "tools/registry.py", "utils/context_helpers.py", "tools/base.py"],
+    "Worker:Manager": ["bot/engine/worker.py", "database/connection.py", "database/job_queue.py", "config.py"],
+    "Worker:Job": ["bot/engine/worker.py", "tools/registry.py", "utils/context_helpers.py", "tools/base.py"],
     "Vision:Capture": ["utils/vision_utils.py", "utils/browser_daemon.py", "utils/browser_lock.py"],
     "PDF:Extract": ["utils/pdf_utils.py", "utils/budget.py"],
     "LLM:": ["clients/llm/factory.py", "clients/llm/payloads.py", "clients/llm/types.py"],
@@ -41,5 +41,5 @@ DEBUGGER_FILE_MAP: dict[str, list[str]] = {
     "Scraper:Extract": ["tools/scraper/extraction.py", "tools/scraper/browser.py", "utils/browser_utils.py"],
     "Research:Step": ["tools/research/tool.py", "tools/research/research_prompts.py", "database/job_queue.py"],
     "Sys:Startup": ["app.py", "config.py", "database/schema.py"],
-    "DEFAULT": ["app.py", "worker/manager.py", "utils/logger/core.py", "config.py"],
+    "DEFAULT": ["app.py", "bot/engine/worker.py", "utils/logger/core.py", "config.py"],
 }

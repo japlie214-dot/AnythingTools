@@ -1,6 +1,9 @@
 # config.py — AnythingTools configuration (safe defaults)
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- API Security ---
 API_KEY: str = os.getenv("API_KEY", "dev_default_key_change_me_in_production")
@@ -25,8 +28,26 @@ ARTIFACTS_ROOT: str = os.getenv("ARTIFACTS_ROOT", "artifacts")
 
 # --- Azure OpenAI (for LLM client) ---
 AZURE_OPENAI_KEY: str | None = os.getenv("AZURE_OPENAI_KEY")
+AZURE_KEY: str | None = os.getenv("AZURE_KEY") or AZURE_OPENAI_KEY
 AZURE_OPENAI_ENDPOINT: str | None = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_ENDPOINT: str | None = os.getenv("AZURE_ENDPOINT") or AZURE_OPENAI_ENDPOINT
 AZURE_DEPLOYMENT: str = os.getenv("AZURE_DEPLOYMENT", "gpt-5.4-mini")
+
+# --- Chutes ---
+CHUTES_API_TOKEN: str | None = os.getenv("CHUTES_API_TOKEN")
+CHUTES_KEY: str | None = os.getenv("CHUTES_KEY") or CHUTES_API_TOKEN
+CHUTES_MODEL: str = os.getenv("CHUTES_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+
+# --- Snowflake ---
+SNOWFLAKE_ACCOUNT: str | None = os.getenv("SNOWFLAKE_ACCOUNT")
+SNOWFLAKE_USER: str | None = os.getenv("SNOWFLAKE_USER")
+SNOWFLAKE_WAREHOUSE: str | None = os.getenv("SNOWFLAKE_WAREHOUSE")
+SNOWFLAKE_DATABASE: str | None = os.getenv("SNOWFLAKE_DATABASE")
+SNOWFLAKE_SCHEMA: str | None = os.getenv("SNOWFLAKE_SCHEMA")
+SNOWFLAKE_PRIVATE_KEY_PATH: str = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH", "snowflake_private_key.p8")
+
+# --- Google ---
+GOOGLE_API_KEY: str | None = os.getenv("GOOGLE_API_KEY")
 
 # --- Logger Agent Context ---
 LOGGER_AGENT_MAX_CONTEXT: int = int(os.getenv("LOGGER_AGENT_MAX_CONTEXT", "100000"))

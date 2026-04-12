@@ -35,6 +35,7 @@ def db_writer_worker() -> None:
       - (sql: str, params: tuple)  -> executed via conn.execute(sql, params)
       - (EXEC_SCRIPT, (script_text,)) -> executed via conn.executescript(script_text)
     """
+    global _write_generation
     conn = DatabaseManager.create_write_connection()
     log.dual_log(tag="DB:Writer:Start", message="DB writer thread started.")
     while True:

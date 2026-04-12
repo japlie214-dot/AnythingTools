@@ -33,6 +33,10 @@ python-dotenv>=1.1.0
 # vec0 sqlite extension helper (binary required separately)
 sqlite-vec>=0.1.0
 
+# Snowflake and Encryption
+snowflake-connector-python>=3.0.0
+cryptography>=41.0.0
+
 # System utilities
 psutil==5.9.5
 
