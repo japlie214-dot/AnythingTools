@@ -269,12 +269,12 @@ def purge_stale_sessions(stale_days: int = 7) -> None:
     conn.row_factory = _sqlite3.Row
     try:
         rows = conn.execute(
-            f"SELECT caller_id FROM execution_ledger GROUP BY caller_id HAVING MAX(timestamp) < datetime('now', '-{stale_days} days')"
+            f"SELECT session_id FROM execution_ledger GROUP BY session_id HAVING MAX(timestamp) < datetime('now', '-{stale_days} days')"
         ).fetchall()
         for r in rows:
-            caller_id = r['caller_id']
-            if caller_id:
-                delete_messages_with_files(conn, "caller_id = ?", (caller_id,))
+            session_id = r['session_id']
+            if session_id:
+                delete_messages_with_files(conn, "session_id = ?", (session_id,))
     except Exception as e:
         log.dual_log(tag="DB:Cleanup", message=f"Failed to purge stale sessions: {e}", level="WARNING")
 

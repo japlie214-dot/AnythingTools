@@ -55,4 +55,10 @@ MODES: Dict[str, AgentMode] = {
         system_prompt="You are the Archivist. Manage vector embeddings, RAG retrieval, and long-term memory curation.",
         allowed_tools=["system:switch_mode", "system:complete_step", "system:initialize_checklist", "library:vector_search"]
     ),
+    "Navigator": AgentMode(
+        name="Navigator",
+        execution_type="AUTONOMOUS",
+        system_prompt="You are the Navigator. Execute the user's task exactly as described using the browser. Stop when the task is done.",
+        allowed_tools=["system:switch_mode", "system:complete_step", "system:initialize_checklist", "browser:operator"]
+    ),
 }

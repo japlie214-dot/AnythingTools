@@ -31,13 +31,13 @@ class FinanceTool(BaseTool):
         
         # Extract required identifiers
         job_id = kwargs.get("job_id")
-        chat_id = kwargs.get("chat_id")
+        session_id = kwargs.get("session_id")
         
         if not job_id:
             return "Error: job_id is required."
         
-        if not chat_id:
-            chat_id = 0
+        if not session_id:
+            session_id = "0"
             
         # Extract and validate arguments
         ticker = args.get("ticker", "").strip().upper()
@@ -47,8 +47,8 @@ class FinanceTool(BaseTool):
         action = args.get("action", "analyze")
         statement = args.get("statement", "Quarterly Earnings")
         
-        # Normalize caller_id
-        caller_id = str(chat_id)
+        # Normalize session_id
+        session_id = str(session_id)
         
         # Pass all args to agent
         agent_args = args.copy()
@@ -56,7 +56,7 @@ class FinanceTool(BaseTool):
         # Instantiate Unified Agent in Quant mode
         agent = UnifiedAgent(
             job_id=job_id,
-            caller_id=caller_id,
+            session_id=session_id,
             initial_mode="Quant"
         )
         

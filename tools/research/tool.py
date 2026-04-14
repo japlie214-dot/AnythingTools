@@ -32,14 +32,14 @@ class ResearchTool(BaseTool):
         
         # Extract required identifiers
         job_id = kwargs.get("job_id")
-        chat_id = kwargs.get("chat_id")
+        session_id = kwargs.get("session_id")
         
         if not job_id:
             return "Error: job_id is required."
         
-        if not chat_id:
+        if not session_id:
             # Fallback for compatibility
-            chat_id = 0
+            session_id = "0"
             
         # Extract and validate arguments
         url = args.get("url")
@@ -49,7 +49,7 @@ class ResearchTool(BaseTool):
             return "Error: URL is required for the research tool."
         
         # Normalize caller_id as string
-        caller_id = str(chat_id)
+        caller_id = str(session_id)
         
         # Prepare arguments for agent (will be passed as kwargs)
         agent_args = {
@@ -60,7 +60,7 @@ class ResearchTool(BaseTool):
         # Instantiate Unified Agent in Analyst mode
         agent = UnifiedAgent(
             job_id=job_id,
-            caller_id=caller_id,
+            session_id=caller_id,
             initial_mode="Analyst"
         )
         

@@ -5,6 +5,7 @@ AnythingTools FastAPI application entrypoint with lifespan hooks:
 - runs zombie-chrome cleanup
 - starts DB writer thread
 - applies SQL migrations found under database/migrations/
+python -m uvicorn app:app --reload --port 8000
 """
 
 from fastapi import FastAPI, Depends
@@ -233,13 +234,21 @@ async def lifespan(app: FastAPI):
 
     # Enqueue authoritative schema init via writer execscript and wait for completion
     try:
-        script = get_init_script()
-        enqueue_execscript(script)
-        try:
-            await wait_for_writes()
-            log.dual_log(tag="DB:Schema", message="Schema initialization completed via writer.")
-        except Exception as e:
-            log.dual_log(tag="DB:Schema", message=f"wait_for_writes failed: {e}", level="WARNING", exc_info=e)
+        from database.schema import ALLOW_DESTRUCTIVE_RESET, init_db
+        if ALLOW_DESTRUCTIVE_RESET:
+            try:
+                init_db()
+                log.dual_log(tag="DB:Schema", message="Schema initialization completed via init_db() (destructive reset enabled).")
+            except Exception as e:
+                log.dual_log(tag="DB:Schema", message=f"init_db() failed: {e}", level="ERROR", exc_info=e)
+        else:
+            script = get_init_script()
+            enqueue_execscript(script)
+            try:
+                await wait_for_writes()
+                log.dual_log(tag="DB:Schema", message="Schema initialization completed via writer.")
+            except Exception as e:
+                log.dual_log(tag="DB:Schema", message=f"wait_for_writes failed: {e}", level="WARNING", exc_info=e)
     except Exception as e:
         log.dual_log(tag="DB:Schema", message=f"Failed to enqueue/initialize schema: {e}", level="ERROR", exc_info=e)
 

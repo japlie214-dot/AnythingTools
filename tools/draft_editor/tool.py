@@ -38,13 +38,13 @@ class DraftEditorTool(BaseTool):
         
         # Extract required identifiers
         job_id = kwargs.get("job_id")
-        chat_id = kwargs.get("chat_id")
+        session_id = kwargs.get("session_id")
         
         if not job_id:
             return "Error: job_id is required."
         
-        if not chat_id:
-            chat_id = 0
+        if not session_id:
+            session_id = "0"
         
         # Extract arguments
         batch_id = args.get("batch_id")
@@ -53,8 +53,8 @@ class DraftEditorTool(BaseTool):
         if not batch_id:
             return "Error: batch_id is required."
         
-        # Normalize caller_id
-        caller_id = str(chat_id)
+        # Normalize session_id
+        session_id = str(session_id)
         
         # Pass all args to agent
         agent_args = args.copy()
@@ -62,7 +62,7 @@ class DraftEditorTool(BaseTool):
         # Instantiate Unified Agent in Editor mode
         agent = UnifiedAgent(
             job_id=job_id,
-            caller_id=caller_id,
+            session_id=session_id,
             initial_mode="Editor"
         )
         

@@ -9,13 +9,13 @@ from utils.logger import get_dual_logger
 log = get_dual_logger(__name__)
 
 # Schema version constant
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # Allow destructive reset via environment variable
 ALLOW_DESTRUCTIVE_RESET = os.getenv("SUMANAL_ALLOW_SCHEMA_RESET", "0") == "1"
 
 INIT_SCRIPT = """
-CREATE TABLE IF NOT EXISTS chats (
-    chat_id    INTEGER PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
     is_busy    INTEGER NOT NULL DEFAULT 0,
     active_job_id TEXT,
     FOREIGN KEY(active_job_id) REFERENCES jobs(job_id) ON DELETE SET NULL
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS execution_ledger (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ledger_id TEXT UNIQUE NOT NULL,
     job_id TEXT NOT NULL,
-    caller_id TEXT,
+    session_id TEXT,
     role TEXT NOT NULL CHECK(role IN ('system','user','assistant','tool')),
     content TEXT NOT NULL,
     attachment_metadata TEXT,
@@ -39,19 +39,19 @@ CREATE INDEX IF NOT EXISTS idx_execution_ledger_job_id
 
 CREATE TABLE IF NOT EXISTS jobs (
     job_id      TEXT PRIMARY KEY,
-    chat_id     INTEGER NOT NULL,
+    session_id  TEXT NOT NULL,
     tool_name   TEXT    NOT NULL,
     args_json   TEXT    NOT NULL DEFAULT '{}',
-    status      TEXT    NOT NULL DEFAULT 'PENDING'
+    status      TEXT NOT NULL DEFAULT 'PENDING'
         CHECK(status IN ('PENDING','QUEUED','RUNNING','INTERRUPTED','COMPLETED','FAILED','ABANDONED','CANCELLING')),
     retry_count INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     result_json TEXT,
-    FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_jobs_chat_status
-    ON jobs(chat_id, status);
+CREATE INDEX IF NOT EXISTS idx_jobs_session_status
+    ON jobs(session_id, status);
 
 CREATE TABLE IF NOT EXISTS job_items (
     item_id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,41 +70,41 @@ CREATE INDEX IF NOT EXISTS idx_job_items_job_id
 CREATE TABLE IF NOT EXISTS telemetry_events (
     id         TEXT PRIMARY KEY,
     job_id     TEXT,
-    chat_id    INTEGER,
+    session_id TEXT,
     tool_name  TEXT NOT NULL,
     status     TEXT NOT NULL,
     message    TEXT,
     occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(job_id)  REFERENCES jobs(job_id)   ON DELETE CASCADE,
-    FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS token_usage (
     id                 TEXT PRIMARY KEY,
-    chat_id            INTEGER NOT NULL,
+    session_id         TEXT NOT NULL,
     telemetry_id       TEXT,
-    provider           TEXT    NOT NULL,
-    model              TEXT    NOT NULL,
+    provider           TEXT NOT NULL,
+    model              TEXT NOT NULL,
     prompt_tokens      INTEGER NOT NULL DEFAULT 0 CHECK(prompt_tokens >= 0),
     completion_tokens  INTEGER NOT NULL DEFAULT 0 CHECK(completion_tokens >= 0),
     reasoning_tokens   INTEGER NOT NULL DEFAULT 0 CHECK(reasoning_tokens >= 0),
     total_tokens       INTEGER NOT NULL DEFAULT 0 CHECK(total_tokens >= 0),
-    recorded_at        TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(chat_id)      REFERENCES chats(chat_id)           ON DELETE CASCADE,
+    recorded_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(session_id)   REFERENCES sessions(session_id)     ON DELETE CASCADE,
     FOREIGN KEY(telemetry_id) REFERENCES telemetry_events(id)     ON DELETE SET NULL
 );
-CREATE INDEX IF NOT EXISTS idx_token_usage_chat_recorded
-    ON token_usage(chat_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_token_usage_session_recorded
+    ON token_usage(session_id, recorded_at);
 
 CREATE TABLE IF NOT EXISTS financial_metrics (
     id           TEXT PRIMARY KEY,
-    chat_id      INTEGER NOT NULL,
-    metric_name  TEXT    NOT NULL,
-    metric_value REAL    NOT NULL,
+    session_id   TEXT NOT NULL,
+    metric_name  TEXT NOT NULL,
+    metric_value REAL NOT NULL,
     metric_unit  TEXT,
-    as_of        TEXT    NOT NULL,
+    as_of        TEXT NOT NULL,
     metadata_json TEXT   NOT NULL DEFAULT '{}',
-    FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS market_data_snapshots (
@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS calculated_metrics (
 
 CREATE TABLE IF NOT EXISTS long_term_memories (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id       INTEGER,
+    session_id    TEXT,
     agent_domain  TEXT,
     topic         TEXT NOT NULL,
     memory        TEXT NOT NULL,
@@ -150,12 +150,12 @@ CREATE TABLE IF NOT EXISTS long_term_memories (
     type          TEXT NOT NULL DEFAULT 'Knowledge',
     created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_memories_agent_domain
     ON long_term_memories(agent_domain, type, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_memories_chat_type
-    ON long_term_memories(chat_id, type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_session_type
+    ON long_term_memories(session_id, type, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS raw_fundamentals (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -221,7 +221,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memories_vec USING vec0(
 -- Transient parsed PDF pages cache (cleared on startup/shutdown)
 CREATE TABLE IF NOT EXISTS pdf_parsed_pages (
     id TEXT PRIMARY KEY,
-    chat_id INTEGER,
+    session_id TEXT,
     pdf_name TEXT NOT NULL,
     page_number INTEGER NOT NULL,
     content TEXT NOT NULL
@@ -348,7 +348,7 @@ def init_db() -> None:
             current_v = 0
         
         # ── Selective destructive reset for legacy versions ────────────────
-        if 0 < current_v < SCHEMA_VERSION:
+        if current_v != SCHEMA_VERSION and ALLOW_DESTRUCTIVE_RESET:
             log.dual_log(
                 tag="DB:Schema",
                 message=f"Performing selective destructive reset to v{SCHEMA_VERSION}.",

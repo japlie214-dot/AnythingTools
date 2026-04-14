@@ -48,8 +48,12 @@ def require_api_key(request: Request):
     return True
 
 
+def get_session_id(request: Request) -> str:
+    return request.headers.get("x-session-id") or request.headers.get("X-Session-ID") or "0"
+
+
 @router.post("/tools/{tool_name}", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
-async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, _=Depends(require_api_key)):
+async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, _=Depends(require_api_key), session_id: str = Depends(get_session_id)):
     # Refresh registry so code changes are visible
     REGISTRY.load_all()
     meta = REGISTRY._tools.get(tool_name)
@@ -87,28 +91,28 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, 
 
     job_id = ULID.generate()
     created = now_iso()
-
+    
     # Persist job record (writer will serialize DB writes)
     # Log system: intent and pre-execution state
     log.dual_log(
         tag="API:Job:Create",
         message=f"Enqueueing job for tool '{tool_name}'",
-        payload={"tool": tool_name, "args": args, "job_id": job_id, "chat_id": 0, "status": "QUEUED"}
+        payload={"tool": tool_name, "args": args, "job_id": job_id, "session_id": session_id, "status": "QUEUED"}
     )
     enqueue_write(
-        "INSERT INTO chats (chat_id) VALUES (0) ON CONFLICT(chat_id) DO NOTHING",
-        (),
+        "INSERT INTO sessions (session_id) VALUES (?) ON CONFLICT(session_id) DO NOTHING",
+        (session_id,),
     )
     enqueue_write(
-        "INSERT INTO jobs (job_id, chat_id, tool_name, args_json, status, created_at, updated_at) VALUES (?, 0, ?, ?, ?, ?, ?)",
-        (job_id, tool_name, json.dumps(args), "QUEUED", created, created),
+        "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (job_id, session_id, tool_name, json.dumps(args), "QUEUED", created, created),
     )
     # Write to execution_ledger as well (preparation for Phase 3)
     # Store args in content as JSON to prevent token-heuristic misidentification as an attachment
     ledger_content = json.dumps({"event": f"Enqueueing tool {tool_name}", "args": args})
     enqueue_write(
-        "INSERT INTO execution_ledger (ledger_id, job_id, caller_id, role, content, attachment_metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (ULID.generate(), job_id, "0", "user", ledger_content, None, created),
+        "INSERT INTO execution_ledger (ledger_id, job_id, session_id, role, content, attachment_metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (ULID.generate(), job_id, session_id, "user", ledger_content, None, created),
     )
     log.dual_log(tag="API:Job:Persist", message=f"Job {job_id} persisted", payload={"job_id": job_id})
 
@@ -216,6 +220,16 @@ async def delete_job(job_id: str, request: Request, _=Depends(require_api_key)):
     else:
         # Job not actively running yet; we marked it in DB and manager will honor it.
         return {"job_id": job_id, "status": "CANCELLING"}
+
+
+@router.delete("/sessions/{session_id}/memory", status_code=status.HTTP_202_ACCEPTED)
+async def clear_session_memory(session_id: str, _=Depends(require_api_key)):
+    """Permanently deletes the execution ledger memory for a given session."""
+    try:
+        enqueue_write("DELETE FROM execution_ledger WHERE session_id = ?", (session_id,))
+        return {"status": "SUCCESS", "message": f"Memory for session {session_id} cleared."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/metrics")

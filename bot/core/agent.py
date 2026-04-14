@@ -22,9 +22,9 @@ log = get_dual_logger(__name__)
 class UnifiedAgent:
     """Re-entrant state machine for autonomous agent execution."""
     
-    def __init__(self, job_id: str, caller_id: str, initial_mode: str):
+    def __init__(self, job_id: str, session_id: str, initial_mode: str):
         self.job_id = job_id
-        self.caller_id = caller_id
+        self.session_id = session_id
         self.current_mode = MODES.get(initial_mode, MODES["Analyst"])
         self.tool_call_count = 0
         self.llm = get_llm_client("azure")
@@ -37,13 +37,13 @@ class UnifiedAgent:
                 tool_name = kwargs.get("tool_name")
                 tool_instance = REGISTRY.create_tool_instance(tool_name)
                 if tool_instance:
-                    tool_result = await run_tool_safely(tool_instance, kwargs, telemetry, job_id=self.job_id, chat_id=self.caller_id, **kwargs)
+                    tool_result = await run_tool_safely(tool_instance, kwargs, telemetry, job_id=self.job_id, session_id=self.session_id, **kwargs)
                     return {"status": "COMPLETED" if tool_result.success else "FAILED", "result": tool_result.output}
                 return {"status": "FAILED", "message": f"Programmatic tool {tool_name} not found."}
 
             messages = build_session_context(
-                self.caller_id, 
-                self.current_mode.system_prompt, 
+                self.session_id,
+                self.current_mode.system_prompt,
                 max_budget=100000
             )
             
@@ -72,8 +72,8 @@ class UnifiedAgent:
             if not response.tool_calls:
                 content = response.content or ""
                 enqueue_write(
-                    "INSERT INTO execution_ledger (job_id, caller_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
-                    (self.job_id, self.caller_id, "assistant", content, len(content))
+                    "INSERT INTO execution_ledger (job_id, session_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
+                    (self.job_id, self.session_id, "assistant", content, len(content))
                 )
                 return {"status": "COMPLETED", "result": content}
 
@@ -92,8 +92,8 @@ class UnifiedAgent:
                 # Record assistant intent
                 intent_content = f"Invoking tool {fn_name} with args {args_str}"
                 enqueue_write(
-                    "INSERT INTO execution_ledger (job_id, caller_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
-                    (self.job_id, self.caller_id, "assistant", intent_content, len(intent_content))
+                    "INSERT INTO execution_ledger (job_id, session_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
+                    (self.job_id, self.session_id, "assistant", intent_content, len(intent_content))
                 )
 
                 # Handle mode switching
@@ -105,8 +105,8 @@ class UnifiedAgent:
                         self.current_mode = MODES[target]
                         switch_msg = f"Mode switched to {target}. Reason: {reason}. Objective: {objective}."
                         enqueue_write(
-                            "INSERT INTO execution_ledger (job_id, caller_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
-                            (self.job_id, self.caller_id, "system", switch_msg, len(switch_msg))
+                            "INSERT INTO execution_ledger (job_id, session_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
+                            (self.job_id, self.session_id, "system", switch_msg, len(switch_msg))
                         )
                         continue  # Skip to next iteration with new mode
 
@@ -120,8 +120,8 @@ class UnifiedAgent:
 
                 # Record tool response
                 enqueue_write(
-                    "INSERT INTO execution_ledger (job_id, caller_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
-                    (self.job_id, self.caller_id, "tool", res_text, len(res_text))
+                    "INSERT INTO execution_ledger (job_id, session_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
+                    (self.job_id, self.session_id, "tool", res_text, len(res_text))
                 )
 
         # 50-call hard cap exceeded

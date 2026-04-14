@@ -55,7 +55,7 @@ def execute_read_sql(sql: str, params: tuple = (), ensure_fresh: bool = False, a
         log.dual_log(tag="DB:Reader", message=f"execute_read_sql failed: {e}", level="ERROR", exc_info=e)
         raise ReaderError(str(e))
 
-def get_chat_messages(chat_id: int, limit: int) -> List[Dict[str, Any]]:
+def get_session_messages(session_id: str, limit: int) -> List[Dict[str, Any]]:
     """Return sanitized execution ledger messages (attachment_metadata parsed into list)."""
     cur = _get_cursor()
     cur.execute("""
@@ -64,8 +64,8 @@ def get_chat_messages(chat_id: int, limit: int) -> List[Dict[str, Any]]:
             COALESCE(attachment_metadata, '[]') AS attachment_path,
             COALESCE(ledger_id, '') AS event_id
         FROM execution_ledger
-        WHERE caller_id = ? ORDER BY id ASC LIMIT ?
-    """, (str(chat_id), limit))
+        WHERE session_id = ? ORDER BY id ASC LIMIT ?
+    """, (session_id, limit))
 
     out: List[Dict[str, Any]] = []
     for row in cur.fetchall():
@@ -83,31 +83,31 @@ def get_chat_messages(chat_id: int, limit: int) -> List[Dict[str, Any]]:
         out.append(r)
     return out
 
-def get_unarchived_messages(chat_id: int, limit: int) -> List[Dict[str, Any]]:
+def get_unarchived_messages(session_id: str, limit: int) -> List[Dict[str, Any]]:
     """Lightweight fetch used by Archivist to retrieve the next batch (no embeddings)."""
     cur = _get_cursor()
     cur.execute("""
         SELECT id as message_id, role, content, 0 as char_count, COALESCE(attachment_metadata, '[]') AS attachment_path
         FROM execution_ledger
-        WHERE caller_id = ? ORDER BY id ASC LIMIT ?
-    """, (str(chat_id), limit))
+        WHERE session_id = ? ORDER BY id ASC LIMIT ?
+    """, (session_id, limit))
     return [dict(r) for r in cur.fetchall()]
 
-def get_top_memories(chat_id: int, limit: int = 30) -> List[Dict[str, Any]]:
+def get_top_memories(session_id: str, limit: int = 30) -> List[Dict[str, Any]]:
     """Return memory metadata only (no embedding BLOBs)."""
     cur = _get_cursor()
     cur.execute("""
         SELECT id, topic, memory, type, updated_at
         FROM long_term_memories
-        WHERE chat_id = ? OR chat_id IS NULL
+        WHERE session_id = ? OR session_id IS NULL
         ORDER BY updated_at DESC LIMIT ?
-    """, (chat_id, limit))
+    """, (session_id, limit))
     return [dict(r) for r in cur.fetchall()]
 
 def get_job_with_steps(job_id: str) -> Optional[Dict[str, Any]]:
     """Return job with parsed args and steps structure."""
     cur = _get_cursor()
-    cur.execute("SELECT job_id, chat_id, tool_name, status, COALESCE(args_json, '{}') as args_json FROM jobs WHERE job_id = ?", (job_id,))
+    cur.execute("SELECT job_id, session_id, tool_name, status, COALESCE(args_json, '{}') as args_json FROM jobs WHERE job_id = ?", (job_id,))
     row = cur.fetchone()
     if not row:
         return None

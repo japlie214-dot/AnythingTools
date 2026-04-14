@@ -13,26 +13,26 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def create_job(chat_id: int, tool_name: str, args_json: str) -> str:
+def create_job(session_id: str, tool_name: str, args_json: str) -> str:
     """Create a job record following the mandatory 3-step insertion order (Golden Rule 6).
     Returns the new job_id.
     """
     job_id = ULID.generate()
-    # Step 1: ensure chat row exists (active_job_id stays NULL for now)
+    # Step 1: ensure session row exists (active_job_id stays NULL for now)
     enqueue_write(
-        "INSERT INTO chats (chat_id) VALUES (?) ON CONFLICT(chat_id) DO NOTHING",
-        (chat_id,)
+        "INSERT INTO sessions (session_id) VALUES (?) ON CONFLICT(session_id) DO NOTHING",
+        (session_id,)
     )
     # Step 2: create the job row
     enqueue_write(
-        "INSERT INTO jobs (job_id, chat_id, tool_name, args_json, status, updated_at) "
+        "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, updated_at) "
         "VALUES (?, ?, ?, ?, 'RUNNING', ?)",
-        (job_id, chat_id, tool_name, args_json, _utcnow())
+        (job_id, session_id, tool_name, args_json, _utcnow())
     )
-    # Step 3: link the job to the chat
+    # Step 3: link the job to the session
     enqueue_write(
-        "UPDATE chats SET active_job_id = ?, is_busy = 1 WHERE chat_id = ?",
-        (job_id, chat_id)
+        "UPDATE sessions SET active_job_id = ?, is_busy = 1 WHERE session_id = ?",
+        (job_id, session_id)
     )
     return job_id
 
@@ -70,15 +70,15 @@ def mark_job_interrupted(job_id: str) -> None:
    )
 
 
-def get_interrupted_job(chat_id: int, tool_name: str) -> Optional[Dict[str, Any]]:
-    """Return the most recently interrupted job for this chat + tool, or None.
+def get_interrupted_job(session_id: str, tool_name: str) -> Optional[Dict[str, Any]]:
+    """Return the most recently interrupted job for this session + tool, or None.
     Only 'INTERRUPTED' status is resumable; 'PENDING' (never started) is excluded.
     """
     from database.reader import execute_read_sql
     rows = execute_read_sql(
-        "SELECT job_id, chat_id, tool_name, args_json, status, retry_count, updated_at "
-        "FROM jobs WHERE chat_id = ? AND tool_name = ? AND status = 'INTERRUPTED' "
+        "SELECT job_id, session_id, tool_name, args_json, status, retry_count, updated_at "
+        "FROM jobs WHERE session_id = ? AND tool_name = ? AND status = 'INTERRUPTED' "
         "ORDER BY updated_at DESC LIMIT 1",
-        (chat_id, tool_name)
+        (session_id, tool_name)
     )
     return rows[0] if rows else None

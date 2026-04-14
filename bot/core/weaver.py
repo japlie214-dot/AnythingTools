@@ -1,13 +1,13 @@
 """
 Context Weaver for Unified Agent Instance.
 
-Fetches execution_ledger rows by caller_id in reverse chronological order,
+Fetches execution_ledger rows by session_id in reverse chronological order,
 applies the Guillotine budget limit, performs User-Proxy Role Flip, and
 injects current browser state.
 
 This is the core context assembly engine that respects the Golden Rules:
 1. Execution Ledger is the Single Source of Truth
-2. Agent context is bound to caller_id (Session Continuity)
+2. Agent context is bound to session_id (Session Continuity)
 3. Hard limit enforced via accumulated char_count + attachment_char_count
 """
 
@@ -17,15 +17,15 @@ from database.connection import DatabaseManager
 
 
 def build_session_context(
-    caller_id: str, 
-    mode_system_prompt: str, 
+    session_id: str,
+    mode_system_prompt: str,
     max_budget: int
 ) -> List[Dict[str, Any]]:
     """
     Fetch caller history, apply Vision Window & Guillotine, enforce User-Proxy.
     
     Args:
-        caller_id: The session identifier for context continuity
+        session_id: The session identifier for context continuity
         mode_system_prompt: System prompt for the current mode
         max_budget: Hard character budget limit (including attachments)
         
@@ -34,11 +34,11 @@ def build_session_context(
     """
     conn = DatabaseManager.get_read_connection()
     
-    # Fetch by caller_id in DESCENDING order (newest first)
+    # Fetch by session_id in DESCENDING order (newest first)
     rows = conn.execute(
         "SELECT role, content, attachment_metadata, char_count, attachment_char_count "
-        "FROM execution_ledger WHERE caller_id = ? ORDER BY id DESC",
-        (str(caller_id),)
+        "FROM execution_ledger WHERE session_id = ? ORDER BY id DESC",
+        (str(session_id),)
     ).fetchall()
 
     raw_messages = []
@@ -125,7 +125,7 @@ def build_session_context(
     return final_messages
 
 
-def get_session_cost(caller_id: str, max_budget: int) -> int:
+def get_session_cost(session_id: str, max_budget: int) -> int:
     """
     Calculate current accumulated cost for a session without building context.
     
@@ -134,8 +134,8 @@ def get_session_cost(caller_id: str, max_budget: int) -> int:
     conn = DatabaseManager.get_read_connection()
     rows = conn.execute(
         "SELECT char_count, attachment_char_count, attachment_metadata "
-        "FROM execution_ledger WHERE caller_id = ? ORDER BY id DESC",
-        (str(caller_id),)
+        "FROM execution_ledger WHERE session_id = ? ORDER BY id DESC",
+        (str(session_id),)
     ).fetchall()
 
     total_cost = 0
@@ -165,11 +165,11 @@ def get_session_cost(caller_id: str, max_budget: int) -> int:
     return total_cost
 
 
-def would_exceed_budget(caller_id: str, additional_cost: int, max_budget: int) -> bool:
+def would_exceed_budget(session_id: str, additional_cost: int, max_budget: int) -> bool:
     """
     Check if adding additional_cost would exceed the Guillotine budget.
     """
-    current_cost = get_session_cost(caller_id, max_budget)
+    current_cost = get_session_cost(session_id, max_budget)
     return current_cost + additional_cost > max_budget
 
 

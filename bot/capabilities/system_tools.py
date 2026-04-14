@@ -57,13 +57,13 @@ class InitializeChecklistTool:
         try:
             steps = args.get("steps", [])
             job_id = args.get("job_id")
-            caller_id = args.get("caller_id")
+            session_id = args.get("session_id")
             
             if not steps:
                 return SystemToolResult(False, "No steps provided")
             
-            if not job_id or not caller_id:
-                return SystemToolResult(False, "Missing job_id or caller_id")
+            if not job_id or not session_id:
+                return SystemToolResult(False, "Missing job_id or session_id")
             
             # Create job_items entries for each step
             for i, step in enumerate(steps):
@@ -81,8 +81,8 @@ class InitializeChecklistTool:
             metadata = {"steps": steps}
             
             enqueue_write(
-                "INSERT INTO execution_ledger (ledger_id, job_id, caller_id, role, content, attachment_metadata, char_count, attachment_char_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (ledger_id, job_id, caller_id, "system", content, json.dumps(metadata), len(content), 0)
+                "INSERT INTO execution_ledger (ledger_id, job_id, session_id, role, content, attachment_metadata, char_count, attachment_char_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (ledger_id, job_id, session_id, "system", content, json.dumps(metadata), len(content), 0)
             )
             
             return SystemToolResult(
@@ -119,13 +119,13 @@ class CompleteStepTool:
             step_identifier = args.get("step_identifier")
             output_data = args.get("output_data", {})
             job_id = args.get("job_id")
-            caller_id = args.get("caller_id")
+            session_id = args.get("session_id")
             
             if not step_identifier:
                 return SystemToolResult(False, "Missing step_identifier")
             
-            if not job_id or not caller_id:
-                return SystemToolResult(False, "Missing job_id or caller_id")
+            if not job_id or not session_id:
+                return SystemToolResult(False, "Missing job_id or session_id")
             
             # Update job_items entry
             enqueue_write(
@@ -139,8 +139,8 @@ class CompleteStepTool:
             metadata = {"output": output_data}
             
             enqueue_write(
-                "INSERT INTO execution_ledger (ledger_id, job_id, caller_id, role, content, attachment_metadata, char_count, attachment_char_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (ledger_id, job_id, caller_id, "system", content, json.dumps(metadata), len(content), 0)
+                "INSERT INTO execution_ledger (ledger_id, job_id, session_id, role, content, attachment_metadata, char_count, attachment_char_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (ledger_id, job_id, session_id, "system", content, json.dumps(metadata), len(content), 0)
             )
             
             return SystemToolResult(
@@ -182,13 +182,13 @@ class SwitchModeTool:
             reason = args.get("reason", "")
             objective = args.get("objective", "")
             job_id = args.get("job_id")
-            caller_id = args.get("caller_id")
+            session_id = args.get("session_id")
             
             if not target:
                 return SystemToolResult(False, "Missing target mode")
             
-            if not job_id or not caller_id:
-                return SystemToolResult(False, "Missing job_id or caller_id")
+            if not job_id or not session_id:
+                return SystemToolResult(False, "Missing job_id or session_id")
             
             # Validate target mode
             target_mode = MODES.get(target)
@@ -213,8 +213,8 @@ class SwitchModeTool:
             }
             
             enqueue_write(
-                "INSERT INTO execution_ledger (ledger_id, job_id, caller_id, role, content, attachment_metadata, char_count, attachment_char_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (ledger_id, job_id, caller_id, "system", content, json.dumps(metadata), len(content), 0)
+                "INSERT INTO execution_ledger (ledger_id, job_id, session_id, role, content, attachment_metadata, char_count, attachment_char_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (ledger_id, job_id, session_id, "system", content, json.dumps(metadata), len(content), 0)
             )
             
             log.dual_log(

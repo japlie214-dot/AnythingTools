@@ -70,6 +70,43 @@ class ToolRegistry:
                         continue
                     self._register_module_tools(module)
 
+        # 3. Public tools discovery: top-level tool modules and packages under tools/
+        #    (e.g., tools/browser_task, tools/research). This ensures public entry
+        #    points are exposed in the /api manifest as intended.
+        for child in package_dir.iterdir():
+            # Skip helper modules
+            if child.name in ('__init__.py', 'registry.py', 'base.py'):
+                continue
+
+            # If it's a package (directory with __init__.py), import package and
+            # also attempt to import common submodules (tool.py, Skill.py) inside it.
+            if child.is_dir():
+                module_name = f"tools.{child.name}"
+                try:
+                    module = importlib.import_module(module_name)
+                    self._register_module_tools(module)
+                except Exception as e:
+                    log.dual_log(tag="Registry:Load", message=f"Failed to import public tool package {module_name}: {e}", level="DEBUG", payload={"module": module_name})
+
+                # Attempt to import conventional submodules inside the package, e.g. tool.py
+                for sub in ("tool", "Skill"):
+                    try:
+                        submod = importlib.import_module(f"tools.{child.name}.{sub}")
+                        self._register_module_tools(submod)
+                    except Exception:
+                        pass
+                continue
+
+            # If it's a top-level .py module file, import it
+            if child.is_file() and child.suffix == '.py':
+                module_name = f"tools.{child.stem}"
+                try:
+                    module = importlib.import_module(module_name)
+                    self._register_module_tools(module)
+                except Exception as e:
+                    log.dual_log(tag="Registry:Load", message=f"Failed to import public tool module {module_name}: {e}", level="DEBUG", payload={"module": module_name})
+                continue
+
     def _register_module_tools(self, module):
         # Attempt to capture INPUT_MODEL.schema() if provided by the module.
         input_schema: Optional[Dict[str, Any]] = None

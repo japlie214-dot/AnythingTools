@@ -62,7 +62,7 @@ class UnifiedWorkerManager:
                 conn = DatabaseManager.get_read_connection()
                 # Prioritize INTERRUPTED (recovery) jobs, then QUEUED
                 rows = conn.execute(
-                    "SELECT job_id, chat_id, tool_name, args_json, status FROM jobs "
+                    "SELECT job_id, session_id, tool_name, args_json, status FROM jobs "
                     "WHERE status IN ('QUEUED', 'INTERRUPTED') ORDER BY status ASC, created_at ASC LIMIT 5"
                 ).fetchall()
                 
@@ -73,7 +73,7 @@ class UnifiedWorkerManager:
 
             for r in rows:
                 job_id = r["job_id"]
-                caller_id = str(r["chat_id"])
+                session_id = str(r["session_id"])
                 tool_name = r["tool_name"]
                 status = r["status"]
                 
@@ -82,12 +82,12 @@ class UnifiedWorkerManager:
                 except Exception:
                     args = {}
 
-                # Caller-Level Lock: prevent concurrent execution for same caller_id
-                if caller_id in self._active_callers:
+                # Session-Level Lock: prevent concurrent execution for same session_id
+                if session_id in self._active_callers:
                     continue
 
-                # Register caller as active
-                self._active_callers.add(caller_id)
+                # Register session as active
+                self._active_callers.add(session_id)
                 
                 # Mark job as RUNNING
                 ts = now_iso()
@@ -104,22 +104,22 @@ class UnifiedWorkerManager:
                         "proceeding. Consult job_items to review completed steps."
                     )
                     enqueue_write(
-                        "INSERT INTO execution_ledger (job_id, caller_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
-                        (job_id, caller_id, "system", recovery_msg, len(recovery_msg))
+                        "INSERT INTO execution_ledger (job_id, session_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
+                        (job_id, session_id, "system", recovery_msg, len(recovery_msg))
                     )
 
                 # Spawn execution thread
                 t = spawn_thread_with_context(
-                    self._run_job, 
-                    args=(job_id, caller_id, tool_name, args), 
-                    name=f"job-{job_id}", 
+                    self._run_job,
+                    args=(job_id, session_id, tool_name, args),
+                    name=f"job-{job_id}",
                     daemon=True
                 )
                 self._active_jobs[job_id] = t
 
             time.sleep(self.poll_interval)
 
-    def _run_job(self, job_id: str, caller_id: str, tool_name: str, args: dict) -> None:
+    def _run_job(self, job_id: str, session_id: str, tool_name: str, args: dict) -> None:
         """Execute a single job using the Unified Agent."""
         try:
             # Map public tool to initial mode
@@ -136,7 +136,7 @@ class UnifiedWorkerManager:
                 """Placeholder telemetry callback."""
                 pass
 
-            agent = UnifiedAgent(job_id, caller_id, initial_mode)
+            agent = UnifiedAgent(job_id, session_id, initial_mode)
             result = asyncio.run(agent.run(telemetry_cb, tool_name=tool_name, **args))
 
             status_str = result.get("status", "FAILED")
@@ -152,9 +152,9 @@ class UnifiedWorkerManager:
             enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("FAILED", now_iso(), job_id))
             
         finally:
-            # Always clean up caller lock
-            if caller_id in self._active_callers:
-                self._active_callers.remove(caller_id)
+            # Always clean up session lock
+            if session_id in self._active_callers:
+                self._active_callers.remove(session_id)
             if job_id in self._active_jobs:
                 del self._active_jobs[job_id]
 
