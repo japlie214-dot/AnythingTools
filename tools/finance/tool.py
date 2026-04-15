@@ -6,7 +6,7 @@ Validates inputs and instantiates the Unified Agent in Quant mode.
 """
 
 from typing import Any
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from bot.core.agent import UnifiedAgent
 
 
@@ -26,7 +26,7 @@ class FinanceTool(BaseTool):
         """Returns True for ingest actions."""
         return args.get("action") == "ingest"
     
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Entry point for Finance. Validates inputs and spawns Quant Agent."""
         
         # Extract required identifiers

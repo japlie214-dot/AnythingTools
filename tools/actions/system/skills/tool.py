@@ -5,14 +5,14 @@ from typing import Any
 
 from database.connection import DatabaseManager
 from database.writer import enqueue_write
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 
 
 class SkillListTool(BaseTool):
     from bot.core.constants import TOOL_SYSTEM_SKILL_LIST
     name = TOOL_SYSTEM_SKILL_LIST
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         conn = DatabaseManager.get_read_connection()
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT id, title FROM ai_skills ORDER BY id").fetchall()
@@ -25,7 +25,7 @@ class SkillReadTool(BaseTool):
     from bot.core.constants import TOOL_SYSTEM_SKILL_READ
     name = TOOL_SYSTEM_SKILL_READ
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         ids = args.get("ids", [])
         if not ids:
             return "Error: 'ids' array is required."
@@ -52,7 +52,7 @@ class SkillCrudTool(BaseTool):
     from bot.core.constants import TOOL_SYSTEM_SKILL_CRUD
     name = TOOL_SYSTEM_SKILL_CRUD
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         action = args.get("action", "").upper()
 
         if action == "CREATE":

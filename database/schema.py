@@ -79,6 +79,21 @@ CREATE TABLE IF NOT EXISTS telemetry_events (
     FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
+-- ── Job logs (persistent tool + runtime logs) ─────────────────────────────────
+CREATE TABLE IF NOT EXISTS job_logs (
+    id           TEXT PRIMARY KEY,
+    job_id       TEXT,
+    tag          TEXT,
+    level         TEXT,
+    status_state TEXT,
+    message      TEXT,
+    payload_json TEXT,
+    timestamp    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_job_logs_job_id
+    ON job_logs(job_id, timestamp);
+
 CREATE TABLE IF NOT EXISTS token_usage (
     id                 TEXT PRIMARY KEY,
     session_id         TEXT NOT NULL,
@@ -355,25 +370,7 @@ def init_db() -> None:
                 level="WARNING",
                 payload={"current_version": current_v, "target_version": SCHEMA_VERSION},
             )
-            # Step 1: Back up long_term_memories BEFORE dropping sessions...
-            try:
-                # Check if sessions table exists before trying to join
-                has_sessions = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'"
-                ).fetchone()
-                
-                if has_sessions:
-                    conn.execute("""
-                        CREATE TABLE IF NOT EXISTS ltm_backup AS
-                        SELECT l.id, l.topic, l.memory, l.embedding, l.type, l.created_at, l.updated_at,
-                               s.chat_id AS resolved_chat_id
-                        FROM long_term_memories l
-                        LEFT JOIN sessions s ON l.session_id = s.id
-                    """)
-            except Exception:
-                pass
-
-            # Step 2: Drop all legacy tables atomically, including chat_messages to apply new schema.
+            # Step 1: Drop all legacy tables atomically, including chat_messages to apply new schema.
             tables_to_drop = [
                 'sessions', 'active_chat_state', 'tool_telemetry', 'grouped_formulas',
                 'job_cache', 'chat_history', 'token_usage', 'financial_metrics',
@@ -402,27 +399,6 @@ def init_db() -> None:
         script_to_run = get_init_script()
         conn.executescript(script_to_run)
 
-        # ── Restore backed-up memories ─────────────────────────────────────
-        _scratch_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='ltm_backup'"
-        )}
-        if 'ltm_backup' in _scratch_tables:
-            try:
-                conn.execute("""
-                    INSERT OR IGNORE INTO long_term_memories
-                        (id, chat_id, topic, memory, embedding, type, created_at, updated_at)
-                    SELECT id, resolved_chat_id, topic, memory, embedding, type, created_at, updated_at
-                        FROM ltm_backup
-                """)
-                conn.execute("DROP TABLE IF EXISTS ltm_backup")
-                conn.commit()
-            except Exception as _e:
-                log.dual_log(
-                    tag="DB:Schema",
-                    message="LTM restore from backup failed (non-fatal).",
-                    level="WARNING",
-                    exc_info=_e,
-                )
 
         # ── Set schema version ──────────────────────────────────────────────
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

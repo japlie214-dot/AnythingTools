@@ -45,15 +45,7 @@ class ToolRegistry:
         self._tools.clear()
         package_dir = Path(__file__).parent
 
-        # 1. Legacy top-level discovery for library_query (public entry point)
-        if (package_dir / "library_query.py").exists():
-            try:
-                module = importlib.import_module("tools.library_query")
-                self._register_module_tools(module)
-            except Exception as e:
-                log.dual_log(tag="Registry:Load", message=f"Failed to import tools.library_query: {e}", level="WARNING", payload={"module": "library_query"})
-
-        # 2. Agent-action discovery under tools/actions/<scope>/
+        # 1. Agent-action discovery under tools/actions/<scope>/
         actions_dir = package_dir / "actions"
         if actions_dir.exists() and actions_dir.is_dir():
             for scope in actions_dir.iterdir():

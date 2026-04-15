@@ -2,7 +2,7 @@
 import sqlite3
 from typing import Any
 import config
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from database.connection import DatabaseManager
 from utils.vector_search import generate_embedding
 
@@ -10,7 +10,7 @@ class PDFSearchTool(BaseTool):
     from bot.core.constants import TOOL_LIBRARY_PDF_SEARCH
     name = TOOL_LIBRARY_PDF_SEARCH
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         pdf_name = args.get("pdf_name")
         search_query = args.get("search_query")
         page_range = args.get("page_range")

@@ -9,7 +9,7 @@ and enforces strict knowledge boundaries (no internal knowledge).
 import json
 from typing import Any
 
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from clients.llm import get_llm_client, LLMRequest
 
 
@@ -18,7 +18,7 @@ class LibraryQueryTool(BaseTool):
 
     name = "library_query"
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         query = args.get("query", "")
         if not query:
             return "Error: query required."

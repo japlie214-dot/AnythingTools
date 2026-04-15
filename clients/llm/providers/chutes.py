@@ -2,7 +2,7 @@
 """ChutesProvider class and its private usage helper."""
 
 import asyncio
-from typing import Any, Dict, AsyncGenerator
+from typing import Any, Dict
 
 from openai import AsyncOpenAI, RateLimitError, APITimeoutError, APIConnectionError
 
@@ -44,41 +44,15 @@ class ChutesProvider(LLMProvider):
             config, "CHUTES_MODEL", "meta-llama/Llama-3.3-70B-Instruct"
         )
 
-    def _build_payload(self, request: LLMRequest, *, stream: bool) -> Dict[str, Any]:
+    def _build_payload(self, request: LLMRequest) -> Dict[str, Any]:
         payload = {
             "model":         request.model or self.default_model,
             "messages":      request.messages,
-            "stream":        stream,
             "extra_headers": {"X-Enable-Thinking": "true"},
         }
         if request.min_tokens is not None:
             payload["extra_body"] = {"min_tokens": request.min_tokens}
         return _apply_common_payload(payload, request)
-
-    async def stream_chat(
-        self, request: LLMRequest
-    ) -> AsyncGenerator[LLMChunk, None]:
-        for attempt in range(1, MAX_API_RETRIES + 1):
-            try:
-                response = await self.client.chat.completions.create(
-                    **self._build_payload(request, stream=True)
-                )
-                async for chunk in response:
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    text  = delta.content if delta and getattr(delta, "content", None) else ""
-                    if text:
-                        yield LLMChunk(
-                            text=text,
-                            provider=self.provider_name,
-                            model=request.model or self.default_model,
-                        )
-                return
-            except (RateLimitError, APITimeoutError, APIConnectionError):
-                if attempt == MAX_API_RETRIES:
-                    raise
-                await asyncio.sleep(
-                    min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
-                )
 
     async def complete_chat(self, request: LLMRequest) -> LLMResponse:
         _resolved_model = request.model or self.default_model
@@ -91,7 +65,7 @@ class ChutesProvider(LLMProvider):
                 "tools":    request.tools,
             },
         )
-        payload  = self._build_payload(request, stream=False)
+        payload  = self._build_payload(request)
         response = await _with_retry(
             lambda: self.client.chat.completions.create(**payload)
         )

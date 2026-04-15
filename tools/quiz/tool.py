@@ -16,7 +16,7 @@ import asyncio
 from typing import Any, List
 
 from clients.llm import get_llm_client, LLMRequest
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from utils.text_processing import parse_llm_json
 import config
 from utils.logger import get_dual_logger
@@ -134,7 +134,7 @@ class QuizTool(BaseTool):
 
         return sent_count
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Execute quiz generation pipeline."""
         # ── DRY_RUN guard ───────────────────────────────────────────
         dry_run = kwargs.get('dry_run', config.TELEGRAM_DRY_RUN)

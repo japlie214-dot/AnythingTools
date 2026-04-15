@@ -1,7 +1,7 @@
 # tools/browser_task/tool.py
 from typing import Any
 from pydantic import BaseModel, Field
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from bot.core.agent import UnifiedAgent
 
 class BrowserTaskInput(BaseModel):
@@ -14,7 +14,7 @@ class BrowserTaskTool(BaseTool):
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return True
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         job_id = kwargs.get("job_id")
         session_id = kwargs.get("session_id", "0")
         

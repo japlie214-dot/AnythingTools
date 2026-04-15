@@ -304,8 +304,8 @@ def _build_responses_payload(
 
     # ── Reasoning / temperature ───────────────────────────────────────────────
     is_reasoning = any(m in resolved_model for m in ["o1", "o3", "gpt-5"])
-    if request.reasoning_effort and is_reasoning:
-        payload["reasoning"] = {"effort": request.reasoning_effort}
+    if is_reasoning:
+        payload["reasoning"] = {"effort": "low"}
     if request.temperature is not None and not is_reasoning:
         payload["temperature"] = request.temperature
     if request.max_tokens is not None:

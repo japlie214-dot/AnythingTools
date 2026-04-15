@@ -6,7 +6,7 @@ Validates inputs and instantiates the Unified Agent in Herald mode.
 """
 
 from typing import Any
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from bot.core.agent import UnifiedAgent
 
 
@@ -23,7 +23,7 @@ class PublisherTool(BaseTool):
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return False
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Entry point for Publisher. Validates inputs and spawns Herald Agent."""
         
         # Extract required identifiers

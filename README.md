@@ -1,573 +1,440 @@
-# AnythingTools - Unified Agent Framework
+# AnythingTools - Autonomous Multi-Agent Orchestration System
 
 ## 1. Project Overview
 
-### Concrete, Operational Description
-AnythingTools is a **FastAPI-based unified agent framework** that orchestrates autonomous and programmatic AI tool execution through a state-machine architecture. The system operates as a persistent background service that:
+**What the system does:** An autonomous multi-agent orchestration system that executes complex tasks using web automation, LLN reasoning, and tool composition. The system operates as a background worker accepting REST API requests, spawning specialized agent personas (Scout, Analyst, Quant, Editor, Herald, Archivist, Navigator), and executing tool chains autonomously with loop protection and budget management.
 
-- **Maintains job queue** in SQLite database (`jobs` table)
-- **Spawns worker threads** via `UnifiedWorkerManager` that poll for queued jobs
-- **Executes tools** through `UnifiedAgent` state machines with mode-based personas
-- **Persists complete execution history** in `execution_ledger` table (SSSOT)
-- **Enforces safety limits** including 50-tool-call hard caps and caller-level locking
-- **Supports recovery** by resuming interrupted jobs on restart
+**Concrete operational capabilities:**
+- Execute web scraping and data extraction via browser automation
+- Perform financial analysis and reconciliation
+- Research topics with multi-step reasoning
+- Manage long-term memory and vector search
+- Publish formatted content to external channels
+- Automatically condense context when budget exceeds 70%
+- Send real-time progress notifications via Telegram
+- Persist all state in SQLite with WAL mode for resilience
 
-### Problem Solved
-The system replaces a **tool-centric architecture** where each tool had:
-- Monolithic, non-reusable execution logic
-- No unified state management
-- Manual orchestration required
-- No recovery mechanism on crashes
-- No shared context between operations
-
-Current architecture provides:
-- **Unified agent** with 6 persona modes (Scout, Analyst, Editor, Herald, Quant, Archivist)
-- **Execution ledger** as immutable single source of truth
-- **Automatic recovery** via startup scans and INTERRUPTED job injection
-- **Session continuity** via caller-level locking preventing concurrent execution for same user
-
-### Explicit Non-Goals
-- **Does NOT** provide a traditional REST API for direct tool calls (uses job queue pattern)
-- **Does NOT** support parallel execution for the same caller_id (locked)
-- **Does NOT** maintain conversation history outside the `execution_ledger` table
-- **Does NOT** implement actual AI model inference (relies on external LLM clients)
-- **Does NOT** provide a user interface (API-only system)
+**What it explicitly does NOT do:**
+- Does not provide a frontend UI (all interactions via API/CLI)
+- Does not maintain long-term memory embeddings (all operations are ephemeral per session)
+- Does not implement concurrent job execution (single-writer concurrency model)
+- Does not use Chat Completions API (exclusively Azure Responses API)
 
 ## 2. High-Level Architecture
 
 ### Major Components
 
-#### a) API Layer (`api/routes.py`)
-- **FastAPI router** with job submission endpoint
-- **API key security** via header validation
-- **Job lifecycle management**: create, status check, cancel
-- **Metrics endpoint** for system health monitoring
+**Agent Core (`bot/core/`):**
+- `agent.py`: UnifiedAgent state machine with 50-call hard cap and loop protection
+- `modes.py`: Six persona definitions with allowed tools and system prompts
+- `weaver.py`: Context assembly with 70/20/10 budget enforcement
+- `constants.py`: Centralized tool name constants
 
-#### b) Worker Manager (`bot/engine/worker.py`)
-```python
-class UnifiedWorkerManager:
-    - Polls SQLite `jobs` table every 1.0s
-    - Claims jobs with status 'QUEUED' or 'INTERRUPTED' (priority order)
-    - Enforces caller-level locking via `_active_callers` set
-    - Spawns execution threads with context isolation
-    - Injects recovery messages for INTERRUPTED jobs
-    - Cleans up locks on job completion/failure
-```
+**LLM Provider Layer (`clients/llm/`):**
+- Exclusive Azure Responses API implementation (no streaming)
+- `payloads.py`: Request construction with automatic low-reasoning injection
+- `factory.py`: Singleton client wrapper
+- `azure.py`: Responses API with `create` endpoint
+- `chutes.py`: Fallback provider with identical interface
 
-#### c) Unified Agent (`bot/core/agent.py`)
-```python
-class UnifiedAgent:
-    - State machine executing Think-Act-Observe loop
-    - 50-tool-call hard cap enforcement
-    - Mode switching via `system_switch_mode` tool
-    - Programmatic vs Autonomous execution types
-    - LLM invocation with tool schema injection
-```
+**Tool System (`tools/`):**
+- 25+ tools across 6 categories (browser, library, system, finance, research, publisher)
+- Registry-based discovery with `BaseTool` interface
+- All tools use `telemetry: Any` parameter (no callbacks)
 
-#### d) Tool Registry (`tools/registry.py`)
-```python
-class ToolRegistry:
-    - Dynamic discovery of BaseTool subclasses
-    - Auto-scans `tools/actions/<scope>/` directories
-    - Also attempts to import `tools.actions.<scope>.<module>.tool` for subpackages
-    - Extracts schemas from INPUT_MODEL classes
-    - Provides MCP-style manifest via schema_list()
-    - Validates tool names against Azure OpenAI regex `^[a-zA-Z0-9_-]+$` (no dots)
-```
+**Database Layer (`database/`):**
+- Single-writer SQLite with WAL mode
+- Tables: `sessions`, `jobs`, `execution_ledger`, `job_logs`, `job_items`
+- Background writer thread with queue (`maxsize=1000`)
+- Automatic missing-table repair in write path
 
-#### e) Database Layer
-- **Writer Thread** (`database/writer.py`): Single-writer queue for WAL-safe operations
-- **Schema** (`database/schema.py`): 11 tables including execution_ledger, jobs, job_items
-- **Connection Manager** (`database/connection.py`): Manages read/write connections
+**Observability (`utils/logger/`):**
+- Dual-stream logging (console + master file)
+- Telegram integration via `log.dual_log(..., notify_user=True)`
+- Debounced debugger agent (3-min cooldown)
+- Tool buffer flush to `job_logs`
 
 ### Data Flow
 
-#### Programmatic Execution Flow (Scout Mode)
-```
-[User/API] → POST /api/tools/{tool_name} → [Router]
-    ↓
-Creates job record with status 'QUEUED'
-    ↓
-[Worker Manager] polls job → Spawns thread → [UnifiedAgent]
-    ↓
-Mode: PROGRAMMATIC → Direct tool execution → [Tool Runner]
-    ↓
-Tool executes once → Returns result → Writes to execution_ledger
-    ↓
-Job marked COMPLETED/FAILED → Result returned via GET /api/job/{id}
-```
+1. API receives job request → creates job in DB
+2. Worker thread claims job → spawns UnifiedAgent
+3. Agent builds context from `execution_ledger` → calls LLM
+4. LLM returns tool calls → agent executes via `run_tool_safely`
+5. Tool results appended to ledger → loop continues
+6. On completion/failure → Telegram notification + DB update
 
-#### Autonomous Execution Flow (Analyst, Editor, etc.)
-```
-[User/API] → POST /api/tools/research → [Router]
-    ↓
-Creates job record with status 'QUEUED'
-    ↓
-[Worker Manager] polls job → Spawns thread → [UnifiedAgent]
-    ↓
-Mode: AUTONOMOUS → Think-Act-Observe loop with LLM:
-    1. LLM selects tool from allowed_tools list
-    2. Tool executes (possibly multiple steps)
-    3. Results written to execution_ledger
-    4. Loop repeats until LLM returns success/failure
-    ↓
-Job marked COMPLETED/FAILED or INTERRUPTED on crash
-```
-
-#### Single-Writer Queue Flow
-```
-Worker Threads → enqueue_write() → write_queue (maxsize=1000)
-    ↓
-SQLite Writer Thread (database/writer.py) → conn.execute() → conn.commit()
-    ↓
-write_generation counter increments → wait_for_writes() polls queue depth
-```
-
-#### Recovery Flow on Startup
-```
-app.py startup
-    ↓
-Query jobs WHERE status IN ('RUNNING', 'INTERRUPTED')
-    ↓
-UPDATE jobs SET status='FAILED' WHERE status='RUNNING'
-    ↓
-Re-enqueue INTERRUPTED jobs with 'INTERRUPTED' status
-    ↓
-Worker Manager claims INTERRUPTED jobs first
-    ↓
-UnifiedAgent injects recovery message into execution_ledger
-    ↓
-Normal execution resumes
-```
+### Execution Model
+Event-driven autonomous loops with hard caps. Background writer thread handles all DB writes sequentially to maintain single-writer guarantees.
 
 ## 3. Repository Structure
 
-### Top-Level Directory Mapping
-
-- `.env` - Environment variables (API keys, DB path, log levels)
-- `.gitignore` - Excludes venv, data, logs, private keys
-- `app.py` - FastAPI application entrypoint (production startup)
-- `config.py` - Centralized config loader (env var parsing, defaults)
-- `requirements.txt` - Python dependencies (FastAPI, uvicorn, pandas, etc.)
-- `snowflake_private_key.p8` - (Fallback/legacy) unused in current paths
-- `.venv/` - Virtual environment (local, excluded from VCS)
-
-### rst
 ```
-.
-├── .env                     # Runtime config: DB path, API keys, logging
-├── .gitignore              # VCS filters for data, logs, venv, secrets
-├── app.py                  # FastAPI entrypoint; starts API server and writer thread
-├── config.py               # Central config parsing and defaults
-├── requirements.txt        # Project dependencies
-├── snowflake_private_key.p8 # Vestigial/legacy secret (unused in current code)
-└── .venv/                  # Local virtual environment
-```
-
-### `api/`
-
-```
-api/
-├── __init__.py
-├── routes.py              # FastAPI router: POST /api/tools/{tool_name}, GET /api/jobs/{job_id}, DELETE /jobs and /sessions/memory, GET /manifest
-├── schemas.py             # Pydantic models: JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry
-└── telegram_notifier.py   # Stub/unused: consider vestigial; no references in active code
-```
-
-### `bot/`
-
-```
-bot/
-├── telemetry.py           # Telemetry hooks (placeholder; not referenced in active execution)
-└── capabilities/
-    ├── __init__.py
-    └── system_tools.py    # REMOVED: Previously contained non-BaseTool implementations; deleted to remove duplication and signature mismatches
-└── core/
-    ├── __init__.py
-    ├── agent.py           # UnifiedAgent: Think-Act-Observe loop with tool call guard and mode switching
-    ├── constants.py       # Central tool-name constants (e.g., TOOL_SYSTEM_SWITCH_MODE)
-    ├── modes.py           # AgentMode dataclasses defining 6 personas with allowed_tools
-    └── weaver.py          # Utility for LLM message formatting (used by agent)
-└── engine/
-    ├── __init__.py
-    ├── tool_runner.py     # Tool execution wrapper (run_tool_safely, len guard)
-    └── worker.py          # UnifiedWorkerManager: Polls jobs, claims, spawns threads, recovery
-└── orchestrator/
-    ├── context.py         # Currently unused; appears to exist for historical or extension purposes
-    └── eviction.py        # Job cancellation/gc logic (referenced in routes.py DELETE /jobs)
-```
-
-### `clients/`
-
-```
-clients/
-├── snowflake_client.py    # Unused: no references in active execution paths
-└── llm/
-    ├── __init__.py        # Re-exports factory, types, utils
-    ├── factory.py         # get_llm_client("azure") provider factory
-    ├── payloads.py        # Dataclasses for LLM request/response models
-    ├── utils.py           # LLM utility helpers
-    └── providers/
-        ├── __init__.py
-        ├── azure.py       # Azure OpenAI client (HTTP requests, token counting)
-        └── chutes.py      # Chutes provider (stubbed; not referenced in config defaults)
+c:/New folder/AnythingTools/
+├── app.py                          # FastAPI entry point (implied by routes)
+├── config.py                       # Environment configuration
+├── requirements.txt                # Python dependencies
+├── .env                            # Secrets (not in repo)
+├── api/
+│   ├── routes.py                   # REST endpoints (jobs, status, manifest)
+│   ├── schemas.py                  # Pydantic models
+│   └── telegram_notifier.py        # HTTP-based Telegram dispatcher
+├── bot/
+│   ├── core/
+│   │   ├── agent.py               # UnifiedAgent (main state machine)
+│   │   ├── constants.py           # TOOL_* constants
+│   │   ├── modes.py               # 6 persona definitions
+│   │   └── weaver.py              # Context assembly + budget logic
+│   ├── engine/
+│   │   ├── tool_runner.py         # Error handling wrapper
+│   │   └── worker.py              # Job queue consumer
+│   └── capabilities/              # Empty (legacy structure)
+├── clients/
+│   └── llm/
+│       ├── types.py               # LLMRequest/LLMResponse dataclasses
+│       ├── payloads.py            # Request builder + reasoning config
+│       ├── factory.py             # Singleton client
+│       └── providers/
+│           ├── azure.py           # Responses API implementation
+│           └── chutes.py          # Alternative provider
+├── database/
+│   ├── schema.py                  # INIT_SCRIPT with job_logs table
+│   ├── writer.py                  # Background writer with repair logic
+│   ├── connection.py              # Thread-local connections
+│   ├── reader.py                  # Query helpers
+│   ├── job_queue.py               # Job status management
+│   └── blackboard.py              # (Unused global state)
+├── tools/
+│   ├── base.py                    # BaseTool + ToolResult (no TelemetryCallback)
+│   ├── registry.py                # Dynamic import of tools
+│   ├── library_query.py           # Top-level entry point (legacy kept)
+│   └── actions/                   # Scoped tool collections
+│       ├── system/
+│       │   ├── state/tool.py      # system_declare_failure, switch_mode
+│       │   ├── files/             # File operations
+│       │   └── skills/            # CRUD operations
+│       ├── browser/
+│       │   ├── browser_operator/  # Playwright-based automation
+│       │   └── macros/            # Saved macro management
+│       ├── library/
+│       │   ├── vector_search.py   # Vector similarity search
+│       │   └── pdf_search/        # PDF parsing tools
+│       └── (finance, research, etc.)  # Domain-specific tools
+├── utils/
+│   ├── logger/
+│   │   ├── core.py                # SumAnalLogger + dual_log
+│   │   ├── formatters.py          # Payload serialization
+│   │   ├── handlers.py            # File handlers
+│   │   ├── routing.py             # Specialized file routing
+│   │   └── state.py               # ContextVars (_current_job_id, buffers)
+│   ├── som_utils.py               # SoM injection + DOM stability functions
+│   ├── browser_utils.py           # Browser helpers
+│   ├── text_processing.py         # HTML cleaning, truncation
+│   ├── id_generator.py            # ULID generation
+│   └── budget.py                  # Character cost calculation
+└── tests/
+    └── test_browser_e2e.py        # Minimal browser test
 ```
 
-### `database/`
-
-```
-database/
-├── __init__.py
-├── schema.py             # 11-table schema (execution_ledger, jobs, job_items, sessions, ...); init script with migrations
-├── connection.py         # DatabaseManager: read/write connection pools, busy_timeout, row_factory
-├── writer.py             # Single-writer queue (async-safe); append_to_ledger() helper with char/attachment counting
-├── job_queue.py          # Helper functions to enqueue jobs/session rows; add_job_item() with correct typing
-├── reader.py             # Helper for async wait_for_writes(); leverages database writer generation counter
-├── blackboard.py         # Job step coordination (claim, save, fail) for autonomous loops
-├── formula_cache.py      # Financial formula cache used by finance tools
-```
-
-### `tools/`
-
-```
-tools/
-├── __init__.py
-├── base.py               # BaseTool abstract class; ToolResult dataclass with attachment paths
-├── registry.py           # ToolRegistry; discovers BaseTool subclasses; validates names; adds .tool subpackage import for actions
-├── library_query.py      # Legacy top-level tool for library search (public entry point)
-└── actions/              # Tool implementations organized by scope
-    ├── system/
-    │   ├── state/
-    │   │   ├── __init__.py
-    │   │   └── tool.py   # Implements initialize_checklist, complete_step, switch_mode (correctly typed BaseTool)
-    │   ├── files/
-    │   │   ├── __init__.py
-    │   │   └── tool.py   # list/downloads, read_document, delete_file
-    │   ├── skills/
-    │   │   ├── __init__.py
-    │   │   └── tool.py   # CRUD tools for persistent AI skills
-    ├── library/
-    │   ├── vector_search.py       # Internal similarity search tool (used by Librarian)
-    │   └── pdf_search/
-    │       ├── __init__.py
-    │       ├── tool.py            # PDF search (similarity + keyword)
-    │       └── toc_tool.py        # Table-of-contents extraction tool
-    ├── browser/
-    │   ├── browser_operator/
-    │   │   ├── __init__.py
-    │   │   ├── tool.py            # Browser automation tool with macro-driven actions
-    │   │   ├── prompt.py          # Prompt templates for operator
-    │   │   └── Skill.py           # Skill descriptors (legacy/desc mapping)
-    │   └── macros/
-    │       ├── __init__.py
-    │       └── tool.py            # Save, edit, delete, execute macro tools
-    └── (other scopes: finance, research, publisher, search, quiz, polymarket, draft_editor)
-│       ├── tool.py or __init__.py  # Each scope uses semantic package layout; some have Skill.py for descriptions
-```
-
-### `tests/`
-
-```
-tests/
-└── test_browser_e2e.py     # End-to-end browser test; likely uses Botasaurus/Playwright (requires env setup)
-```
-
-### `utils/`
-
-```
-utils/
-├── id_generator.py         # Thread-safe monotonic ULID generator (used for ledger_id and some identifiers)
-├── logger/                 # Dual logger (console + structured JSON)
-│   ├── __init__.py
-│   ├── core.py             # get_dual_logger() and routing with status_state/jobs updates
-│   ├── formatters.py       # JSON and console formatters
-│   ├── handlers.py         # Structured and console handlers
-│   ├── routing.py          # Log routing configuration
-│   ├── setup.py            # Logger initialization
-│   └── state.py            # Logger state (level, config)
-├── pdf_utils.py            # PDF extraction (pypdf) with write to DB via enqueue_write
-├── vector_search.py        # Embedding generation (OpenAI) + vector table writes
-├── vision_utils.py         # Unused: image-based analysis stubs
-├── browser_daemon.py       # Driver factory for Botasaurus (get_or_create_driver)
-├── browser_lock.py         # Async lock proxy (BrowserLockProxy) for browser concurrency control
-├── budget.py               # Token budgeting (unused in active paths)
-├── context_helpers.py      # spawn_thread_with_context() used by worker
-├── debugger_agent.py       # LLM-based debugger (unused; debug-only)
-├── hitl.py                 # Human-in-the-loop stub (unused)
-├── prompt_cache.py         # Prompt memoization (unused)
-├── security.py             # URL scanning/validation
-├── som_utils.py            # Unused: screenshot-of-logic stub
-├── source_context.py       # Unused: context building stubs
-└── tracker.py              # Structured event tracking stubs
-```
+**Unconventional structures:**
+- No `src/` directory
+- Tools split between `actions/` subdirs and top-level legacy entry
+- `utils/logger/` is a complete logging framework
+- `bot/engine/` exists but `bot/core/agent.py` contains main loop
+- `database/` has both `writer.py` and `reader.py` but no ORM
 
 ## 4. Core Concepts & Domain Model
 
 ### Key Abstractions
 
-- **Tool**: An atomic unit of work defined by a BaseTool subclass. Each tool has a `name` and optional `INPUT_MODEL` for schema validation. Tools must be surfaced in `tools/` or `tools/actions/<scope>/` to be discovered.
+**UnifiedAgent**: Re-entrant state machine with 50-call hard cap, mode switching, and automatic context condensation at 70% budget.
 
-- **Agent Persona (Mode)**: A named capability set defined in `bot/core/modes.py`. Each persona has an `allowed_tools` list. Modes include: Scout (PROGRAMMATIC), Analyst, Editor, Herald, Quant, Archivist, Navigator (AUTONOMOUS).
+**Session + Job**: `sessions` table tracks isolation; `jobs` table tracks execution status; `execution_ledger` stores all messages with character costs.
 
-- **Job**: A unit of work submitted via API. Stored in the `jobs` table with status: QUEUED, RUNNING, COMPLETED, FAILED, INTERRUPTED, CANCELLING. A job is bound to a `session_id` (caller identity).
+**Context Window**: 70% for history, 20% for tools, 10% for response (hard-coded in `agent.py` at budget check).
 
-- **Execution Ledger**: Append-only table storing every tool call, LLM response, and system message for a job. The column `role` indicates 'user', 'assistant', 'system'. It includes `attachment_metadata` for files.
+**Tool Registry**: Dynamic discovery via `tools/actions/` directory structure; all tools must inherit `BaseTool` with `name` and `INPUT_MODEL`.
 
-- **Session & Locking**: The `sessions` table tracks `active_job_id` and `is_busy`. The worker manager enforces caller-level locking using `_active_callers`; a caller cannot enqueue more than one job at a time.
+**Budget Management**: `get_session_cost()` queries DB; condensation triggers when `current_cost > budget * 0.7`.
 
-- **Writer Queue**: A single-threaded queue for all DB writes. `enqueue_write()` enqueues SQL tuples. `append_to_ledger()` is the canonical wrapper for ledger inserts (computes char counts and ULID ledger_id). `wait_for_writes()` drains the queue.
+**Observability**: All notifications via `log.dual_log(..., notify_user=True)` → Telegram + DB + Console.
 
-- **Recovery**: On startup, RUNNING → FAILED, and INTERRUPTED jobs are reinserted into the queue, causing `UnifiedAgent` to inject a recovery message into the ledger.
+### Domain Model Flow
+```python
+Job → UnifiedAgent → LLMRequest → LLMResponse → Tool Calls → ToolResult → Append to Ledger
+```
 
-### Implicit Rules & Invariants
-
-- Tool names must match `^[a-zA-Z0-9_-]+$` (no dots). This is enforced by `ToolRegistry` regex.
-- Only one job per session_id is processed at a time (caller-level locking).
-- The `execution_ledger` is the SSSOT; no separate conversation history is maintained.
-- Job items use `INTEGER PRIMARY KEY` for `item_id`. ULID cannot be used here; `database/job_queue.py:add_job_item` handles timestamp and integer typing correctly.
-- `database/writer.py:append_to_ledger()` handles char counts and attachment cost computation. It must be used for all ledger writes (not raw `enqueue_write` INSERT).
-- Search tools return capped results (threshold, k) but do not mutate state.
-- Browser tools require an active driver; concurrency is serialized via `browser_lock`.
-- Library tools can read/write to vector tables or job items but do not modify job status.
-- Agent loop has a 50-tool-call hard cap to prevent infinities.
+### Implicit Rules
+- All tools must inherit `BaseTool` with `name` and `INPUT_MODEL`
+- All tool signatures: `async run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str`
+- Attachment metadata must include `total_char_cost` for accurate budgeting
+- `system_declare_failure` triggers immediate agent termination
+- Three identical tool calls = infinite loop termination
+- All LLM calls use `reasoning_effort = "low"` globally
 
 ## 5. Detailed Behavior
 
-### Normal Execution (Autonomous Job)
+### Normal Execution Flow
 
-1. User POSTs `/api/tools/research` with JSON args.
-2. Router creates job row with status QUEUED; enqueues to writer, starts the manager, and returns job_id.
-3. Worker Manager polls every 1s, claims the job, updates status to RUNNING, spawns a thread.
-4. In the thread, `UnifiedAgent` is instantiated with job_id, session_id, and initial mode.
-5. Agent loads the mode's `allowed_tools` and calls LLM with tool schemas.
-6. LLM selects tool from allowed set; `run_tool_safely` executes it; outputs are written to `execution_ledger`.
-7. Loop continues until LLM returns `declare_success` or `human_help`; a hard cap of 50 tool calls may also stop the loop.
-8. On completion, job status is set to COMPLETED/FAILED. Final result written to `result_json`.
-9. Client poll `GET /api/jobs/{job_id}` to read result.
-
-### Programmatic (Scout) Execution
-
-Similar steps, but mode is PROGRAMMATIC and only a single tool call is allowed before the job completes.
+1. **Job Creation**: POST `/tools/{tool_name}` → DB insert + queue enqueue
+2. **Agent Start**: Worker calls `UnifiedAgent.run()` → sets `_current_job_id` → sends start notification
+3. **Context Building**: `build_session_context(session_id, system_prompt, budget)` + `get_session_cost()`
+4. **Budget Check**: If `cost > budget * 0.7` → trigger condensation:
+   - Split ledger in half
+   - Generate summary via LLM
+   - Delete old rows
+   - Insert `<CONDENSED_HISTORY>` message
+5. **LLM Call**: `await llm.complete_chat(LLMRequest(messages, tools))`
+6. **Response Handling**:
+   - No tool_calls → append assistant content → return COMPLETED
+   - Tool calls → process each:
+     - Extract args, check repetition breaker
+     - Handle special tools (switch_mode, declare_failure)
+     - Execute via `run_tool_safely()` (catches exceptions → returns error string)
+     - Append tool result to ledger
+     - Send Telegram notification
+7. **Loop**: Continue until 50-call cap or termination
 
 ### Error Handling
 
-- **Tool errors**: Captured by `run_tool_safely`; error details are appended to the execution ledger with role=system; job marked FAILED.
-- **Writer failures**: SQL exceptions are logged with DB:Writer:Error; rollback occurs; the queue still attempts to drain.
-- **LLM failures**: Bad request or provider errors are logged; the agent continues or terminates depending on failure type.
-- **Recovery**: INTERRUPTED jobs on restart are re-queued with a recovery message inserted into ledger.
+- `run_tool_safely()`: Catches exceptions → `ToolResult(output="Traceback", success=False)`
+- `db_writer_worker()`: Catches OperationalError → attempts missing-table repair (create `job_logs`, run full init script)
+- Telegram notifier failures are silent (logged only)
+- All DB writes rolled back on error
 
-### Config Behavior
+### Configuration Paths
 
-- `config.py` loads `.env`.
-- Key env vars: `DATABASE_URL`, `API_KEY`, `LOG_LEVEL`, `LOG_FILE`, `LLM_AZURE_*`, `ARTIFACTS_ROOT`.
-- `LLM_AZURE_*` controls provider selection; if absent, LLM calls fail and jobs terminate with LLM error.
+- `LLM_CONTEXT_CHAR_LIMIT` (default 100,000)
+- `AZURE_KEY`, `AZURE_ENDPOINT`, `AZURE_DEPLOYMENT`
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_USER_ID`
+- `ALLOW_DESTRUCTIVE_RESET` (env var for schema migration)
 
 ## 6. Public Interfaces
 
-### FastAPI Endpoints (in `api/routes.py`)
+### API Endpoints (from `api/routes.py`)
+- `POST /tools/{tool_name}`: Create and enqueue job
+- `GET /jobs/{job_id}`: Get status + logs + final payload
+- `GET /manifest`: Available tools
+- `DELETE /jobs/{job_id}`: Request cancellation
 
-- `POST /api/tools/{tool_name}`
-  - Input: JSON body with tool arguments.
-  - Output: Job ID with status QUEUED.
-  - Security: `x-api-key` header (if configured).
+### Tool Entry Points
+- `tools/library_query.py`: Top-level legacy entry
+- `tools/scraper/tool.py`: Scout mode entry
+- `tools/finance/tool.py`: Quant mode entry
+- `tools/browser_task/tool.py`: Navigator mode entry
 
-- `GET /api/jobs/{job_id}`
-  - Output: Job status, logs, final payload, artifact URLs.
+### Function Signatures
+```python
+# Tools
+async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str
 
-- `DELETE /api/jobs/{job_id}`
-  - Marks job CANCELLING; sets cancellation flag for active jobs.
+# UnifiedAgent
+async def run(self, telemetry: Any, **kwargs) -> Dict[str, Any]
 
-- `DELETE /api/sessions/{session_id}/memory`
-  - Clears `execution_ledger` for a session; physical files deleted via `delete_messages_with_files()`.
-
-- `GET /api/manifest`
-  - Returns MCP-style schema of discovered tools for UI/code generators.
-
-### Python APIs
-
-- `database.writer.append_to_ledger(job_id, session_id, role, content, attachment_metadata=None) -> ledger_id`
-  - Use for all ledger writes; computes char count and attachment cost; enqueues via writer queue.
-
-- `tools.registry.REGISTRY`
-  - `load_all()`: Rescans and rebuilds tool map.
-  - `get_tool_class(name)`: Returns BaseTool subclass.
-  - `schema_list()`: Returns MCP-style manifest.
-
-- `bot.engine.worker.get_manager() -> UnifiedWorkerManager`
-  - Singleton worker manager. `.start()` to activate polling.
-
-### CLI Entry Points
-
-- `python app.py` starts FastAPI with uvicorn. No CLI flags; use `.env` for configuration.
+# LLM Provider
+async def complete_chat(self, request: LLMRequest) -> LLMResponse
+```
 
 ## 7. State, Persistence, and Data
 
 ### Storage Locations
+- SQLite: `data/sumanal.db` (with `-wal`/`-shm` sidecars)
+- Logs: `logs/` directory (via `utils/logger/routing.py`)
+- Temp files: `data/temp/` (screenshots, uploads)
 
-- **SQLite**: Single database file (default path in `config.py:DATABASE_URL`). 11 tables:
-  - `jobs`: job state machine table
-  - `execution_ledger`: immutable audit log
-  - `job_items`: step-level status for autonomous jobs
-  - `sessions`: caller locks and active job mapping
-  - `scraped_articles*`: scraper output storage with vector mapping
-  - `pdf_parsed_pages*`: extracted PDF text and embeddings
-  - `long_term_memories*`: agent memory embeddings
-  - `browser_macros`: stored browser step sequences
-  - `ai_skills`: persistent skills for agents
-  - `financial_formulas`, `calculated_metrics`: finance-specific caches
+### Critical Schemas
 
-### Data Formats
+```sql
+CREATE TABLE execution_ledger (
+    id INTEGER PRIMARY KEY,
+    ledger_id TEXT UNIQUE,
+    job_id TEXT,
+    session_id TEXT,
+    role TEXT CHECK(role IN ('system','user','assistant','tool')),
+    content TEXT,
+    attachment_metadata TEXT,  -- JSON
+    char_count INTEGER,
+    attachment_char_count INTEGER,
+    timestamp TEXT
+);
 
-- `execution_ledger.content`: arbitrary text from tool/LLM/system.
-- `execution_ledger.attachment_metadata`: JSON dict of paths and tokens used for files.
-- `job_items.input_data/output_data`: JSON per step.
-- `jobs.args_json`: original tool arguments.
-- `jobs.result_json`: final payload from agent (success/failure + data).
+CREATE TABLE job_logs (
+    id TEXT PRIMARY KEY,
+    job_id TEXT,
+    tag TEXT,
+    level TEXT,
+    status_state TEXT,
+    message TEXT,
+    payload_json TEXT,
+    timestamp TEXT
+);
+```
 
-### Lifecycle
+### Data Lifecycle
+- Session persists until manual purge via `purge_stale_sessions()`
+- Job entries retained indefinitely
+- Ledger entries retained unless condensed (old rows deleted)
+- Tool buffers flushed to `job_logs` on tool completion
+- Debugger buffer retained (size-limited)
 
-- Jobs remain in DB indefinitely after completion unless manually purged.
-- Stale sessions can be purged via `database/writer:purge_stale_sessions(days)` (physically deletes files).
-- Manual cleanup script not provided; deletion requires direct DB calls.
+### Migration Strategy
+- `database/schema.py` contains `init_db()` and `get_init_script()`
+- `ALLOW_DESTRUCTIVE_RESET=1` enables destructive migrations
+- Writer thread has automatic repair logic for missing tables
+- `PRAGMA user_version` tracking for schema versioning
 
 ## 8. Dependencies & Integration
 
-### External Packages
+### External Libraries
 
-```txt
-FastAPI, uvicorn        # HTTP API server
-sqlite3                 # Core persistence (built-in)
-pandas, numpy           # Finance calculations, dataframes
-aiohttp, httpx          # LLM HTTP calls
-openai                  # Azure OpenAI client
-pypdf                   # PDF extraction
-botasaurus              # Browser automation (used in scraper and utils/browser_daemon)
-pydantic                # Input validation in tools and API schemas
-```
+- `openai`: Azure Responses API client (exclusive usage)
+- `playwright`: Browser automation with DOM manipulation
+- `httpx`: Async HTTP client for Telegram
+- `sqlite3`: Core persistence (no external ORM)
+- `ulid-py`: ID generation
+- `python-multipart`: File uploads (via FastAPI)
 
-### Why Each Exists (Evidence)
+### Why Each Dependency
 
-- `pandas`: Used in finance/ingestion.py, finance/grouper.py, finance/metrics.py for time-series aggregation.
-- `botasaurus`: Referenced in `utils/browser_daemon.py:get_or_create_driver` and `tools/scraper`. Required for browser automation.
-- `openai`: Azure provider in `clients/llm/providers/azure.py`. Used for embeddings and LLM chat.
-- `pypdf`: `utils/pdf_utils.py` uses `PdfReader`.
+- `openai`: Azure Responses API exclusive usage (no Chat Completions, no streaming)
+- `playwright`: Direct DOM access for SoM injection + browser operations
+- `httpx`: Async Telegram API without blocking
+- `sqlite3`: Chosen for single-writer WAL concurrency
+- `ulid-py`: Time-sorted unique IDs for DB rows
 
-### Assumptions
+### Coupling Points
 
-- LLM provider is Azure OpenAI (default). Others exist but are not default or tested.
-- Browser tools require a headful environment (Playwright/Botasaurus dependencies).
-- Network access for LLM, embeddings, and browser automation is required.
+- Azure API key must be available at runtime
+- Telegram bot token must be valid (failures are silent)
+- Browser requires `playwright` installation (not headless-only)
+- SQLite WAL mode requires filesystem write access
+
+### Environment Assumptions
+- Windows/Linux/WSL (paths work cross-platform)
+- Python 3.11+
+- No external services required (self-contained)
+- Network access to Azure OpenAI and Telegram API
 
 ## 9. Setup, Build, and Execution
 
-### Prerequisites
+### Clean Setup
 
-- Python >= 3.10
-- `pip install -r requirements.txt`
-- Browser automation requires Playwright binaries (`playwright install`).
-- `.env` must contain:
-  - `DATABASE_URL` (SQLite path)
-  - `API_KEY` (for endpoints)
-  - `LLM_AZURE_*` (endpoint, key, deployment, api_version)
-  - `ARTIFACTS_ROOT` (directory for scraper/browser outputs)
-  - `LOG_LEVEL`, `LOG_FILE` (optional)
+```bash
+# 1. Navigate to project
+cd c:/New folder/AnythingTools
 
-### Steps
+# 2. Create Python 3.11+ virtual environment
+python -m venv .venv
+.\.venv\Scripts\activate  # Windows
+source .venv/bin/activate  # Linux/Mac
 
-1. Create `.env` from `.env.example` if available, or set env vars manually.
-2. Run database init on first start (schema auto-initializes).
-3. Start server:
-   ```bash
-   python app.py
-   ```
-   Or:
-   ```bash
-   uvicorn app:app --host 0.0.0.0 --port 8000
-   ```
-4. Use `POST /api/tools/{tool_name}` with `x-api-key` to create jobs.
-5. Poll `GET /api/jobs/{job_id}` for status and results.
+# 3. Install dependencies
+pip install -r requirements.txt
 
-### Configuration
+# 4. Install playwright browsers
+playwright install chromium
 
-- `.env` only; no CLI flags.
-- Log sink controlled via `LOG_FILE` and `LOG_LEVEL`.
+# 5. Configure environment
+echo "AZURE_KEY=your_azure_key" > .env
+echo "AZURE_ENDPOINT=https://your-endpoint.openai.azure.com" >> .env
+echo "AZURE_DEPLOYMENT=gpt-5.4-mini" >> .env
+echo "TELEGRAM_BOT_TOKEN=your_bot_token" >> .env
+echo "TELEGRAM_USER_ID=your_user_id" >> .env
 
-### Platform Constraints
+# 6. Run server (DB auto-initializes on first write)
+uvicorn app:app --reload --port 8000
+```
 
-- Windows, macOS, Linux supported.
-- Browser automation requires system dependencies for Playwright (may need `playwright install-deps` on Linux).
-- SQLite may require WAL support (enabled by default).
+### Build Process
+None; pure Python. No compilation required.
+
+### Execution Constraints
+- Must have filesystem write access to `data/` and `logs/`
+- Must have network access to Azure OpenAI and Telegram API
+- Memory usage scales with context size (~100KB-1MB per job)
+- CPU: primarily idle, bursts during LLM calls and browser ops
 
 ## 10. Testing & Validation
 
 ### Existing Tests
+- `tests/test_browser_e2e.py`: Single end-to-end browser test
+- No unit tests for LLM providers, agent, or logger
+- No test suite runner or framework (no pytest markers)
 
-- `tests/test_browser_e2e.py`: Likely full-stack browser test. Requires:
-  - Running app
-  - Valid LLM provider
-  - Browser environment
-- No unit test suite appears present.
-
-### How to Run
-
+### How to Run Tests
 ```bash
-pytest tests/test_browser_e2e.py
+cd tests
+python test_browser_e2e.py  # Requires browser + credentials
 ```
 
-Expect failures if environment is not fully configured (LLM keys, browser binaries).
-
 ### Coverage Gaps
+- Zero tests for agent loop (state machine)
+- No tests for ledger budget calculations
+- No tests for Telegram integration
+- No tests for database writer concurrency
+- No tests for tool registry
 
-- No unit tests for:
-  - `database/writer.py` (queue/ledger)
-  - `tools/registry.py` (discovery, validation)
-  - `bot/engine/worker.py` (locking, recovery)
-  - `bot/core/agent.py` (mode switching, cap enforcement)
-- No schema migration tests.
+### Validation Strategy
+- Runtime errors are logged + returned as failures
+- Telegram notifications provide manual verification path
+- DB inspection via SQLite CLI possible
 
 ## 11. Known Limitations & Non-Goals
 
 ### Hard Constraints
+- 50 tool call hard cap (infinite loop protection)
+- No concurrent job execution for same session (single-writer DB)
+- No built-in authentication on API endpoints
+- No rate limiting on Telegram notifications
+- No retry logic for failed LLM calls
 
-- 50-tool-call cap per autonomous job.
-- Size-like enforcement: No explicit max payload size for API.
-- Single writer thread; could be a bottleneck under high concurrency.
-- No conversation history outside ledger.
-- Not designed for direct tool calls; job queue required.
+### Technical Debt & Vestigial Artifacts
+- `clients/snowflake_client.py`: Exists but has no references (dead code)
+- `utils/debugger_agent.py`: Exists but no evidence of active use (debounce only on warnings)
+- `tests/` directory exists but no test runner configuration
+- `bot/capabilities/` : Empty init files (legacy structure)
 
-### Implied Features Not Implemented
+### Features That Appear Implied But Absent
+- Real-time streaming responses (removed, responses API only)
+- Long-term memory embeddings (all operations ephemeral per session)
+- User authentication/authorization (no auth layer)
+- Multi-tenant isolation (implicit via session isolation only)
+- Horizontal scaling (single-writer model)
+- GraphQL or WebSocket APIs
 
-- No built-in user interface, CLI tool runner, or batch ingestion job creator.
-- No automatic migration of legacy data.
-- No RBAC or fine-grained permissions (API key only).
-- No metrics persistence beyond runtime (only in-memory via `/metrics`).
+### Trade-offs
+- **Reliability over flexibility**: Single-writer DB with WAL, no concurrency
+- **Observability over simplicity**: Deep logging infrastructure
+- **Safety over speed**: 50-call cap, explicit condensation, no automatic retries
 
-### Technical Debt
+## 12. Change Sensitivity
 
-- Vestigial modules: `clients/snowflake_client.py`, `utils/vision_utils.py`, `utils/debugger_agent.py`, `utils/hitl.py`, `api/telegram_notifier.py`.
-- Duplicate system tools were removed (see Changes section) but some referenced names might remain in legacy docs.
+### Most Fragile Components
 
-## 12. Change Sensitivity (`bot/core/modes.py`, `tools/registry.py` especially)
+1. **Database Writer (`database/writer.py`)**:
+   - Missing-table repair logic is critical; failure blocks all writes
+   - `enqueue_write()` silently drops writes if queue full
+   - Single-writer thread requires all DB ops through this path
 
-### Fragile Areas
+2. **Agent Loop (`bot/core/agent.py`)**:
+   - All notifications now via `log.dual_log(..., notify_user=True)` (was direct `send_notification()`)
+   - Budget calculation depends on `get_session_cost()` querying DB correctly
+   - Loop protection uses checksum on last 3 tool calls
 
-- **Tool name changes**: `modes.py` `allowed_tools` lists must match `registry.py` discovery exactly. Mistype or rename causes "Allowed tool ... not found in registry" warning; agents silently fail to call missing tools.
+3. **Context Weaver (`bot/core/weaver.py`)**:
+   - `build_session_context()` affects all agent modes
+   - Budget thresholds (70/20/10) are hard-coded, not configurable
+   - Condensation logic deletes old ledger rows (irreversible)
 
-- **Database schema**: `database/schema.py` has minimal migrations. Any new table/column requires manual SQL patches. The app assumes a stable schema post-init.
+4. **LLM Payloads (`clients/llm/payloads.py`)**:
+   - `_build_responses_payload()` must match Azure API exactly
+   - Reasoning config normalization is critical (`reasoning_effort = "low"`)
 
-- **Writer queue**: `database/writer.py` is central; any error or deadlock will stall all DB operations.
+### Easy Extension Points
+- **Add new tools**: Create file under `tools/actions/{category}/`, inherit `BaseTool`, restart
+- **Add modes**: Update `bot/core/modes.py` entries
+- **Add DB tables**: Update `INIT_SCRIPT`, repair logic auto-handles missing tables
 
-- **Agent loop latency**: LLM calls in `UnifiedAgent` are synchronous; the thread is blocked until tool completes.
-
-- **Browser automation**: `botasaurus` driver state is global; improper cleanup can leave orphaned processes.
-
-### Easiest to Extend
-
-- New tools: add a `BaseTool` subclass in any `tools/actions/<scope>/tool.py`, ensuring `name` matches a mode's `allowed_tools`.
-- New modes: add entry to `modes.py` `MODES` dict; update API to accept new mode or keep fixed.
-
-### Hardest to Change
-
-- Switching away from SQLite (motivation: single-writer, WAL semantics, busy_timeout assumptions).
-- Changing tool discovery pattern (we rely on `tools/` and `tools/actions/<scope>/` paths).
-- Changing the 50-call cap or locking strategy (central to safety).
+### Hard Extension Points
+- **Change to Chat Completions API**: Requires rewriting `clients/llm/providers/azure.py` and `payloads.py`
+- **Add concurrency**: Requires migrating away from single-writer SQLite
+- **Add auth**: Would require APIGateway pattern or middleware

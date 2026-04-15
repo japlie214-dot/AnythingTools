@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 import config
-from tools.base import BaseTool, TelemetryCallback, ToolResult
+from tools.base import BaseTool, ToolResult
 from clients.llm import MIME_TYPE_MAP
 
 _DOWNLOAD_DIR = "chrome_download"
@@ -25,7 +25,7 @@ class FileListDownloadsTool(BaseTool):
     from bot.core.constants import TOOL_SYSTEM_FILE_LIST_DOWNLOADS
     name = TOOL_SYSTEM_FILE_LIST_DOWNLOADS
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         if not os.path.exists(_DOWNLOAD_DIR):
             return f"Downloads directory '{_DOWNLOAD_DIR}' does not exist."
 
@@ -53,12 +53,12 @@ class FileReadDocumentTool(BaseTool):
     from bot.core.constants import TOOL_SYSTEM_FILE_READ_DOCUMENT
     name = TOOL_SYSTEM_FILE_READ_DOCUMENT
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         # Never called: execute() is overridden below.  Satisfies abstract contract.
         return ""
 
     async def execute(
-        self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs
+        self, args: dict[str, Any], telemetry: Any, **kwargs
     ) -> ToolResult:
         """Override BaseTool.execute() directly so the LLM-diagnosis wrapper is
         bypassed and attachment_path is set on the returned ToolResult."""
@@ -87,7 +87,7 @@ class FileDeleteTool(BaseTool):
     from bot.core.constants import TOOL_SYSTEM_FILE_DELETE
     name = TOOL_SYSTEM_FILE_DELETE
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         filename = args.get("filename", "").strip()
         if not filename:
             return "Error: 'filename' is required."

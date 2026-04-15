@@ -2,14 +2,14 @@
 import sqlite3
 import re
 from typing import Any
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from database.connection import DatabaseManager
 
 class PDFTocTool(BaseTool):
     from bot.core.constants import TOOL_LIBRARY_GET_PDF_TOC
     name = TOOL_LIBRARY_GET_PDF_TOC
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         pdf_name = args.get("pdf_name")
         if not pdf_name: return "Error: pdf_name required."
         

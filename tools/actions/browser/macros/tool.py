@@ -7,7 +7,7 @@ from typing import Any
 import config
 from database.connection import DatabaseManager
 from database.writer import enqueue_write
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from tools.registry import REGISTRY
 from utils.browser_daemon import append_action_log
 from utils.id_generator import ULID
@@ -18,7 +18,7 @@ class MacroSaveTool(BaseTool):
     from bot.core.constants import TOOL_BROWSER_MACRO_SAVE
     name = TOOL_BROWSER_MACRO_SAVE
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         name       = args.get("name", "").strip()
         steps_json = args.get("steps_json", "").strip()
         if not name:
@@ -51,7 +51,7 @@ class MacroEditTool(BaseTool):
     from bot.core.constants import TOOL_BROWSER_MACRO_EDIT
     name = TOOL_BROWSER_MACRO_EDIT
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Apply index-based step REPLACEMENT deltas to a macro's steps_json.
         Each delta: {"index": int, "step": {tool: str, args: dict}}.
         Step deletion is intentionally unsupported: pop() shifts subsequent indices,
@@ -98,7 +98,7 @@ class MacroDeleteTool(BaseTool):
     from bot.core.constants import TOOL_BROWSER_MACRO_DELETE
     name = TOOL_BROWSER_MACRO_DELETE
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         mac_id = args.get("macro_id", "").strip()
         if not mac_id:
             return "Error: 'macro_id' is required."
@@ -111,7 +111,7 @@ class MacroExecuteTool(BaseTool):
     from bot.core.constants import TOOL_BROWSER_MACRO_EXECUTE
     name = TOOL_BROWSER_MACRO_EXECUTE
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         mac_id = args.get("macro_id", "").strip()
         if not mac_id:
             return "Error: 'macro_id' is required."

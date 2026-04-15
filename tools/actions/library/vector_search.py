@@ -9,7 +9,7 @@ This is an internal action intended only for use by the Librarian.
 import json
 from typing import Any
 
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from database.connection import DatabaseManager
 from utils.vector_search import generate_embedding
 
@@ -20,7 +20,7 @@ class VectorSearchAction(BaseTool):
     from bot.core.constants import TOOL_LIBRARY_VECTOR_SEARCH
     name = TOOL_LIBRARY_VECTOR_SEARCH
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         query = args.get("query", "")
         limit = args.get("limit", 5)
         threshold = args.get("threshold", 0.50)

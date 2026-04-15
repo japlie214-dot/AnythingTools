@@ -3,7 +3,7 @@
 
 import abc
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 
 # MIME type mapping for file extensions
 MIME_TYPE_MAP: dict[str, str] = {
@@ -61,10 +61,6 @@ class LLMResponse:
 
 
 class LLMProvider(abc.ABC):
-    @abc.abstractmethod
-    async def stream_chat(self, request: LLMRequest) -> AsyncGenerator[LLMChunk, None]:
-        raise NotImplementedError
-
     @abc.abstractmethod
     async def complete_chat(self, request: LLMRequest) -> LLMResponse:
         raise NotImplementedError

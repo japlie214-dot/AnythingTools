@@ -14,7 +14,7 @@ from typing import Any
 
 from ddgs import DDGS
 import config
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from clients.llm import get_llm_client, LLMRequest
 from utils.logger import get_dual_logger
 
@@ -28,7 +28,7 @@ from tools.polymarket.polymarket_prompts import (
 class PolymarketTool(BaseTool):
     name = "polymarket"
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         topic = args.get("topic", "").lower()
         limit = int(args.get("limit", 1))
 

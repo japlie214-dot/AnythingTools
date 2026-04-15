@@ -9,7 +9,7 @@ import json
 from typing import Any
 from pydantic import BaseModel, Field
 
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from bot.core.agent import UnifiedAgent
 
 
@@ -33,7 +33,7 @@ class DraftEditorTool(BaseTool):
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return True
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Entry point for Draft Editor. Validates inputs and spawns Editor Agent."""
         
         # Extract required identifiers

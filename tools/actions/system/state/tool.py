@@ -8,7 +8,8 @@ import json
 from typing import Any, List, Dict
 from pydantic import BaseModel, Field
 
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
+from typing import Any
 from database.job_queue import add_job_item, update_item_status
 
 
@@ -22,7 +23,7 @@ class InitializeChecklistTool(BaseTool):
     name = TOOL_SYSTEM_INITIALIZE_CHECKLIST
     INPUT_MODEL = InitializeChecklistInput
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         job_id = kwargs.get("job_id")
         if not job_id:
             return "Error: No job_id found in context."
@@ -46,7 +47,7 @@ class CompleteStepTool(BaseTool):
     name = TOOL_SYSTEM_COMPLETE_STEP
     INPUT_MODEL = CompleteStepInput
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         job_id = kwargs.get("job_id")
         if not job_id:
             return "Error: No job_id found in context."
@@ -70,7 +71,7 @@ class SwitchModeTool(BaseTool):
     name = TOOL_SYSTEM_SWITCH_MODE
     INPUT_MODEL = SwitchModeInput
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         # Note: This is a fallback. In practice, bot/core/agent.py intercepts
         # this tool call to perform the actual mode swap and ledger injection.
         target = args.get("target")
@@ -78,3 +79,19 @@ class SwitchModeTool(BaseTool):
         objective = args.get("objective")
         
         return f"Mode switched to {target}. Reason: {reason}. Objective: {objective}."
+
+
+# --- New: Declare Failure tool ---------------------------------------------
+class DeclareFailureInput(BaseModel):
+    reason: str = Field(..., description="Explanation of why the task cannot be completed.")
+
+
+class DeclareFailureTool(BaseTool):
+    """Declare that the task cannot be completed."""
+    from bot.core.constants import TOOL_SYSTEM_DECLARE_FAILURE
+    name = TOOL_SYSTEM_DECLARE_FAILURE
+    INPUT_MODEL = DeclareFailureInput
+
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
+        # Intercepted by bot/core/agent.py directly.
+        return f"Task failed: {args.get('reason')}"

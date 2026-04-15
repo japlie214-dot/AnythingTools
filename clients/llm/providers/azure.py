@@ -2,7 +2,7 @@
 """AzureProvider class and all Azure Responses API helpers."""
 
 import asyncio
-from typing import Any, Dict, AsyncGenerator
+from typing import Any, Dict
 
 from openai import AsyncAzureOpenAI, RateLimitError, APITimeoutError, APIConnectionError
 
@@ -74,55 +74,16 @@ class AzureProvider(LLMProvider):
         self.provider_name = "azure"
         self.default_model = getattr(config, "AZURE_DEPLOYMENT", "gpt-5.4-mini")
 
-    def _build_payload(self, request: LLMRequest, *, stream: bool) -> Dict[str, Any]:
-        payload = {
-            "model":    request.model or self.default_model,
-            "messages": request.messages,
-            "stream":   stream,
-        }
-        if request.reasoning_effort and any(
-            m in (request.model or self.default_model) for m in ["o1", "o3", "gpt-5"]
-        ):
-            payload["reasoning_effort"] = request.reasoning_effort
-        return _apply_common_payload(payload, request)
-
-    async def stream_chat(
-        self, request: LLMRequest
-    ) -> AsyncGenerator[LLMChunk, None]:
-        for attempt in range(1, MAX_API_RETRIES + 1):
-            try:
-                response = await self.client.chat.completions.create(
-                    **self._build_payload(request, stream=True)
-                )
-                async for chunk in response:
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    text  = delta.content if delta and getattr(delta, "content", None) else ""
-                    if text:
-                        yield LLMChunk(
-                            text=text,
-                            provider=self.provider_name,
-                            model=request.model or self.default_model,
-                        )
-                return
-            except (RateLimitError, APITimeoutError, APIConnectionError):
-                if attempt == MAX_API_RETRIES:
-                    raise
-                await asyncio.sleep(
-                    min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
-                )
-
     async def complete_chat(self, request: LLMRequest) -> LLMResponse:
         _resolved_model = request.model or self.default_model
         log.dual_log(
             tag="LLM:Azure:Request",
             message=f"Sending request to {_resolved_model}",
+            notify_user=True,
             payload={
                 "model":            _resolved_model,
                 "messages":         request.messages,
                 "tools":            request.tools,
-                "file_attachments": [
-                    att["path"] for att in (request.file_attachments or [])
-                ],
             },
         )
         payload  = _build_responses_payload(request, self.default_model)
@@ -146,6 +107,7 @@ class AzureProvider(LLMProvider):
         log.dual_log(
             tag="LLM:Azure:Response",
             message=f"Received response. {tools_called_str}",
+            notify_user=True,
             payload={
                 "model":         _final_model,
                 "finish_reason": getattr(response, "status", None),

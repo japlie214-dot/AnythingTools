@@ -22,33 +22,54 @@ log = get_dual_logger(__name__)
 # ── Marker injection & cleanup (allowed run_js use-cases) ─────────────────────
 
 
-def inject_ai_ids(driver: Driver) -> None:
-    """Inject data-ai-id attributes into visible elements (SoM)."""
+def inject_som(driver: Driver, start_id: int = 1) -> int:
+    """Inject data-ai-id attributes and return the last ID used."""
     try:
-        driver.run_js(
-            """(function(){
-                if (window.__ai_ids_injected) return;
-                var walker = document.createTreeWalker(
-                    document.body || document,
-                    NodeFilter.SHOW_ELEMENT,
-                    null,
-                    false
-                );
-                var id = 1;
+        last_id = driver.run_js(
+            """(function(startId){
+                var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null, false);
+                var id = startId;
                 while (walker.nextNode()) {
                     var el = walker.currentNode;
-                    if (el && el.offsetParent !== null) {
-                        var style = window.getComputedStyle(el);
-                        if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
-                            el.setAttribute('data-ai-id', String(id++));
-                        }
+                    if (el.offsetParent !== null) {
+                        el.setAttribute('data-ai-id', String(id++));
                     }
                 }
-                window.__ai_ids_injected = true;
-            })();"""
+                return id;
+            })(%s);""" % start_id
         )
-    except Exception as e:
-        log.dual_log(tag="SoM:Inject", message=f"Failed to inject AI IDs: {e}", level="WARNING", exc_info=e)
+        return last_id or start_id
+    except Exception:
+        return start_id
+
+
+def wait_for_dom_stability(driver: Driver, timeout: int = 10):
+    """Wait for the number of elements to stop changing."""
+    import time
+    last_count = 0
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        current_count = driver.run_js("return document.querySelectorAll('*').length")
+        if current_count == last_count and current_count > 0:
+            break
+        last_count = current_count
+        time.sleep(0.5)
+
+
+def extract_surgical_html(driver: Driver) -> str:
+    """Returns readable HTML while preserving data-ai-id attributes."""
+    from utils.text_processing import clean_html_for_agent
+    return clean_html_for_agent(driver.page_html or "", extra_attrs={"data-ai-id"})
+
+
+def reinject_all(driver: Driver, id_tracking: dict):
+    """Utility expected by agentic loops to refresh markers."""
+    inject_som(driver)
+
+
+def inject_ai_ids(driver: Driver) -> None:
+    """Legacy wrapper—kept as alias for backward compatibility."""
+    inject_som(driver)
 
 
 def remove_overlays(driver: Driver) -> None:

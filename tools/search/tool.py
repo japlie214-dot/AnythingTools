@@ -12,7 +12,7 @@ from typing import Any
 
 from ddgs import DDGS
 
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from clients.llm import get_llm_client, LLMRequest
 from utils.logger import get_dual_logger
 
@@ -28,7 +28,7 @@ _DDGS_RETRY_DELAY_S = 3
 class SearchTool(BaseTool):
     name = "search"
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """
         Iterative, evaluate-and-refine DuckDuckGo search loop with LLM synthesis.
 

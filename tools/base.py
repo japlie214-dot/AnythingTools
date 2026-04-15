@@ -2,29 +2,23 @@
 """Base classes for tool implementations.
 
 Each tool must inherit from ``BaseTool`` and implement the ``run`` coroutine.
-The ``run`` method receives a telemetry callback that accepts a ``StatusUpdate``.
 """
 
 from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
-
-from bot.telemetry import StatusUpdate
-
-
-TelemetryCallback = Callable[[StatusUpdate], Awaitable[None]]
+from typing import Any
 
 
 @dataclass
 class ToolResult:
     """Structured return type for ``BaseTool.execute``.
 
-    attachment_paths — list of absolute file paths produced by the tool
+    attachment_paths  list of absolute file paths produced by the tool
                        (e.g. one path per image slice). None when the tool
                        produces no file output.
-    event_id         — shared ULID for all paths in attachment_paths when
+    event_id          shared ULID for all paths in attachment_paths when
                        they originate from a single capture_and_optimize()
                        call. None for tools that do not capture images.
     """
@@ -38,7 +32,7 @@ class ToolResult:
 class BaseTool(abc.ABC):
     """Abstract base class for all tools.
 
-    Sub‑classes should set ``name`` and implement ``run``.
+    Subclasses should set ``name`` and implement ``run``.
     """
 
     name: str
@@ -47,19 +41,8 @@ class BaseTool(abc.ABC):
         """Return True if this tool supports mid-run resume for the given args."""
         return False
 
-    def status(self, message: str, status: str = "RUNNING") -> StatusUpdate:
-        """Convenience helper to create a ``StatusUpdate`` for this tool."""
-        from datetime import datetime, timezone
-
-        return StatusUpdate(
-            timestamp=datetime.now(timezone.utc).strftime("%H:%M:%S"),
-            tool_name=self.name,
-            message=message,
-            status=status,
-        )
-
     @abc.abstractmethod
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Execute tool logic and emit telemetry via the provided callback.
 
         MANDATORY DEVELOPER CONTRACT:
@@ -69,16 +52,16 @@ class BaseTool(abc.ABC):
         the text return value is the only guaranteed-persistent output.
 
         Additional keyword arguments may include:
-        - dry_run: bool    — When True, skip external side effects.
-        - session_id: str  — Unique identifier for the current session.
-        - chat_id: int     — Telegram chat identifier.
+        - dry_run: bool     When True, skip external side effects.
+        - session_id: str   Unique identifier for the current session.
+        - chat_id: int      Telegram chat identifier.
         """
         raise NotImplementedError
 
     async def execute(
         self,
         args: dict[str, Any],
-        telemetry: TelemetryCallback,
+        telemetry: Any,
         **kwargs,
     ) -> ToolResult:
         """Execute tool logic. Exceptions are caught by bot/engine/tool_runner.py."""

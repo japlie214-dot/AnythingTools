@@ -1,11 +1,9 @@
 # clients/llm/factory.py
 """UnifiedLLM wrapper and singleton cache."""
 
-from typing import AsyncGenerator
-
 from clients.llm.providers.azure  import AzureProvider
 from clients.llm.providers.chutes import ChutesProvider
-from clients.llm.types import LLMRequest, LLMChunk, LLMResponse, LLMProvider
+from clients.llm.types import LLMRequest, LLMResponse, LLMProvider
 
 _LLM_SINGLETON_CACHE: dict = {}
 
@@ -32,12 +30,6 @@ class UnifiedLLM:
             self.provider = ChutesProvider()
         else:
             raise ValueError(f"Unsupported provider_type: {provider_type}")
-
-    async def stream_chat(
-        self, request: LLMRequest
-    ) -> AsyncGenerator[LLMChunk, None]:
-        async for chunk in self.provider.stream_chat(request):
-            yield chunk
 
     async def complete_chat(self, request: LLMRequest) -> LLMResponse:
         return await self.provider.complete_chat(request)

@@ -7,6 +7,7 @@ All tool names are defined here to ensure consistency across the codebase.
 TOOL_SYSTEM_INITIALIZE_CHECKLIST = "system_initialize_checklist"
 TOOL_SYSTEM_COMPLETE_STEP = "system_complete_step"
 TOOL_SYSTEM_SWITCH_MODE = "system_switch_mode"
+TOOL_SYSTEM_DECLARE_FAILURE = "system_declare_failure"
 TOOL_SYSTEM_SKILL_LIST = "system_skill_list"
 TOOL_SYSTEM_SKILL_READ = "system_skill_read"
 TOOL_SYSTEM_SKILL_CRUD = "system_skill_crud"

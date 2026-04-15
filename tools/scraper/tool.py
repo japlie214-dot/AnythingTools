@@ -17,7 +17,7 @@ from pathlib import Path
 
 import config
 from pydantic import BaseModel
-from tools.base import BaseTool, TelemetryCallback, ToolResult
+from tools.base import BaseTool, ToolResult
 from clients.llm import get_llm_client, LLMRequest
 from utils.logger import get_dual_logger
 from utils.browser_lock import browser_lock
@@ -44,7 +44,7 @@ class ScraperTool(BaseTool):
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return True
 
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Main entry point for Scout execution."""
         cancellation_flag = kwargs.get("cancellation_flag") or threading.Event()
         if cancellation_flag.is_set():
@@ -59,7 +59,7 @@ class ScraperTool(BaseTool):
         finally:
             browser_lock.release()
 
-    async def _run_internal(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def _run_internal(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Internal implementation with full pipeline."""
         dry_run = kwargs.get("dry_run", config.TELEMETRY_DRY_RUN)
         if dry_run:

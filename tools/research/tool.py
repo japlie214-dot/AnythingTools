@@ -8,7 +8,7 @@ instantiates the Unified Agent in Analyst mode.
 
 import os
 from typing import Any
-from tools.base import BaseTool, TelemetryCallback
+from tools.base import BaseTool
 from bot.core.agent import UnifiedAgent
 
 
@@ -27,7 +27,7 @@ class ResearchTool(BaseTool):
         """Returns True as research jobs can be resumed."""
         return True
     
-    async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Entry point for Research. Validates inputs and spawns Analyst Agent."""
         
         # Extract required identifiers

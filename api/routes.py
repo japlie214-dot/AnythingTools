@@ -22,9 +22,7 @@ from pydantic import ValidationError
 log = get_dual_logger(__name__)
 router = APIRouter()
 
-# Lightweight in-memory mirrors for operational convenience (durable state is in DB)
-# Retained for quick lookups; authoritative state is in SQLite
-JOBS: Dict[str, Dict[str, Any]] = {}
+# Durable state exclusively in the database; in-memory mirrors removed.
 
 
 def now_iso() -> str:
@@ -124,9 +122,6 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, 
     except Exception as e:
         log.dual_log(tag="API:Worker:Start", message=f"Failed to start worker manager: {e}", level="WARNING", exc_info=e)
 
-    # Local cache for quick reads
-    JOBS[job_id] = {"status": "QUEUED", "created_at": created, "tool_name": tool_name}
-
     return {"job_id": job_id, "status": "QUEUED"}
 
 
@@ -145,10 +140,10 @@ async def get_job_status(job_id: str, request: Request, _=Depends(require_api_ke
     except Exception:
         row = None
 
-    if not row and job_id not in JOBS:
+    if not row:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    status_val = row["status"] if row is not None else JOBS[job_id].get("status")
+    status_val = row["status"]
 
     # Load job logs from persistent store (job_logs)
     job_logs = []
@@ -161,10 +156,7 @@ async def get_job_status(job_id: str, request: Request, _=Depends(require_api_ke
         for r in rows:
             job_logs.append(JobLogEntry(timestamp=r["timestamp"], level=r["level"], tag=r["tag"], status_state=r["status_state"], message=r["message"]))
     except Exception:
-        # If DB is temporarily unavailable, return any in-memory logs we have.
-        in_mem = JOBS.get(job_id, {})
-        if in_mem:
-            job_logs = [JobLogEntry(timestamp=now_iso(), level="INFO", message=f"Status cached: {in_mem.get('status')}")]
+        pass
 
     # Attempt to read latest payload row from job_logs (payload_json) for final_payload
     final_payload = None
