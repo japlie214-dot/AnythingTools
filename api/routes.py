@@ -12,7 +12,7 @@ from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, 
 from tools.registry import REGISTRY
 from utils.logger.core import get_dual_logger
 from utils.id_generator import ULID
-from database.writer import start_writer, enqueue_write
+from database.writer import start_writer, append_to_ledger, enqueue_write
 from database.connection import DatabaseManager
 from utils.artifacts import artifact_url_from_request
 from bot.engine.worker import get_manager
@@ -110,10 +110,8 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, 
     # Write to execution_ledger as well (preparation for Phase 3)
     # Store args in content as JSON to prevent token-heuristic misidentification as an attachment
     ledger_content = json.dumps({"event": f"Enqueueing tool {tool_name}", "args": args})
-    enqueue_write(
-        "INSERT INTO execution_ledger (ledger_id, job_id, session_id, role, content, attachment_metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (ULID.generate(), job_id, session_id, "user", ledger_content, None, created),
-    )
+    # Centralized ledger entry for job enqueue
+    append_to_ledger(job_id, session_id, "user", ledger_content)
     log.dual_log(tag="API:Job:Persist", message=f"Job {job_id} persisted", payload={"job_id": job_id})
 
     # Ensure background writer is running

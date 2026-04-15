@@ -8,7 +8,8 @@ from utils.browser_utils import safe_google_get, extract_hybrid_html
 from utils.tracker import TestTracker
 
 class BrowserOperator(BaseTool):
-    name = "browser:operator"
+    from bot.core.constants import TOOL_BROWSER_OPERATOR
+    name = TOOL_BROWSER_OPERATOR
 
     async def run(self, args: dict[str, Any], telemetry, **kwargs) -> str:
         """Execute the browser operator tool.

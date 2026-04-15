@@ -17,7 +17,8 @@ from utils.vector_search import generate_embedding
 class VectorSearchAction(BaseTool):
     """Internal agent action: similarity search against KB."""
 
-    name = "library:vector_search"
+    from bot.core.constants import TOOL_LIBRARY_VECTOR_SEARCH
+    name = TOOL_LIBRARY_VECTOR_SEARCH
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         query = args.get("query", "")

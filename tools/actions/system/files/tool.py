@@ -22,7 +22,8 @@ def _safe_path(filename: str) -> str | None:
 
 
 class FileListDownloadsTool(BaseTool):
-    name = "system:file_list_downloads"
+    from bot.core.constants import TOOL_SYSTEM_FILE_LIST_DOWNLOADS
+    name = TOOL_SYSTEM_FILE_LIST_DOWNLOADS
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         if not os.path.exists(_DOWNLOAD_DIR):
@@ -49,7 +50,8 @@ class FileListDownloadsTool(BaseTool):
 
 
 class FileReadDocumentTool(BaseTool):
-    name = "system:file_read_document"
+    from bot.core.constants import TOOL_SYSTEM_FILE_READ_DOCUMENT
+    name = TOOL_SYSTEM_FILE_READ_DOCUMENT
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         # Never called: execute() is overridden below.  Satisfies abstract contract.
@@ -82,7 +84,8 @@ class FileReadDocumentTool(BaseTool):
 
 
 class FileDeleteTool(BaseTool):
-    name = "system:file_delete"
+    from bot.core.constants import TOOL_SYSTEM_FILE_DELETE
+    name = TOOL_SYSTEM_FILE_DELETE
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         filename = args.get("filename", "").strip()

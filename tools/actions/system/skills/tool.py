@@ -9,7 +9,8 @@ from tools.base import BaseTool, TelemetryCallback
 
 
 class SkillListTool(BaseTool):
-    name = "system:skill_list"
+    from bot.core.constants import TOOL_SYSTEM_SKILL_LIST
+    name = TOOL_SYSTEM_SKILL_LIST
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         conn = DatabaseManager.get_read_connection()
@@ -21,7 +22,8 @@ class SkillListTool(BaseTool):
 
 
 class SkillReadTool(BaseTool):
-    name = "system:skill_read"
+    from bot.core.constants import TOOL_SYSTEM_SKILL_READ
+    name = TOOL_SYSTEM_SKILL_READ
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         ids = args.get("ids", [])
@@ -47,7 +49,8 @@ class SkillReadTool(BaseTool):
 
 
 class SkillCrudTool(BaseTool):
-    name = "system:skill_crud"
+    from bot.core.constants import TOOL_SYSTEM_SKILL_CRUD
+    name = TOOL_SYSTEM_SKILL_CRUD
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         action = args.get("action", "").upper()

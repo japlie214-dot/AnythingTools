@@ -7,7 +7,8 @@ from database.connection import DatabaseManager
 from utils.vector_search import generate_embedding
 
 class PDFSearchTool(BaseTool):
-    name = "library:pdf_search"
+    from bot.core.constants import TOOL_LIBRARY_PDF_SEARCH
+    name = TOOL_LIBRARY_PDF_SEARCH
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         pdf_name = args.get("pdf_name")

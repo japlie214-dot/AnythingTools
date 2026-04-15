@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import config
 from utils.logger.core import get_dual_logger
 from database.connection import DatabaseManager
-from database.writer import enqueue_write
+from database.writer import append_to_ledger, enqueue_write
 from utils.id_generator import ULID
 from utils.context_helpers import spawn_thread_with_context
 from tools.registry import REGISTRY
@@ -103,10 +103,7 @@ class UnifiedWorkerManager:
                         "The browser has been restarted at Google. Verify your location before "
                         "proceeding. Consult job_items to review completed steps."
                     )
-                    enqueue_write(
-                        "INSERT INTO execution_ledger (job_id, session_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
-                        (job_id, session_id, "system", recovery_msg, len(recovery_msg))
-                    )
+                    append_to_ledger(job_id, session_id, "system", recovery_msg)
 
                 # Spawn execution thread
                 t = spawn_thread_with_context(

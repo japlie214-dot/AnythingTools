@@ -6,7 +6,8 @@ from tools.base import BaseTool, TelemetryCallback
 from database.connection import DatabaseManager
 
 class PDFTocTool(BaseTool):
-    name = "library:get_pdf_toc"
+    from bot.core.constants import TOOL_LIBRARY_GET_PDF_TOC
+    name = TOOL_LIBRARY_GET_PDF_TOC
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         pdf_name = args.get("pdf_name")

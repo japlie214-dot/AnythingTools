@@ -12,7 +12,7 @@ from bot.core.modes import MODES
 from bot.core.weaver import build_session_context
 from bot.engine.tool_runner import run_tool_safely
 from tools.registry import REGISTRY
-from database.writer import enqueue_write
+from database.writer import append_to_ledger
 from clients.llm import get_llm_client, LLMRequest
 from utils.logger import get_dual_logger
 
@@ -47,20 +47,8 @@ class UnifiedAgent:
                 max_budget=100000
             )
             
-            # Prepare tool schemas for LLM (ALL registered tools, not just action namespaces)
-            available_tools = []
-            tool_schemas = REGISTRY.schema_list()
-            for t_name in self.current_mode.allowed_tools:
-                for schema in tool_schemas:
-                    if schema["name"] == t_name:
-                        available_tools.append({
-                            "type": "function",
-                            "function": {
-                                "name": t_name,
-                                "description": schema.get("description", ""),
-                                "parameters": schema.get("input_schema", {})
-                            }
-                        })
+            # Prepare tool schemas for LLM using flat format required by Azure Responses API
+            available_tools = REGISTRY.get_responses_tools(self.current_mode.allowed_tools)
 
             # ACT: Call LLM
             response = await self.llm.complete_chat(LLMRequest(
@@ -71,10 +59,7 @@ class UnifiedAgent:
             # No tool calls = final response
             if not response.tool_calls:
                 content = response.content or ""
-                enqueue_write(
-                    "INSERT INTO execution_ledger (job_id, session_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
-                    (self.job_id, self.session_id, "assistant", content, len(content))
-                )
+                append_to_ledger(self.job_id, self.session_id, "assistant", content)
                 return {"status": "COMPLETED", "result": content}
 
             # OBSERVE: Execute tool calls
@@ -91,23 +76,18 @@ class UnifiedAgent:
 
                 # Record assistant intent
                 intent_content = f"Invoking tool {fn_name} with args {args_str}"
-                enqueue_write(
-                    "INSERT INTO execution_ledger (job_id, session_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
-                    (self.job_id, self.session_id, "assistant", intent_content, len(intent_content))
-                )
+                append_to_ledger(self.job_id, self.session_id, "assistant", intent_content)
 
                 # Handle mode switching
-                if fn_name == "system:switch_mode":
+                from bot.core.constants import TOOL_SYSTEM_SWITCH_MODE
+                if fn_name == TOOL_SYSTEM_SWITCH_MODE:
                     target = args.get("target")
                     reason = args.get("reason")
                     objective = args.get("objective")
                     if target in MODES:
                         self.current_mode = MODES[target]
                         switch_msg = f"Mode switched to {target}. Reason: {reason}. Objective: {objective}."
-                        enqueue_write(
-                            "INSERT INTO execution_ledger (job_id, session_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
-                            (self.job_id, self.session_id, "system", switch_msg, len(switch_msg))
-                        )
+                        append_to_ledger(self.job_id, self.session_id, "system", switch_msg)
                         continue  # Skip to next iteration with new mode
 
                 # Execute tool
@@ -119,10 +99,7 @@ class UnifiedAgent:
                     res_text = tool_result.output
 
                 # Record tool response
-                enqueue_write(
-                    "INSERT INTO execution_ledger (job_id, session_id, role, content, char_count) VALUES (?, ?, ?, ?, ?)",
-                    (self.job_id, self.session_id, "tool", res_text, len(res_text))
-                )
+                append_to_ledger(self.job_id, self.session_id, "tool", res_text)
 
         # 50-call hard cap exceeded
         return {"status": "FAILED", "message": "Hard limit of 50 tool calls exceeded. Infinite loop aborted."}

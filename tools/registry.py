@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import pkgutil
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Type
 
@@ -69,6 +70,15 @@ class ToolRegistry:
                         log.dual_log(tag="Registry:Load", message=f"Failed to import actions.{scope.name}.{module_name}: {e}", level="WARNING", payload={"module": f"{scope.name}.{module_name}"})
                         continue
                     self._register_module_tools(module)
+
+                    # If the discovered module is a package, attempt to import its inner 'tool' submodule
+                    if module_info.ispkg:
+                        try:
+                            submod = importlib.import_module(f"tools.actions.{scope.name}.{module_name}.tool")
+                            self._register_module_tools(submod)
+                        except Exception:
+                            # Silently ignore missing 'tool' submodule – not all packages expose it
+                            pass
 
         # 3. Public tools discovery: top-level tool modules and packages under tools/
         #    (e.g., tools/browser_task, tools/research). This ensures public entry
@@ -155,6 +165,10 @@ class ToolRegistry:
                     log.dual_log(tag="Registry:Register", message=f"Skipping tool class because name not found and instantiation failed: {obj}: {e}", level="WARNING", payload={"class": f"{obj}"})
                     continue
 
+            # Validate tool name against Azure OpenAI naming constraints
+            if not tool_name or not re.match(r'^[a-zA-Z0-9_-]+$', tool_name):
+                raise ValueError(f"Invalid tool name '{tool_name}'. Tool names must match ^[a-zA-Z0-9_-]+$")
+
             self._tools[tool_name] = {
                 "cls": obj,
                 "input_schema": input_schema,
@@ -219,6 +233,32 @@ class ToolRegistry:
             })
         return entries
 
+
+    def get_responses_tools(self, tool_names: list[str]) -> list[Dict[str, Any]]:
+        """Return tools in the exact format required by Azure OpenAI Responses API (and OpenAI Responses API)."""
+        if not tool_names:
+            return []
+
+        # Build a quick lookup of schemas by name for O(1) access.
+        schema_map = {s["name"]: s for s in self.schema_list()}
+
+        tools: list[Dict[str, Any]] = []
+        for name in tool_names:
+            schema = schema_map.get(name)
+            if not schema:
+                log.dual_log(
+                    tag="Registry:Tools",
+                    message=f"Allowed tool '{name}' not found in registry",
+                    level="WARNING",
+                )
+                continue
+            tools.append({
+                "type": "function",
+                "name": name,
+                "description": schema.get("description") or f"Dynamically discovered tool {name}",
+                "parameters": schema.get("input_schema") or {"type": "object", "properties": {}, "required": []},
+            })
+        return tools
 
 # Singleton registry instance
 REGISTRY = ToolRegistry()

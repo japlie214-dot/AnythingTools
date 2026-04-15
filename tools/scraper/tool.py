@@ -23,7 +23,7 @@ from utils.logger import get_dual_logger
 from utils.browser_lock import browser_lock
 from tools.scraper.task import _run_botasaurus_scraper
 from utils.id_generator import ULID
-from database.writer import enqueue_write
+from database.writer import append_to_ledger, enqueue_write
 
 log = get_dual_logger(__name__)
 
@@ -66,19 +66,16 @@ class ScraperTool(BaseTool):
             return "[DRY RUN] Scraper tool execution skipped."
 
         job_id = kwargs.get("job_id")
-        caller_id = str(kwargs.get("chat_id", "0"))
+        session_id = str(kwargs.get("session_id") or kwargs.get("chat_id", "0"))
         target_site = args.get("target_site")
         
         if not target_site:
             return "Error: target_site argument is required."
 
         # 📝 LOG: Scout initialization to execution_ledger
-        if job_id and caller_id != "0":
+        if job_id and session_id != "0":
             msg = f"The Scout: Starting extraction for {target_site}."
-            enqueue_write(
-                "INSERT INTO execution_ledger (job_id, caller_id, role, content, char_count) VALUES (?, ?, 'system', ?, ?)",
-                (job_id, caller_id, msg, len(msg))
-            )
+            append_to_ledger(job_id, session_id, "system", msg)
 
         loop = asyncio.get_running_loop()
         
@@ -211,12 +208,9 @@ class ScraperTool(BaseTool):
                 )
 
             # 📝 LOG: Intelligent Manifest to execution_ledger
-            if job_id and caller_id != "0":
+            if job_id and session_id != "0":
                 manifest_content = "\n".join(manifest_lines)
-                enqueue_write(
-                    "INSERT INTO execution_ledger (job_id, caller_id, role, content, char_count) VALUES (?, ?, 'system', ?, ?)",
-                    (job_id, caller_id, manifest_content, len(manifest_content))
-                )
+                append_to_ledger(job_id, session_id, "system", manifest_content)
 
             # Save to broadcast_batches
             try:

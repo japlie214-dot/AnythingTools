@@ -45,70 +45,60 @@ def _get_dom_tools() -> list:
     return [
         {
             "type": "function",
-            "function": {
-                "name": "verified_type",
-                "description": "Type text into an input field identified by its data-ai-id number.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "ai_id": {"type": "integer", "description": "The data-ai-id value of the target input field."},
-                        "text":  {"type": "string",  "description": "The exact text to type into the field."},
-                    },
-                    "required": ["ai_id", "text"],
+            "name": "verified_type",
+            "description": "Type text into an input field identified by its data-ai-id number.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ai_id": {"type": "integer", "description": "The data-ai-id value of the target input field."},
+                    "text":  {"type": "string",  "description": "The exact text to type into the field."},
                 },
+                "required": ["ai_id", "text"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "verified_click",
-                "description": "Click an interactive element identified by its data-ai-id number.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "ai_id": {"type": "integer", "description": "The data-ai-id value of the target element."},
-                    },
-                    "required": ["ai_id"],
+            "name": "verified_click",
+            "description": "Click an interactive element identified by its data-ai-id number.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ai_id": {"type": "integer", "description": "The data-ai-id value of the target element."},
                 },
+                "required": ["ai_id"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "visit_url",
-                "description": "Navigate the browser to a new URL.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"url": {"type": "string"}},
-                    "required": ["url"],
-                },
+            "name": "visit_url",
+            "description": "Navigate the browser to a new URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "declare_success",
-                "description": "Call this when the main article content is fully visible and unobstructed.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"reason": {"type": "string"}},
-                    "required": ["reason"],
-                },
+            "name": "declare_success",
+            "description": "Call this when the main article content is fully visible and unobstructed.",
+            "parameters": {
+                "type": "object",
+                "properties": {"reason": {"type": "string"}},
+                "required": ["reason"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "human_help",
-                "description": (
-                    "Call this when blocked by a hard CAPTCHA (Cloudflare Turnstile, "
-                    "image-grid reCAPTCHA), or when the HTML dump is truncated."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"reason": {"type": "string"}},
-                    "required": ["reason"],
-                },
+            "name": "human_help",
+            "description": (
+                "Call this when blocked by a hard CAPTCHA (Cloudflare Turnstile, "
+                "image-grid reCAPTCHA), or when the HTML dump is truncated."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"reason": {"type": "string"}},
+                "required": ["reason"],
             },
         },
     ]

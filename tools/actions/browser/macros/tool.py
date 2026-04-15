@@ -15,7 +15,8 @@ from utils.prompt_cache import mark_macros_dirty
 
 
 class MacroSaveTool(BaseTool):
-    name = "browser:macro_save"
+    from bot.core.constants import TOOL_BROWSER_MACRO_SAVE
+    name = TOOL_BROWSER_MACRO_SAVE
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         name       = args.get("name", "").strip()
@@ -47,7 +48,8 @@ class MacroSaveTool(BaseTool):
 
 
 class MacroEditTool(BaseTool):
-    name = "browser:macro_edit"
+    from bot.core.constants import TOOL_BROWSER_MACRO_EDIT
+    name = TOOL_BROWSER_MACRO_EDIT
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         """Apply index-based step REPLACEMENT deltas to a macro's steps_json.
@@ -93,7 +95,8 @@ class MacroEditTool(BaseTool):
 
 
 class MacroDeleteTool(BaseTool):
-    name = "browser:macro_delete"
+    from bot.core.constants import TOOL_BROWSER_MACRO_DELETE
+    name = TOOL_BROWSER_MACRO_DELETE
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         mac_id = args.get("macro_id", "").strip()
@@ -105,7 +108,8 @@ class MacroDeleteTool(BaseTool):
 
 
 class MacroExecuteTool(BaseTool):
-    name = "browser:macro_execute"
+    from bot.core.constants import TOOL_BROWSER_MACRO_EXECUTE
+    name = TOOL_BROWSER_MACRO_EXECUTE
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
         mac_id = args.get("macro_id", "").strip()

@@ -18,7 +18,8 @@ class InitializeChecklistInput(BaseModel):
 
 class InitializeChecklistTool(BaseTool):
     """Initialize a multi-step checklist in job_items."""
-    name = "system:initialize_checklist"
+    from bot.core.constants import TOOL_SYSTEM_INITIALIZE_CHECKLIST
+    name = TOOL_SYSTEM_INITIALIZE_CHECKLIST
     INPUT_MODEL = InitializeChecklistInput
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
@@ -41,7 +42,8 @@ class CompleteStepInput(BaseModel):
 
 class CompleteStepTool(BaseTool):
     """Mark a step as completed with output data."""
-    name = "system:complete_step"
+    from bot.core.constants import TOOL_SYSTEM_COMPLETE_STEP
+    name = TOOL_SYSTEM_COMPLETE_STEP
     INPUT_MODEL = CompleteStepInput
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:
@@ -64,7 +66,8 @@ class SwitchModeInput(BaseModel):
 
 class SwitchModeTool(BaseTool):
     """Request a mode switch (handled by agent loop)."""
-    name = "system:switch_mode"
+    from bot.core.constants import TOOL_SYSTEM_SWITCH_MODE
+    name = TOOL_SYSTEM_SWITCH_MODE
     INPUT_MODEL = SwitchModeInput
 
     async def run(self, args: dict[str, Any], telemetry: TelemetryCallback, **kwargs) -> str:

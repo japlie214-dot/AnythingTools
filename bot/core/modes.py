@@ -23,42 +23,42 @@ MODES: Dict[str, AgentMode] = {
         name="Scout",
         execution_type="PROGRAMMATIC",
         system_prompt="You are the Scout. Find, extract, and structure raw web data.",
-        allowed_tools=["system:complete_step", "system:initialize_checklist"]
+        allowed_tools=["system_complete_step", "system_initialize_checklist"]
     ),
     "Analyst": AgentMode(
         name="Analyst",
         execution_type="AUTONOMOUS",
         system_prompt="You are the Analyst. Run deep, multi-step chain-of-thought processing and synthesis.",
-        allowed_tools=["system:switch_mode", "system:complete_step", "system:initialize_checklist", "library:vector_search", "browser:operator"]
+        allowed_tools=["system_switch_mode", "system_complete_step", "system_initialize_checklist", "library_vector_search", "browser_operator"]
     ),
     "Quant": AgentMode(
         name="Quant",
         execution_type="AUTONOMOUS",
         system_prompt="You are the Quant. Handle numerical reconciliation, SQL generation, and SEC EDGAR parsing.",
-        allowed_tools=["system:switch_mode", "system:complete_step", "system:initialize_checklist"]
+        allowed_tools=["system_switch_mode", "system_complete_step", "system_initialize_checklist"]
     ),
     "Editor": AgentMode(
         name="Editor",
         execution_type="AUTONOMOUS",
         system_prompt="You are the Editor. Modify, reorder, and format structured outputs using batch tools.",
-        allowed_tools=["system:switch_mode", "system:complete_step", "system:initialize_checklist", "system:draft_editor", "library:vector_search"]
+        allowed_tools=["system_switch_mode", "system_complete_step", "system_initialize_checklist", "draft_editor", "library_vector_search"]
     ),
     "Herald": AgentMode(
         name="Herald",
         execution_type="AUTONOMOUS",
         system_prompt="You are the Herald. Format and broadcast finalized intelligence to external channels.",
-        allowed_tools=["system:switch_mode", "system:complete_step", "system:initialize_checklist", "publisher"]
+        allowed_tools=["system_switch_mode", "system_complete_step", "system_initialize_checklist", "publisher"]
     ),
     "Archivist": AgentMode(
         name="Archivist",
         execution_type="AUTONOMOUS",
         system_prompt="You are the Archivist. Manage vector embeddings, RAG retrieval, and long-term memory curation.",
-        allowed_tools=["system:switch_mode", "system:complete_step", "system:initialize_checklist", "library:vector_search"]
+        allowed_tools=["system_switch_mode", "system_complete_step", "system_initialize_checklist", "library_vector_search"]
     ),
     "Navigator": AgentMode(
         name="Navigator",
         execution_type="AUTONOMOUS",
         system_prompt="You are the Navigator. Execute the user's task exactly as described using the browser. Stop when the task is done.",
-        allowed_tools=["system:switch_mode", "system:complete_step", "system:initialize_checklist", "browser:operator"]
+        allowed_tools=["system_switch_mode", "system_complete_step", "system_initialize_checklist", "browser_operator"]
     ),
 }
