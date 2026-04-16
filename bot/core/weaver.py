@@ -36,7 +36,7 @@ def build_session_context(
     
     # Fetch by session_id in DESCENDING order (newest first)
     rows = conn.execute(
-        "SELECT role, content, attachment_metadata, char_count, attachment_char_count "
+        "SELECT role, content, tool_call_id, tool_calls_json, attachment_metadata, char_count, attachment_char_count "
         "FROM execution_ledger WHERE session_id = ? ORDER BY id DESC",
         (str(session_id),)
     ).fetchall()
@@ -71,11 +71,28 @@ def build_session_context(
         
         total_cost += cost
         
-        raw_messages.append({
+        msg_dict = {
             "role": row["role"],
             "content": row["content"],
             "attachment_metadata": meta
-        })
+        }
+        # sqlite3.Row does not implement .get(); use subscripting with fallbacks
+        try:
+            tcid = row["tool_call_id"]
+        except Exception:
+            tcid = None
+        if tcid:
+            msg_dict["tool_call_id"] = tcid
+        try:
+            tcs_raw = row["tool_calls_json"]
+        except Exception:
+            tcs_raw = None
+        if tcs_raw:
+            try:
+                msg_dict["tool_calls"] = json.loads(tcs_raw)
+            except Exception:
+                msg_dict["tool_calls"] = None
+        raw_messages.append(msg_dict)
 
     # Reverse to get chronological order (oldest first for LLM context)
     raw_messages.reverse()

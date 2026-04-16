@@ -138,8 +138,30 @@ class UnifiedWorkerManager:
             agent = UnifiedAgent(job_id, session_id, initial_mode)
             result = asyncio.run(agent.run(telemetry_cb, tool_name=tool_name, **args))
 
-            status_str = result.get("status", "FAILED")
-            payload_json = json.dumps(result, ensure_ascii=False)
+            # Normalize result to a plain dict. Defensive handling is important
+            # because some code paths (or regressions) may accidentally return a
+            # sqlite3.Row or other mapping-like object which does not implement
+            # the full dict interface expected below (e.g. .get()). Coerce
+            # safely to avoid crashing the worker thread.
+            try:
+                import sqlite3 as _sqlite3
+            except Exception:
+                _sqlite3 = None
+
+            if isinstance(result, dict):
+                normal = result
+            elif _sqlite3 is not None and isinstance(result, _sqlite3.Row):
+                normal = dict(result)
+            else:
+                try:
+                    # Try to coerce any mapping-like or object to dict
+                    normal = dict(result)
+                except Exception:
+                    # Fallback to a minimal serializable dict
+                    normal = {"status": "FAILED", "result": str(result)}
+
+            status_str = normal.get("status", "FAILED")
+            payload_json = json.dumps(normal, ensure_ascii=False)
 
             enqueue_write(
                 "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",

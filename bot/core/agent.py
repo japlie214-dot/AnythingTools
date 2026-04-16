@@ -124,9 +124,16 @@ class UnifiedAgent:
                 )
                 return {"status": "COMPLETED", "result": content}
 
+            # 1. Log the structured assistant response (the tool calls)
+            append_to_ledger(
+                self.job_id, self.session_id, "assistant",
+                content=response.content or "",
+                tool_calls=response.tool_calls
+            )
+
             for tool_call in response.tool_calls:
                 self.tool_call_count += 1
-                
+                call_id = tool_call.get("id")
                 fn_name = tool_call["function"]["name"]
                 args_str = tool_call["function"].get("arguments", "{}")
                 
@@ -152,12 +159,11 @@ class UnifiedAgent:
                 except Exception:
                     args = {}
 
-                intent_content = f"Invoking tool {fn_name} with args {args_str}"
-                append_to_ledger(self.job_id, self.session_id, "assistant", intent_content)
+                # Log a concise structured trace (assistant structured intent already saved)
                 log.dual_log(
                     tag="Agent:Action",
                     message=f"🛠️ Invoking {fn_name}",
-                    payload={"args_preview": args_str[:500]},
+                    payload={"args_preview": args_str[:500], "call_id": call_id},
                     notify_user=True
                 )
 
@@ -222,7 +228,12 @@ class UnifiedAgent:
                     payload={"output_length": len(res_text)},
                     notify_user=True
                 )
-                append_to_ledger(self.job_id, self.session_id, "tool", res_text)
+                # 2. Log the tool result WITH the call_id
+                append_to_ledger(
+                    self.job_id, self.session_id, "tool",
+                    content=res_text,
+                    tool_call_id=call_id
+                )
 
         msg = "🚨 Security Intervention: Job force-terminated (50 tool calls exceeded)"
         log.dual_log(

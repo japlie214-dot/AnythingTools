@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS execution_ledger (
     session_id TEXT,
     role TEXT NOT NULL CHECK(role IN ('system','user','assistant','tool')),
     content TEXT NOT NULL,
+    tool_call_id TEXT,
+    tool_calls_json TEXT,
     attachment_metadata TEXT,
     char_count INTEGER NOT NULL DEFAULT 0,
     attachment_char_count INTEGER NOT NULL DEFAULT 0,

@@ -20,7 +20,7 @@ _write_generation: int = 0
 # Special marker for execute-script tasks enqueued to the writer.
 EXEC_SCRIPT = "__EXEC_SCRIPT__"
 
-def append_to_ledger(job_id: str, session_id: str, role: str, content: str, attachment_metadata: dict = None) -> str:
+def append_to_ledger(job_id: str, session_id: str, role: str, content: str, attachment_metadata: dict = None, tool_call_id: str = None, tool_calls: list = None) -> str:
     """Centralized helper to append an entry to the execution_ledger.
     Generates a ULID for ledger_id, computes character count, and handles optional attachment metadata.
     Returns the generated ledger_id.
@@ -31,6 +31,7 @@ def append_to_ledger(job_id: str, session_id: str, role: str, content: str, atta
     ledger_id = ULID.generate()
     char_count = len(content) if content else 0
     att_meta_str = json.dumps(attachment_metadata) if attachment_metadata is not None else None
+    tool_calls_str = json.dumps(tool_calls) if tool_calls is not None else None
 
     # Compute attachment character cost if metadata provided
     att_cost = 0
@@ -49,8 +50,8 @@ def append_to_ledger(job_id: str, session_id: str, role: str, content: str, atta
                     att_cost += 50000
 
     enqueue_write(
-        "INSERT INTO execution_ledger (ledger_id, job_id, session_id, role, content, attachment_metadata, char_count, attachment_char_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (ledger_id, job_id, session_id, role, content, att_meta_str, char_count, att_cost)
+        "INSERT INTO execution_ledger (ledger_id, job_id, session_id, role, content, tool_call_id, tool_calls_json, attachment_metadata, char_count, attachment_char_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (ledger_id, job_id, session_id, role, content, tool_call_id, tool_calls_str, att_meta_str, char_count, att_cost)
     )
     return ledger_id
 
