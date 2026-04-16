@@ -348,6 +348,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # 9) Background: Telegram orphan handshake
+    try:
+        from api.telegram_client import TelegramBot
+        asyncio.create_task(TelegramBot.run_orphan_handshake())
+    except Exception as e:
+        logging.exception("Failed to start Telegram Handshake task: %s", e)
+
     yield
 
     logging.info("AnythingTools shutdown: lifecycle complete")

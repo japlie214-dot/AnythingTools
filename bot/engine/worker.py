@@ -33,11 +33,13 @@ class UnifiedWorkerManager:
     """Poll jobs table and execute via Unified Agent with caller locks."""
     
     def __init__(self, poll_interval: float = 1.0):
+        import collections
         self.poll_interval = poll_interval
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._active_jobs: Dict[str, threading.Thread] = {}
         self._active_callers: Set[str] = set()
+        self._system_errors = collections.defaultdict(int)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -144,9 +146,27 @@ class UnifiedWorkerManager:
                 (status_str, payload_json, now_iso(), job_id),
             )
             
+            # Reset errors on success
+            if job_id in self._system_errors:
+                del self._system_errors[job_id]
+                
         except Exception as e:
-            log.dual_log(tag="Worker:Job:Crashed", message=f"Job {job_id} crashed: {e}", level="ERROR", exc_info=e)
-            enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("FAILED", now_iso(), job_id))
+            err_str = str(e)
+            if err_str.startswith("PAUSED_FOR_HITL:"):
+                msg = err_str.split(":", 1)[1].strip() if ":" in err_str else err_str
+                log.dual_log(tag="Worker:Job:Paused", message=f"Job {job_id} paused for HITL: {msg}", level="WARNING")
+                enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("PAUSED_FOR_HITL", now_iso(), job_id))
+                append_to_ledger(job_id, session_id, "system", f"PAUSED_FOR_HITL: {msg}")
+            else:
+                self._system_errors[job_id] += 1
+                if self._system_errors[job_id] >= 3:
+                    log.dual_log(tag="Worker:Job:Abandoned", message=f"Job {job_id} ABANDONED after 3 consecutive system errors: {e}", level="CRITICAL", notify_user=True)
+                    enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("ABANDONED", now_iso(), job_id))
+                    del self._system_errors[job_id]
+                else:
+                    log.dual_log(tag="Worker:Job:Crashed", message=f"Job {job_id} crashed (Attempt {self._system_errors[job_id]}/3). Sleeping 10s: {e}", level="ERROR", exc_info=e)
+                    time.sleep(10)
+                    enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("INTERRUPTED", now_iso(), job_id))
             
         finally:
             # Always clean up session lock

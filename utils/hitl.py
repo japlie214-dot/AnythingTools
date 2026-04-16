@@ -91,3 +91,20 @@ def mark_paused_for_hitl(
         level="WARNING",
         notify_user=True,
     )
+
+
+def pause_for_hitl(message: str) -> None:
+    """Transitions the job to PAUSED_FOR_HITL, safely releases browser lock, and halts execution."""
+    from utils.browser_lock import browser_lock
+    browser_lock.safe_release()
+    
+    log.dual_log(
+        tag="HITL:Pause",
+        message=message,
+        status_state="PAUSED_FOR_HITL",
+        level="WARNING",
+        notify_user=True,
+    )
+    
+    # Raise a special exception that the UnifiedWorkerManager catches
+    raise Exception(f"PAUSED_FOR_HITL:{message}")

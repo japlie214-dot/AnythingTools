@@ -18,6 +18,7 @@ from utils.som_utils import reinject_all, verify_visibility_and_click, verify_vi
 from utils.text_processing import clean_html_for_agent
 from utils.vision_utils import capture_and_optimize
 from tools.research.blocker_detection import is_hard_blocked
+from utils.hitl import pause_for_hitl
 
 log = get_dual_logger(__name__)
 
@@ -229,17 +230,9 @@ def agentic_recovery_loop(
                             level="WARNING",
                         )
                     else:
-                        print(f"\n🚨 [AI NAVIGATOR] HUMAN HELP REQUESTED 🚨\nReason: {reason}")
-                        user_input = input(
-                            ">> Interact with the browser, then press ENTER to resume, "
-                            "or type 'Stop' to cancel: "
-                        ).strip()
-                        if user_input == "Stop":
-                            if cancellation_flag is not None:
-                                cancellation_flag.set()
-                            return False
-                        driver.short_random_sleep()
-                        reinject_all(driver, id_tracking)
+                        from utils.hitl import pause_for_hitl
+                        pause_for_hitl(f"[AI NAVIGATOR] HUMAN HELP REQUESTED: {reason}")
+                        return False
 
                 elif name == "verified_click":
                     ai_id = args.get("ai_id")

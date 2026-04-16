@@ -20,6 +20,7 @@ from tools.base import BaseTool
 from utils.text_processing import parse_llm_json
 import config
 from utils.logger import get_dual_logger
+from api.telegram_client import TelegramBot
 
 log = get_dual_logger(__name__)
 from tools.quiz.quiz_prompts import TRANSLATION_PROMPT, prepare_quiz_for_translation, QUIZ_TOPIC_EXTRACTION_PROMPT, QUIZ_GENERATION_PROMPT
@@ -78,8 +79,6 @@ class QuizTool(BaseTool):
 
     async def _deliver_polls(
         self,
-        bot,
-        chat_id: int,
         validated_quizzes: list[dict],
         telemetry,
     ) -> int:
@@ -87,8 +86,6 @@ class QuizTool(BaseTool):
         Deliver validated quiz questions as native Telegram Quiz Polls.
         Returns count of polls successfully sent.
         """
-        from telegram.error import TelegramError
-
         sent_count = 0
         for i, q in enumerate(validated_quizzes):
             question    = q['q'][:300]
@@ -110,19 +107,15 @@ class QuizTool(BaseTool):
                 correct = 0
 
             try:
-                await bot.send_poll(
-                    chat_id=chat_id,
+                await TelegramBot.send_poll(
                     question=question,
                     options=options,
-                    type='quiz',
                     correct_option_id=correct,
                     explanation=explanation,
-                    explanation_parse_mode='HTML',
-                    is_anonymous=True,
                 )
                 sent_count += 1
                 await telemetry(self.status(f'Poll {i+1}/{len(validated_quizzes)} sent.', 'RUNNING'))
-            except TelegramError as e:
+            except Exception as e:
                 log.dual_log(
                     tag="Quiz:Poll",
                     message=f"Failed to send poll Q{i+1}: {e}",
@@ -130,7 +123,7 @@ class QuizTool(BaseTool):
                     exc_info=e,
                 )
             finally:
-                await asyncio.sleep(config.TELEGRAM_MESSAGE_DELAY)
+                await asyncio.sleep(getattr(config, "TELEGRAM_MESSAGE_DELAY", 1.0))
 
         return sent_count
 
@@ -210,13 +203,10 @@ class QuizTool(BaseTool):
             final_en.append(f"  ✅ Correct: Option #{validated_q['correct'] + 1}")
             final_en.append(f"  💡 {validated_q['exp']}\n")
         
-        # If bot/chat_id were provided by orchestrator, deliver native Telegram quiz polls
-        bot = kwargs.get('bot')
-        chat_id = kwargs.get('chat_id')
-        if bot and chat_id:
-            await telemetry(self.status('Sending quiz polls to Telegram...', 'RUNNING'))
-            polls_sent = await self._deliver_polls(bot, chat_id, validated_quizzes, telemetry)
-            await telemetry(self.status(f'{polls_sent} quiz polls delivered.', 'SUCCESS'))
+        # Deliver native Telegram quiz polls using centralized TelegramBot
+        await telemetry(self.status('Sending quiz polls to Telegram...', 'RUNNING'))
+        polls_sent = await self._deliver_polls(validated_quizzes, telemetry)
+        await telemetry(self.status(f'{polls_sent} quiz polls delivered.', 'SUCCESS'))
 
         # ── Step 5: Bilingual Translation with Structural Isolation ──
         await telemetry(self.status("Translating to Bahasa Indonesia...", "RUNNING"))

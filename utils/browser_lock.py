@@ -42,5 +42,12 @@ class BrowserLockProxy:
     def release(self):
         self.lock.release()
 
+    def safe_release(self):
+        if self.locked():
+            try:
+                self.lock.release()
+            except RuntimeError:
+                pass
+
 # One lock governs all browser-capable tools.
 browser_lock = BrowserLockProxy()

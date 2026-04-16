@@ -10,19 +10,14 @@ import time
 import re as _re
 from typing import Any
 
-from ddgs import DDGS
-
 from tools.base import BaseTool
 from clients.llm import get_llm_client, LLMRequest
 from utils.logger import get_dual_logger
+from utils.search_client import SearchClient
 
 log = get_dual_logger(__name__)
 from tools.search.search_prompts import SEARCH_INITIAL_PROMPT, SEARCH_EVALUATION_VERBOSE_PROMPT, SEARCH_FINAL_SYNTHESIS_PROMPT
 import config
-
-# Maximum number of retry attempts for transient DDGS failures
-_DDGS_MAX_RETRIES = 2
-_DDGS_RETRY_DELAY_S = 3
 
 
 class SearchTool(BaseTool):
@@ -56,53 +51,27 @@ class SearchTool(BaseTool):
 
         def fetch_ddg(q: str) -> list[str]:
             """Blocking call — runs in a thread via asyncio.to_thread."""
-            text_res: list[str] = []
-            news_res: list[str] = []
-
-            for attempt in range(_DDGS_MAX_RETRIES + 1):
-                try:
-                    with DDGS() as ddgs:
-                        for r in ddgs.text(q, region="wt-wt", safesearch="moderate", max_results=5):
-                            url = r.get("href")
-                            if url and normalize(url) not in seen_urls:
-                                seen_urls.add(normalize(url))
-                                text_res.append(
-                                    f"Title: {r.get('title')}\n"
-                                    f"URL: {url}\n"
-                                    f"Snippet: {r.get('body')}"
-                                )
-
-                        for r in ddgs.news(q, region="wt-wt", safesearch="moderate", max_results=3):
-                            url = r.get("url", r.get("href"))
-                            if url and normalize(url) not in seen_urls:
-                                seen_urls.add(normalize(url))
-                                news_res.append(
-                                    f"Title: {r.get('title')}\n"
-                                    f"URL: {url}\n"
-                                    f"Snippet: {r.get('body')}"
-                                )
-                    break  # success
-                except Exception as exc:
-                    if attempt < _DDGS_MAX_RETRIES:
-                        log.dual_log(
-                            tag="Tool:Search",
-                            message=f"DDGS attempt {attempt + 1} failed, retrying in {_DDGS_RETRY_DELAY_S}s: {exc}",
-                            level="WARNING",
-                        )
-                        time.sleep(_DDGS_RETRY_DELAY_S)
-                    else:
-                        log.dual_log(
-                            tag="Tool:Search",
-                            message=f"DDGS fetch exhausted retries for query: {q}",
-                            level="ERROR",
-                        )
-            final_res = text_res + news_res
+            # Use the centralized SearchClient
+            final_res = SearchClient.fetch_text_and_news(q, max_text=5, max_news=3)
+            
+            # Deduplicate against seen_urls
+            deduplicated = []
+            for r in final_res:
+                # Extract URL from the result format
+                lines = r.split('\n')
+                url_line = next((line for line in lines if line.startswith('URL: ')), None)
+                if url_line:
+                    url = url_line[5:]  # Remove 'URL: ' prefix
+                    if normalize(url) not in seen_urls:
+                        seen_urls.add(normalize(url))
+                        deduplicated.append(r)
+            
             log.dual_log(
                 tag="Tool:Search:Fetch",
-                message=f"DDG fetch complete for query: {q!r}  {len(final_res)} result(s)",
-                payload={"results": final_res},
+                message=f"DDG fetch complete for query: {q!r}   {len(deduplicated)} result(s)",
+                payload={"results": deduplicated},
             )
-            return final_res
+            return deduplicated
 
         def clean_query(q: str) -> str:
             """Remove conversational noise and limit query length."""

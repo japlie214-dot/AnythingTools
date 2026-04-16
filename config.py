@@ -11,7 +11,8 @@ ANYTHINGTOOLS_PORT: int = int(os.getenv("ANYTHINGTOOLS_PORT", "8000"))
 
 # --- Telegram Push Notifications (Optional) ---
 TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_USER_ID: str | None = os.getenv("TELEGRAM_USER_ID")
+# TELEGRAM_USER_ID is now dynamically bound via startup handshake.
+TELEGRAM_USER_ID: str | None = None
 
 # --- Browser / Chrome Data Dir ---
 CHROME_USER_DATA_DIR: str = os.getenv("CHROME_USER_DATA_DIR", "chrome_profile")

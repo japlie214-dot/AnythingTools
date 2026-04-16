@@ -58,10 +58,13 @@ class ToolRegistry:
                     try:
                         # All action modules use tools.actions.<scope>.<module>
                         module = importlib.import_module(f"tools.actions.{scope.name}.{module_name}")
+                        self._register_module_tools(module)
+                    except ImportError as e:
+                        log.dual_log(tag="Registry:Load", message=f"ImportError in actions.{scope.name}.{module_name}: {e}. Creating PhantomTool.", level="WARNING")
+                        self._register_phantom_tool(scope / module_name / "tool.py" if (scope / module_name).is_dir() else Path(f"{scope}/{module_name}.py"), str(e))
                     except Exception as e:
                         log.dual_log(tag="Registry:Load", message=f"Failed to import actions.{scope.name}.{module_name}: {e}", level="WARNING", payload={"module": f"{scope.name}.{module_name}"})
                         continue
-                    self._register_module_tools(module)
 
                     # If the discovered module is a package, attempt to import its inner 'tool' submodule
                     if module_info.ispkg:
@@ -87,6 +90,9 @@ class ToolRegistry:
                 try:
                     module = importlib.import_module(module_name)
                     self._register_module_tools(module)
+                except ImportError as e:
+                    log.dual_log(tag="Registry:Load", message=f"ImportError in {module_name}: {e}. Creating PhantomTool.", level="WARNING")
+                    self._register_phantom_tool(child / "tool.py", str(e))
                 except Exception as e:
                     log.dual_log(tag="Registry:Load", message=f"Failed to import public tool package {module_name}: {e}", level="DEBUG", payload={"module": module_name})
 
@@ -95,6 +101,9 @@ class ToolRegistry:
                     try:
                         submod = importlib.import_module(f"tools.{child.name}.{sub}")
                         self._register_module_tools(submod)
+                    except ImportError as e:
+                        if sub == "tool":
+                            self._register_phantom_tool(child / "tool.py", str(e))
                     except Exception:
                         pass
                 continue
@@ -105,9 +114,46 @@ class ToolRegistry:
                 try:
                     module = importlib.import_module(module_name)
                     self._register_module_tools(module)
+                except ImportError as e:
+                    log.dual_log(tag="Registry:Load", message=f"ImportError in {module_name}: {e}. Creating PhantomTool.", level="WARNING")
+                    self._register_phantom_tool(child, str(e))
                 except Exception as e:
                     log.dual_log(tag="Registry:Load", message=f"Failed to import public tool module {module_name}: {e}", level="DEBUG", payload={"module": module_name})
                 continue
+
+    def _register_phantom_tool(self, file_path: Path, error_msg: str):
+        """Register a PhantomTool when a real tool fails to import due to missing dependencies."""
+        import ast
+        if not file_path.exists():
+            return
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                tree = ast.parse(f.read(), filename=str(file_path))
+            
+            tool_name = None
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == "name":
+                            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                                tool_name = node.value.value
+                                break
+            
+            if tool_name:
+                class PhantomTool(BaseTool):
+                    name = tool_name
+                    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
+                        return f"SYSTEM ERROR: This tool is OFFLINE. Missing dependency: {error_msg}"
+                
+                self._tools[tool_name] = {
+                    "cls": PhantomTool,
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                    "module": str(file_path),
+                    "description": f"⚠️ OFFLINE: Missing Dependency ({error_msg})",
+                }
+                log.dual_log(tag="Registry:Phantom", message=f"Registered PhantomTool: {tool_name}", level="WARNING")
+        except Exception as e:
+            log.dual_log(tag="Registry:Phantom", message=f"Failed to parse AST for {file_path}: {e}", level="DEBUG")
 
     def _register_module_tools(self, module):
         # Attempt to capture INPUT_MODEL.schema() if provided by the module.

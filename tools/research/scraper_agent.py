@@ -21,6 +21,7 @@ from tools.scraper.browser import extract_hybrid_html
 from tools.research.mechanical_bypass import attempt_mechanical_bypass
 from tools.research.agentic_loop import agentic_recovery_loop
 from utils.som_utils import extract_surgical_html
+from utils.hitl import pause_for_hitl
 
 log = get_dual_logger(__name__)
 
@@ -38,15 +39,12 @@ log = get_dual_logger(__name__)
 
 
 
-
 class AgenticBrowserScraper:
     def __init__(self, max_retries: int = 3, base_delay: float = 2.0, headless: bool = False):
         self.max_retries = max_retries
         self.base_delay = base_delay
         self._topic_hint: str = ''
         self._headless: bool = headless   # ← stored here; never read from driver.config
-
-
 
     def _enrich_content(self, driver: Driver) -> str:
         try:
@@ -133,6 +131,8 @@ class AgenticBrowserScraper:
                     if not is_hard_blocked(raw_html):
                         break
                 except Exception as e:
+                    if str(e).startswith("PAUSED_FOR_HITL:"):
+                        raise
                     log.dual_log(
                         tag="Research:Scraper",
                         message=f"Scrape attempt {attempt + 1} failed: {e}",
@@ -221,20 +221,6 @@ class AgenticBrowserScraper:
             )
             return False
 
-        # Infinite loop: user resolves the block, types exact 'Stop', or presses Ctrl-C.
-        print(f"\n🚨 BLOCKER DETECTED 🚨")
-        print(">> Please resolve the challenge (CAPTCHA / Cloudflare / Paywall) in the browser.")
-        while True:
-            print(">> To cancel: type exactly 'Stop' (capital S, lowercase 'top') and press ENTER.")
-            print(">> Any other casing — 'stop', 'STOP', 'sTop' — will NOT cancel; prompt repeats.")
-            user_input = input(">> Press ENTER to resume, or type 'Stop' to cancel: ").strip()
-            if user_input == "Stop":
-                if cancellation_flag is not None:
-                    cancellation_flag.set()
-                print("Mission cancellation confirmed. Shutting down gracefully.")
-                return False
-            driver.short_random_sleep()
-            if not is_hard_blocked(extract_surgical_html(driver)):
-                log.dual_log(tag="Research:Scraper", message="HITL resolution confirmed.", level="INFO")
-                return True
-            print("⚠️  Page still appears blocked. Please try again.")
+        # Use pause_for_hitl instead of infinite input loop
+        pause_for_hitl("BLOCKER DETECTED: Please resolve the challenge (CAPTCHA / Cloudflare / Paywall) in the browser.")
+        return False

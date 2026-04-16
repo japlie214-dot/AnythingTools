@@ -12,11 +12,11 @@ import json
 import re
 from typing import Any
 
-from ddgs import DDGS
 import config
 from tools.base import BaseTool
 from clients.llm import get_llm_client, LLMRequest
 from utils.logger import get_dual_logger
+from utils.search_client import SearchClient
 
 log = get_dual_logger(__name__)
 from tools.polymarket.polymarket_prompts import (
@@ -162,9 +162,12 @@ class PolymarketTool(BaseTool):
     def _web_search(query: str) -> str:
         lines: list[str] = []
         try:
-            with DDGS() as ddgs:
-                for r in ddgs.news(query, max_results=3):
-                    lines.append(f"- {r.get('title')}: {r.get('body')}")
+            results = SearchClient.fetch_text_and_news(query, max_text=0, max_news=3)
+            for r in results:
+                parts = r.split('\n')
+                title = parts[0].replace('Title: ', '')
+                snippet = parts[2].replace('Snippet: ', '') if len(parts) > 2 else ""
+                lines.append(f"- {title}: {snippet}")
         except Exception:
             pass
         return "\n".join(lines) if lines else "No recent news found."

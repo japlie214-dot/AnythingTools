@@ -53,12 +53,22 @@ class UnifiedAgent:
             notify_user=True
         )
 
+        # Check for HITL re-orientation after pause
+        conn = DatabaseManager.get_read_connection()
+        last_sys = conn.execute("SELECT content FROM execution_ledger WHERE session_id = ? AND role = 'system' ORDER BY id DESC LIMIT 1", (self.session_id,)).fetchone()
+        if last_sys and "PAUSED_FOR_HITL" in last_sys["content"]:
+            msg = "System: You have just resumed from a human-in-the-loop pause. The browser state may have changed. You MUST use the browser_operator tool to check the current URL and page title before continuing your plan."
+            append_to_ledger(self.job_id, self.session_id, "system", msg)
+            log.dual_log(tag="Agent:Lifecycle", message="Resumed from HITL pause. Injected re-orientation prompt.", notify_user=True)
+
         while self.tool_call_count < 50:
             if self.current_mode.execution_type == "PROGRAMMATIC":
                 tool_name = kwargs.get("tool_name")
                 tool_instance = REGISTRY.create_tool_instance(tool_name)
                 if tool_instance:
                     tool_result = await run_tool_safely(tool_instance, kwargs, telemetry, job_id=self.job_id, session_id=self.session_id, **kwargs)
+                    if "PAUSED_FOR_HITL:" in tool_result.output:
+                        raise Exception(tool_result.output[tool_result.output.find("PAUSED_FOR_HITL:"):].split("\n")[0])
                     return {"status": "COMPLETED" if tool_result.success else "FAILED", "result": tool_result.output}
                 return {"status": "FAILED", "message": f"Programmatic tool {tool_name} not found."}
 
@@ -186,6 +196,25 @@ class UnifiedAgent:
                 else:
                     tool_result = await run_tool_safely(tool_instance, args, telemetry, job_id=self.job_id, session_id=self.session_id, **kwargs)
                     res_text = tool_result.output
+                    
+                    # Check for PAUSED_FOR_HITL in tool result
+                    if "PAUSED_FOR_HITL:" in res_text:
+                        raise Exception(res_text[res_text.find("PAUSED_FOR_HITL:"):].split("\n")[0])
+                    
+                    # Artifact Deep Linking
+                    if tool_result.attachment_paths:
+                        import os, config
+                        from utils.artifacts import artifact_relpath_for_http
+                        base_url = os.getenv("BASE_URL", f"http://localhost:{getattr(config, 'ANYTHINGTOOLS_PORT', 8000)}")
+                        links = []
+                        for path in tool_result.attachment_paths:
+                            try:
+                                rel = artifact_relpath_for_http(path)
+                                links.append(f"<a href='{base_url}/artifacts/{rel}'>{rel.split('/')[-1]}</a>")
+                            except Exception:
+                                pass
+                        if links:
+                            res_text += "\n\n📎 Artifacts:\n" + "\n".join(f"• {link}" for link in links)
 
                 log.dual_log(
                     tag="Agent:Observation",

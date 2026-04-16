@@ -57,7 +57,7 @@ class ScraperTool(BaseTool):
         try:
             return await self._run_internal(args, telemetry, cancellation_flag=cancellation_flag, **kwargs)
         finally:
-            browser_lock.release()
+            browser_lock.safe_release()
 
     async def _run_internal(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Internal implementation with full pipeline."""
@@ -225,6 +225,8 @@ class ScraperTool(BaseTool):
             return f"Scout Mode Extraction Complete. Batch ID: {batch_id}. Briefing posted to ledger."
 
         except Exception as exc:
+            if str(exc).startswith("PAUSED_FOR_HITL:"):
+                raise
             await telemetry(self.status("Scraper failed.", "ERROR"))
             return f"Scout Mode failed: {exc}"
 
