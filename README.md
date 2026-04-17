@@ -165,29 +165,165 @@ The registry supports only:
 
 ## 6. Public Interfaces
 
-### REST API (`app.py`)
+### REST API
 
-**Enqueue Job**
-- `POST /tools/{tool_name}`
-- Body: `{"args": {...}, "client_metadata": {...}}`
-- Response: `{"job_id": "...", "status": "QUEUED"}`
+All endpoints are exposed at `/api` prefix.
 
-**Get Status**
-- `GET /jobs/{job_id}`
-- Response: `{"status": "...", "logs": [...], "result": "..."}`
+#### **Enqueue Job**
+- **Path**: `POST /api/tools/{tool_name}`
+- **Path Parameters**:
+  - `tool_name`: string, one of `scraper`, `draft_editor`, `publisher`, `batch_reader`
+- **Request Body**:
+  ```json
+  {
+    "args": {
+      // Tool-specific arguments (see Section 6.1)
+    },
+    "client_metadata": {
+      // Optional metadata forwarded to tool
+    }
+  }
+  ```
+- **Response**: `202 Accepted`
+  ```json
+  {
+    "job_id": "01J8XYZ...",
+    "status": "QUEUED"
+  }
+  ```
 
-**Get Manifest**
-- `GET /manifest`
-- Response: List of the 4 available tools and their schemas.
+#### **Get Job Status**
+- **Path**: `GET /api/jobs/{job_id}`
+- **Path Parameters**:
+  - `job_id`: string, unique identifier returned by enqueue
+- **Response**: `200 OK`
+  ```json
+  {
+    "job_id": "01J8XYZ...",
+    "status": "COMPLETED",
+    "job_logs": [
+      {
+        "timestamp": "2026-04-17T03:45:00.123Z",
+        "level": "INFO",
+        "tag": "Scraper:Init",
+        "status_state": "RUNNING",
+        "message": "Starting extraction..."
+      }
+    ],
+    "final_payload": {
+      // Tool-specific result or error
+    }
+  }
+  ```
+- **Status Values**: `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLING`, `INTERRUPTED`, `PAUSED_FOR_HITL`, `ABANDONED`
 
-**Cancel Job**
-- `DELETE /jobs/{job_id}` (Sets status to `CANCELLING`).
+#### **Cancel Job**
+- **Path**: `DELETE /api/jobs/{job_id}`
+- **Path Parameters**:
+  - `job_id`: string, job to cancel
+- **Response**: `202 Accepted`
+  ```json
+  {
+    "job_id": "01J8XYZ...",
+    "status": "CANCELLING"
+  }
+  ```
+- **Behavior**: Sets job status, activates cancellation flag if job is running.
+
+#### **Get Manifest**
+- **Path**: `GET /api/manifest`
+- **Response**: `200 OK`
+  ```json
+  {
+    "tools": [
+      {
+        "name": "scraper",
+        "input_model": { /* Pydantic schema */ }
+      },
+      {
+        "name": "draft_editor",
+        "input_model": { /* Pydantic schema */ }
+      },
+      {
+        "name": "publisher",
+        "input_model": { /* Pydantic schema */ }
+      },
+      {
+        "name": "batch_reader",
+        "input_model": { /* Pydantic schema */ }
+      }
+    ]
+  }
+  ```
+
+#### **Metrics**
+- **Path**: `GET /api/metrics`
+- **Response**: `200 OK`
+  ```json
+  {
+    "write_queue_size": 0,
+    "active_jobs": 0,
+    "registered_tools": 4
+  }
+  ```
+
+### 6.1 Tool-Specific Arguments
+
+#### **scraper**
+```json
+{
+  "args": {
+    "target_site": "FT"  // One of: "FT", "Bloomberg", "Technoz"
+  }
+}
+```
+**Returns**: JSON string with `{"batch_id": "...", "top_10": [...], "inventory": [...], "total_count": N}`
+
+#### **draft_editor**
+```json
+{
+  "args": {
+    "batch_id": "01J8XYZ...",
+    "operations": [
+      {
+        "index_top10": 0,
+        "target_identifier": "01J8ABC..."  // ULID or index from inventory
+      }
+    ]
+  }
+}
+```
+**Returns**: `"Success"` or raises `ValueError`
+
+#### **publisher**
+```json
+{
+  "args": {
+    "batch_id": "01J8XYZ..."
+  }
+}
+```
+**Returns**: `"Publisher Pipeline Complete."` or error message
+
+#### **batch_reader**
+```json
+{
+  "args": {
+    "batch_id": "01J8XYZ...",
+    "query": "semiconductor supply chain",
+    "limit": 5
+  }
+}
+```
+**Returns**: JSON string with `{"batch_id": "...", "query": "...", "results": [...]}`
+**Side Effect**: Returns `{error: "Vector search unavailable..."}` if `sqlite_vec` extension is missing.
 
 ### Tool Interface
 All tools inherit `tools.base.BaseTool`:
 ```python
 async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
     # Returns JSON string or error message
+    # kwargs includes: job_id, session_id, cancellation_flag (threading.Event)
 ```
 
 ## 7. State, Persistence, and Data
@@ -225,14 +361,14 @@ async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
 1. `pip install -r requirements.txt`
 2. `playwright install chromium`
 3. Configure `.env`:
-   ```env
-   AZURE_KEY=...
-   AZURE_ENDPOINT=...
-   AZURE_DEPLOYMENT=...
-   ANYTHINGLLM_BASE_URL=...  # Critical for Callback
-   TELEGRAM_BOT_TOKEN=...
-   TELEGRAM_ARCHIVE_CHAT_ID=...
-   ```
+    ```env
+    AZURE_KEY=...
+    AZURE_ENDPOINT=...
+    AZURE_DEPLOYMENT=...
+    ANYTHINGLLM_BASE_URL=...  # Critical for Callback
+    TELEGRAM_BOT_TOKEN=...
+    TELEGRAM_ARCHIVE_CHAT_ID=...
+    ```
 4. Run: `uvicorn app:app --reload --port 8000`
 
 ## 10. Testing & Validation
@@ -252,5 +388,7 @@ async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
 
 ### Fragile Components
 - **`tools/registry.py`**: Modifying the hardcoded list risks loading non-existent or deprecated tools.
-- **`bot/engine/worker.py`**: The `AnythingLLM` callback payload format must match the receiving system.
-- **`utils/telegram_publisher.py`**: Rate limiting logic is critical to avoid API bans.
+- **`bot/engine/worker.py`**: The `AnythingLLM` callback payload format must match the receiving system. The cancellation flag propagation logic is critical.
+- **`utils/telegram_publisher.py`**: Rate limiting logic is critical to avoid API bans. The producer-consumer coordination handles failure gracefully but requires the `try/except` pattern to be maintained.
+- **`utils/browser_lock.py`**: Mixing `asyncio.Lock` with threading causes RuntimeErrors. Must remain as `threading.Lock`.
+- **`database/schema.py`**: The `PAUSED_FOR_HITL` status constraint must be preserved in the jobs CHECK constraint.

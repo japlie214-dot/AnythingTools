@@ -145,5 +145,14 @@ class PublisherPipeline:
     async def run_pipeline(self):
         prod_task = asyncio.create_task(self.producer())
         cons_task = asyncio.create_task(self.consumer())
-        await asyncio.gather(prod_task, cons_task)
+        try:
+            await prod_task
+        except Exception:
+            # Ensure consumer receives sentinel so it can terminate cleanly
+            try:
+                await self.queue.put(None)
+            except Exception:
+                pass
+            raise
+        await cons_task
         return "Publisher Pipeline Complete."

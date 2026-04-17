@@ -189,25 +189,19 @@ def process_article(
                     reason = val_data.get("reason", "unknown")
                     log.dual_log(
                         tag="Scraper:Validation",
-                        message=f"Page invalid ({reason}). Initiating recovery sequence.",
+                        message=f"Page invalid ({reason}). Scraping failed.",
                         level="WARNING",
                     )
-                    from tools.research.scraper_agent import AgenticBrowserScraper
-                    scraper_util = AgenticBrowserScraper()
-                    scraper_util._topic_hint = "News article"
-                    if not scraper_util.recover_blocker(driver, "News article", cancellation_flag):
-                        if cancellation_flag is not None and cancellation_flag.is_set():
-                            return {"status": "CANCELED", "reason": "User requested stop via Human Help mode."}
-                        return {
-                            "status": "FAILED",
-                            "reason": (
-                                "❌ Scraping failed: Unresolvable blocker encountered. "
-                                "AI Navigator exhausted all attempts."
-                            ),
-                        }
-                    raw_html, html_len = extract_hybrid_html(driver)
-                    b64_image = _capture_screenshot_b64(driver)
-                    continue
+                    # Agentic recovery removed per Exorcism (PLAN-03): do not invoke deprecated agentic components.
+                    # If validation fails, fail fast. Preserve cancellation semantics.
+                    if cancellation_flag is not None and cancellation_flag.is_set():
+                        return {"status": "CANCELED", "reason": "User requested stop via Human Help mode."}
+                    return {
+                        "status": "FAILED",
+                        "reason": (
+                            "❌ Scraping failed: Unresolvable blocker encountered. Agentic recovery disabled."
+                        ),
+                    }
                 # Phase 2: Local state update first, then fire-and-forget DB persist.
                 local_meta["validation_passed"] = True
                 _sync_meta("RUNNING")

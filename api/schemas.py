@@ -1,9 +1,9 @@
+# api/schemas.py
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 
 
 class JobCreateRequest(BaseModel):
-    tool_name: str
     args: Dict[str, Any] = {}
     client_metadata: Optional[Dict[str, Any]] = None
 

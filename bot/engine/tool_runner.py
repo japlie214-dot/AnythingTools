@@ -12,9 +12,7 @@ import json
 from typing import Any, Dict
 from tools.base import ToolResult, BaseTool
 from utils.logger import get_dual_logger
-from utils.source_context import SourceContextManager
 from clients.llm import get_llm_client, LLMRequest
-from tools.logger_agent.logger_prompts import ERROR_HEADER, LOGGER_AGENT_SYSTEM_PROMPT, trim_log_buffer
 from utils.text_processing import escape_prompt_separators
 import config
 

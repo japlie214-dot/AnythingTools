@@ -214,6 +214,8 @@ async def lifespan(app: FastAPI):
     try:
         start_writer()
         log.dual_log(tag="DB:WriterStart", message="Database writer started.")
+        conn = DatabaseManager.get_read_connection()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception as e:
         logging.exception("Failed to start DB writer thread: %s", e)
 
@@ -254,7 +256,7 @@ async def lifespan(app: FastAPI):
         from utils.browser_utils import safe_google_get
 
         try:
-            await browser_lock.acquire()
+            browser_lock.acquire()
             try:
                 _warmup_driver = get_or_create_driver()
                 safe_google_get(_warmup_driver, "https://www.google.com")
@@ -308,9 +310,7 @@ async def lifespan(app: FastAPI):
             enqueue_write("UPDATE jobs SET status = 'FAILED' WHERE job_id = ?", (row['job_id'],))
             enqueue_write("DELETE FROM job_items WHERE job_id = ?", (row['job_id'],))
         
-        from database.writer import purge_stale_sessions
-        purge_stale_sessions(7)
-        log.dual_log(tag="DB:Cleanup", message="Stale job and session cleanup complete.")
+        log.dual_log(tag="DB:Cleanup", message="Stale job cleanup complete.")
     except Exception as e:
         log.dual_log(tag="DB:Cleanup", message="Cleanup error.", level="ERROR", exc_info=e)
 

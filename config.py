@@ -12,7 +12,6 @@ ANYTHINGTOOLS_PORT: int = int(os.getenv("ANYTHINGTOOLS_PORT", "8000"))
 # --- Telegram Push Notifications (Optional) ---
 TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
 # TELEGRAM_USER_ID is now dynamically bound via startup handshake.
-TELEGRAM_USER_ID: str | None = None
 
 # --- Browser / Chrome Data Dir ---
 CHROME_USER_DATA_DIR: str = os.getenv("CHROME_USER_DATA_DIR", "chrome_profile")
@@ -50,17 +49,8 @@ SNOWFLAKE_PRIVATE_KEY_PATH: str = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH", "snowf
 # --- Google ---
 GOOGLE_API_KEY: str | None = os.getenv("GOOGLE_API_KEY")
 
-# --- Logger Agent Context ---
-LOGGER_AGENT_MAX_CONTEXT: int = int(os.getenv("LOGGER_AGENT_MAX_CONTEXT", "100000"))
-DEBUGGER_AGENT_TRIGGER_ON_WARNING: bool = os.getenv("DEBUGGER_AGENT_TRIGGER_ON_WARNING", "true").lower() in ("true", "1", "yes")
-# Full‑fidelity payload logging limit (bytes). Aligns with plan to allow up to 5 MB per log entry.
-LOGGER_TRUNCATION_LIMIT: int = int(os.getenv("LOGGER_TRUNCATION_LIMIT", "5000000"))
-
-# --- Debugger Agent Context Limits ---
-MODEL_MAX_CONTEXT_CHARS: int = int(os.getenv("MODEL_MAX_CONTEXT_CHARS", "800000"))
-DEBUGGER_CONTEXT_RATIO: float = float(os.getenv("DEBUGGER_CONTEXT_RATIO", "0.85"))
-DEBUGGER_LOG_FRACTION: float = float(os.getenv("DEBUGGER_LOG_FRACTION", "0.60"))
-DEBUGGER_AGENT_CONTEXT_CHAR_LIMIT: int = int(MODEL_MAX_CONTEXT_CHARS * DEBUGGER_CONTEXT_RATIO)
+# Logger agent / debugger configuration removed — drifting legacy values.
+# LOGGER_TRUNCATION_LIMIT is still honored by log formatters via getattr on _log_config.
 
 # --- AnythingLLM Integration ---
 ANYTHINGLLM_API_KEY: str = os.getenv("ANYTHINGLLM_API_KEY", "YEZTCHW-KHT4C1J-GP8DPW5-SK77TE5")

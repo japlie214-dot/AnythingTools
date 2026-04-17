@@ -1,6 +1,6 @@
 # utils/browser_lock.py
 """
-Singleton asyncio Lock for browser-capable tools.
+Singleton threading.Lock for browser-capable tools.
 
 Purpose:
 - Ensures mutual exclusion across ResearchTool, ScraperTool, and IBKRTool
@@ -13,31 +13,29 @@ Usage:
     if browser_lock.locked():
         return "⚠️ System is currently busy running another browser task. Please try again later."
     
-    await browser_lock.acquire()
+    browser_lock.acquire()
     try:
         # ... browser work here ...
     finally:
         browser_lock.release()
 """
 
-import asyncio
+import threading
 
 class BrowserLockProxy:
-    """Lazy proxy for asyncio.Lock to avoid RuntimeError on import outside an event loop."""
+    """Proxy for threading.Lock for safe cross-thread browser synchronization."""
     def __init__(self):
-        self._lock = None
+        self._lock = threading.Lock()
 
     @property
-    def lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+    def lock(self) -> threading.Lock:
         return self._lock
 
     def locked(self) -> bool:
         return self.lock.locked()
 
-    async def acquire(self):
-        return await self.lock.acquire()
+    def acquire(self):
+        return self.lock.acquire()
 
     def release(self):
         self.lock.release()

@@ -54,56 +54,6 @@ def execute_read_sql(sql: str, params: tuple = (), ensure_fresh: bool = False, a
     except Exception as e:
         log.dual_log(tag="DB:Reader", message=f"execute_read_sql failed: {e}", level="ERROR", exc_info=e)
         raise ReaderError(str(e))
-
-def get_session_messages(session_id: str, limit: int) -> List[Dict[str, Any]]:
-    """Return sanitized execution ledger messages (attachment_metadata parsed into list)."""
-    cur = _get_cursor()
-    cur.execute("""
-        SELECT
-            id as message_id, role, content, 0 as char_count, 0 as attachment_char_count,
-            COALESCE(attachment_metadata, '[]') AS attachment_path,
-            COALESCE(ledger_id, '') AS event_id
-        FROM execution_ledger
-        WHERE session_id = ? ORDER BY id ASC LIMIT ?
-    """, (session_id, limit))
-
-    out: List[Dict[str, Any]] = []
-    for row in cur.fetchall():
-        r = dict(row)
-        r['message_id'] = int(r.get('message_id', 0))
-        r['char_count'] = int(r.get('char_count', 0))
-        r['attachment_char_count'] = int(r.get('attachment_char_count', 0))
-        # Parse attachment_metadata safely — legacy plain strings allowed.
-        raw = r.get('attachment_path') or '[]'
-        try:
-            parsed = json.loads(raw)
-            r['attachment_path'] = parsed if isinstance(parsed, list) else [parsed]
-        except Exception:
-            r['attachment_path'] = [raw] if raw else []
-        out.append(r)
-    return out
-
-def get_unarchived_messages(session_id: str, limit: int) -> List[Dict[str, Any]]:
-    """Lightweight fetch used by Archivist to retrieve the next batch (no embeddings)."""
-    cur = _get_cursor()
-    cur.execute("""
-        SELECT id as message_id, role, content, 0 as char_count, COALESCE(attachment_metadata, '[]') AS attachment_path
-        FROM execution_ledger
-        WHERE session_id = ? ORDER BY id ASC LIMIT ?
-    """, (session_id, limit))
-    return [dict(r) for r in cur.fetchall()]
-
-def get_top_memories(session_id: str, limit: int = 30) -> List[Dict[str, Any]]:
-    """Return memory metadata only (no embedding BLOBs)."""
-    cur = _get_cursor()
-    cur.execute("""
-        SELECT id, topic, memory, type, updated_at
-        FROM long_term_memories
-        WHERE session_id = ? OR session_id IS NULL
-        ORDER BY updated_at DESC LIMIT ?
-    """, (session_id, limit))
-    return [dict(r) for r in cur.fetchall()]
-
 def get_job_with_steps(job_id: str) -> Optional[Dict[str, Any]]:
     """Return job with parsed args and steps structure."""
     cur = _get_cursor()

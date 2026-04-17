@@ -14,44 +14,19 @@ SCHEMA_VERSION = 2
 ALLOW_DESTRUCTIVE_RESET = os.getenv("SUMANAL_ALLOW_SCHEMA_RESET", "0") == "1"
 
 INIT_SCRIPT = """
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY,
-    is_busy    INTEGER NOT NULL DEFAULT 0,
-    active_job_id TEXT,
-    FOREIGN KEY(active_job_id) REFERENCES jobs(job_id) ON DELETE SET NULL
-);
-
-CREATE TABLE IF NOT EXISTS execution_ledger (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ledger_id TEXT UNIQUE NOT NULL,
-    job_id TEXT NOT NULL,
-    session_id TEXT,
-    role TEXT NOT NULL CHECK(role IN ('system','user','assistant','tool')),
-    content TEXT NOT NULL,
-    tool_call_id TEXT,
-    tool_calls_json TEXT,
-    attachment_metadata TEXT,
-    char_count INTEGER NOT NULL DEFAULT 0,
-    attachment_char_count INTEGER NOT NULL DEFAULT 0,
-    timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_execution_ledger_job_id
-    ON execution_ledger(job_id, id ASC);
-
 CREATE TABLE IF NOT EXISTS jobs (
     job_id      TEXT PRIMARY KEY,
     session_id  TEXT NOT NULL,
     tool_name   TEXT    NOT NULL,
     args_json   TEXT    NOT NULL DEFAULT '{}',
     status      TEXT NOT NULL DEFAULT 'PENDING'
-        CHECK(status IN ('PENDING','QUEUED','RUNNING','INTERRUPTED','COMPLETED','FAILED','ABANDONED','CANCELLING')),
+        CHECK(status IN ('PENDING','QUEUED','RUNNING','INTERRUPTED','PAUSED_FOR_HITL','COMPLETED','FAILED','ABANDONED','CANCELLING')),
     retry_count INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    result_json TEXT,
-    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    result_json TEXT
 );
+
 CREATE INDEX IF NOT EXISTS idx_jobs_session_status
     ON jobs(session_id, status);
 
@@ -68,18 +43,6 @@ CREATE TABLE IF NOT EXISTS job_items (
 );
 CREATE INDEX IF NOT EXISTS idx_job_items_job_id
     ON job_items(job_id, status);
-
-CREATE TABLE IF NOT EXISTS telemetry_events (
-    id         TEXT PRIMARY KEY,
-    job_id     TEXT,
-    session_id TEXT,
-    tool_name  TEXT NOT NULL,
-    status     TEXT NOT NULL,
-    message    TEXT,
-    occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(job_id)  REFERENCES jobs(job_id)   ON DELETE CASCADE,
-    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
-);
 
 -- ── Job logs (persistent tool + runtime logs) ─────────────────────────────────
 CREATE TABLE IF NOT EXISTS job_logs (
@@ -106,9 +69,7 @@ CREATE TABLE IF NOT EXISTS token_usage (
     completion_tokens  INTEGER NOT NULL DEFAULT 0 CHECK(completion_tokens >= 0),
     reasoning_tokens   INTEGER NOT NULL DEFAULT 0 CHECK(reasoning_tokens >= 0),
     total_tokens       INTEGER NOT NULL DEFAULT 0 CHECK(total_tokens >= 0),
-    recorded_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(session_id)   REFERENCES sessions(session_id)     ON DELETE CASCADE,
-    FOREIGN KEY(telemetry_id) REFERENCES telemetry_events(id)     ON DELETE SET NULL
+    recorded_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_token_usage_session_recorded
     ON token_usage(session_id, recorded_at);
@@ -120,8 +81,7 @@ CREATE TABLE IF NOT EXISTS financial_metrics (
     metric_value REAL NOT NULL,
     metric_unit  TEXT,
     as_of        TEXT NOT NULL,
-    metadata_json TEXT   NOT NULL DEFAULT '{}',
-    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    metadata_json TEXT   NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS market_data_snapshots (
@@ -166,8 +126,7 @@ CREATE TABLE IF NOT EXISTS long_term_memories (
     embedding     BLOB,
     type          TEXT NOT NULL DEFAULT 'Knowledge',
     created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    updated_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_memories_agent_domain
     ON long_term_memories(agent_domain, type, created_at DESC);
@@ -226,45 +185,11 @@ CREATE INDEX IF NOT EXISTS idx_scraped_articles_norm_url
     ON scraped_articles(normalized_url);
 CREATE INDEX IF NOT EXISTS idx_scraped_articles_status
     ON scraped_articles(embedding_status);
-
 CREATE VIRTUAL TABLE IF NOT EXISTS scraped_articles_vec USING vec0(
     embedding float[1024]
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memories_vec USING vec0(
-    embedding float[1024]
-);
 
--- Transient parsed PDF pages cache (cleared on startup/shutdown)
-CREATE TABLE IF NOT EXISTS pdf_parsed_pages (
-    id TEXT PRIMARY KEY,
-    session_id TEXT,
-    pdf_name TEXT NOT NULL,
-    page_number INTEGER NOT NULL,
-    content TEXT NOT NULL
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS pdf_parsed_pages_vec USING vec0(
-    embedding float[1024]
-);
-
-CREATE TABLE IF NOT EXISTS browser_macros (
-    id           TEXT PRIMARY KEY,
-    name         TEXT UNIQUE NOT NULL,
-    description  TEXT,
-    start_point  TEXT,
-    end_point    TEXT,
-    prerequisites TEXT,
-    steps_json   TEXT NOT NULL,
-    created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS ai_skills (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    title      TEXT NOT NULL UNIQUE,
-    content    TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
 CREATE TABLE IF NOT EXISTS broadcast_batches (
     batch_id              TEXT PRIMARY KEY,
     target_site           TEXT NOT NULL,
@@ -374,9 +299,11 @@ def init_db() -> None:
             )
             # Step 1: Drop all legacy tables atomically, including chat_messages to apply new schema.
             tables_to_drop = [
-                'sessions', 'active_chat_state', 'tool_telemetry', 'grouped_formulas',
+                'sessions', 'execution_ledger', 'active_chat_state', 'tool_telemetry', 'grouped_formulas',
                 'job_cache', 'chat_history', 'token_usage', 'financial_metrics',
-                'long_term_memories', 'long_term_memories_vec',
+                'long_term_memories', 'long_term_memories_vec', 'market_data_snapshots',
+                'financial_formulas', 'calculated_metrics', 'raw_fundamentals', 'stock_prices',
+                'pdf_parsed_pages', 'pdf_parsed_pages_vec', 'browser_macros', 'ai_skills',
                 'scraped_articles', 'scraped_articles_vec', 'chat_messages'
             ]
             for _t in tables_to_drop:

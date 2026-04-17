@@ -1,10 +1,11 @@
+# tools/batch_reader/tool.py
 import json
 import sqlite3
 from typing import Any
 from pydantic import BaseModel, Field
 
 from tools.base import BaseTool
-from database.connection import DatabaseManager
+from database.connection import DatabaseManager, SQLITE_VEC_AVAILABLE
 from utils.vector_search import generate_embedding
 
 class BatchReaderInput(BaseModel):
@@ -17,9 +18,12 @@ class BatchReaderTool(BaseTool):
     INPUT_MODEL = BatchReaderInput
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
+        if not SQLITE_VEC_AVAILABLE:
+            return json.dumps({"error": "Vector search unavailable: sqlite_vec extension not loaded."})
+
         batch_id = args.get("batch_id")
         query = args.get("query")
-        limit = args.get("limit", 5)
+        limit = min(int(args.get("limit", 5)), 50)
         
         if not batch_id or not query:
             return json.dumps({"error": "batch_id and query are required"})
@@ -55,11 +59,11 @@ class BatchReaderTool(BaseTool):
             SELECT a.title, a.summary, a.conclusion, a.id as ulid, (1 - v.distance) AS sim
             FROM scraped_articles_vec v
             JOIN scraped_articles a ON v.rowid = a.vec_rowid
-            WHERE v.embedding MATCH ? AND k = {limit * 3} 
+            WHERE v.embedding MATCH ? AND k = ?
             AND a.id IN ({pl})
         """
         
-        rows = conn.execute(sql, [query_embedding] + valid_ulids).fetchall()
+        rows = conn.execute(sql, [query_embedding, limit * 3] + valid_ulids).fetchall()
         
         results = []
         for r in rows[:limit]:

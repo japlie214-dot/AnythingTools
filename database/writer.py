@@ -20,40 +20,6 @@ _write_generation: int = 0
 # Special marker for execute-script tasks enqueued to the writer.
 EXEC_SCRIPT = "__EXEC_SCRIPT__"
 
-def append_to_ledger(job_id: str, session_id: str, role: str, content: str, attachment_metadata: dict = None, tool_call_id: str = None, tool_calls: list = None) -> str:
-    """Centralized helper to append an entry to the execution_ledger.
-    Generates a ULID for ledger_id, computes character count, and handles optional attachment metadata.
-    Returns the generated ledger_id.
-    """
-    import json
-    from utils.id_generator import ULID
-
-    ledger_id = ULID.generate()
-    char_count = len(content) if content else 0
-    att_meta_str = json.dumps(attachment_metadata) if attachment_metadata is not None else None
-    tool_calls_str = json.dumps(tool_calls) if tool_calls is not None else None
-
-    # Compute attachment character cost if metadata provided
-    att_cost = 0
-    if attachment_metadata:
-        if isinstance(attachment_metadata, dict):
-            for k, v in attachment_metadata.items():
-                if isinstance(v, dict):
-                    att_cost += v.get("total_char_cost", 50000)
-                else:
-                    att_cost += 50000
-        elif isinstance(attachment_metadata, list):
-            for item in attachment_metadata:
-                if isinstance(item, dict):
-                    att_cost += item.get("total_char_cost", 50000)
-                else:
-                    att_cost += 50000
-
-    enqueue_write(
-        "INSERT INTO execution_ledger (ledger_id, job_id, session_id, role, content, tool_call_id, tool_calls_json, attachment_metadata, char_count, attachment_char_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (ledger_id, job_id, session_id, role, content, tool_call_id, tool_calls_str, att_meta_str, char_count, att_cost)
-    )
-    return ledger_id
 
 def get_write_generation() -> int:
     # Thread-safe snapshot token for reader visibility checks.
@@ -279,77 +245,6 @@ def start_writer() -> threading.Thread:
         return _writer_thread
 
 
-def delete_messages_with_files(conn, where_clause: str, params: tuple) -> None:
-    """
-    Enforce GOLDEN RULE 5: physically delete on-disk attachment files before
-    removing their execution_ledger rows from the database.
-
-    Caller MUST set conn.row_factory = sqlite3.Row before passing the connection.
-    Uses try/except OSError so a file already deleted (e.g., by a concurrent /reset)
-    is silently ignored and never raises.
-    """
-    import os
-    import sqlite3 as _sqlite3
-    
-    # Verify row_factory is set
-    if not hasattr(conn, 'row_factory') or conn.row_factory != _sqlite3.Row:
-        log.dual_log(
-            tag="DB:FileCleanup",
-            message="delete_messages_with_files requires conn.row_factory = sqlite3.Row",
-            level="ERROR",
-        )
-        # Still enqueue the DELETE even if we can't read attachment_metadata safely
-        enqueue_write(f"DELETE FROM execution_ledger WHERE {where_clause}", params)
-        return
-
-    try:
-        rows = conn.execute(
-            f"SELECT attachment_metadata FROM execution_ledger WHERE {where_clause}",
-            params,
-        ).fetchall()
-        import json as _dw_json
-        for row in rows:
-            meta_raw = row["attachment_metadata"]
-            if not meta_raw:
-                continue
-            
-            try:
-                meta = _dw_json.loads(meta_raw)
-                # New stateful architecture: metadata is a dict of {key: path}
-                if isinstance(meta, dict):
-                    paths = [v for v in meta.values() if isinstance(v, str)]
-                elif isinstance(meta, list):
-                    paths = [p for p in meta if isinstance(p, str)]
-                else:
-                    paths = [meta_raw] if isinstance(meta_raw, str) else []
-            except Exception:
-                paths = [meta_raw] if isinstance(meta_raw, str) else []
-
-            for path in paths:
-                if path and isinstance(path, str) and os.path.exists(path):
-                    try:
-                        os.remove(path)
-                        log.dual_log(
-                            tag="DB:FileCleanup",
-                            message=f"Deleted attachment: {path}",
-                            level="DEBUG",
-                        )
-                    except OSError as e:
-                        log.dual_log(
-                            tag="DB:FileCleanup",
-                            message=f"Could not delete attachment {path}: {e}",
-                            level="WARNING",
-                        )
-    except Exception as e:
-        log.dual_log(
-            tag="DB:FileCleanup",
-            message=f"Error reading attachment_metadata before deletion: {e}",
-            level="ERROR",
-        )
-    finally:
-        # Always enqueue the SQL DELETE regardless of file-cleanup outcome.
-        enqueue_write(f"DELETE FROM execution_ledger WHERE {where_clause}", params)
-
 
 async def wait_for_writes(timeout: float | None = None) -> bool:
     """Wait until the writer queue is drained and all tasks are completed.
@@ -367,23 +262,6 @@ async def wait_for_writes(timeout: float | None = None) -> bool:
         log.dual_log(tag="DB:Writer", message=f"wait_for_writes failed: {e}", level="WARNING", exc_info=e)
         return False
 
-
-def purge_stale_sessions(stale_days: int = 7) -> None:
-    """Physically delete files and purge DB rows for sessions inactive > 7 days (Golden Rule 4)."""
-    import sqlite3 as _sqlite3
-    from database.connection import DatabaseManager
-    conn = DatabaseManager.get_read_connection()
-    conn.row_factory = _sqlite3.Row
-    try:
-        rows = conn.execute(
-            f"SELECT session_id FROM execution_ledger GROUP BY session_id HAVING MAX(timestamp) < datetime('now', '-{stale_days} days')"
-        ).fetchall()
-        for r in rows:
-            session_id = r['session_id']
-            if session_id:
-                delete_messages_with_files(conn, "session_id = ?", (session_id,))
-    except Exception as e:
-        log.dual_log(tag="DB:Cleanup", message=f"Failed to purge stale sessions: {e}", level="WARNING")
 
 
 def shutdown_writer() -> None:

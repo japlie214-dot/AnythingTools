@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import config
 from utils.logger.core import get_dual_logger
 from database.connection import DatabaseManager
-from database.writer import append_to_ledger, enqueue_write
+from database.writer import enqueue_write
 from utils.id_generator import ULID
 from utils.context_helpers import spawn_thread_with_context
 from tools.registry import REGISTRY
@@ -42,6 +42,7 @@ class UnifiedWorkerManager:
         self._thread: threading.Thread | None = None
         self._active_jobs: Dict[str, threading.Thread] = {}
         self._system_errors = collections.defaultdict(int)
+        self.cancellation_flags: Dict[str, threading.Event] = {}
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -100,12 +101,16 @@ class UnifiedWorkerManager:
                         "The browser has been restarted at Google. Verify your location before "
                         "proceeding. Consult job_items to review completed steps."
                     )
-                    append_to_ledger(job_id, session_id, "system", recovery_msg)
+                    log.dual_log(tag="Worker:Job:Recovery", message=recovery_msg)
+
+                # Prepare cancellation flag
+                flag = threading.Event()
+                self.cancellation_flags[job_id] = flag
 
                 # Spawn execution thread
                 t = spawn_thread_with_context(
                     self._run_job,
-                    args=(job_id, session_id, tool_name, args),
+                    args=(job_id, session_id, tool_name, args, flag),
                     name=f"job-{job_id}",
                     daemon=True
                 )
@@ -113,7 +118,7 @@ class UnifiedWorkerManager:
 
             time.sleep(self.poll_interval)
 
-    def _run_job(self, job_id: str, session_id: str, tool_name: str, args: dict) -> None:
+    def _run_job(self, job_id: str, session_id: str, tool_name: str, args: dict, cancellation_flag: threading.Event) -> None:
         """Execute a single job using direct tool invocation."""
         try:
             async def telemetry_cb(update):
@@ -126,7 +131,7 @@ class UnifiedWorkerManager:
                 result = {"status": "FAILED", "result": f"Tool {tool_name} not found"}
             else:
                 from bot.engine.tool_runner import run_tool_safely
-                res = asyncio.run(run_tool_safely(tool_instance, args, telemetry_cb, job_id=job_id, session_id=session_id))
+                res = asyncio.run(run_tool_safely(tool_instance, args, telemetry_cb, job_id=job_id, session_id=session_id, cancellation_flag=cancellation_flag))
                 attachments = res.attachment_paths or []
                 if res.success:
                     # Attempt to parse JSON output for structured payloads
@@ -186,7 +191,6 @@ class UnifiedWorkerManager:
                 msg = err_str.split(":", 1)[1].strip() if ":" in err_str else err_str
                 log.dual_log(tag="Worker:Job:Paused", message=f"Job {job_id} paused for HITL: {msg}", level="WARNING")
                 enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("PAUSED_FOR_HITL", now_iso(), job_id))
-                append_to_ledger(job_id, session_id, "system", f"PAUSED_FOR_HITL: {msg}")
             else:
                 self._system_errors[job_id] += 1
                 if self._system_errors[job_id] >= 3:

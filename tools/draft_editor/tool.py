@@ -17,16 +17,21 @@ from tools.base import BaseTool
 from database.connection import DatabaseManager
 
 
+class SwapOperation(BaseModel):
+    index_top10: int = Field(..., ge=0)
+    target_identifier: str | int = Field(...)
+
 class DraftEditorInput(BaseModel):
     batch_id: str = Field(..., description="The unique ULID of the batch to edit.")
-    operations: list = Field([], description="List of SWAP operations: [{'index_top10': 0, 'target_identifier': 'ULID_OR_INT'}]")
+    operations: list[SwapOperation] = Field([], description="List of SWAP operations: [{'index_top10': 0, 'target_identifier': 'ULID_OR_INT'}]")
+
+INPUT_MODEL = DraftEditorInput
 
 
 class DraftEditorTool(BaseTool):
     """Draft Editor Tool: Deterministic SWAP list manager for Top 10 curation."""
     
     name = "draft_editor"
-    INPUT_MODEL = DraftEditorInput
     
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return False
@@ -36,14 +41,14 @@ class DraftEditorTool(BaseTool):
         operations = args.get("operations", [])
         
         if not batch_id:
-            return json.dumps({"error": "batch_id is required."})
+            raise ValueError("batch_id is required.")
 
         conn = DatabaseManager.get_read_connection()
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT raw_json_path, curated_json_path FROM broadcast_batches WHERE batch_id = ?", (batch_id,)).fetchone()
         
         if not row or not row["curated_json_path"]:
-            return json.dumps({"error": "Batch not found or missing curated data."})
+            raise ValueError("Batch not found or missing curated data.")
             
         try:
             with open(row["curated_json_path"], "r", encoding="utf-8") as f:
@@ -51,10 +56,12 @@ class DraftEditorTool(BaseTool):
             with open(row["raw_json_path"], "r", encoding="utf-8") as f:
                 raw_data = json.load(f)
         except Exception as e:
-            return json.dumps({"error": f"File read error: {e}"})
+            raise ValueError(f"File read error: {e}")
 
         # Process SWAP operations
         for op in operations:
+            if hasattr(op, "dict"):
+                op = op.dict()
             idx = op.get("index_top10")
             target = op.get("target_identifier")
             
@@ -93,7 +100,7 @@ class DraftEditorTool(BaseTool):
                 tmp_name = tf.name
             os.replace(tmp_name, row["curated_json_path"])
         except Exception as e:
-            return json.dumps({"error": f"Save failed: {e}"})
+            raise ValueError(f"Save failed: {e}")
 
         # Return updated state
         return json.dumps({"batch_id": batch_id, "status": "SUCCESS", "top_10": top_10}, ensure_ascii=False)

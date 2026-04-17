@@ -34,7 +34,7 @@ def _parse_article_result(raw_result: dict, url: str) -> dict:
     status = "SUCCESS" if (title and conclusion) else "SUCCESS_NO_PARSE"
 
     ulid_str = ULID.generate()
-    _id = abs(hash(ulid_str)) % (2 ** 63)
+    _id = int(ulid_str[:8], 36) % (2 ** 63)
 
     return {
         "status":         status,

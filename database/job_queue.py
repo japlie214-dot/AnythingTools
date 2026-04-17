@@ -14,25 +14,12 @@ def _utcnow() -> str:
 
 
 def create_job(session_id: str, tool_name: str, args_json: str) -> str:
-    """Create a job record following the mandatory 3-step insertion order (Golden Rule 6).
-    Returns the new job_id.
-    """
+    """Create a job record. Returns the new job_id."""
     job_id = ULID.generate()
-    # Step 1: ensure session row exists (active_job_id stays NULL for now)
-    enqueue_write(
-        "INSERT INTO sessions (session_id) VALUES (?) ON CONFLICT(session_id) DO NOTHING",
-        (session_id,)
-    )
-    # Step 2: create the job row
     enqueue_write(
         "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, updated_at) "
         "VALUES (?, ?, ?, ?, 'RUNNING', ?)",
         (job_id, session_id, tool_name, args_json, _utcnow())
-    )
-    # Step 3: link the job to the session
-    enqueue_write(
-        "UPDATE sessions SET active_job_id = ?, is_busy = 1 WHERE session_id = ?",
-        (job_id, session_id)
     )
     return job_id
 

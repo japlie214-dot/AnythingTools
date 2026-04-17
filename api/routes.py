@@ -12,7 +12,7 @@ from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, 
 from tools.registry import REGISTRY
 from utils.logger.core import get_dual_logger
 from utils.id_generator import ULID
-from database.writer import start_writer, append_to_ledger, enqueue_write
+from database.writer import start_writer, enqueue_write
 from database.connection import DatabaseManager
 from utils.artifacts import artifact_url_from_request
 from bot.engine.worker import get_manager
@@ -36,22 +36,13 @@ def _ensure_writer_running() -> None:
         log.dual_log(tag="API:Writer:Start", message="start_writer() failed (non-fatal)")
 
 
-# Security dependency: require API key when configured
-def require_api_key(request: Request):
-    expected = getattr(config, "API_KEY", "")
-    if expected:
-        provided = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
-        if not provided or provided != expected:
-            raise HTTPException(status_code=401, detail="Invalid API Key")
-    return True
-
 
 def get_session_id(request: Request) -> str:
     return "0"  # Hardcoded fallback for legacy DB constraints
 
 
 @router.post("/tools/{tool_name}", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
-async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, _=Depends(require_api_key)):
+async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
     session_id = "0"  # Hardcoded fallback for legacy DB constraints
     # Refresh registry so code changes are visible
     REGISTRY.load_all()
@@ -99,18 +90,9 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, 
         payload={"tool": tool_name, "args": args, "job_id": job_id, "session_id": session_id, "status": "QUEUED"}
     )
     enqueue_write(
-        "INSERT INTO sessions (session_id) VALUES (?) ON CONFLICT(session_id) DO NOTHING",
-        (session_id,),
-    )
-    enqueue_write(
         "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (job_id, session_id, tool_name, json.dumps(args), "QUEUED", created, created),
     )
-    # Write to execution_ledger as well (preparation for Phase 3)
-    # Store args in content as JSON to prevent token-heuristic misidentification as an attachment
-    ledger_content = json.dumps({"event": f"Enqueueing tool {tool_name}", "args": args})
-    # Centralized ledger entry for job enqueue
-    append_to_ledger(job_id, session_id, "user", ledger_content)
     log.dual_log(tag="API:Job:Persist", message=f"Job {job_id} persisted", payload={"job_id": job_id})
 
     # Ensure background writer is running
@@ -127,13 +109,13 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, 
 
 
 @router.get("/manifest")
-async def manifest(_=Depends(require_api_key)):
+async def manifest():
     REGISTRY.load_all()
     return {"tools": REGISTRY.schema_list()}
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(job_id: str, request: Request, _=Depends(require_api_key)):
+async def get_job_status(job_id: str, request: Request):
     # Attempt to read canonical status from the DB; fall back to in-memory state.
     try:
         conn = DatabaseManager.get_read_connection()
@@ -189,7 +171,7 @@ async def get_job_status(job_id: str, request: Request, _=Depends(require_api_ke
 
 
 @router.delete("/jobs/{job_id}", status_code=status.HTTP_202_ACCEPTED)
-async def delete_job(job_id: str, request: Request, _=Depends(require_api_key)):
+async def delete_job(job_id: str, request: Request):
     """Request job cancellation. Marks job as CANCELLING and sets cancellation flag if running."""
     mgr = get_manager()
     flag = mgr.cancellation_flags.get(job_id) if mgr is not None else None
@@ -216,7 +198,7 @@ async def delete_job(job_id: str, request: Request, _=Depends(require_api_key)):
 
 
 @router.get("/metrics")
-async def metrics(_=Depends(require_api_key)):
+async def metrics():
     try:
         from database.writer import write_queue
         qsize = write_queue.qsize()

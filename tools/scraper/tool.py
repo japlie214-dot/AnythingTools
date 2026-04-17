@@ -23,7 +23,7 @@ from utils.logger import get_dual_logger
 from utils.browser_lock import browser_lock
 from tools.scraper.task import _run_botasaurus_scraper
 from utils.id_generator import ULID
-from database.writer import append_to_ledger, enqueue_write
+from database.writer import enqueue_write
 
 log = get_dual_logger(__name__)
 
@@ -53,7 +53,7 @@ class ScraperTool(BaseTool):
         if browser_lock.locked():
             return "System busy: another browser task is running."
         
-        await browser_lock.acquire()
+        browser_lock.acquire()
         try:
             return await self._run_internal(args, telemetry, cancellation_flag=cancellation_flag, **kwargs)
         finally:
@@ -72,10 +72,10 @@ class ScraperTool(BaseTool):
         if not target_site:
             return "Error: target_site argument is required."
 
-        # 📝 LOG: Scout initialization to execution_ledger
+        # Scout initialization (legacy ledger removed) — log for auditing
         if job_id and session_id != "0":
             msg = f"The Scout: Starting extraction for {target_site}."
-            append_to_ledger(job_id, session_id, "system", msg)
+            log.dual_log(tag="Scraper:Init", message=msg, payload={"job_id": job_id, "session_id": session_id})
 
         loop = asyncio.get_running_loop()
         
@@ -207,10 +207,10 @@ class ScraperTool(BaseTool):
                     f"(e.g., 'semiconductor supply chain constraints') to pull relevant article segments into your active context."
                 )
 
-            # 📝 LOG: Intelligent Manifest to execution_ledger
+            # Intelligent Manifest generated — persisted via broadcast_batches; log summary
             if job_id and session_id != "0":
                 manifest_content = "\n".join(manifest_lines)
-                append_to_ledger(job_id, session_id, "system", manifest_content)
+                log.dual_log(tag="Scraper:Manifest", message="Intelligent manifest generated.", payload={"job_id": job_id, "manifest": manifest_content})
 
             # Save to broadcast_batches
             try:
