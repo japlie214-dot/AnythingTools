@@ -171,7 +171,7 @@ def process_article(
                 )
             else:
                 from utils.text_processing import escape_prompt_separators
-                slim_val  = clean_html_for_agent(raw_html, max_chars=15_000)
+                slim_val  = raw_html[:15000]
                 val_msgs  = _build_multimodal_messages(
                     VALIDATION_PROMPT, 
                     escape_prompt_separators(slim_val) + "\n###", 
@@ -208,7 +208,7 @@ def process_article(
 
             # ── Summarisation (only on valid page) ─────────────────────────
             # slim_sum is computed once and refreshed only after re-navigation.
-            slim_sum = clean_html_for_agent(raw_html, max_chars=40_000)
+            slim_sum = raw_html
 
             for sum_attempt in range(1, 4):
                 from utils.text_processing import escape_prompt_separators
@@ -271,7 +271,7 @@ def process_article(
                     # builds sum_msgs from the newly captured page state.
                     raw_html, html_len = extract_hybrid_html(driver)
                     b64_image = _capture_screenshot_b64(driver)
-                    slim_sum  = clean_html_for_agent(raw_html, max_chars=40_000)
+                    slim_sum  = raw_html
 
             return {
                 "status": "FAILED",

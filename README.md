@@ -203,21 +203,45 @@ CREATE VIRTUAL TABLE IF NOT EXISTS pdf_parsed_pages_vec USING vec0(
 
 ### Normal Execution Flow (Direct)
 
-1.  **Worker Loop**: `UnifiedWorkerManager._run_loop()` sleeps 1s, polls `jobs` for `QUEUED` status.
+1.  **Worker Loop**: `UnifiedWorkerManager._run_loop()` sleeps 1s, polls `jobs` for `QUEUED` status. Prioritizes `INTERRUPTED` jobs for recovery.
 2.  **Job Execution**:
-    - `UnifiedWorkerManager._run_job()` extracts args.
+    - `UnifiedWorkerManager._run_job()` extracts args and creates `cancellation_flag` (threading.Event).
     - `REGISTRY.create_tool_instance()` instantiates the specific tool class.
-    - `run_tool_safely()` calls `tool.run()`.
-    - **Scraper**: Performs browser action, saves JSON to disk, writes DB entries.
-    - **Draft Editor**: Reads JSON, performs swap, writes atomically.
-    - **Batch Reader**: Reads file, builds SQL `IN (...)` query, executes vector search.
-    - **Publisher**: Spawns `PublisherPipeline`, where `consumer` waits for `queue.get()` and sends HTTP POSTs to Telegram with `time.sleep`.
+    - `run_tool_safely()` calls `tool.run()` with `job_id`, `session_id`, `cancellation_flag` kwargs.
+    - **Scraper**: Performs browser action, saves JSON to disk, writes DB entries. **Resume behavior**: Embedding-only path reads from `scraped_articles` and uses direct `snowflake_client.embed()` + `struct.pack()`. No `generate_embedding_sync()` call.
+    - **Draft Editor**: Reads JSON, performs swap, writes atomically. **Validation**: Checks `broadcast_batches.status == 'PENDING'`; rejects with error if not.
+    - **Batch Reader**: Reads file, builds SQL `IN (...)` query with `ORDER BY v.distance ASC`, executes vector search.
+    - **Publisher**: Spawns `PublisherPipeline(batch_id, top_10, inventory, job_id)`.
+      - **Producer**: Checks `job_items` for `trans_{ulid}` with `COMPLETED` status. Skips cached translations. Writes new translations to `job_items`.
+      - **Consumer**: Checks `job_items` for `pub_a_{ulid}` / `pub_b_{ulid}`. Skips already-sent messages. Writes delivery status to `job_items`.
+      - **Batch Status**: Sets `PUBLISHING` → `PARTIAL` (on exception) or `COMPLETED` (on success) in `broadcast_batches`.
     - **PDF Processing**: Extracts text, generates embeddings, stores in `pdf_parsed_pages` + `pdf_parsed_pages_vec`.
 3.  **Callback**:
     - Worker calls `_invoke_anythingllm_callback(job_id, result, attachments)`.
     - Reads files, encodes to Base64.
-    - POSTs to configured URL.
+    - POSTs to configured URL with `TOOL_RESULT_CORRELATION_ID:{job_id}`.
 4.  **Finish**: Job marked `COMPLETED`.
+
+### Resume Behavior (INTERRUPTED Jobs)
+
+**Startup Recovery** (line 284-296 in `app.py`):
+- Automatically requeues `RUNNING` and `INTERRUPTED` jobs to `QUEUED` status on startup.
+
+**Publisher Pipeline Resume**:
+- **Translation Cache**: `producer()` queries `job_items` for `status='COMPLETED' AND step_identifier='trans_{ulid}'`. If found, deserializes `output_data` and skips LLM call.
+- **Delivery Deduplication**: `consumer()` queries `pub_a_{ulid}` / `pub_b_{ulid}` before sending. Prevents duplicate Telegram messages.
+- **Batch State**: PublisherTool checks `broadcast_batches.status`; returns early if `COMPLETED`.
+
+**Scraper Resume**:
+- **Embedding-Only Path**: When `validation_passed=True` and `summary_generated=True` in `job_items` metadata, reads existing `scraped_articles` and re-generates embedding only using direct Snowflake client call:
+  ```python
+  _emb = _sf.embed(_et)
+  _eb = _struct.pack(f"{len(_emb)}f", *_emb)
+  ```
+
+**Draft Editor Protection**:
+- Explicitly rejects `status != 'PENDING'` batches to preserve Top-10 cardinality.
+- Returns JSON error: `{"status": "FAILED", "error": "Cannot modify batch {id} because its status is {status}."}`
 
 ### Error Handling & Auto-Repair
 - Tool execution errors are caught by `run_tool_safely` and returned as string output (failure message).
@@ -348,11 +372,15 @@ All endpoints are exposed at `/api` prefix.
 ```json
 {
   "args": {
-    "target_site": "FT"  // One of: "FT", "Bloomberg", "Technoz"
+    "target_site": "FT"  // One of: "FT", "Bloomberg", "Technoz" (validated against VALID_TARGET_NAMES)
   }
 }
 ```
 **Returns**: JSON string with `{"batch_id": "...", "top_10": [...], "inventory": [...], "total_count": N}`
+**Behavior**:
+- Validates `target_site` against `VALID_TARGET_NAMES` (set of valid targets)
+- Uses direct `snowflake_client.embed()` for embeddings (no `generate_embedding_sync()`)
+- Resume-capable: `cancellation_flag` kwarg supported
 
 #### **draft_editor**
 ```json
@@ -368,17 +396,27 @@ All endpoints are exposed at `/api` prefix.
   }
 }
 ```
-**Returns**: `"Success"` or raises `ValueError`
+**Returns**: JSON string with `{"batch_id": "...", "status": "SUCCESS", "top_10": [...]}`
+**Behavior**:
+- Validates `broadcast_batches.status == 'PENDING'` before modification
+- Returns error JSON if status is `PUBLISHING`, `PARTIAL`, `COMPLETED`, or `FAILED`
 
 #### **publisher**
 ```json
 {
   "args": {
     "batch_id": "01J8XYZ..."
+  },
+  "kwargs": {
+    "job_id": "01J..."  // Optional, enables resume capability
   }
 }
 ```
-**Returns**: `"Publisher Pipeline Complete."` or error message
+**Returns**: `{"status": "SUCCESS", "message": "Batch {batch_id} published successfully."}` or error
+**Behavior**:
+- Checks `broadcast_batches.status`; returns early if `COMPLETED`
+- Sets status: `PUBLISHING` → `PARTIAL` (on failure) → `COMPLETED` (on success)
+- **Resume**: Uses `job_items` to skip cached translations (`trans_{ulid}`) and duplicate delivery (`pub_a_{ulid}`, `pub_b_{ulid}`)
 
 #### **batch_reader**
 ```json
@@ -390,8 +428,11 @@ All endpoints are exposed at `/api` prefix.
   }
 }
 ```
-**Returns**: JSON string with `{"batch_id": "...", "query": "...", "results": [...]}`  
-**Side Effect**: Returns `{error: "Vector search unavailable..."}` if `sqlite_vec` extension is missing (falls back to BLOB storage).
+**Returns**: JSON string with `{"batch_id": "...", "query": "...", "results": [...]}`
+**Behavior**:
+- Search results ordered by `v.distance ASC` (most similar first)
+- Filters by `batch_id` raw JSON file contents
+- Returns error if `sqlite_vec` unavailable
 
 ### Tool Interface
 All tools inherit `tools.base.BaseTool`:
@@ -486,3 +527,69 @@ async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
 - **`utils/browser_lock.py`**: Mixing `asyncio.Lock` with threading causes RuntimeErrors. Must remain as `threading.Lock`.
 - **`database/writer.py`**: Repair loop logic must maintain `MAX_REPAIR_RETRIES = 1` and include both FK and missing table detection.
 - **`database/schema.py`**: `get_repair_script()` must return identical patterns to `get_init_script()` fallback replacements for consistency.
+
+## 13. Changes (Evolutionary Analysis from Current Code)
+
+This section identifies significant architectural refactors based on observable evidence within the current codebase. Each change is inferred from code patterns, deprecated file locations, and structural inconsistencies.
+
+### 13.1 Publisher Pipeline Resume Capability
+
+**Pain Point Addressed**: The publisher pipeline had no mechanism to recover from interruptions. If a job crashed during translation or delivery, it would restart from zero, causing duplicate LLM API calls (expensive) and duplicate Telegram messages (poor user experience).
+
+**Solution Implemented**:
+1. **`utils/telegram_publisher.py`**:
+   - Added `job_id: str | None = None` parameter to `PublisherPipeline.__init__()` (line 21)
+   - `producer()` queries `job_items` for `trans_{ulid}` entries with `COMPLETED` status before calling LLM
+   - `consumer()` queries `pub_a_{ulid}` / `pub_b_{ulid}` to prevent duplicate Telegram sends
+   - Both methods call `add_job_item()` and `update_item_status()` to persist progress
+
+2. **`tools/publisher/tool.py`**:
+   - `run()` method accepts `job_id` from kwargs
+   - Manages `broadcast_batches.status` lifecycle: `PUBLISHING` → `PARTIAL`/`COMPLETED`
+   - Passes `job_id` to pipeline and checks for `COMPLETED` status to skip already-published batches
+
+**Evidence**: Direct code additions in publisher files show explicit `job_items` queries and status tracking.
+
+### 13.2 Scraper Embedding Generation Refactor
+
+**Pain Point Addressed**: `utils/vector_search.py` contained `generate_embedding_sync()` with complex event loop detection logic, redundant with async path, causing issues in resume paths.
+
+**Solution Implemented**:
+- **Deleted**: `generate_embedding_sync()` from `utils/vector_search.py` (23 lines removed)
+- **Modified**: `tools/scraper/task.py` resume path directly uses `snowflake_client.embed()` + `struct.pack()`
+
+**Evidence**: Function deletion from file and direct synchronous calls in scraper task resume path.
+
+### 13.3 Draft Editor State Enforcement (Swap-Only Constraint)
+
+**Pain Point Addressed**: Draft editor could modify batches mid-publication, causing race conditions and breaking Top-10 cardinality.
+
+**Solution Implemented**:
+- **Modified**: `tools/draft_editor/tool.py` `run()` method checks `broadcast_batches.status == 'PENDING'`
+- Returns error JSON if status is `PUBLISHING`, `PARTIAL`, `COMPLETED`, or `FAILED`
+
+**Evidence**: Direct status check addition with explicit error return.
+
+### 13.4 Batch Reader Vector Ordering Fix
+
+**Pain Point Addressed**: Results appeared in arbitrary order, making curation difficult.
+
+**Solution Implemented**:
+- **Modified**: `tools/batch_reader/tool.py` SQL query adds `ORDER BY v.distance ASC`
+
+**Evidence**: SQL modification in batch reader file.
+
+### 13.5 Infrastructure Pre-existing
+
+The base resume capability exists but was extended:
+- **`app.py`** lines 284-296: Startup recovery scans for `RUNNING`/`INTERRUPTED` jobs
+- **`bot/engine/worker.py`**: Handles `INTERRUPTED` status with recovery message
+- **`tools/base.py`**: Resets `_last_artifacts` on each execution
+
+**Inference**: Recent changes extended job-level recovery to granular `job_items` tracking specifically for publisher pipeline.
+
+**Confidence Level**: **High** for all changes (direct code evidence exists in current files)
+
+### Summary
+
+Architectural evolution: Stateless execution → Resume-capable → Enforced constraints → Direct synchronous calls → Ranked results. The system matured toward reliability, cost-efficiency, and user safety.

@@ -69,18 +69,88 @@ def _build_multimodal_messages(
     ]
 
 
-from utils.browser_utils import extract_hybrid_html as centralized_extract
-
-
 def extract_hybrid_html(driver: Driver) -> tuple[str, int]:
     """
-    Surgical extraction using Botasaurus driver.page_html.
+    Greedy extraction: Captures leaf-node content containers with >40 characters.
     """
     try:
-        html = driver.page_html or ""
-        result_text = centralized_extract(html)
-        return result_text, len(result_text)
-
+        html_content = driver.page_html or ""
+        if not html_content or len(html_content.strip()) < 100:
+            return "INSUFFICIENT_CONTENT", 0
+        
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        # 1. Strip structural noise & iframes entirely
+        for tag in soup.find_all(["iframe", "script", "style", "noscript", "header", "footer", "nav"]):
+            tag.decompose()
+            
+        # 2. Minimize attributes globally to prevent descendants from leaking noise
+        allowed_attrs = {"href", "data-ai-id"}
+        for tag in soup.find_all(True):
+            tag.attrs = {k: v for k, v in tag.attrs.items() if k in allowed_attrs}
+            
+        fragments = []
+        captured_node_ids = set() # Tracks `id()` of captured elements
+        
+        for element in soup.find_all(True):
+            if not element.parent:
+                continue
+                
+            # --- ANCESTOR CHECK ---
+            # If any parent of this element was already captured, skip it to prevent duplication
+            parent = element.parent
+            is_already_captured = False
+            while parent:
+                if id(parent) in captured_node_ids:
+                    is_already_captured = True
+                    break
+                parent = parent.parent
+                
+            if is_already_captured:
+                continue
+            # ----------------------
+                
+            node_text = element.get_text(strip=True)
+            text_length = len(node_text)
+            
+            # Ignore tiny fragments
+            if text_length <= 40:
+                continue
+            
+            # --- WRAPPER DETECTION ---
+            # Sum the text length of all DIRECT children.
+            # If direct children account for >80% of this element's text, it's just a structural wrapper.
+            direct_children_text_len = sum(
+                len(child.get_text(strip=True)) 
+                for child in element.find_all(True, recursive=False)
+            )
+            
+            if direct_children_text_len > (text_length * 0.8):
+                continue # Skip wrapper; the loop will naturally process its children.
+            # -------------------------
+            
+            # This is a leaf-node container! Capture it and protect its descendants.
+            captured_node_ids.add(id(element))
+            
+            fragments.append(str(element))
+        
+        # Join cleanly with newlines
+        result = "\n".join(fragments)
+        
+        MAX_CONTEXT = 60000
+        if len(result) > MAX_CONTEXT:
+            result = result[:MAX_CONTEXT] + "\n... [TRUNCATED]"
+            
+        if len(result) < 100:
+            return "INSUFFICIENT_CONTENT", 0
+            
+        return result, len(result)
+        
     except Exception as e:
-        log.dual_log(tag="Scraper:Extract:Hybrid", message=f"Hybrid extraction failed: {e}", level="WARNING", exc_info=e)
+        log.dual_log(
+            tag="Scraper:Extract:Hybrid",
+            message=f"Greedy extraction failed: {e}",
+            level="ERROR",
+            exc_info=e
+        )
         return "INSUFFICIENT_CONTENT", 0

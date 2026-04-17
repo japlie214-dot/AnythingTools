@@ -312,10 +312,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.dual_log(tag="DB:Cleanup", message="Cleanup error.", level="ERROR", exc_info=e)
 
-    # 7) Load tool registry
+    # 7) Load tool registry & Start Worker Engine
     try:
         REGISTRY.load_all()
         log.dual_log(tag="Sys:Registry", message="Tool registry loaded.")
+        
+        # Start the worker manager to pick up QUEUED jobs automatically
+        try:
+            from bot.engine.worker import get_manager
+            mgr = get_manager()
+            mgr.start()
+            log.dual_log(tag="API:Worker:Start", message="Unified WorkerManager started on app launch.")
+        except Exception as e:
+            log.dual_log(tag="API:Worker:Start", message="Worker manager failed to start.", level="WARNING", exc_info=e)
     except Exception as e:
         log.dual_log(tag="Sys:Registry", message="Tool registry load failed.", level="WARNING", exc_info=e)
 
@@ -329,7 +338,7 @@ async def lifespan(app: FastAPI):
 
     logging.info("AnythingTools shutdown: lifecycle complete")
 
-    # Shutdown: Truncate transient PDF cache again, stop writer, and shutdown driver.
+    # Shutdown: Truncate transient PDF cache again, stop worker manager, stop writer, and shutdown driver.
     try:
         enqueue_write("DELETE FROM pdf_parsed_pages")
         try:
@@ -338,6 +347,15 @@ async def lifespan(app: FastAPI):
             pass
     except Exception:
         pass
+
+    # Stop the worker manager to avoid new jobs being processed while shutting down resources.
+    try:
+        from bot.engine.worker import get_manager
+        mgr = get_manager()
+        mgr.stop()
+        log.dual_log(tag="API:Worker:Stop", message="Unified WorkerManager stopped on shutdown.")
+    except Exception as e:
+        log.dual_log(tag="API:Worker:Stop", message="Failed to stop WorkerManager during shutdown.", level="WARNING", exc_info=e)
 
     try:
         shutdown_writer()

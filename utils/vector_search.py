@@ -165,3 +165,16 @@ def get_memory_context_string(relevant_memories: List[Tuple[str, str]]) -> str:
     context_lines.append("</INSTITUTIONAL_CONTEXT>")
     
     return "\n".join(context_lines)
+
+
+def generate_embedding_sync(text: str, provider_type: str = "azure") -> bytes:
+    """
+    Synchronous bypass for embedding generation.
+    Safely callable from background threads without event-loop acrobatics.
+    """
+    from clients.snowflake_client import snowflake_client
+    import struct
+    
+    # snowflake_client.embed() internally handles its own thread-safe locks
+    emb_list = snowflake_client.embed(text)
+    return struct.pack(f'{len(emb_list)}f', *emb_list)

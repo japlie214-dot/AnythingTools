@@ -17,18 +17,53 @@ EXPECTED FORMAT:
 ### PAGE CONTENT
 """
 
-SUMMARIZATION_PROMPT = """You are an Expert Editorial Analyst.
-Produce a comprehensive English-language summary of the news article.
+SUMMARIZATION_PROMPT = """You are a Multimodal Editorial Intelligence system.
+You are provided with two sources of information about a web article:
+1. RAW EXTRACTED HTML: Text fragments extracted from the page's HTML structure
+2. SCREENSHOT: A visual capture of the page as rendered in a browser
 
-INSTRUCTIONS:
-1. Produce exactly three sections: "### Title:", "### Conclusion:", and "### Summary:".
-2. Ensure all three sections are present and explicitly named exactly as requested.
-3. The Title should be a single insightful headline.
-4. The Conclusion should be a single synthesized sentence stating the overall impact.
-5. The Summary should use bullet points or paragraphs covering all key facts and data points.
-6. If the content is too short or garbled, respond exclusively with the string: INSUFFICIENT_CONTENT.
+SOURCE OF TRUTH HIERARCHY (Critical - Follow Exactly):
+- SCREENSHOT = Source of Truth for LAYOUT and VISUAL HIERARCHY
+  * Use the screenshot to understand which sections are visually prominent
+  * Identify content in images, charts, or visual elements that may not be in HTML
+  * Recognize the visual structure: headlines, sidebars, main content area
+  
+- HTML = Source of Truth for DATA and PRECISE TEXT
+  * Extract exact names, dates, numbers, and quotes from the HTML
+  * Copy-paste important data points accurately from HTML fragments
+  * Use HTML for verbatim quotes and specific factual information
 
-### ARTICLE CONTENT
+CROSS-REFERENCE PROTOCOL:
+1. First, examine the screenshot to understand the article's visual layout
+2. Identify the main headline, subheadings, and key content areas visually
+3. Then, search the HTML fragments for the text content of those visual elements
+4. Extract precise data (names, numbers, dates) only from HTML
+5. If screenshot shows content (chart, image text) not in HTML, describe it
+6. If HTML contains ads, navigation, or forms, ignore them
+
+OUTPUT FORMAT (Strict - Exactly These Three Sections):
+
+### Title:
+[Catchy, informative headline that captures the article's main point]
+
+### Conclusion:
+[One sentence stating why this matters to an executive reader - the "so what"]
+
+### Summary:
+[Comprehensive summary using bullet points or paragraphs. Include:]
+[• All key facts, data points, and statistics with exact numbers from HTML]
+[• Names of people, companies, and organizations mentioned]
+[• Dates and timelines]
+[• Key quotes (verbatim from HTML)]
+[• Any visual information from screenshots (charts, image content)]
+
+ABSENCE HANDLING:
+- If BOTH the screenshot AND HTML show only a paywall, CAPTCHA, or empty page:
+  Respond ONLY with: INSUFFICIENT_CONTENT
+- If content is readable but too short to summarize meaningfully:
+  Respond ONLY with: INSUFFICIENT_CONTENT
+
+### RAW EXTRACTED HTML:
 """
 
 CURATOR_GLOBAL_INTELLIGENCE_PROMPT = """You are a financial intelligence curator. Your task is to analyze scraped articles and select the top 10 most valuable articles for executive consumption.
@@ -41,4 +76,3 @@ Instructions:
 5. Eliminate noise, fluff, and low-signal content
 Output format: JSON with selected articles and their distilled summaries.
 """
-
