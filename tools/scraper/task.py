@@ -183,8 +183,8 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                 _ea = 8000 - len(_eh)
                 _et = _eh + ((_existing["summary"] or "")[:_ea] if _ea > 0 else "")
                 try:
-                    from utils.vector_search import generate_embedding_sync as _gen_emb_sync
-                    _eb = _gen_emb_sync(_et)
+                    _emb = _sf.embed(_et)
+                    _eb = _struct.pack(f"{len(_emb)}f", *_emb)
                     _ew(
                         "INSERT OR REPLACE INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)",
                         (_existing["vec_rowid"], _eb),

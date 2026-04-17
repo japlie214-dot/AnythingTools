@@ -41,6 +41,16 @@ class BaseTool(abc.ABC):
         """Return True if this tool supports mid-run resume for the given args."""
         return False
 
+    def status(self, message: str, status: str = "RUNNING") -> dict:
+        """Convenience helper to create a status update for this tool."""
+        from datetime import datetime, timezone
+        return {
+            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "tool_name": self.name,
+            "message": message,
+            "status": status,
+        }
+
     @abc.abstractmethod
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Execute tool logic and emit telemetry via the provided callback.
@@ -67,6 +77,7 @@ class BaseTool(abc.ABC):
         """Execute tool logic. Exceptions are caught by bot/engine/tool_runner.py."""
         from utils.logger.state import _tool_log_buffer, _current_job_id
         from utils.logger import get_dual_logger
+        self._last_artifacts = None  # Ensure pristine state per execution
         job_id = kwargs.get("job_id") if kwargs is not None else None
         token_job = _current_job_id.set(job_id)
         token = _tool_log_buffer.set([])

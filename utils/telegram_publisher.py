@@ -8,6 +8,9 @@ import json
 import httpx
 from typing import List, Dict, Any
 from clients.llm import get_llm_client, LLMRequest
+from database.job_queue import add_job_item, update_item_status
+from database.connection import DatabaseManager
+import sqlite3
 import config
 from utils.logger import get_dual_logger
 
@@ -15,10 +18,11 @@ log = get_dual_logger(__name__)
 
 
 class PublisherPipeline:
-    def __init__(self, batch_id: str, top_10: List[Dict], inventory: List[Dict]):
+    def __init__(self, batch_id: str, top_10: List[Dict], inventory: List[Dict], job_id: str | None = None):
         self.batch_id = batch_id
         self.top_10 = top_10
         self.inventory = inventory
+        self.job_id = job_id
         self.queue = asyncio.Queue()
         
     async def _translate_chunk(self, items: List[Dict]) -> List[Dict]:
@@ -58,33 +62,58 @@ class PublisherPipeline:
 
     async def producer(self):
         """Translates articles in chunks of 10 and pushes to queue."""
-        # Combine Top 10 and Inventory to translate everything
         all_articles = self.top_10 + self.inventory
         
+        conn = DatabaseManager.get_read_connection()
+        conn.row_factory = sqlite3.Row
+        uncached = []
+        trans_map = {}
+        
+        if self.job_id:
+            for article in all_articles:
+                ulid = article.get("ulid")
+                row = conn.execute(
+                    "SELECT output_data FROM job_items WHERE job_id = ? AND step_identifier = ? AND status = 'COMPLETED'",
+                    (self.job_id, f"trans_{ulid}")
+                ).fetchone()
+                if row and row["output_data"]:
+                    try:
+                        trans_map[ulid] = json.loads(row["output_data"])
+                    except Exception:
+                        uncached.append(article)
+                else:
+                    uncached.append(article)
+        else:
+            uncached = all_articles
+
         chunk_size = 10
-        for i in range(0, len(all_articles), chunk_size):
-            chunk = all_articles[i:i+chunk_size]
+        for i in range(0, len(uncached), chunk_size):
+            chunk = uncached[i:i+chunk_size]
             translated = await self._translate_chunk(chunk)
             
-            # Map translations back to original URLs/Status
-            trans_map = {item.get("ulid"): item for item in translated if isinstance(item, dict)}
+            for t in translated:
+                if isinstance(t, dict) and t.get("ulid"):
+                    ulid = t["ulid"]
+                    trans_map[ulid] = t
+                    if self.job_id:
+                        add_job_item(self.job_id, f"trans_{ulid}", "")
+                        update_item_status(self.job_id, f"trans_{ulid}", "COMPLETED", json.dumps(t))
             
-            for article in chunk:
-                ulid = article.get("ulid")
-                is_top10 = any(t.get("ulid") == ulid for t in self.top_10)
-                trans_data = trans_map.get(ulid, {})
-                
-                enriched = {
-                    "ulid": ulid,
-                    "url": article.get("normalized_url", article.get("url", "")),
-                    "is_top10": is_top10,
-                    "title": trans_data.get("translated_title", article.get("title", "")),
-                    "conclusion": trans_data.get("translated_conclusion", article.get("conclusion", "")),
-                    "summary": trans_data.get("translated_summary", article.get("summary", ""))
-                }
-                await self.queue.put(enriched)
-                
-        # Signal completion
+        for article in all_articles:
+            ulid = article.get("ulid")
+            is_top10 = any(t.get("ulid") == ulid for t in self.top_10)
+            trans_data = trans_map.get(ulid, {})
+            
+            enriched = {
+                "ulid": ulid,
+                "url": article.get("normalized_url", article.get("url", "")),
+                "is_top10": is_top10,
+                "title": trans_data.get("translated_title", article.get("title", "")),
+                "conclusion": trans_data.get("translated_conclusion", article.get("conclusion", "")),
+                "summary": trans_data.get("translated_summary", article.get("summary", ""))
+            }
+            await self.queue.put(enriched)
+            
         await self.queue.put(None)
 
     async def consumer(self):
@@ -130,15 +159,37 @@ class PublisherPipeline:
                 msg2_briefing = f"<b>{title}</b>\n\n{conclusion}"
                 msg2_archive = f"<b>{title}</b>\n\n<b>Conclusion:</b> {conclusion}\n\n<b>Summary:</b>\n{summary}"
 
-                # Destination A (Briefing Channel) -> Top 10 Only
-                if is_top10 and chat_a:
+                conn = DatabaseManager.get_read_connection()
+                conn.row_factory = sqlite3.Row
+                ulid = article.get("ulid")
+
+                sent_a = False
+                if self.job_id and is_top10 and chat_a:
+                    row_a = conn.execute("SELECT status FROM job_items WHERE job_id = ? AND step_identifier = ?", (self.job_id, f"pub_a_{ulid}")).fetchone()
+                    if row_a and row_a["status"] == "COMPLETED":
+                        sent_a = True
+
+                sent_b = False
+                if self.job_id and chat_b:
+                    row_b = conn.execute("SELECT status FROM job_items WHERE job_id = ? AND step_identifier = ?", (self.job_id, f"pub_b_{ulid}")).fetchone()
+                    if row_b and row_b["status"] == "COMPLETED":
+                        sent_b = True
+
+                if is_top10 and chat_a and not sent_a:
+                    if self.job_id:
+                        add_job_item(self.job_id, f"pub_a_{ulid}", "")
                     await send_msg(chat_a, msg1_url)
                     await send_msg(chat_a, msg2_briefing)
+                    if self.job_id:
+                        update_item_status(self.job_id, f"pub_a_{ulid}", "COMPLETED", "{}")
                     
-                # Destination B (Archive Channel) -> All Articles
-                if chat_b:
+                if chat_b and not sent_b:
+                    if self.job_id:
+                        add_job_item(self.job_id, f"pub_b_{ulid}", "")
                     await send_msg(chat_b, msg1_url)
                     await send_msg(chat_b, msg2_archive)
+                    if self.job_id:
+                        update_item_status(self.job_id, f"pub_b_{ulid}", "COMPLETED", "{}")
                 
                 self.queue.task_done()
 

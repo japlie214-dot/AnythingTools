@@ -36,3 +36,5 @@ ARTICLE_BODY_SELECTORS = [
     "#content",
     ".story-body",
 ]
+
+VALID_TARGET_NAMES = {t["name"] for t in TARGETS}

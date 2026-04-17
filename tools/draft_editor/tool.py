@@ -45,10 +45,13 @@ class DraftEditorTool(BaseTool):
 
         conn = DatabaseManager.get_read_connection()
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT raw_json_path, curated_json_path FROM broadcast_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+        row = conn.execute("SELECT raw_json_path, curated_json_path, status FROM broadcast_batches WHERE batch_id = ?", (batch_id,)).fetchone()
         
         if not row or not row["curated_json_path"]:
             raise ValueError("Batch not found or missing curated data.")
+
+        if row["status"] != "PENDING":
+            return json.dumps({"status": "FAILED", "error": f"Cannot modify batch {batch_id} because its status is {row['status']}. Modifications are only allowed before publishing begins."})
             
         try:
             with open(row["curated_json_path"], "r", encoding="utf-8") as f:

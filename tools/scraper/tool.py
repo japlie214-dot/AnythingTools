@@ -22,6 +22,7 @@ from clients.llm import get_llm_client, LLMRequest
 from utils.logger import get_dual_logger
 from utils.browser_lock import browser_lock
 from tools.scraper.task import _run_botasaurus_scraper
+from tools.scraper.targets import VALID_TARGET_NAMES
 from utils.id_generator import ULID
 from database.writer import enqueue_write
 
@@ -46,7 +47,10 @@ class ScraperTool(BaseTool):
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Main entry point for Scout execution."""
-        cancellation_flag = kwargs.get("cancellation_flag") or threading.Event()
+        cancellation_flag = kwargs.pop("cancellation_flag", None)
+        if cancellation_flag is None:
+            cancellation_flag = threading.Event()
+            
         if cancellation_flag.is_set():
             return "__CANCELED__"
 
@@ -55,11 +59,11 @@ class ScraperTool(BaseTool):
         
         browser_lock.acquire()
         try:
-            return await self._run_internal(args, telemetry, cancellation_flag=cancellation_flag, **kwargs)
+            return await self._run_internal(args, telemetry, cancellation_flag, **kwargs)
         finally:
             browser_lock.safe_release()
 
-    async def _run_internal(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
+    async def _run_internal(self, args: dict[str, Any], telemetry: Any, cancellation_flag: threading.Event, **kwargs) -> str:
         """Internal implementation with full pipeline."""
         dry_run = kwargs.get("dry_run", config.TELEMETRY_DRY_RUN)
         if dry_run:
@@ -71,6 +75,16 @@ class ScraperTool(BaseTool):
         
         if not target_site:
             return "Error: target_site argument is required."
+
+        if target_site not in VALID_TARGET_NAMES:
+            valid_list = ", ".join(sorted(VALID_TARGET_NAMES))
+            log.dual_log(
+                tag="Scraper:Validation",
+                message=f"Invalid target_site rejected: {target_site}",
+                level="ERROR",
+                payload={"received": target_site, "valid_options": list(VALID_TARGET_NAMES)},
+            )
+            return f"Error: '{target_site}' is not a valid target site. Valid options: {valid_list}"
 
         # Scout initialization (legacy ledger removed) — log for auditing
         if job_id and session_id != "0":
@@ -95,7 +109,6 @@ class ScraperTool(BaseTool):
             return asyncio.run_coroutine_threadsafe(_call(), loop).result(timeout=300)
 
         await telemetry(self.status(f"Launching headful scraper for {target_site}..."))
-        cancellation_flag = kwargs.get("cancellation_flag") or threading.Event()
 
         try:
             # Run Botasaurus pipeline

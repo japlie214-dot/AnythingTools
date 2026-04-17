@@ -61,6 +61,7 @@ class BatchReaderTool(BaseTool):
             JOIN scraped_articles a ON v.rowid = a.vec_rowid
             WHERE v.embedding MATCH ? AND k = ?
             AND a.id IN ({pl})
+            ORDER BY v.distance ASC
         """
         
         rows = conn.execute(sql, [query_embedding, limit * 3] + valid_ulids).fetchall()

@@ -39,31 +39,6 @@ async def generate_embedding(text: str, provider_type: str = "azure") -> bytes:
     return struct.pack(f'{len(emb_list)}f', *emb_list)
 
 
-def generate_embedding_sync(text: str, provider_type: str = "azure") -> bytes:
-    """Synchronous helper returning packed float32 embedding bytes.
-
-    Prefers the Snowflake client's async_embed when safe to run (not inside an
-    already-running event loop). Falls back to the synchronous `embed` call.
-    """
-    import asyncio as _asyncio
-    try:
-        # Detect whether an event loop is running on this thread.
-        try:
-            _asyncio.get_running_loop()
-            loop_running = True
-        except RuntimeError:
-            loop_running = False
-
-        if hasattr(snowflake_client, "async_embed") and not loop_running:
-            emb_list = _asyncio.run(snowflake_client.async_embed(text))
-        else:
-            emb_list = snowflake_client.embed(text)
-    except Exception:
-        # Final fallback: synchronous embed
-        emb_list = snowflake_client.embed(text)
-    return struct.pack(f'{len(emb_list)}f', *emb_list)
-
-
 async def retrieve_relevant_memories(
     query: str,
     agent_domain: str | None = None,

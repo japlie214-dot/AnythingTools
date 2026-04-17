@@ -21,10 +21,24 @@ log = get_dual_logger(__name__)
 
 async def run_tool_safely(tool: BaseTool, args: Dict[str, Any], telemetry: Any, **kwargs) -> ToolResult:
     """Execute a tool with centralized error handling to return string-based tool results to the LLM."""
+    job_id = kwargs.get("job_id")
     try:
         return await tool.execute(args, telemetry, **kwargs)
     except Exception as exc:
         raw_tb = traceback.format_exc()
         error_msg = f"Tool Execution Failure: {str(exc)}\n\nTraceback:\n{raw_tb}"
+        if job_id:
+            try:
+                from database.writer import enqueue_write
+                from utils.id_generator import ULID
+                from datetime import datetime, timezone
+                enqueue_write(
+                    "INSERT INTO job_logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (ULID.generate(), job_id, "ToolRunner:Error", "ERROR", error_msg, json.dumps({"traceback": raw_tb}), datetime.now(timezone.utc).isoformat())
+                )
+            except Exception as log_err:
+                log.dual_log(tag="ToolRunner", message=f"Failed to log error to job_logs: {log_err}", level="WARNING")
+        
+        log.dual_log(tag="ToolRunner", message=f"Tool execution failed: {exc}", level="ERROR", payload={"job_id": job_id, "tool": tool.name})
         return ToolResult(output=error_msg, success=False)
         

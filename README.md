@@ -125,10 +125,23 @@ AnythingTools/
 
 ### Whitelisted Tools
 The registry supports only:
-1.  `scraper` (Scout): Outputs `batch_id`, `top_10`, `inventory`, `total_count`.
-2.  `draft_editor` (Editor): Modifies curated JSON files. No LLM use.
-3.  `batch_reader` (Reader): Filters vector search by `batch_id`. Outputs structured JSON.
-4.  `publisher` (Herald): Translates content and posts to Telegram.
+1.  `scraper` (Scout): Outputs `batch_id`, `top_10`, `inventory`, `total_count`. Now with resume-capable embedding generation using direct `snowflake_client.embed()` call (no async wrapper).
+2.  `draft_editor` (Editor): Modifies curated JSON files. Strictly SWAP-only operations. Rejects modifications when batch status is not `PENDING`.
+3.  `batch_reader` (Reader): Filters vector search by `batch_id`. Outputs structured JSON with `ORDER BY v.distance ASC` for accurate semantic ranking.
+4.  `publisher` (Herald): Translates content and posts to Telegram. Full resume capability via `job_items` caching with `PUBLISHING`/`PARTIAL`/`COMPLETED` batch states.
+
+### Job Items State Tracking
+The `job_items` table enables granular resume capability:
+- **Step identifiers**: `trans_{ulid}` for translations, `pub_a_{ulid}` and `pub_b_{ulid}` for delivery tracking
+- **Status tracking**: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`
+- **Data persistence**: `input_data` and `output_data` fields store state
+
+### Publisher Pipeline State Management
+**Parallel to `broadcast_batches.status`**:
+- `PENDING`: Batch exists, not yet published
+- `PUBLISHING`: Active publishing in progress (set before pipeline start)
+- `PARTIAL`: Publishing failed mid-stream (set on exception)
+- `COMPLETED`: All messages delivered successfully (set on complete)
 
 ### Database Schema Versioning & Auto-Repair
 **Version: 3** (Current)
