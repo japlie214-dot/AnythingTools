@@ -239,15 +239,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.dual_log(tag="DB:Schema", message=f"Failed to enqueue/initialize schema: {e}", level="ERROR", exc_info=e)
 
-    # 3) Truncate transient PDF cache (non-fatal) — use single-writer enqueue + wait
+    # 3) Truncate transient PDF cache after ensuring schema is ready
     try:
+        await wait_for_writes() # Ensure INIT_SCRIPT from block 1.5/2 has finished
         enqueue_write("DELETE FROM pdf_parsed_pages")
-        try:
-            await wait_for_writes()
-        except Exception:
-            pass
-    except Exception:
-        pass
+        await wait_for_writes()
+    except Exception as e:
+        log.dual_log(tag="Sys:Startup:Cleanup", message=f"PDF cache purge failed: {e}", level="WARNING")
 
     # 4) Warm up the singleton Driver (non-fatal if Chrome unavailable)
     try:

@@ -1,6 +1,7 @@
 # database/writer.py
 import queue
 import threading
+import re
 from typing import Optional
 
 import config
@@ -19,6 +20,37 @@ _write_generation: int = 0
 
 # Special marker for execute-script tasks enqueued to the writer.
 EXEC_SCRIPT = "__EXEC_SCRIPT__"
+MAX_REPAIR_RETRIES = 1
+
+
+def _extract_table_name(error_msg: str) -> Optional[str]:
+    # Handles unquoted, quoted ("table"), and schema-qualified (main.table) names
+    match = re.search(r'no such table:\s*(?:\"|[\w\.]+\.)?(\w+)\"?', error_msg, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _is_no_such_table_error(error: Exception) -> bool:
+    return "no such table" in str(error).lower()
+
+
+def _is_foreign_key_error(error: Exception) -> bool:
+    return "foreign key constraint failed" in str(error).lower()
+
+
+def _attempt_table_repair(conn, table_name: str) -> bool:
+    """Strictly executes DDL repair script. Returns True on success."""
+    from database.schema import get_repair_script
+    script = get_repair_script(table_name)
+    if not script:
+        return False
+    try:
+        conn.executescript(script)
+        conn.commit()
+        log.dual_log(tag="DB:Writer:Repair", message=f"Repaired table: {table_name}")
+        return True
+    except Exception:
+        conn.rollback()
+        return False
 
 
 def get_write_generation() -> int:
@@ -48,101 +80,31 @@ def db_writer_worker() -> None:
             sql, params = task
             try:
                 if sql == EXEC_SCRIPT:
-                    # Execute a multi-statement SQL script atomically on the writer connection.
                     script_text = params[0] if params else ""
-                    try:
-                        conn.executescript(script_text)
-                        conn.commit()
-                        # Advance write generation so readers know a new commit occurred.
-                        with _writer_lock:
-                            _write_generation += 1
-                    except Exception as e:
-                        log.dual_log(
-                                tag="DB:Writer:Error",
-                                message="Database execscript failed.",
-                            level="ERROR",
-                            payload={"script_head": script_text[:200]},
-                            exc_info=e,
-                        )
-                        conn.rollback()
+                    conn.executescript(script_text)
+                    conn.commit()
+                    with _writer_lock:
+                        _write_generation += 1
                 else:
-                    try:
-                        conn.execute(sql, params)
-                        conn.commit()
-                        # Advance write generation so readers know a new commit occurred.
-                        with _writer_lock:
-                            _write_generation += 1
-                    except Exception as e:
-                        # Attempt automatic recovery for missing-table errors (common after schema drift)
+                    for attempt in range(MAX_REPAIR_RETRIES + 1):
                         try:
-                            import sqlite3 as _sqlite3
-                            msg = str(e).lower()
-                        except Exception:
-                            msg = str(e)
-
-                        if isinstance(e, Exception) and "no such table" in msg:
-                            # Extract missing table name and attempt best-effort repair
-                            try:
-                                missing = str(e).split(":")[-1].strip()
-                                if missing == "job_logs":
-                                    # Create job_logs table on-demand
-                                    conn.execute(
-                                        """CREATE TABLE IF NOT EXISTS job_logs (
-                                            id           TEXT PRIMARY KEY,
-                                            job_id       TEXT,
-                                            tag          TEXT,
-                                            level        TEXT,
-                                            status_state TEXT,
-                                            message      TEXT,
-                                            payload_json TEXT,
-                                            timestamp    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                                            FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
-                                        )"""
-                                    )
-                                    conn.commit()
-                                    # retry the original statement once
-                                    conn.execute(sql, params)
-                                    conn.commit()
-                                    with _writer_lock:
-                                        _write_generation += 1
-                                else:
-                                    # As a last resort, try to initialize the full schema
-                                    try:
-                                        from database.schema import get_init_script
-                                        script = get_init_script()
-                                        conn.executescript(script)
-                                        conn.commit()
-                                        conn.execute(sql, params)
-                                        conn.commit()
-                                        with _writer_lock:
-                                            _write_generation += 1
-                                    except Exception as _e2:
-                                        log.dual_log(
-                                            tag="DB:Writer:Error",
-                                            message=f"Failed to repair missing table {missing}.",
-                                            level="ERROR",
-                                            payload={"sql": sql, "params": str(params)},
-                                            exc_info=_e2,
-                                        )
-                                        conn.rollback()
-                            except Exception as _e:
-                                log.dual_log(
-                                    tag="DB:Writer:Error",
-                                    message="Automatic missing-table repair attempted and failed.",
-                                    level="ERROR",
-                                    payload={"sql": sql, "params": str(params)},
-                                    exc_info=_e,
-                                )
+                            conn.execute(sql, params)
+                            conn.commit()
+                            with _writer_lock:
+                                _write_generation += 1
+                            break
+                        except Exception as e:
+                            if _is_no_such_table_error(e):
+                                table_name = _extract_table_name(str(e))
+                                if table_name and _attempt_table_repair(conn, table_name) and attempt < MAX_REPAIR_RETRIES:
+                                    continue
+                            elif _is_foreign_key_error(e):
+                                log.dual_log(tag="DB:Writer:FK", message="FK Constraint failed", level="ERROR", payload={"sql": sql, "params": str(params)})
                                 conn.rollback()
-                        else:
-                            log.dual_log(
-                                tag="DB:Writer:Error",
-                                message="Database write failed.",
-                                level="ERROR",
-                                payload={"sql": sql, "params": str(params)},
-                                exc_info=e,
-                            )
+                                break
+                            log.dual_log(tag="DB:Writer:Error", message=f"Write failed: {e}", level="ERROR", payload={"sql": sql, "params": str(params)})
                             conn.rollback()
+                            break
             except Exception as e:
                 log.dual_log(
                     tag="DB:Writer:Error",

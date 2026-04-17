@@ -11,6 +11,7 @@ The legacy autonomous agent architecture (UnifiedAgent) has been fully quarantin
 - **Draft Editor:** Atomic list management for curation (Top 10 swaps and replacements).
 - **Batch Reader:** Vector search queries restricted to specific batch IDs.
 - **Publisher:** Translation and delivery via a Producer-Consumer pipeline with rate limiting.
+- **PDF Processing:** PDF parsing with vector embedding storage and semantic search.
 
 **What it explicitly does NOT do:**
 - **No Autonomous Agents:** Does not contain an agent loop, reasoning engine, or dynamic persona switching.
@@ -47,8 +48,16 @@ The system has been refactored from an autonomous agent loop into a direct execu
 - Payload includes JSON result and Base64-encoded file attachments.
 
 **Database (`database/`):**
-- Single-writer SQLite with WAL mode.
-- Tables: `jobs`, `broadcast_batches`, `scraped_articles`.
+- **Single-writer SQLite with WAL mode** (v3 schema with auto-repair capability).
+- **Automatic Schema Recovery**: Missing tables trigger DDL repair without manual intervention.
+- **Comprehensive Table Repair Dictionary**: All 17 core tables can be repaired automatically.
+- Tables: `jobs`, `broadcast_batches`, `scraped_articles`, `pdf_parsed_pages`, `token_usage`, etc.
+
+**PDF Processing (`utils/pdf_utils.py`):**
+- Embeds text chunks with Snowflake embeddings.
+- Stores page content in `pdf_parsed_pages` (id INTEGER, chat_id INTEGER, pdf_name TEXT, content TEXT).
+- Stores vectors in `pdf_parsed_pages_vec` (rowid INTEGER PRIMARY KEY, embedding BLOB).
+- Supports SQLite vector search with automatic fallback to BLOB storage when vec0 extension unavailable.
 
 ### Data Flow (Direct Invocation)
 
@@ -92,21 +101,25 @@ AnythingTools/
 │   ├── batch_reader/               # Vector Search Filtered by Batch ID
 │   └── publisher/                  # Translation + Telegram Producer-Consumer
 ├── database/
-│   ├── connection.py               # Thread-local connections (WAL settings)
-│   ├── writer.py                   # Background async writer
-│   ├── schema.py                   # DB Initialization (Jobs, Articles, Batches)
-│   └── job_queue.py                # Job status management
+│   ├── connection.py               # Thread-local connections (WAL settings, SQLITE_VEC detection)
+│   ├── writer.py                   # Background async writer with **Auto-Repair Logic**
+│   ├── schema.py                   # DB Initialization + **Schema Repair Dictionary (v3)**
+│   ├── job_queue.py                # Job status management
+│   └── reader.py                   # Read-through cache with generation tracking
 └── utils/
     ├── logger/                     # Dual logging (Console + File)
     ├── browser_lock.py             # Async lock for browser operations
     ├── hitl.py                     # Human-in-the-loop (Pause/Cancel logic)
-    └── telegram_publisher.py       # Producer-Consumer pipeline for messages
+    ├── telegram_publisher.py       # Producer-Consumer pipeline for messages
+    ├── pdf_utils.py                # **PDF parsing with vec0/BLOB fallback**
+    └── vector_search.py            # **Semantic search with rowid JOIN logic**
 ```
 
 **Key Structural Notes:**
 - **`deprecated/`**: Contains all non-core logic. These files are not imported or used by the runtime engine.
 - **`tools/`**: Contains only the 4 active tools. No dynamic scanning occurs.
 - **`bot/engine/`**: Replaces `bot/core/agent.py` as the execution path.
+- **Database Layer**: Now includes robust self-healing capabilities for missing or corrupted schemas.
 
 ## 4. Core Concepts & Domain Model
 
@@ -116,6 +129,45 @@ The registry supports only:
 2.  `draft_editor` (Editor): Modifies curated JSON files. No LLM use.
 3.  `batch_reader` (Reader): Filters vector search by `batch_id`. Outputs structured JSON.
 4.  `publisher` (Herald): Translates content and posts to Telegram.
+
+### Database Schema Versioning & Auto-Repair
+**Version: 3** (Current)
+
+**Automatic Recovery Mechanism:**
+When a "no such table" error occurs during database operations:
+1. Table name is extracted using robust regex: `r'no such table:\s*(?:\"|[\w\.]+\.)?(\w+)\"?'`
+2. Repair script is fetched from `TABLE_REPAIR_SCRIPTS` dictionary
+3. DDL is executed (schema only, no data re-execution)
+4. Original query is retried once (bounded by `MAX_REPAIR_RETRIES = 1`)
+
+**Schema Mismatch Resolution:**
+- **Original Issue**: `pdf_parsed_pages.id` was TEXT, causing JOIN failures
+- **Fixed in v3**: Changed to INTEGER to match `pdf_parsed_pages_vec.rowid`
+- **Impact**: Prevents type coercion errors during vector search
+
+**PDF Processing Schema:**
+```sql
+CREATE TABLE IF NOT EXISTS pdf_parsed_pages (
+    id INTEGER NOT NULL PRIMARY KEY,  -- Changed from TEXT (see Changes section)
+    chat_id INTEGER,
+    pdf_name TEXT NOT NULL,
+    page_number INTEGER NOT NULL,
+    content TEXT,
+    embedding_status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK(embedding_status IN ('PENDING','EMBEDDED','SKIPPED')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS pdf_parsed_pages_vec USING vec0(
+    embedding float[1024]
+);
+-- Fallback (no sqlite_vec): rowid INTEGER PRIMARY KEY AUTOINCREMENT, embedding BLOB
+```
+
+**Vector Search Pattern:**
+- Uses JOIN on `rowid` (vec table) = `CAST(id AS INTEGER)` (main table)
+- Supports both real vec0 virtual tables and BLOB fallbacks
+- All vec INSERT operations use `(rowid, embedding)` pattern
 
 ### Batch Management
 - **`broadcast_batches` table**: Stores `batch_id` and file paths (`raw_json_path`, `curated_json_path`).
@@ -147,21 +199,30 @@ The registry supports only:
     - **Draft Editor**: Reads JSON, performs swap, writes atomically.
     - **Batch Reader**: Reads file, builds SQL `IN (...)` query, executes vector search.
     - **Publisher**: Spawns `PublisherPipeline`, where `consumer` waits for `queue.get()` and sends HTTP POSTs to Telegram with `time.sleep`.
+    - **PDF Processing**: Extracts text, generates embeddings, stores in `pdf_parsed_pages` + `pdf_parsed_pages_vec`.
 3.  **Callback**:
     - Worker calls `_invoke_anythingllm_callback(job_id, result, attachments)`.
     - Reads files, encodes to Base64.
     - POSTs to configured URL.
 4.  **Finish**: Job marked `COMPLETED`.
 
-### Error Handling
+### Error Handling & Auto-Repair
 - Tool execution errors are caught by `run_tool_safely` and returned as string output (failure message).
 - HTTP errors (Telegram/Callback) are logged.
 - Browser failures may raise exceptions caught by the worker.
+- **Database Auto-Repair**: When `no such table` errors occur:
+  - Regex extracts table name from error message
+  - DDL script fetched from `TABLE_REPAIR_SCRIPTS`
+  - Schema repaired without data loss
+  - Original operation retried once
+- **Foreign Key Constraint Failures**: Immediately abort with detailed payload logging (includes params for debugging).
+- **Retry Logic**: Bounded to `MAX_REPAIR_RETRIES = 1` to prevent infinite loops.
 
 ### Configuration Paths
 - `ANYTHINGLLM_BASE_URL`: Required for callback.
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ARCHIVE_CHAT_ID`: Required for Publisher.
 - `CHROME_USER_DATA_DIR`: Used by browser tools.
+- `SUMANAL_ALLOW_SCHEMA_RESET`: Boolean flag to enable destructive schema resets (default: false).
 
 ## 6. Public Interfaces
 
@@ -264,6 +325,7 @@ All endpoints are exposed at `/api` prefix.
     "write_queue_size": 0,
     "active_jobs": 0,
     "registered_tools": 4
+    "schema_version": 3
   }
   ```
 
@@ -315,8 +377,8 @@ All endpoints are exposed at `/api` prefix.
   }
 }
 ```
-**Returns**: JSON string with `{"batch_id": "...", "query": "...", "results": [...]}`
-**Side Effect**: Returns `{error: "Vector search unavailable..."}` if `sqlite_vec` extension is missing.
+**Returns**: JSON string with `{"batch_id": "...", "query": "...", "results": [...]}`  
+**Side Effect**: Returns `{error: "Vector search unavailable..."}` if `sqlite_vec` extension is missing (falls back to BLOB storage).
 
 ### Tool Interface
 All tools inherit `tools.base.BaseTool`:
@@ -329,7 +391,7 @@ async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
 ## 7. State, Persistence, and Data
 
 ### Storage
-- **SQLite**: `data/sumanal.db` (WAL enabled).
+- **SQLite**: `data/sumanal.db` (WAL enabled, Schema Version 3).
 - **Artifacts**: `artifacts/` (Scraper raw/curated JSON).
 - **Logs**: `logs/` (Dual stream).
 
@@ -337,18 +399,26 @@ async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
 - `jobs`: Execution lifecycle (QUEUED -> RUNNING -> COMPLETED).
 - `broadcast_batches`: Links batch IDs to file paths.
 - `scraped_articles`: Raw content for vector search.
+- `pdf_parsed_pages`: PDF text content with INTEGER primary key.
+- `pdf_parsed_pages_vec`: Vector embeddings (virtual or BLOB).
 
 ### Data Lifecycle
 - Jobs are retained indefinitely.
 - Log files rotate.
 - WAL files persist.
 
+### Schema Evolution
+- **v2 to v3 Migration**: Destructive reset when `SUMANAL_ALLOW_SCHEMA_RESET=1`
+- **Auto-Repair Operations**: Non-destructive schema corrections on missing tables
+- **Vector Table Fallbacks**: Automatic BLOB table creation when vec0 unavailable
+
 ## 8. Dependencies & Integration
 
 - **`botasaurus`**: Wrapper for Playwright used by Scraper.
 - **`httpx`**: Async HTTP used by Publisher and Callback.
 - **`openai`**: used *only* by `publisher` (internal translation step).
-- **`sqlite3`**: Core persistence.
+- **`sqlite3`**: Core persistence with version 3 schema.
+- **`sqlite-vec`**: Optional extension for vector search (fallback to BLOB).
 - **`python-telegram-bot`**: Telegram delivery.
 
 ## 9. Setup, Build, and Execution
@@ -356,6 +426,7 @@ async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
 ### Prerequisites
 - Python 3.11+
 - `PLAYWRIGHT_BROWSERS_PATH` (via `playwright install chromium`).
+- Optional: `sqlite-vec` extension for native vector search.
 
 ### Installation
 1. `pip install -r requirements.txt`
@@ -368,14 +439,21 @@ async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
     ANYTHINGLLM_BASE_URL=...  # Critical for Callback
     TELEGRAM_BOT_TOKEN=...
     TELEGRAM_ARCHIVE_CHAT_ID=...
+    SUMANAL_ALLOW_SCHEMA_RESET=0  # Set to 1 for destructive v3 migration
     ```
 4. Run: `uvicorn app:app --reload --port 8000`
+
+### Database Initialization
+- **First Run**: Creates v3 schema with all 17 tables
+- **Subsequent Runs**: Validates version, applies auto-repair if needed
+- **Migration**: Requires `SUMANAL_ALLOW_SCHEMA_RESET=1` for major version changes
 
 ## 10. Testing & Validation
 
 - **`tests/test_browser_e2e.py`**: Minimal browser check.
 - No formal unit test suite exists for the deterministic tools.
 - Validation is achieved by inspecting the `jobs` table and `logs/` directory.
+- **Schema Validation**: Check `PRAGMA user_version` returns 3
 
 ## 11. Known Limitations & Non-Goals
 
@@ -383,6 +461,8 @@ async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
 - **No Autonomous Logic**: The engine waits for specific instructions.
 - **No Legacy Features**: Finance, Research, etc., are in `deprecated/` and cannot run.
 - **No Concurrency**: Single-writer DB prevents concurrent job execution per session.
+- **Manual Migration Required**: Schema version changes require `SUMANAL_ALLOW_SCHEMA_RESET=1` (destructive).
+- **Bounded Auto-Repair**: Only 1 retry per missing table (prevents infinite loops).
 
 ## 12. Change Sensitivity
 
@@ -391,4 +471,5 @@ async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
 - **`bot/engine/worker.py`**: The `AnythingLLM` callback payload format must match the receiving system. The cancellation flag propagation logic is critical.
 - **`utils/telegram_publisher.py`**: Rate limiting logic is critical to avoid API bans. The producer-consumer coordination handles failure gracefully but requires the `try/except` pattern to be maintained.
 - **`utils/browser_lock.py`**: Mixing `asyncio.Lock` with threading causes RuntimeErrors. Must remain as `threading.Lock`.
-- **`database/schema.py`**: The `PAUSED_FOR_HITL` status constraint must be preserved in the jobs CHECK constraint.
+- **`database/writer.py`**: Repair loop logic must maintain `MAX_REPAIR_RETRIES = 1` and include both FK and missing table detection.
+- **`database/schema.py`**: `get_repair_script()` must return identical patterns to `get_init_script()` fallback replacements for consistency.

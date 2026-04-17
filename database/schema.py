@@ -9,7 +9,7 @@ from utils.logger import get_dual_logger
 log = get_dual_logger(__name__)
 
 # Schema version constant
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # Allow destructive reset via environment variable
 ALLOW_DESTRUCTIVE_RESET = os.getenv("SUMANAL_ALLOW_SCHEMA_RESET", "0") == "1"
 
@@ -189,6 +189,28 @@ CREATE VIRTUAL TABLE IF NOT EXISTS scraped_articles_vec USING vec0(
     embedding float[1024]
 );
 
+CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memories_vec USING vec0(
+    embedding float[1024]
+);
+
+CREATE TABLE IF NOT EXISTS pdf_parsed_pages (
+    id INTEGER NOT NULL PRIMARY KEY,
+    chat_id INTEGER,
+    pdf_name TEXT NOT NULL,
+    page_number INTEGER NOT NULL,
+    content TEXT,
+    embedding_status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK(embedding_status IN ('PENDING','EMBEDDED','SKIPPED')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pdf_pages_file_page
+ON pdf_parsed_pages(pdf_name, page_number);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS pdf_parsed_pages_vec USING vec0(
+    embedding float[1024]
+);
+
 
 CREATE TABLE IF NOT EXISTS broadcast_batches (
     batch_id              TEXT PRIMARY KEY,
@@ -208,6 +230,200 @@ CREATE INDEX IF NOT EXISTS idx_broadcast_batches_status
     ON broadcast_batches(status);
 """
 
+TABLE_REPAIR_SCRIPTS: dict[str, str] = {
+    "jobs": """CREATE TABLE IF NOT EXISTS jobs (
+        job_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        args_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'PENDING'
+            CHECK(status IN ('PENDING','QUEUED','RUNNING','INTERRUPTED','PAUSED_FOR_HITL','COMPLETED','FAILED','ABANDONED','CANCELLING')),
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        result_json TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_session_status ON jobs(session_id, status);""",
+    
+    "job_items": """CREATE TABLE IF NOT EXISTS job_items (
+        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        step_identifier TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','RUNNING','COMPLETED','FAILED')),
+        input_data TEXT,
+        output_data TEXT,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_job_items_job_id ON job_items(job_id, status);""",
+    
+    "job_logs": """CREATE TABLE IF NOT EXISTS job_logs (
+        id TEXT PRIMARY KEY,
+        job_id TEXT,
+        tag TEXT,
+        level TEXT,
+        status_state TEXT,
+        message TEXT,
+        payload_json TEXT,
+        timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_job_logs_job_id ON job_logs(job_id, timestamp);""",
+    
+    "token_usage": """CREATE TABLE IF NOT EXISTS token_usage (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        telemetry_id TEXT,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK(prompt_tokens >= 0),
+        completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK(completion_tokens >= 0),
+        reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK(reasoning_tokens >= 0),
+        total_tokens INTEGER NOT NULL DEFAULT 0 CHECK(total_tokens >= 0),
+        recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_token_usage_session_recorded ON token_usage(session_id, recorded_at);""",
+    
+    "financial_metrics": """CREATE TABLE IF NOT EXISTS financial_metrics (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        metric_name TEXT NOT NULL,
+        metric_value REAL NOT NULL,
+        metric_unit TEXT,
+        as_of TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+    );""",
+    
+    "market_data_snapshots": """CREATE TABLE IF NOT EXISTS market_data_snapshots (
+        id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        source TEXT NOT NULL,
+        snapshot_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        UNIQUE(symbol, source, snapshot_at)
+    );
+    CREATE INDEX IF NOT EXISTS idx_market_data_snapshots_symbol_snapshot_at ON market_data_snapshots(symbol, snapshot_at);""",
+    
+    "financial_formulas": """CREATE TABLE IF NOT EXISTS financial_formulas (
+        ticker TEXT NOT NULL,
+        statement_type TEXT NOT NULL,
+        sql_query TEXT NOT NULL,
+        validation_score REAL NOT NULL DEFAULT 0.0,
+        validated_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (ticker, statement_type)
+    );
+    CREATE INDEX IF NOT EXISTS idx_formulas_ticker_stmt ON financial_formulas(ticker, statement_type, validated_at DESC);""",
+    
+    "calculated_metrics": """CREATE TABLE IF NOT EXISTS calculated_metrics (
+        ticker TEXT NOT NULL,
+        date TEXT NOT NULL,
+        moving_avg_3y REAL,
+        std_dev_3y REAL,
+        pe_ratio REAL,
+        PRIMARY KEY (ticker, date)
+    );""",
+    
+    "long_term_memories": """CREATE TABLE IF NOT EXISTS long_term_memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT,
+        agent_domain TEXT,
+        topic TEXT NOT NULL,
+        memory TEXT NOT NULL,
+        embedding BLOB,
+        type TEXT NOT NULL DEFAULT 'Knowledge',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_memories_agent_domain ON long_term_memories(agent_domain, type, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memories_session_type ON long_term_memories(session_id, type, created_at DESC);""",
+    
+    "raw_fundamentals": """CREATE TABLE IF NOT EXISTS raw_fundamentals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL,
+        statement_type TEXT NOT NULL,
+        period_end_date TEXT NOT NULL,
+        label TEXT NOT NULL,
+        concept TEXT NOT NULL,
+        value REAL NOT NULL,
+        unit TEXT DEFAULT 'USD',
+        source TEXT DEFAULT 'SEC_EDGAR',
+        extracted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(ticker, statement_type, period_end_date, concept)
+    );
+    CREATE INDEX IF NOT EXISTS idx_raw_fundamentals_ticker_period ON raw_fundamentals(ticker, period_end_date);
+    CREATE INDEX IF NOT EXISTS idx_raw_fundamentals_concept ON raw_fundamentals(concept);
+    CREATE INDEX IF NOT EXISTS idx_fundamentals_ticker_date ON raw_fundamentals(ticker, statement_type, period_end_date DESC);""",
+    
+    "stock_prices": """CREATE TABLE IF NOT EXISTS stock_prices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL,
+        date TEXT NOT NULL,
+        open REAL,
+        high REAL,
+        low REAL,
+        close REAL,
+        volume INTEGER,
+        UNIQUE(ticker, date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON stock_prices(ticker, date DESC);""",
+    
+    "scraped_articles": """CREATE TABLE IF NOT EXISTS scraped_articles (
+        id TEXT NOT NULL PRIMARY KEY,
+        vec_rowid INTEGER NOT NULL,
+        normalized_url TEXT NOT NULL UNIQUE,
+        url TEXT NOT NULL,
+        title TEXT,
+        conclusion TEXT,
+        summary TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        embedding_status TEXT NOT NULL DEFAULT 'PENDING'
+            CHECK(embedding_status IN ('PENDING','EMBEDDED','SKIPPED')),
+        scraped_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_scraped_articles_norm_url ON scraped_articles(normalized_url);
+    CREATE INDEX IF NOT EXISTS idx_scraped_articles_status ON scraped_articles(embedding_status);""",
+    
+    "long_term_memories_vec": """CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memories_vec USING vec0(
+    embedding float[1024]
+);""",
+    
+    "scraped_articles_vec": """CREATE VIRTUAL TABLE IF NOT EXISTS scraped_articles_vec USING vec0(
+    embedding float[1024]
+);""",
+    
+    "pdf_parsed_pages": """CREATE TABLE IF NOT EXISTS pdf_parsed_pages (
+        id INTEGER NOT NULL PRIMARY KEY,
+        chat_id INTEGER,
+        pdf_name TEXT NOT NULL,
+        page_number INTEGER NOT NULL,
+        content TEXT,
+        embedding_status TEXT NOT NULL DEFAULT 'PENDING'
+            CHECK(embedding_status IN ('PENDING','EMBEDDED','SKIPPED')),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_pdf_pages_file_page ON pdf_parsed_pages(pdf_name, page_number);""",
+    
+    "pdf_parsed_pages_vec": """CREATE VIRTUAL TABLE IF NOT EXISTS pdf_parsed_pages_vec USING vec0(
+    embedding float[1024]
+);""",
+    
+    "broadcast_batches": """CREATE TABLE IF NOT EXISTS broadcast_batches (
+        batch_id TEXT PRIMARY KEY,
+        target_site TEXT NOT NULL,
+        raw_json_path TEXT NOT NULL,
+        curated_json_path TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING'
+            CHECK(status IN ('PENDING','PUBLISHING','PARTIAL','COMPLETED','FAILED')),
+        posted_research_ulids TEXT NOT NULL DEFAULT '[]',
+        posted_summary_ulids TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_broadcast_batches_status ON broadcast_batches(status);"""
+}
+
 
 def get_init_script() -> str:
     """Return the canonical INIT script with environment-aware fallbacks applied.
@@ -225,43 +441,41 @@ def get_init_script() -> str:
 
     if not SQLITE_VEC_AVAILABLE_local:
         # Replace vec0 virtual tables with basic BLOB-backed fallback tables.
-        script_to_run = script_to_run.replace(
-            """CREATE VIRTUAL TABLE IF NOT EXISTS scraped_articles_vec USING vec0(
-    embedding float[1024]
-);
-""",
-            """CREATE TABLE IF NOT EXISTS scraped_articles_vec (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    embedding BLOB
-);
-""",
-        )
-
-        script_to_run = script_to_run.replace(
-            """CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memories_vec USING vec0(
-    embedding float[1024]
-);
-""",
-            """CREATE TABLE IF NOT EXISTS long_term_memories_vec (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    embedding BLOB
-);
-""",
-        )
-
-        script_to_run = script_to_run.replace(
-            """CREATE VIRTUAL TABLE IF NOT EXISTS pdf_parsed_pages_vec USING vec0(
-    embedding float[1024]
-);
-""",
-            """CREATE TABLE IF NOT EXISTS pdf_parsed_pages_vec (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    embedding BLOB
-);
-""",
-        )
+        # Use regex replacement to handle whitespace variations in INIT_SCRIPT
+        import re
+        
+        patterns = [
+            "scraped_articles_vec",
+            "long_term_memories_vec",
+            "pdf_parsed_pages_vec"
+        ]
+        
+        for table in patterns:
+            pattern = rf'CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0\(\s*embedding float\[1024\]\s*\);'
+            replacement = f'CREATE TABLE IF NOT EXISTS {table} (rowid INTEGER PRIMARY KEY AUTOINCREMENT, embedding BLOB);'
+            script_to_run = re.sub(pattern, replacement, script_to_run, flags=re.IGNORECASE | re.MULTILINE)
 
     return script_to_run
+
+
+def get_repair_script(table_name: str) -> str | None:
+    """Return a repair script for the specified table with vector fallback."""
+    script = TABLE_REPAIR_SCRIPTS.get(table_name)
+    if not script:
+        return None
+        
+    try:
+        from database.connection import SQLITE_VEC_AVAILABLE
+    except Exception:
+        vec_available = False
+    else:
+        vec_available = SQLITE_VEC_AVAILABLE
+
+    if not vec_available and "_vec" in table_name:
+        # Fallback matches get_init_script pattern - uses rowid for INSERT compatibility
+        return f"CREATE TABLE IF NOT EXISTS {table_name} (rowid INTEGER PRIMARY KEY AUTOINCREMENT, embedding BLOB);"
+    
+    return script
 
 
 def _remove_db_files() -> None:
