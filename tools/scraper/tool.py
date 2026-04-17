@@ -222,7 +222,15 @@ class ScraperTool(BaseTool):
                 pass
 
             await telemetry(self.status("Scraper and curation finished.", "SUCCESS"))
-            return f"Scout Mode Extraction Complete. Batch ID: {batch_id}. Briefing posted to ledger."
+            
+            payload = {
+                "message": f"### Scout Extraction Complete\n**Batch ID:** `{batch_id}`\nUse `batch_reader` to query inventory.",
+                "batch_id": batch_id,
+                "top_10": [{"title": item.get("title", ""), "summary": item.get("conclusion", ""), "ulid": item.get("ulid", "")} for item in top_10_list],
+                "inventory": [{"title": item.get("title", ""), "ulid": item.get("ulid", "")} for item in next_50],
+                "total_count": total
+            }
+            return json.dumps(payload, ensure_ascii=False)
 
         except Exception as exc:
             if str(exc).startswith("PAUSED_FOR_HITL:"):

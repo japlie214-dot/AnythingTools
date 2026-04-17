@@ -1,5 +1,5 @@
 # tools/registry.py
-"""Dynamic registry that discovers and loads all tool implementations.
+"""Registry that loads only the whitelisted core tools.
 
 Tools are expected to reside in the ``tools/`` package (excluding ``base`` and
 ``registry`` modules) and subclass ``BaseTool``. The registry stores tool
@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import pkgutil
 import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Type
@@ -37,7 +36,7 @@ class ToolRegistry:
         self._tools: Dict[str, Dict[str, Any]] = {}
 
     def load_all(self) -> None:
-        """Import all modules under ``tools`` and register any ``BaseTool`` subclasses.
+        """Import only the whitelisted core tools.
 
         This method is resilient: failures to import a particular tool module
         are logged and do not abort discovery of other modules.
@@ -45,115 +44,29 @@ class ToolRegistry:
         self._tools.clear()
         package_dir = Path(__file__).parent
 
-        # 1. Agent-action discovery under tools/actions/<scope>/
-        actions_dir = package_dir / "actions"
-        if actions_dir.exists() and actions_dir.is_dir():
-            for scope in actions_dir.iterdir():
-                if not scope.is_dir() or scope.name.startswith("_"):
-                    continue
-                # Discover modules inside each scope folder
-                for module_info in pkgutil.iter_modules([str(scope)]):
-                    module_name = module_info.name
-                    module_path = scope / module_name
-                    try:
-                        # All action modules use tools.actions.<scope>.<module>
-                        module = importlib.import_module(f"tools.actions.{scope.name}.{module_name}")
-                        self._register_module_tools(module)
-                    except ImportError as e:
-                        log.dual_log(tag="Registry:Load", message=f"ImportError in actions.{scope.name}.{module_name}: {e}. Creating PhantomTool.", level="WARNING")
-                        self._register_phantom_tool(scope / module_name / "tool.py" if (scope / module_name).is_dir() else Path(f"{scope}/{module_name}.py"), str(e))
-                    except Exception as e:
-                        log.dual_log(tag="Registry:Load", message=f"Failed to import actions.{scope.name}.{module_name}: {e}", level="WARNING", payload={"module": f"{scope.name}.{module_name}"})
-                        continue
-
-                    # If the discovered module is a package, attempt to import its inner 'tool' submodule
-                    if module_info.ispkg:
-                        try:
-                            submod = importlib.import_module(f"tools.actions.{scope.name}.{module_name}.tool")
-                            self._register_module_tools(submod)
-                        except Exception:
-                            # Silently ignore missing 'tool' submodule – not all packages expose it
-                            pass
-
-        # 3. Public tools discovery: top-level tool modules and packages under tools/
-        #    (e.g., tools/browser_task, tools/research). This ensures public entry
-        #    points are exposed in the /api manifest as intended.
-        for child in package_dir.iterdir():
-            # Skip helper modules
-            if child.name in ('__init__.py', 'registry.py', 'base.py'):
+        # Load only explicitly whitelisted core tools
+        core_tools = ["scraper", "draft_editor", "publisher", "batch_reader"]
+        
+        for tool_dir in core_tools:
+            child = package_dir / tool_dir
+            if not child.exists():
                 continue
-
-            # If it's a package (directory with __init__.py), import package and
-            # also attempt to import common submodules (tool.py, Skill.py) inside it.
-            if child.is_dir():
-                module_name = f"tools.{child.name}"
-                try:
-                    module = importlib.import_module(module_name)
-                    self._register_module_tools(module)
-                except ImportError as e:
-                    log.dual_log(tag="Registry:Load", message=f"ImportError in {module_name}: {e}. Creating PhantomTool.", level="WARNING")
-                    self._register_phantom_tool(child / "tool.py", str(e))
-                except Exception as e:
-                    log.dual_log(tag="Registry:Load", message=f"Failed to import public tool package {module_name}: {e}", level="DEBUG", payload={"module": module_name})
-
-                # Attempt to import conventional submodules inside the package, e.g. tool.py
-                for sub in ("tool", "Skill"):
-                    try:
-                        submod = importlib.import_module(f"tools.{child.name}.{sub}")
-                        self._register_module_tools(submod)
-                    except ImportError as e:
-                        if sub == "tool":
-                            self._register_phantom_tool(child / "tool.py", str(e))
-                    except Exception:
-                        pass
-                continue
-
-            # If it's a top-level .py module file, import it
-            if child.is_file() and child.suffix == '.py':
-                module_name = f"tools.{child.stem}"
-                try:
-                    module = importlib.import_module(module_name)
-                    self._register_module_tools(module)
-                except ImportError as e:
-                    log.dual_log(tag="Registry:Load", message=f"ImportError in {module_name}: {e}. Creating PhantomTool.", level="WARNING")
-                    self._register_phantom_tool(child, str(e))
-                except Exception as e:
-                    log.dual_log(tag="Registry:Load", message=f"Failed to import public tool module {module_name}: {e}", level="DEBUG", payload={"module": module_name})
-                continue
-
-    def _register_phantom_tool(self, file_path: Path, error_msg: str):
-        """Register a PhantomTool when a real tool fails to import due to missing dependencies."""
-        import ast
-        if not file_path.exists():
-            return
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                tree = ast.parse(f.read(), filename=str(file_path))
-            
-            tool_name = None
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name) and target.id == "name":
-                            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                                tool_name = node.value.value
-                                break
-            
-            if tool_name:
-                class PhantomTool(BaseTool):
-                    name = tool_name
-                    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
-                        return f"SYSTEM ERROR: This tool is OFFLINE. Missing dependency: {error_msg}"
                 
-                self._tools[tool_name] = {
-                    "cls": PhantomTool,
-                    "input_schema": {"type": "object", "properties": {}, "required": []},
-                    "module": str(file_path),
-                    "description": f"⚠️ OFFLINE: Missing Dependency ({error_msg})",
-                }
-                log.dual_log(tag="Registry:Phantom", message=f"Registered PhantomTool: {tool_name}", level="WARNING")
-        except Exception as e:
-            log.dual_log(tag="Registry:Phantom", message=f"Failed to parse AST for {file_path}: {e}", level="DEBUG")
+            module_name = f"tools.{child.name}"
+            try:
+                module = importlib.import_module(module_name)
+                self._register_module_tools(module)
+            except Exception as e:
+                log.dual_log(tag="Registry:Load", message=f"Failed to import tool package {module_name}: {e}", level="WARNING", payload={"module": module_name})
+
+            # Attempt to import conventional submodules inside the package
+            for sub in ("tool", "Skill"):
+                try:
+                    submod = importlib.import_module(f"tools.{child.name}.{sub}")
+                    self._register_module_tools(submod)
+                except Exception:
+                    pass
+
 
     def _register_module_tools(self, module):
         # Attempt to capture INPUT_MODEL.schema() if provided by the module.

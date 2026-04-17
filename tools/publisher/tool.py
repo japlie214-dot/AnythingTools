@@ -1,62 +1,59 @@
-"""tools/publisher/new_tool.py
+"""tools/publisher/tool.py
 
-Publisher Tool - Mode Initializer for Herald Mode.
-
-Validates inputs and instantiates the Unified Agent in Herald mode.
+Publisher Tool - Translates and delivers curated intelligence via Producer-Consumer pipeline.
 """
 
+import json
+import sqlite3
 from typing import Any
+from pydantic import BaseModel, Field
+
 from tools.base import BaseTool
-from bot.core.agent import UnifiedAgent
+from database.connection import DatabaseManager
+from utils.telegram_publisher import PublisherPipeline
+
+
+class PublisherInput(BaseModel):
+    batch_id: str = Field(..., description="The unique ULID of the batch to publish.")
 
 
 class PublisherTool(BaseTool):
-    """
-    Publisher Tool entry point. Instantiates the Unified Agent in Herald Mode.
-    
-    Input arguments:
-        batch_id (str, required): The batch ID to publish
-    """
+    """Publisher Tool: Translates and delivers curated intelligence via Producer-Consumer pipeline."""
     
     name = "publisher"
+    INPUT_MODEL = PublisherInput
     
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return False
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
-        """Entry point for Publisher. Validates inputs and spawns Herald Agent."""
-        
-        # Extract required identifiers
-        job_id = kwargs.get("job_id")
-        session_id = kwargs.get("session_id")
-        
-        if not job_id:
-            return "Error: job_id is required."
-        
-        if not session_id:
-            session_id = "0"
-        
-        # Extract arguments
         batch_id = args.get("batch_id")
         if not batch_id:
-            return "Error: batch_id is required."
+            return json.dumps({"error": "batch_id is required."})
+
+        conn = DatabaseManager.get_read_connection()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT raw_json_path, curated_json_path FROM broadcast_batches WHERE batch_id = ?", (batch_id,)).fetchone()
         
-        # Normalize session_id
-        session_id = str(session_id)
-        
-        # Pass all args to agent
-        agent_args = args.copy()
-        
-        # Instantiate Unified Agent in Herald mode
-        agent = UnifiedAgent(
-            job_id=job_id,
-            session_id=session_id,
-            initial_mode="Herald"
-        )
-        
+        if not row or not row["curated_json_path"] or not row["raw_json_path"]:
+            return json.dumps({"error": "Batch not found or missing data."})
+            
         try:
-            result = await agent.run(telemetry, **agent_args)
-            return result.get("result", result.get("message", "Publisher execution complete."))
+            with open(row["curated_json_path"], "r", encoding="utf-8") as f:
+                top_10 = json.load(f)
+            with open(row["raw_json_path"], "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
         except Exception as e:
-            return f"### ❌ Publisher Failed\n{str(e)}"
+            return json.dumps({"error": f"File read error: {e}"})
+
+        # Inventory is everything in raw_data not in top_10
+        top_10_ulids = {item.get("ulid") for item in top_10}
+        inventory = []
+        for v in (raw_data.values() if isinstance(raw_data, dict) else raw_data):
+            if isinstance(v, dict) and v.get("ulid") not in top_10_ulids:
+                inventory.append(v)
+
+        pipeline = PublisherPipeline(batch_id, top_10, inventory)
+        await pipeline.run_pipeline()
         
+        return json.dumps({"status": "SUCCESS", "message": f"Batch {batch_id} published successfully."})

@@ -47,11 +47,12 @@ def require_api_key(request: Request):
 
 
 def get_session_id(request: Request) -> str:
-    return request.headers.get("x-session-id") or request.headers.get("X-Session-ID") or "0"
+    return "0"  # Hardcoded fallback for legacy DB constraints
 
 
 @router.post("/tools/{tool_name}", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
-async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, _=Depends(require_api_key), session_id: str = Depends(get_session_id)):
+async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request, _=Depends(require_api_key)):
+    session_id = "0"  # Hardcoded fallback for legacy DB constraints
     # Refresh registry so code changes are visible
     REGISTRY.load_all()
     meta = REGISTRY._tools.get(tool_name)
@@ -212,14 +213,6 @@ async def delete_job(job_id: str, request: Request, _=Depends(require_api_key)):
         return {"job_id": job_id, "status": "CANCELLING"}
 
 
-@router.delete("/sessions/{session_id}/memory", status_code=status.HTTP_202_ACCEPTED)
-async def clear_session_memory(session_id: str, _=Depends(require_api_key)):
-    """Permanently deletes the execution ledger memory for a given session."""
-    try:
-        enqueue_write("DELETE FROM execution_ledger WHERE session_id = ?", (session_id,))
-        return {"status": "SUCCESS", "message": f"Memory for session {session_id} cleared."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/metrics")

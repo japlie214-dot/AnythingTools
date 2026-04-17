@@ -10,7 +10,7 @@ import threading
 import time
 import json
 import asyncio
-from typing import Dict, Set
+from typing import Dict, Set, Any
 from datetime import datetime, timezone
 
 import config
@@ -20,7 +20,10 @@ from database.writer import append_to_ledger, enqueue_write
 from utils.id_generator import ULID
 from utils.context_helpers import spawn_thread_with_context
 from tools.registry import REGISTRY
-from bot.core.agent import UnifiedAgent
+import httpx
+import base64
+import os
+import mimetypes
 
 log = get_dual_logger(__name__)
 
@@ -30,7 +33,7 @@ def now_iso() -> str:
 
 
 class UnifiedWorkerManager:
-    """Poll jobs table and execute via Unified Agent with caller locks."""
+    """Poll jobs table and execute tools directly."""
     
     def __init__(self, poll_interval: float = 1.0):
         import collections
@@ -38,7 +41,6 @@ class UnifiedWorkerManager:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._active_jobs: Dict[str, threading.Thread] = {}
-        self._active_callers: Set[str] = set()
         self._system_errors = collections.defaultdict(int)
 
     def start(self) -> None:
@@ -55,7 +57,7 @@ class UnifiedWorkerManager:
             self._thread.join(timeout=timeout)
 
     def _run_loop(self) -> None:
-        """Poll for jobs and spawn execution threads."""
+        """Poll for jobs and spawn execution threads (no session locks)."""
         while not self._stop_event.is_set():
             try:
                 # Refresh registry for new tools
@@ -84,13 +86,6 @@ class UnifiedWorkerManager:
                 except Exception:
                     args = {}
 
-                # Session-Level Lock: prevent concurrent execution for same session_id
-                if session_id in self._active_callers:
-                    continue
-
-                # Register session as active
-                self._active_callers.add(session_id)
-                
                 # Mark job as RUNNING
                 ts = now_iso()
                 enqueue_write(
@@ -119,24 +114,29 @@ class UnifiedWorkerManager:
             time.sleep(self.poll_interval)
 
     def _run_job(self, job_id: str, session_id: str, tool_name: str, args: dict) -> None:
-        """Execute a single job using the Unified Agent."""
+        """Execute a single job using direct tool invocation."""
         try:
-            # Map public tool to initial mode
-            mode_map = {
-                "research": "Analyst",
-                "scraper": "Scout",
-                "finance": "Quant",
-                "draft_editor": "Editor",
-                "publisher": "Herald"
-            }
-            initial_mode = mode_map.get(tool_name, "Analyst")
-
             async def telemetry_cb(update):
                 """Placeholder telemetry callback."""
                 pass
 
-            agent = UnifiedAgent(job_id, session_id, initial_mode)
-            result = asyncio.run(agent.run(telemetry_cb, tool_name=tool_name, **args))
+            attachments = []
+            tool_instance = REGISTRY.create_tool_instance(tool_name)
+            if not tool_instance:
+                result = {"status": "FAILED", "result": f"Tool {tool_name} not found"}
+            else:
+                from bot.engine.tool_runner import run_tool_safely
+                res = asyncio.run(run_tool_safely(tool_instance, args, telemetry_cb, job_id=job_id, session_id=session_id))
+                attachments = res.attachment_paths or []
+                if res.success:
+                    # Attempt to parse JSON output for structured payloads
+                    try:
+                        parsed = json.loads(res.output)
+                        result = {"status": "COMPLETED", "result": parsed}
+                    except Exception:
+                        result = {"status": "COMPLETED", "result": res.output}
+                else:
+                    result = {"status": "FAILED", "result": res.output}
 
             # Normalize result to a plain dict. Defensive handling is important
             # because some code paths (or regressions) may accidentally return a
@@ -167,6 +167,14 @@ class UnifiedWorkerManager:
                 "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
                 (status_str, payload_json, now_iso(), job_id),
             )
+
+            # Invoke AnythingLLM callback for completed jobs (non-blocking best-effort)
+            if status_str == "COMPLETED":
+                try:
+                    self._invoke_anythingllm_callback(job_id, normal.get("result"), attachments)
+                except Exception:
+                    # Callback failures must not break worker execution
+                    pass
             
             # Reset errors on success
             if job_id in self._system_errors:
@@ -191,11 +199,66 @@ class UnifiedWorkerManager:
                     enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("INTERRUPTED", now_iso(), job_id))
             
         finally:
-            # Always clean up session lock
-            if session_id in self._active_callers:
-                self._active_callers.remove(session_id)
             if job_id in self._active_jobs:
                 del self._active_jobs[job_id]
+
+    def _invoke_anythingllm_callback(self, job_id: str, tool_output: Any, attachment_paths: list[str]) -> None:
+        """Send the tool output and attachments back to AnythingLLM via HTTP POST.
+
+        Files are Base64-encoded and included as data URIs to avoid multipart complexity.
+        """
+        if not getattr(config, "ANYTHINGLLM_BASE_URL", None) or not getattr(config, "ANYTHINGLLM_API_KEY", None):
+            return
+
+        url = f"{config.ANYTHINGLLM_BASE_URL.rstrip('/')}/api/v1/workspace/{config.ANYTHINGLLM_WORKSPACE_SLUG}/chat"
+        headers = {"Authorization": f"Bearer {config.ANYTHINGLLM_API_KEY}", "Content-Type": "application/json"}
+
+        attachments_payload = []
+        for path in (attachment_paths or []):
+            try:
+                if not os.path.exists(path):
+                    continue
+                ext = os.path.splitext(path)[1].lower()
+                mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+                with open(path, "rb") as f:
+                    b64_data = base64.b64encode(f.read()).decode("utf-8")
+                attachments_payload.append({
+                    "name": os.path.basename(path),
+                    "mime": mime,
+                    "contentString": f"data:{mime};base64,{b64_data}",
+                })
+            except Exception as e:
+                try:
+                    log.dual_log(tag="Worker:Callback:File", message=f"Failed to encode {path}: {e}", level="WARNING")
+                except Exception:
+                    pass
+
+        # Construct the payload. TOOL_RESULT_CORRELATION_ID ensures the caller can match callbacks.
+        try:
+            payload_body = json.dumps(tool_output, ensure_ascii=False) if not isinstance(tool_output, str) else tool_output
+        except Exception:
+            payload_body = str(tool_output)
+
+        callback_payload = {
+            "message": f"TOOL_RESULT_CORRELATION_ID:{job_id}\n\n{payload_body}",
+            "mode": "chat",
+            "attachments": attachments_payload,
+            "reset": False,
+        }
+
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(url, json=callback_payload, headers=headers)
+                resp.raise_for_status()
+            try:
+                log.dual_log(tag="Worker:Callback:Success", message=f"Callback delivered for {job_id} (Files: {len(attachments_payload)})")
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                log.dual_log(tag="Worker:Callback:Error", message=f"AnythingLLM callback failed: {str(e)}", level="ERROR")
+            except Exception:
+                pass
 
 
 # Module-level singleton

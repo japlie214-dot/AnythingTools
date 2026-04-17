@@ -94,17 +94,22 @@ def mark_paused_for_hitl(
 
 
 def pause_for_hitl(message: str) -> None:
-    """Transitions the job to PAUSED_FOR_HITL, safely releases browser lock, and halts execution."""
-    from utils.browser_lock import browser_lock
-    browser_lock.safe_release()
-    
-    log.dual_log(
-        tag="HITL:Pause",
-        message=message,
-        status_state="PAUSED_FOR_HITL",
-        level="WARNING",
-        notify_user=True,
-    )
-    
-    # Raise a special exception that the UnifiedWorkerManager catches
-    raise Exception(f"PAUSED_FOR_HITL:{message}")
+    """Blocks the worker thread until the operator resolves the challenge.
+
+    Important: Do NOT release the shared browser_lock here. Holding the lock
+    prevents other worker threads from hijacking the browser while the operator
+    interacts with the UI. This function intentionally performs only a
+    synchronous input() call and returns; the caller retains responsibility for
+    lock handling and job lifecycle.
+    """
+    print(f"\n\n[!!!] HITL ALERT: {message}")
+    print(">>> Solve the CAPTCHA/Blocker in the browser window.")
+    print(">>> Press ENTER to resume, or type 'cancel' to kill the job.")
+
+    try:
+        user_input = input("Decision: ").strip().lower()
+    except EOFError:
+        user_input = "cancel"
+
+    if user_input == "cancel":
+        raise Exception("USER_CANCELLED: Job terminated by operator.")

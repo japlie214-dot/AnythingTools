@@ -21,21 +21,6 @@ from pathlib import Path
 import config as config_module
 
 
-async def prefetch_paddleocr():
-    try:
-        def _init_ocr():
-            from paddleocr import PaddleOCR
-            PaddleOCR(
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False
-            )
-        await asyncio.to_thread(_init_ocr)
-        from utils.logger.core import get_dual_logger
-        get_dual_logger(__name__).dual_log(tag="Sys:Startup:OCR", message="PaddleOCR models pre-fetched successfully.")
-    except Exception as e:
-        from utils.logger.core import get_dual_logger
-        get_dual_logger(__name__).dual_log(tag="Sys:Startup:OCR", message=f"Failed to pre-fetch PaddleOCR: {e}", level="WARNING")
 
 try:
     import psutil
@@ -295,18 +280,18 @@ async def lifespan(app: FastAPI):
         # If browser modules are unavailable entirely, continue silently.
         pass
 
-    # 5) Startup Recovery Scan: mark RUNNING jobs as INTERRUPTED (best-effort)
+    # 5) Startup Recovery Scan: auto-resume RUNNING/INTERRUPTED jobs by requeuing them
     try:
         import sqlite3
 
         conn = DatabaseManager.get_read_connection()
         conn.row_factory = sqlite3.Row
-        for row in conn.execute("SELECT job_id FROM jobs WHERE status = 'RUNNING'").fetchall():
+        for row in conn.execute("SELECT job_id FROM jobs WHERE status IN ('RUNNING', 'INTERRUPTED')").fetchall():
             enqueue_write(
-                "UPDATE jobs SET status = 'INTERRUPTED', updated_at = datetime('now') WHERE job_id = ?",
+                "UPDATE jobs SET status = 'QUEUED', updated_at = datetime('now') WHERE job_id = ?",
                 (row['job_id'],),
             )
-        log.dual_log(tag="DB:Recovery", message="Startup recovery scan complete.")
+        log.dual_log(tag="DB:Recovery", message="Startup recovery scan complete. Stale jobs requeued.")
     except Exception as e:
         log.dual_log(tag="DB:Recovery", message="Recovery scan error.", level="ERROR", exc_info=e)
 
@@ -336,24 +321,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.dual_log(tag="Sys:Registry", message="Tool registry load failed.", level="WARNING", exc_info=e)
 
-    # 7) Pre-fetch PaddleOCR models
-    try:
-        asyncio.create_task(prefetch_paddleocr())
-    except Exception:
-        pass
-
-    # 8) Background: reconcile any pending embeddings
+    # 7) Background: reconcile any pending embeddings
     try:
         asyncio.create_task(reconcile_pending_embeddings())
     except Exception:
         pass
-
-    # 9) Background: Telegram orphan handshake
-    try:
-        from api.telegram_client import TelegramBot
-        asyncio.create_task(TelegramBot.run_orphan_handshake())
-    except Exception as e:
-        logging.exception("Failed to start Telegram Handshake task: %s", e)
 
     yield
 

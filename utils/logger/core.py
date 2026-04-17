@@ -1,14 +1,8 @@
 # utils/logger/core.py
-import asyncio
-import hashlib
 import json
 import logging
-import threading
-# timedelta is REQUIRED for the debounce comparison in dual_log().
-# The original monolith imported it at the top level; omitting it here
-# causes NameError at the first WARNING/ERROR/CRITICAL dispatch.
-from datetime import datetime, timezone, timedelta
 from typing import Any
+from datetime import datetime, timezone
 
 from utils.id_generator import ULID
 from utils.logger.formatters import _serialize_payload
@@ -21,21 +15,10 @@ from utils.logger.handlers import (
 )
 from utils.logger.routing import LOG_MAP, _LOG_DIR
 from utils.logger.state import (
-    _debounce_dict,
-    _debounce_lock,
-    _debugger_log_buffer,
     _log_config,
     _tool_log_buffer,
     _current_job_id,  # imported for dual_log state sync
 )
-
-# Module-alias import for _debugger_main_loop specifically.
-# This variable requires rebinding (not in-place mutation), so it must be
-# accessed via the module object: `_state_mod._debugger_main_loop = loop`.
-# A direct `from utils.logger.state import _debugger_main_loop` would give a
-# local alias pointing at the original None; subsequent rebinding inside this
-# module would be invisible to all other readers.
-import utils.logger.state as _state_mod
 
 _logger_cache: dict[str, "SumAnalLogger"] = {}
 
@@ -145,99 +128,7 @@ class SumAnalLogger:
                 )
 
             if notify_user:
-                try:
-                    from api.telegram_notifier import send_notification
-                    formatted = f"[{status_state or level.upper()}] {tag} — {message}"
-                    try:
-                        _loop = asyncio.get_running_loop()
-                        _loop.create_task(send_notification(formatted))
-                    except RuntimeError:
-                        # Fallback spawn in a small daemon thread
-                        threading.Thread(
-                            target=lambda: asyncio.run(send_notification(formatted)),
-                            name=f"Notifier-{job_id}",
-                            daemon=True,
-                        ).start()
-                except Exception:
-                    # Do not break logging if notifier fails
-                    pass
-
-        # ── Debugger Agent: Step 1 — Unconditional buffer append ─────────────
-        _debugger_log_buffer.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            "level":     level.upper(),
-            "tag":       tag,
-            "message":   message,
-            "payload":   _serialize_payload(payload),
-        })
-
-        # ── Step 2 — Level gate ───────────────────────────────────────────────
-        if level_int < logging.WARNING:
-            return
-
-        # ── Step 3 — Infinite Loop Guard ──────────────────────────────────────
-        if tag.startswith("Debugger:"):
-            return
-
-        # ── Step 4 — Warning toggle ───────────────────────────────────────────
-        _trigger_on_warn = (
-            getattr(_log_config, "DEBUGGER_AGENT_TRIGGER_ON_WARNING", True)
-            if _log_config else True
-        )
-        if level_int == logging.WARNING and not _trigger_on_warn:
-            return
-
-        # ── Step 5 — Atomic debounce ──────────────────────────────────────────
-        _debounce_key = hashlib.sha256(f"{tag}::{message}".encode("utf-8")).hexdigest()
-        _now = datetime.now(timezone.utc)
-        with _debounce_lock:
-            _last = _debounce_dict.get(_debounce_key)
-            if _last and (_now - _last) < timedelta(minutes=3):
-                return
-            _debounce_dict[_debounce_key] = _now
-
-        # ── Step 6 — Thread-safe snapshot ────────────────────────────────────
-        while True:
-            try:
-                _snapshot = list(_debugger_log_buffer)
-                break
-            except RuntimeError:
-                pass
-
-        # ── Step 7 — Three-tier dispatch ──────────────────────────────────────
-        # Deferred import breaks the core ↔ debugger_agent circular dependency
-        # at module load time. sys.modules caches it after the first call.
-        from utils.debugger_agent import run_debugger_agent  # noqa: PLC0415
-
-        # Tier 1 — caller is on the event-loop thread.
-        try:
-            _loop = asyncio.get_running_loop()
-            if _state_mod._debugger_main_loop is None:
-                _state_mod._debugger_main_loop = _loop  # lazily capture for Tier 2
-            _loop.create_task(run_debugger_agent(tag, _snapshot))
-            return
-        except RuntimeError:
-            pass  # not in a running loop on this thread
-
-        # Tier 2 — caller is a background thread; main loop is alive elsewhere.
-        if (
-            _state_mod._debugger_main_loop is not None
-            and _state_mod._debugger_main_loop.is_running()
-        ):
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    run_debugger_agent(tag, _snapshot),
-                    _state_mod._debugger_main_loop,
-                )
-                return
-            except Exception:
-                pass  # loop stopped between check and call
-
-        # Tier 3 — no usable loop reference; spin up an isolated daemon thread.
-        def _fallback_runner() -> None:
-            asyncio.run(run_debugger_agent(tag, _snapshot))
-
-        threading.Thread(target=_fallback_runner, daemon=True).start()
+                pass # Telegram notifier removed for pure tool-hosting environment.
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
