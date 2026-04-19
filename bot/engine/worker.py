@@ -173,8 +173,8 @@ class UnifiedWorkerManager:
                 (status_str, payload_json, now_iso(), job_id),
             )
 
-            # Invoke AnythingLLM callback for completed jobs (non-blocking best-effort)
-            if status_str == "COMPLETED":
+            # Invoke AnythingLLM callback for completed and partial jobs (non-blocking best-effort)
+            if status_str in ("COMPLETED", "PARTIAL"):
                 try:
                     self._invoke_anythingllm_callback(job_id, normal.get("result"), attachments)
                 except Exception:

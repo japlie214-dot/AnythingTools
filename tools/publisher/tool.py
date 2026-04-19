@@ -63,9 +63,12 @@ class PublisherTool(BaseTool):
         
         enqueue_write("UPDATE broadcast_batches SET status = 'PUBLISHING', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?", (batch_id,))
         try:
-            await pipeline.run_pipeline()
-            enqueue_write("UPDATE broadcast_batches SET status = 'COMPLETED', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?", (batch_id,))
-            return json.dumps({"status": "SUCCESS", "message": f"Batch {batch_id} published successfully."})
+            result = await pipeline.run_pipeline()
+            return json.dumps({
+                "status": result["batch_status"],
+                "message": f"Batch {batch_id}: {result['archive_posted']}/{result['total_items']} published, {result['translation_failed']} failed",
+                **result
+            }, ensure_ascii=False)
         except Exception as e:
             enqueue_write("UPDATE broadcast_batches SET status = 'PARTIAL', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?", (batch_id,))
             raise e

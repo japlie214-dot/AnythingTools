@@ -10,7 +10,7 @@ API_KEY: str = os.getenv("API_KEY", "dev_default_key_change_me_in_production")
 ANYTHINGTOOLS_PORT: int = int(os.getenv("ANYTHINGTOOLS_PORT", "8000"))
 
 # --- Telegram Push Notifications (Optional) ---
-TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN", "7772650631:AAGg5cT76mj_kWi5_5UnL9q7fbm9iJlXzEw")
 # TELEGRAM_USER_ID is now dynamically bound via startup handshake.
 
 # --- Browser / Chrome Data Dir ---
@@ -58,6 +58,6 @@ ANYTHINGLLM_BASE_URL: str = os.getenv("ANYTHINGLLM_BASE_URL", "http://localhost:
 ANYTHINGLLM_WORKSPACE_SLUG: str = os.getenv("ANYTHINGLLM_WORKSPACE_SLUG", "my-workspace")
 
 # --- Telegram Destination Routing ---
-TELEGRAM_BRIEFING_CHAT_ID: str | None = os.getenv("TELEGRAM_BRIEFING_CHAT_ID")
-TELEGRAM_ARCHIVE_CHAT_ID: str | None = os.getenv("TELEGRAM_ARCHIVE_CHAT_ID")
+TELEGRAM_BRIEFING_CHAT_ID: str | None = os.getenv("TELEGRAM_BRIEFING_CHAT_ID", "-1001832461600")
+TELEGRAM_ARCHIVE_CHAT_ID: str | None = os.getenv("TELEGRAM_ARCHIVE_CHAT_ID", "-1002574049512")
 TELEGRAM_MESSAGE_DELAY: float = float(os.getenv("TELEGRAM_MESSAGE_DELAY", "3.1"))

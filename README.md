@@ -4,12 +4,13 @@
 
 **AnythingTools** is a deterministic tool-hosting service that executes four whitelisted tools via HTTP API. The system has evolved from autonomous agent architecture into a direct execution engine with robust state management, automatic database recovery, and resume-capable pipelines.
 
-**Current Schema Version:** 3 via migration system (target: 4)  
-**Architecture:** Single-writer SQLite with WAL mode, autonomous migration management  
-**Tool Count:** 4 (scraper, draft_editor, batch_reader, publisher)  
-**Resume Capability:** Full granular tracking via job_items table  
-**Auto-Repair:** Schema-aware automatic recovery for 17 core tables  
+**Current Schema Version:** 4 via migration system (target: 5)
+**Architecture:** Single-writer SQLite with WAL mode, autonomous migration management
+**Tool Count:** 4 (scraper, draft_editor, batch_reader, publisher)
+**Resume Capability:** Full granular tracking via job_items table
+**Auto-Repair:** Schema-aware automatic recovery for 17 core tables
 **Migration System:** Domain-driven schema, auto-folding to 3-file limit, transaction safety with rollback guards
+**Publisher Status:** Queue-with-requeue architecture, PARTIAL status support, item-centric tracking
 
 ---
 
@@ -30,7 +31,9 @@ The system transitioned from autonomous agent loops to deterministic execution:
 - Hardcoded tool whitelist (4 tools only)
 - Controlled LLM usage (Publisher translation only)
 - State machine with resume capability
-- **Database Migration System** (NEW) - Autonomous migration management
+- **Database Migration System** - Autonomous migration management
+- **Publisher Queue Architecture** - Item-centric requeue with PARTIAL status support
+- **v004 + v005 Migrations** - Metadata conversion and PARTIAL status addition
 
 ### 1.2 High-Level Data Flow
 
@@ -76,7 +79,12 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Anyt
 }
 ```
 
-**Status States:** `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLING`, `INTERRUPTED`, `PAUSED_FOR_HITL`, `ABANDONED`
+**Status States:** `QUEUED`, `RUNNING`, `COMPLETED`, `PARTIAL`, `FAILED`, `CANCELLING`, `INTERRUPTED`, `PAUSED_FOR_HITL`, `ABANDONED`
+
+**Batch Status Calculation (Publisher):**
+- `COMPLETED`: 100% of valid items translated AND all briefings and archives posted
+- `PARTIAL`: Some success, some failures (mixed outcomes)
+- `FAILED`: 0 translations succeeded with translation failures, OR all items invalid
 
 #### `api/schemas.py`
 Pydantic models for input validation of all four tools.
@@ -102,9 +110,14 @@ def _run_job(self, job_id, session_id, tool_name, args, cancellation_flag):
     # 2. Run tool_safely with cancellation flag
     # 3. Parse result (JSON or string)
     # 4. Update job status
-    # 5. Invoke AnythingLLM callback (if completed)
+    # 5. Invoke AnythingLLM callback (if COMPLETED or PARTIAL)
     # 6. Handle crashes (3 strikes → ABANDONED)
 ```
+
+**Worker Callback Logic:**
+- Triggers on `COMPLETED` or `PARTIAL` status
+- Ensures LLM integration receives partial completion data
+- Callbacks are best-effort, failures don't break worker execution
 
 **Startup Recovery (lines 284-296 in `app.py`):**
 - Scans for `RUNNING` and `INTERRUPTED` jobs
@@ -184,7 +197,7 @@ def init_db() -> None:
 
 **Critical Change:** No longer contains embedded migration logic. Delegates to `database/migrations/`.
 
-#### `database/migrations/` - NEW Migration System
+#### `database/migrations/` - Migration System
 
 **Purpose:** Autonomous migration management with safety guarantees
 
@@ -195,6 +208,10 @@ def init_db() -> None:
 - `run_migrations(conn)` - Safe execution with backup/restore
 - `_discover_migrations()` - Sequential version validation
 - `get_latest_version()` - Migration version discovery
+
+**Current Migrations:**
+- `v004_step_to_metadata.py` - Converts `step_identifier` to `item_metadata` JSON (v3 → v4)
+- `v005_jobs_partial.py` - Adds `PARTIAL` status to jobs table (v4 → v5)
 
 **Safety Mechanisms:**
 - **WAL Checkpoint:** `PRAGMA wal_checkpoint(TRUNCATE)` before migration
@@ -298,8 +315,18 @@ def add_job_item(job_id: str, item_metadata: str, input_data: str) -> None: ...
 **Updated Functions:**
 - `create_job()` - Creates job with tool name and args
 - `add_job_item()` - Persists JSON metadata
-- `update_item_status()` - Updates status with JSON
+- `update_item_status()` - Updates status with JSON AND metadata (overwrites metadata)
 - `get_interrupted_job()` - Resume discovery
+
+**Critical Change in v005:**
+```python
+# BEFORE (v004):
+"UPDATE job_items SET status = ?, output_data = ?, updated_at = ?..."
+
+# AFTER (v005):
+"UPDATE job_items SET status = ?, output_data = ?, updated_at = ?, item_metadata = ?..."
+# This ensures retry counts and metadata changes persist across updates
+```
 
 #### `database/reader.py` - Read Operations
 
@@ -625,25 +652,67 @@ ORDER BY v.distance ASC
 ```
 
 **Execution Flow:**
-1. Check `broadcast_batches.status` → early return if `COMPLETED`
-2. Set status to `PUBLISHING`
-3. Spawn `PublisherPipeline(batch_id, top_10, inventory, job_id)`
-4. Run 3-phase pipeline
-5. On success: Set status `COMPLETED`
-6. On exception: Set status `PARTIAL`, re-raise
+1. Read batch from `broadcast_batches` (loads `top_10` and `inventory`)
+2. Spawn `PublisherPipeline(batch_id, top_10, inventory, job_id)`
+3. Run pipeline (returns status dict)
+4. Update `broadcast_batches` with accurate status (COMPLETED/PARTIAL/FAILED)
+
+**Publisher Pipeline Architecture (Complete Rewrite):**
+
+**Phase 0: Validation**
+- Validates all articles for ULID and title
+- Records skipped items in database
+- Populates `valid_articles` and `skipped_articles`
+
+**Phase 1: Translation with Queue-with-Requeue**
+```python
+# Uses deque for O(1) operations
+# Processes in batches of 10
+# Tracks retry counts per item
+# Loads cached translations from job_items
+# Requeues failed items up to MAX_TRANSLATION_RETRIES=3
+# Returns detailed metrics on completion
+```
+
+**Phase 2: Briefing Upload (Top-10)**
+- Target: `TELEGRAM_BRIEFING_CHAT_ID` (default: -1001832461600)
+- **2 messages per article**:
+  1. Link URL
+  2. `<b>{title}</b>\n\n{summary}\n\n<b>Conclusion:</b> {conclusion}`
+- Idempotent: Skips already-posted items
+
+**Phase 3: Archive Upload (All Valid)**
+- Target: `TELEGRAM_ARCHIVE_CHAT_ID` (default: -1002574049512)
+- **2 messages per article**:
+  1. Link URL
+  2. `<b>{title}</b>\n\n<b>Conclusion:</b> {conclusion}\n\n<b>Summary:</b>\n{summary}`
+- Idempotent: Skips already-posted items
+
+**Phase 4: Finalization**
+- Calculates `batch_status` based on complete metrics
+- Updates `broadcast_batches` with status and posted ULIDs
+- Logs detailed summary
+- Returns result dict
+
+**Key Features:**
+- **Set tracking works in all contexts** (with/without job_id)
+- **Accurate status calculation** prevents false COMPLETED
+- **Full translation required** (title + summary + conclusion)
+- **Partial failures don't block success** (pipeline proceeds)
+- **Item-centric retry tracking** via job_items table
 
 ---
 
 ## 5. Database Architecture
 
-### 5.1 Schema v3 Complete Structure
+### 5.1 Schema v4 Complete Structure (Current - After v004 Migration)
 
 ```sql
 -- Core Tables
-jobs                    -- Job lifecycle
-job_items               -- Step tracking (JSON metadata)
+jobs                    -- Job lifecycle, CHECK(status IN (...,'PARTIAL',...))
+job_items               -- Step tracking (JSON metadata, item_metadata TEXT)
 job_logs                -- Structured logs
-broadcast_batches       -- Batch metadata
+broadcast_batches       -- Batch metadata, CHECK(status IN (...,'PARTIAL',...))
 
 -- Scraper Tables
 scraped_articles        -- Raw content
@@ -658,6 +727,14 @@ token_usage             -- LLM cost tracking
 
 -- Support Tables (10 more)
 ```
+
+**Schema Changes from v3 to v4 (v004_step_to_metadata.py):**
+- `job_items.step_identifier` → `job_items.item_metadata` (JSON)
+- New indexes: `idx_job_items_meta_step`, `idx_job_items_meta_ulid`
+
+**Schema Changes from v4 to v5 (v005_jobs_partial.py):**
+- `jobs.status` CHECK constraint adds `'PARTIAL'`
+- `job_items` updated to persist metadata on status updates
 
 ### 5.2 Migration System Architecture
 
@@ -717,7 +794,7 @@ PENDING → RUNNING → COMPLETED/FAILED
 - `publish_briefing` - Top-10 delivery
 - `publish_archive` - Full inventory delivery
 
-**Metadata Structure (Version 4):**
+**Metadata Structure (Version 4+):**
 ```json
 {
   "step": "translate",
@@ -729,6 +806,12 @@ PENDING → RUNNING → COMPLETED/FAILED
   "error": "Timeout after 3 attempts"
 }
 ```
+
+**Step Types (Publisher):**
+- `"validate"` - Article validation (pre-translation)
+- `"translate"` - Article translation (Title/Summary/Conclusion)
+- `"publish_briefing"` - Top-10 delivery to briefing chat
+- `"publish_archive"` - Full inventory delivery to archive chat
 
 ### 5.5 Auto-Repair Dictionary
 
@@ -761,22 +844,58 @@ Example for `job_items`:
 
 ## 6. Data Flows & Pipelines
 
-### 6.1 Scraper → Publisher Pipeline
+### 6.1 Scraper → Publisher Pipeline (Current Architecture)
 
 ```
-1. Scraper creates batch
+1. Scraper creates batch with top_10 + inventory
    ↓
 2. Batch stored in broadcast_batches (PENDING)
    ↓
 3. Publisher tool invoked
    ↓
-4. Translation phase (job_items tracking)
+4. Phase 0: Validation
+   - Validate all articles (ULID + title)
+   - Separate valid_items from skipped_items
+   - Record skipped items in job_items (FAILED)
    ↓
-5. Briefing delivery (Top-10)
+5. Phase 1: Translation (Queue-with-Requeue)
+   - Load cached translations from job_items
+   - Queue remaining items (deque)
+   - Process in batches of 10
+   - Requeue failed items up to 3 times
+   - Track retry counts per item
    ↓
-6. Archive delivery (Full inventory)
+6. Phase 2: Briefing Upload
+   - Target: TELEGRAM_BRIEFING_CHAT_ID
+   - Process only top-10 items
+   - 2 messages per article (link + body)
+   - Skip if already posted (idempotent)
    ↓
-7. Status: COMPLETED
+7. Phase 3: Archive Upload
+   - Target: TELEGRAM_ARCHIVE_CHAT_ID
+   - Process all valid items
+   - 2 messages per article (link + body)
+   - Skip if already posted (idempotent)
+   ↓
+8. Phase 4: Finalization
+   - Calculate accurate batch_status:
+     * COMPLETED: 100% success
+     * PARTIAL: Mixed success/failure
+     * FAILED: All invalid or complete failure
+   - Update broadcast_batches
+   - Return metrics
+```
+
+**Batch Status Logic:**
+```python
+if len(valid_articles) == 0:
+    status = "FAILED"
+elif all_translated and all_briefings_posted and all_archives_posted:
+    status = "COMPLETED"
+elif translations == 0 and translation_failures > 0:
+    status = "FAILED"
+else:
+    status = "PARTIAL"
 ```
 
 ### 6.2 Resume Capability Flow
@@ -926,10 +1045,10 @@ ANYTHINGLLM_BASE_URL=http://localhost:3001
 ANYTHINGLLM_WORKSPACE_SLUG=my-workspace
 
 # Telegram (Publisher)
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_BRIEFING_CHAT_ID=...
-TELEGRAM_ARCHIVE_CHAT_ID=...
-TELEGRAM_MESSAGE_DELAY=3.1  # Rate limit
+TELEGRAM_BOT_TOKEN=...  # Default: 7772650631:AAGg5cT76mj_kWi5_5UnL9q7fbm9iJlXzEw
+TELEGRAM_BRIEFING_CHAT_ID=...  # Default: -1001832461600
+TELEGRAM_ARCHIVE_CHAT_ID=...   # Default: -1002574049512
+TELEGRAM_MESSAGE_DELAY=3.1  # Rate limit (enforced)
 
 # Browser
 CHROME_USER_DATA_DIR=chrome_profile

@@ -42,11 +42,11 @@ def add_job_item(job_id: str, item_metadata: str, input_data: str) -> None:
 
 def update_item_status(job_id: str, item_metadata: str, status: str, output_data: str) -> None:
     enqueue_write(
-        "UPDATE job_items SET status = ?, output_data = ?, updated_at = ? "
+        "UPDATE job_items SET status = ?, output_data = ?, updated_at = ?, item_metadata = ? "
         "WHERE job_id = ? "
         "AND json_extract(item_metadata, '$.step') = json_extract(?, '$.step') "
         "AND json_extract(item_metadata, '$.ulid') = json_extract(?, '$.ulid')",
-        (status, output_data, _utcnow(), job_id, item_metadata, item_metadata)
+        (status, output_data, _utcnow(), item_metadata, job_id, item_metadata, item_metadata)
     )
 
 
