@@ -14,6 +14,7 @@ from tools.scraper.persistence import (
 )
 from database.connection import DatabaseManager
 from utils.text_processing import normalize_url
+from utils.metadata_helpers import make_metadata
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
@@ -70,7 +71,9 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             "embedding_synced": False, "retryable": False,
         })
         for _lnk in deduped_urls:
-            _add_ji(job_id, normalize_url(_lnk), _init_meta)
+            _norm = normalize_url(_lnk)
+            _meta = make_metadata("scrape", _norm)
+            _add_ji(job_id, _meta, _init_meta)
 
     # Black Box boundary log (Rule 4 — layer-crossing data object).
     log.dual_log(
@@ -116,7 +119,9 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
         if job_id:
             _row = _read_conn.execute(
                 "SELECT status, output_data, input_data FROM job_items "
-                "WHERE job_id = ? AND step_identifier = ?",
+                "WHERE job_id = ? "
+                "AND json_extract(item_metadata, '$.step') = 'scrape' "
+                "AND json_extract(item_metadata, '$.ulid') = ?",
                 (job_id, _norm),
             ).fetchone()
             if _row:
@@ -165,7 +170,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
         )
 
         if job_id:
-            _upd(job_id, _norm, "RUNNING", json.dumps(_local_meta))
+            _upd(job_id, _meta, "RUNNING", json.dumps(_local_meta))
 
         # RESUME_EMBED_ONLY: validation and summarization confirmed from prior run.
         # Read the existing scraped_articles row and regenerate only the embedding.
@@ -195,7 +200,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                     )
                     _local_meta["embedding_synced"] = True
                     if job_id:
-                        _upd(job_id, _norm, "COMPLETED", json.dumps(_local_meta))
+                        _upd(job_id, _meta, "COMPLETED", json.dumps(_local_meta))
                     _stats["success"] += 1
                     results[link] = {
                         "status": "SUCCESS", "ulid": _existing["id"],
@@ -210,7 +215,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                     )
                     _local_meta["retryable"] = True
                     if job_id:
-                        _upd(job_id, _norm, "FAILED", json.dumps(_local_meta))
+                        _upd(job_id, _meta, "FAILED", json.dumps(_local_meta))
                     _stats["fail"] += 1
                     _stats["fail_reasons"].append(f"{link}: EmbedError")
             continue  # Skip normal process_article path in all RESUME_EMBED_ONLY cases.
@@ -226,12 +231,12 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             _persist_scraped_article(parsed_result)
             _local_meta["embedding_synced"] = True
             if job_id:
-                _upd(job_id, _norm, "COMPLETED", json.dumps(_local_meta))
+                _upd(job_id, _meta, "COMPLETED", json.dumps(_local_meta))
             _stats["success"] += 1
         else:
             _local_meta["retryable"] = True
             if job_id:
-                _upd(job_id, _norm, "FAILED", json.dumps(_local_meta))
+                _upd(job_id, _meta, "FAILED", json.dumps(_local_meta))
             _stats["fail"] += 1
             _stats["fail_reasons"].append(
                 f"{link}: {parsed_result.get('reason', 'Unknown')}"

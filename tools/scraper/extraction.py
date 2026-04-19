@@ -17,6 +17,7 @@ from utils.browser_utils import safe_google_get
 from utils.text_processing import clean_html_for_agent, parse_llm_json
 from tools.scraper.scraper_prompts import VALIDATION_PROMPT, SUMMARIZATION_PROMPT
 from utils.logger import get_dual_logger
+from utils.metadata_helpers import make_metadata
 
 log = get_dual_logger(__name__)
 
@@ -106,7 +107,8 @@ def process_article(
         if job_id and norm_url:
             import json as _json
             from database.job_queue import update_item_status
-            update_item_status(job_id, norm_url, status, _json.dumps(local_meta))
+            _meta = make_metadata("scrape", norm_url)
+            update_item_status(job_id, _meta, status, _json.dumps(local_meta))
 
     # Phase 2: Both prior sub-steps confirmed; signal caller to handle embed-only path.
     # This guard is a safety net; task.py's pre-loop check normally prevents reaching here.

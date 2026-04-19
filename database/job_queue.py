@@ -24,22 +24,29 @@ def create_job(session_id: str, tool_name: str, args_json: str) -> str:
     return job_id
 
 
-def add_job_item(job_id: str, step_identifier: str, input_data: str) -> None:
+def add_job_item(job_id: str, item_metadata: str, input_data: str) -> None:
     """Insert a job_item row via the async writer queue.
-    Idempotent via conditional insertion. Does not return an item_id to avoid blocking.
+    Idempotent via conditional insertion based on step and ulid.
     """
     enqueue_write(
-        "INSERT INTO job_items (job_id, step_identifier, input_data, updated_at) "
+        "INSERT INTO job_items (job_id, item_metadata, input_data, updated_at) "
         "SELECT ?, ?, ?, ? "
-        "WHERE NOT EXISTS (SELECT 1 FROM job_items WHERE job_id = ? AND step_identifier = ?)",
-        (job_id, step_identifier, input_data, _utcnow(), job_id, step_identifier)
+        "WHERE NOT EXISTS ("
+        "    SELECT 1 FROM job_items WHERE job_id = ? "
+        "    AND json_extract(item_metadata, '$.step') = json_extract(?, '$.step') "
+        "    AND json_extract(item_metadata, '$.ulid') = json_extract(?, '$.ulid')"
+        ")",
+        (job_id, item_metadata, input_data, _utcnow(), job_id, item_metadata, item_metadata)
     )
 
 
-def update_item_status(job_id: str, step_identifier: str, status: str, output_data: str) -> None:
+def update_item_status(job_id: str, item_metadata: str, status: str, output_data: str) -> None:
     enqueue_write(
-        "UPDATE job_items SET status = ?, output_data = ?, updated_at = ? WHERE job_id = ? AND step_identifier = ?",
-        (status, output_data, _utcnow(), job_id, step_identifier)
+        "UPDATE job_items SET status = ?, output_data = ?, updated_at = ? "
+        "WHERE job_id = ? "
+        "AND json_extract(item_metadata, '$.step') = json_extract(?, '$.step') "
+        "AND json_extract(item_metadata, '$.ulid') = json_extract(?, '$.ulid')",
+        (status, output_data, _utcnow(), job_id, item_metadata, item_metadata)
     )
 
 

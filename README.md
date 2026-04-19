@@ -1,595 +1,1083 @@
 # AnythingTools - Deterministic Tool Hosting Service
+  
+## Executive Summary
 
-## 1. Project Overview
+**AnythingTools** is a deterministic tool-hosting service that executes four whitelisted tools via HTTP API. The system has evolved from autonomous agent architecture into a direct execution engine with robust state management, automatic database recovery, and resume-capable pipelines.
 
-**What the system does:**
-This system functions as a deterministic tool-hosting service. It accepts HTTP API requests for specific tools, executes them in a stateless or state-managed manner, and returns results. It is designed to integrate with an external orchestrator (e.g., AnythingLLM) by providing a strictly defined set of capabilities.
-The legacy autonomous agent architecture (UnifiedAgent) has been fully quarantined and disabled. The system no longer performs autonomous reasoning loops, dynamic tool discovery, or uncontrolled LLM interaction.
+**Current Schema Version:** 3  
+**Architecture:** Single-writer SQLite with WAL mode  
+**Tool Count:** 4 (scraper, draft_editor, batch_reader, publisher)  
+**Resume Capability:** Full granular tracking via job_items table  
+**Auto-Repair:** Schema-aware automatic recovery for 17 core tables  
 
-**Concrete operational capabilities:**
-- **Scraper:** Programmatic web scouting with Intelligent Manifest generation and structured JSON output.
-- **Draft Editor:** Atomic list management for curation (Top 10 swaps and replacements).
-- **Batch Reader:** Vector search queries restricted to specific batch IDs.
-- **Publisher:** Translation and delivery via a Producer-Consumer pipeline with rate limiting.
-- **PDF Processing:** PDF parsing with vector embedding storage and semantic search.
+---
 
-**What it explicitly does NOT do:**
-- **No Autonomous Agents:** Does not contain an agent loop, reasoning engine, or dynamic persona switching.
-- **No Dynamic Tool Loading:** Only the four whitelisted tools are executable.
-- **No Legacy Features:** Finance analysis, research agents, polymarket trackers, quiz generators, and vector memory have been removed from the active execution path.
-- **No LLM Integration (Direct):** The core engine does not initiate LLM calls (except within the specific Publisher pipeline for translation).
+## 1. Architecture Overview
 
-## 2. High-Level Architecture
+### 1.1 System Evolution
 
-The system has been refactored from an autonomous agent loop into a direct execution engine.
+The system transitioned from autonomous agent loops to deterministic execution:
 
-### Major Components
+**Legacy (Deprecated):**
+- UnifiedAgent with reasoning loops
+- Dynamic tool discovery
+- Uncontrolled LLM interaction
+- Finance, Research, Polymarket, Quiz tools
 
-**API Layer (`api/`):**
-- `routes.py`: Exposes endpoints to enqueue jobs and retrieve status.
-- `schemas.py`: Pydantic models for the four core tools.
+**Current (Active):**
+- Direct tool execution via worker poller
+- Hardcoded tool whitelist (4 tools only)
+- Controlled LLM usage (Publisher translation only)
+- State machine with resume capability
 
-**Execution Engine (`bot/engine/`):**
-- `worker.py`: The core poller. It queries the database for QUEUED jobs and executes them **directly**.
-- `tool_runner.py`: Safety wrapper for tool execution (error handling).
-
-**Tool System (`tools/`):**
-- `registry.py`: **Lockdown Mode**. Hardcoded whitelist allowing only `scraper`, `draft_editor`, `publisher`, `batch_reader`.
-- `base.py`: Abstract base class for tools.
-- **Core Tools:**
-  - `scraper`: Browsers automation + analysis.
-  - `draft_editor`: JSON file manipulation.
-  - `batch_reader`: SQL vector search.
-  - `publisher`: Async pipeline for Telegram delivery.
-
-**AnythingLLM Integration (`bot/engine/worker.py`):**
-- Implements `_invoke_anythingllm_callback`.
-- Sends HTTP POST requests to `ANYTHINGLLM_BASE_URL`.
-- Payload includes JSON result and Base64-encoded file attachments.
-
-**Database (`database/`):**
-- **Single-writer SQLite with WAL mode** (v3 schema with auto-repair capability).
-- **Automatic Schema Recovery**: Missing tables trigger DDL repair without manual intervention.
-- **Comprehensive Table Repair Dictionary**: All 17 core tables can be repaired automatically.
-- Tables: `jobs`, `broadcast_batches`, `scraped_articles`, `pdf_parsed_pages`, `token_usage`, etc.
-
-**PDF Processing (`utils/pdf_utils.py`):**
-- Embeds text chunks with Snowflake embeddings.
-- Stores page content in `pdf_parsed_pages` (id INTEGER, chat_id INTEGER, pdf_name TEXT, content TEXT).
-- Stores vectors in `pdf_parsed_pages_vec` (rowid INTEGER PRIMARY KEY, embedding BLOB).
-- Supports SQLite vector search with automatic fallback to BLOB storage when vec0 extension unavailable.
-
-### Data Flow (Direct Invocation)
-
-1.  **API Request:** `POST /tools/{tool_name}` creates a job entry in `jobs` table (Status: QUEUED).
-2.  **Worker Polling:** `UnifiedWorkerManager` polls the `jobs` table.
-3.  **Direct Execution:**
-    - Worker creates a tool instance via `REGISTRY.create_tool_instance()`.
-    - Worker executes `tool.run(args, telemetry)`.
-    - **No LLM reasoning loop occurs here.**
-4.  **Result Processing:**
-    - Tool output is captured.
-    - `_invoke_anythingllm_callback` is called to POST results back to the external system.
-5.  **Completion:** Job status updated to `COMPLETED`.
-
-### Lifecycle
-Event-driven polling (1-second interval). No long-running autonomous loops.
-
-## 3. Repository Structure
+### 1.2 High-Level Data Flow
 
 ```
-AnythingTools/
-├── app.py                          # FastAPI entry point (startup: auto-resume jobs)
-├── config.py                       # Config (LLM/Telegram endpoints, Chrome profile)
-├── README.md                       # This file
-├── requirements.txt                # Dependencies
-├── snowflake_private_key.p8        # (Unused in core, legacy artifact)
-├── deprecated/                     # Quarantined Legacy Code
-│   ├── bot/core/                   # UnifiedAgent (State Machine, Weaver, Modes)
-│   └── tools/                      # Finance, Research, Polymarket, Quiz, etc.
-├── api/
-│   ├── routes.py                   # POST /tools, GET /jobs, GET /manifest
-│   └── schemas.py                  # Input models for core tools
-├── bot/engine/
-│   ├── worker.py                   # Core execution loop + AnythingLLM Callback
-│   └── tool_runner.py              # Error handling wrapper
-├── tools/
-│   ├── registry.py                 # Hardcoded Whitelist (4 tools)
-│   ├── base.py                     # BaseTool interface
-│   ├── scraper/                    # Web Scout (Botasaurus + Analysis)
-│   ├── draft_editor/               # JSON Atomic Swap/Split
-│   ├── batch_reader/               # Vector Search Filtered by Batch ID
-│   └── publisher/                  # Translation + Telegram Producer-Consumer
-├── database/
-│   ├── connection.py               # Thread-local connections (WAL settings, SQLITE_VEC detection)
-│   ├── writer.py                   # Background async writer with **Auto-Repair Logic**
-│   ├── schema.py                   # DB Initialization + **Schema Repair Dictionary (v3)**
-│   ├── job_queue.py                # Job status management
-│   └── reader.py                   # Read-through cache with generation tracking
-└── utils/
-    ├── logger/                     # Dual logging (Console + File)
-    ├── browser_lock.py             # Async lock for browser operations
-    ├── hitl.py                     # Human-in-the-loop (Pause/Cancel logic)
-    ├── telegram_publisher.py       # Producer-Consumer pipeline for messages
-    ├── pdf_utils.py                # **PDF parsing with vec0/BLOB fallback**
-    └── vector_search.py            # **Semantic search with rowid JOIN logic**
+API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → AnythingLLM Callback → COMPLETED
 ```
 
-**Key Structural Notes:**
-- **`deprecated/`**: Contains all non-core logic. These files are not imported or used by the runtime engine.
-- **`tools/`**: Contains only the 4 active tools. No dynamic scanning occurs.
-- **`bot/engine/`**: Replaces `bot/core/agent.py` as the execution path.
-- **Database Layer**: Now includes robust self-healing capabilities for missing or corrupted schemas.
+**Key Characteristics:**
+- **Event-driven polling:** 1-second interval
+- **No autonomous loops:** Direct execution only
+- **Single-writer database:** Prevents concurrent write conflicts
+- **Background writer thread:** Async DB operations with batching
+- **Lifecycle hooks:** Startup recovery, zombie cleanup, reconciliation
 
-## 4. Core Concepts & Domain Model
+---
 
-### Whitelisted Tools
-The registry supports only:
-1.  `scraper` (Scout): Outputs `batch_id`, `top_10`, `inventory`, `total_count`. Now with resume-capable embedding generation using direct `snowflake_client.embed()` call (no async wrapper).
-2.  `draft_editor` (Editor): Modifies curated JSON files. Strictly SWAP-only operations. Rejects modifications when batch status is not `PENDING`.
-3.  `batch_reader` (Reader): Filters vector search by `batch_id`. Outputs structured JSON with `ORDER BY v.distance ASC` for accurate semantic ranking.
-4.  `publisher` (Herald): Translates content and posts to Telegram. Full resume capability via `job_items` caching with `PUBLISHING`/`PARTIAL`/`COMPLETED` batch states.
+## 2. Core Components
 
-### Job Items State Tracking
-The `job_items` table enables granular resume capability:
-- **Step identifiers**: `trans_{ulid}` for translations, `pub_a_{ulid}` and `pub_b_{ulid}` for delivery tracking
-- **Status tracking**: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`
-- **Data persistence**: `input_data` and `output_data` fields store state
+### 2.1 API Layer (`api/`)
 
-### Publisher Pipeline State Management
-**Parallel to `broadcast_batches.status`**:
-- `PENDING`: Batch exists, not yet published
-- `PUBLISHING`: Active publishing in progress (set before pipeline start)
-- `PARTIAL`: Publishing failed mid-stream (set on exception)
-- `COMPLETED`: All messages delivered successfully (set on complete)
+#### `api/routes.py`
+**Endpoints:**
+- `POST /api/tools/{tool_name}` - Enqueue job (202 Accepted)
+- `GET /api/jobs/{job_id}` - Job status with logs
+- `DELETE /api/jobs/{job_id}` - Request cancellation
+- `GET /api/manifest` - Tool schemas
+- `GET /api/metrics` - System metrics
 
-### Database Schema Versioning & Auto-Repair
-**Version: 3** (Current)
-
-**Automatic Recovery Mechanism:**
-When a "no such table" error occurs during database operations:
-1. Table name is extracted using robust regex: `r'no such table:\s*(?:\"|[\w\.]+\.)?(\w+)\"?'`
-2. Repair script is fetched from `TABLE_REPAIR_SCRIPTS` dictionary
-3. DDL is executed (schema only, no data re-execution)
-4. Original query is retried once (bounded by `MAX_REPAIR_RETRIES = 1`)
-
-**Schema Mismatch Resolution:**
-- **Original Issue**: `pdf_parsed_pages.id` was TEXT, causing JOIN failures
-- **Fixed in v3**: Changed to INTEGER to match `pdf_parsed_pages_vec.rowid`
-- **Impact**: Prevents type coercion errors during vector search
-
-**PDF Processing Schema:**
-```sql
-CREATE TABLE IF NOT EXISTS pdf_parsed_pages (
-    id INTEGER NOT NULL PRIMARY KEY,  -- Changed from TEXT (see Changes section)
-    chat_id INTEGER,
-    pdf_name TEXT NOT NULL,
-    page_number INTEGER NOT NULL,
-    content TEXT,
-    embedding_status TEXT NOT NULL DEFAULT 'PENDING'
-        CHECK(embedding_status IN ('PENDING','EMBEDDED','SKIPPED')),
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS pdf_parsed_pages_vec USING vec0(
-    embedding float[1024]
-);
--- Fallback (no sqlite_vec): rowid INTEGER PRIMARY KEY AUTOINCREMENT, embedding BLOB
-```
-
-**Vector Search Pattern:**
-- Uses JOIN on `rowid` (vec table) = `CAST(id AS INTEGER)` (main table)
-- Supports both real vec0 virtual tables and BLOB fallbacks
-- All vec INSERT operations use `(rowid, embedding)` pattern
-
-### Batch Management
-- **`broadcast_batches` table**: Stores `batch_id` and file paths (`raw_json_path`, `curated_json_path`).
-- **Scope Isolation**: `batch_reader` specifically filters `ids` found in the raw JSON file to ensure search results are restricted to that batch.
-
-### Atomic File Operations
-- `draft_editor` utilizes `tempfile.NamedTemporaryFile` and `os.replace` to ensure file integrity during writes.
-
-### Producer-Consumer Pattern
-- `publisher` utilizes `asyncio.Queue` to translate articles (Producer) and send them to Telegram (Consumer) with strict rate limiting (`TELEGRAM_MESSAGE_DELAY`).
-
-### AnythingLLM Callback Contract
-- **Trigger**: Job completion.
-- **Method**: HTTP POST.
-- **Destination**: `config.ANYTHINGLLM_BASE_URL`.
-- **Payload**: JSON result + Base64 attachments.
-- **Correlation**: Includes `TOOL_RESULT_CORRELATION_ID:{job_id}` in the message body.
-
-## 5. Detailed Behavior
-
-### Normal Execution Flow (Direct)
-
-1.  **Worker Loop**: `UnifiedWorkerManager._run_loop()` sleeps 1s, polls `jobs` for `QUEUED` status. Prioritizes `INTERRUPTED` jobs for recovery.
-2.  **Job Execution**:
-    - `UnifiedWorkerManager._run_job()` extracts args and creates `cancellation_flag` (threading.Event).
-    - `REGISTRY.create_tool_instance()` instantiates the specific tool class.
-    - `run_tool_safely()` calls `tool.run()` with `job_id`, `session_id`, `cancellation_flag` kwargs.
-    - **Scraper**: Performs browser action, saves JSON to disk, writes DB entries. **Resume behavior**: Embedding-only path reads from `scraped_articles` and uses direct `snowflake_client.embed()` + `struct.pack()`. No `generate_embedding_sync()` call.
-    - **Draft Editor**: Reads JSON, performs swap, writes atomically. **Validation**: Checks `broadcast_batches.status == 'PENDING'`; rejects with error if not.
-    - **Batch Reader**: Reads file, builds SQL `IN (...)` query with `ORDER BY v.distance ASC`, executes vector search.
-    - **Publisher**: Spawns `PublisherPipeline(batch_id, top_10, inventory, job_id)`.
-      - **Producer**: Checks `job_items` for `trans_{ulid}` with `COMPLETED` status. Skips cached translations. Writes new translations to `job_items`.
-      - **Consumer**: Checks `job_items` for `pub_a_{ulid}` / `pub_b_{ulid}`. Skips already-sent messages. Writes delivery status to `job_items`.
-      - **Batch Status**: Sets `PUBLISHING` → `PARTIAL` (on exception) or `COMPLETED` (on success) in `broadcast_batches`.
-    - **PDF Processing**: Extracts text, generates embeddings, stores in `pdf_parsed_pages` + `pdf_parsed_pages_vec`.
-3.  **Callback**:
-    - Worker calls `_invoke_anythingllm_callback(job_id, result, attachments)`.
-    - Reads files, encodes to Base64.
-    - POSTs to configured URL with `TOOL_RESULT_CORRELATION_ID:{job_id}`.
-4.  **Finish**: Job marked `COMPLETED`.
-
-### Resume Behavior (INTERRUPTED Jobs)
-
-**Startup Recovery** (line 284-296 in `app.py`):
-- Automatically requeues `RUNNING` and `INTERRUPTED` jobs to `QUEUED` status on startup.
-
-**Publisher Pipeline Resume**:
-- **Translation Cache**: `producer()` queries `job_items` for `status='COMPLETED' AND step_identifier='trans_{ulid}'`. If found, deserializes `output_data` and skips LLM call.
-- **Delivery Deduplication**: `consumer()` queries `pub_a_{ulid}` / `pub_b_{ulid}` before sending. Prevents duplicate Telegram messages.
-- **Batch State**: PublisherTool checks `broadcast_batches.status`; returns early if `COMPLETED`.
-
-**Scraper Resume**:
-- **Embedding-Only Path**: When `validation_passed=True` and `summary_generated=True` in `job_items` metadata, reads existing `scraped_articles` and re-generates embedding only using direct Snowflake client call:
-  ```python
-  _emb = _sf.embed(_et)
-  _eb = _struct.pack(f"{len(_emb)}f", *_emb)
-  ```
-
-**Draft Editor Protection**:
-- Explicitly rejects `status != 'PENDING'` batches to preserve Top-10 cardinality.
-- Returns JSON error: `{"status": "FAILED", "error": "Cannot modify batch {id} because its status is {status}."}`
-
-### Error Handling & Auto-Repair
-- Tool execution errors are caught by `run_tool_safely` and returned as string output (failure message).
-- HTTP errors (Telegram/Callback) are logged.
-- Browser failures may raise exceptions caught by the worker.
-- **Database Auto-Repair**: When `no such table` errors occur:
-  - Regex extracts table name from error message
-  - DDL script fetched from `TABLE_REPAIR_SCRIPTS`
-  - Schema repaired without data loss
-  - Original operation retried once
-- **Foreign Key Constraint Failures**: Immediately abort with detailed payload logging (includes params for debugging).
-- **Retry Logic**: Bounded to `MAX_REPAIR_RETRIES = 1` to prevent infinite loops.
-
-### Configuration Paths
-- `ANYTHINGLLM_BASE_URL`: Required for callback.
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ARCHIVE_CHAT_ID`: Required for Publisher.
-- `CHROME_USER_DATA_DIR`: Used by browser tools.
-- `SUMANAL_ALLOW_SCHEMA_RESET`: Boolean flag to enable destructive schema resets (default: false).
-
-## 6. Public Interfaces
-
-### REST API
-
-All endpoints are exposed at `/api` prefix.
-
-#### **Enqueue Job**
-- **Path**: `POST /api/tools/{tool_name}`
-- **Path Parameters**:
-  - `tool_name`: string, one of `scraper`, `draft_editor`, `publisher`, `batch_reader`
-- **Request Body**:
-  ```json
-  {
-    "args": {
-      // Tool-specific arguments (see Section 6.1)
-    },
-    "client_metadata": {
-      // Optional metadata forwarded to tool
-    }
-  }
-  ```
-- **Response**: `202 Accepted`
-  ```json
-  {
-    "job_id": "01J8XYZ...",
-    "status": "QUEUED"
-  }
-  ```
-
-#### **Get Job Status**
-- **Path**: `GET /api/jobs/{job_id}`
-- **Path Parameters**:
-  - `job_id`: string, unique identifier returned by enqueue
-- **Response**: `200 OK`
-  ```json
-  {
-    "job_id": "01J8XYZ...",
-    "status": "COMPLETED",
-    "job_logs": [
-      {
-        "timestamp": "2026-04-17T03:45:00.123Z",
-        "level": "INFO",
-        "tag": "Scraper:Init",
-        "status_state": "RUNNING",
-        "message": "Starting extraction..."
-      }
-    ],
-    "final_payload": {
-      // Tool-specific result or error
-    }
-  }
-  ```
-- **Status Values**: `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLING`, `INTERRUPTED`, `PAUSED_FOR_HITL`, `ABANDONED`
-
-#### **Cancel Job**
-- **Path**: `DELETE /api/jobs/{job_id}`
-- **Path Parameters**:
-  - `job_id`: string, job to cancel
-- **Response**: `202 Accepted`
-  ```json
-  {
-    "job_id": "01J8XYZ...",
-    "status": "CANCELLING"
-  }
-  ```
-- **Behavior**: Sets job status, activates cancellation flag if job is running.
-
-#### **Get Manifest**
-- **Path**: `GET /api/manifest`
-- **Response**: `200 OK`
-  ```json
-  {
-    "tools": [
-      {
-        "name": "scraper",
-        "input_model": { /* Pydantic schema */ }
-      },
-      {
-        "name": "draft_editor",
-        "input_model": { /* Pydantic schema */ }
-      },
-      {
-        "name": "publisher",
-        "input_model": { /* Pydantic schema */ }
-      },
-      {
-        "name": "batch_reader",
-        "input_model": { /* Pydantic schema */ }
-      }
-    ]
-  }
-  ```
-
-#### **Metrics**
-- **Path**: `GET /api/metrics`
-- **Response**: `200 OK`
-  ```json
-  {
-    "write_queue_size": 0,
-    "active_jobs": 0,
-    "registered_tools": 4
-    "schema_version": 3
-  }
-  ```
-
-### 6.1 Tool-Specific Arguments
-
-#### **scraper**
+**Request Format:**
 ```json
 {
-  "args": {
-    "target_site": "FT"  // One of: "FT", "Bloomberg", "Technoz" (validated against VALID_TARGET_NAMES)
-  }
+  "args": { /* tool-specific */ },
+  "client_metadata": { /* optional */ }
 }
 ```
-**Returns**: JSON string with `{"batch_id": "...", "top_10": [...], "inventory": [...], "total_count": N}`
-**Behavior**:
-- Validates `target_site` against `VALID_TARGET_NAMES` (set of valid targets)
-- Uses direct `snowflake_client.embed()` for embeddings (no `generate_embedding_sync()`)
-- Resume-capable: `cancellation_flag` kwarg supported
 
-#### **draft_editor**
+**Response Format:**
 ```json
 {
-  "args": {
-    "batch_id": "01J8XYZ...",
-    "operations": [
-      {
-        "index_top10": 0,
-        "target_identifier": "01J8ABC..."  // ULID or index from inventory
-      }
-    ]
-  }
+  "job_id": "01J8XYZ...",
+  "status": "QUEUED"
 }
 ```
-**Returns**: JSON string with `{"batch_id": "...", "status": "SUCCESS", "top_10": [...]}`
-**Behavior**:
-- Validates `broadcast_batches.status == 'PENDING'` before modification
-- Returns error JSON if status is `PUBLISHING`, `PARTIAL`, `COMPLETED`, or `FAILED`
 
-#### **publisher**
-```json
-{
-  "args": {
-    "batch_id": "01J8XYZ..."
-  },
-  "kwargs": {
-    "job_id": "01J..."  // Optional, enables resume capability
-  }
-}
-```
-**Returns**: `{"status": "SUCCESS", "message": "Batch {batch_id} published successfully."}` or error
-**Behavior**:
-- Checks `broadcast_batches.status`; returns early if `COMPLETED`
-- Sets status: `PUBLISHING` → `PARTIAL` (on failure) → `COMPLETED` (on success)
-- **Resume**: Uses `job_items` to skip cached translations (`trans_{ulid}`) and duplicate delivery (`pub_a_{ulid}`, `pub_b_{ulid}`)
+**Status States:** `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLING`, `INTERRUPTED`, `PAUSED_FOR_HITL`, `ABANDONED`
 
-#### **batch_reader**
-```json
-{
-  "args": {
-    "batch_id": "01J8XYZ...",
-    "query": "semiconductor supply chain",
-    "limit": 5
-  }
-}
-```
-**Returns**: JSON string with `{"batch_id": "...", "query": "...", "results": [...]}`
-**Behavior**:
-- Search results ordered by `v.distance ASC` (most similar first)
-- Filters by `batch_id` raw JSON file contents
-- Returns error if `sqlite_vec` unavailable
+#### `api/schemas.py`
+Pydantic models for input validation of all four tools.
 
-### Tool Interface
-All tools inherit `tools.base.BaseTool`:
+### 2.2 Execution Engine (`bot/engine/`)
+
+#### `bot/engine/worker.py` - UnifiedWorkerManager
+
+**Core Loop:**
 ```python
-async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
-    # Returns JSON string or error message
-    # kwargs includes: job_id, session_id, cancellation_flag (threading.Event)
+def _run_loop(self):
+    while not self._stop_event.is_set():
+        # 1. Poll jobs (prioritize INTERRUPTED)
+        # 2. Mark as RUNNING
+        # 3. Spawn execution thread
+        # 4. Sleep 1s
 ```
 
-## 7. State, Persistence, and Data
+**Job Execution:**
+```python
+def _run_job(self, job_id, session_id, tool_name, args, cancellation_flag):
+    # 1. Create tool instance
+    # 2. Run tool_safely with cancellation flag
+    # 3. Parse result (JSON or string)
+    # 4. Update job status
+    # 5. Invoke AnythingLLM callback (if completed)
+    # 6. Handle crashes (3 strikes → ABANDONED)
+```
 
-### Storage
-- **SQLite**: `data/sumanal.db` (WAL enabled, Schema Version 3).
-- **Artifacts**: `artifacts/` (Scraper raw/curated JSON).
-- **Logs**: `logs/` (Dual stream).
+**Startup Recovery (lines 284-296 in `app.py`):**
+- Scans for `RUNNING` and `INTERRUPTED` jobs
+- Requeues them to `QUEUED` status
+- Enables automatic resume on restart
 
-### Key Tables
-- `jobs`: Execution lifecycle (QUEUED -> RUNNING -> COMPLETED).
-- `broadcast_batches`: Links batch IDs to file paths.
-- `scraped_articles`: Raw content for vector search.
-- `pdf_parsed_pages`: PDF text content with INTEGER primary key.
-- `pdf_parsed_pages_vec`: Vector embeddings (virtual or BLOB).
+**Crash Recovery Logic:**
+- 1st crash → Log, sleep 10s, set `INTERRUPTED`
+- 2nd crash → Log, sleep 10s, set `INTERRUPTED`
+- 3rd crash → Set `ABANDONED`, purge from retry
 
-### Data Lifecycle
-- Jobs are retained indefinitely.
-- Log files rotate.
-- WAL files persist.
+#### `bot/engine/tool_runner.py` - run_tool_safely
 
-### Schema Evolution
-- **v2 to v3 Migration**: Destructive reset when `SUMANAL_ALLOW_SCHEMA_RESET=1`
-- **Auto-Repair Operations**: Non-destructive schema corrections on missing tables
-- **Vector Table Fallbacks**: Automatic BLOB table creation when vec0 unavailable
+Safety wrapper with error handling and timeout management.
 
-## 8. Dependencies & Integration
+### 2.3 Tool Registry (`tools/`)
 
-- **`botasaurus`**: Wrapper for Playwright used by Scraper.
-- **`httpx`**: Async HTTP used by Publisher and Callback.
-- **`openai`**: used *only* by `publisher` (internal translation step).
-- **`sqlite3`**: Core persistence with version 3 schema.
-- **`sqlite-vec`**: Optional extension for vector search (fallback to BLOB).
-- **`python-telegram-bot`**: Telegram delivery.
+#### `tools/registry.py` - ToolRegistry
 
-## 9. Setup, Build, and Execution
+**Whitelist Implementation (line 48):**
+```python
+core_tools = ["scraper", "draft_editor", "publisher", "batch_reader"]
+```
 
-### Prerequisites
+**Registration Process:**
+1. Iterates only whitelisted directories
+2. Import `tool.py` and `Skill.py` modules
+3. Extracts `INPUT_MODEL` for schema validation
+4. Registers `BaseTool` subclasses
+5. Validates tool names against Azure OpenAI constraints
+
+**Manifest Generation:**
+- Returns MCP-style schemas for external integration
+- Includes input validation models
+
+### 2.4 Database Layer
+
+#### `database/connection.py` - DatabaseManager
+- Thread-local connections
+- WAL mode enabled
+- Automatic `sqlite_vec` detection
+- Connection pooling
+
+#### `database/writer.py` - Background Writer
+
+**Key Features:**
+- Single writer thread with queue
+- Batch commit optimization
+- **Auto-repair logic** for missing tables
+- `MAX_REPAIR_RETRIES = 1` (prevents infinite loops)
+
+**Auto-Repair Flow:**
+1. Catch `no such table` error
+2. Extract table name via regex: `r'no such table:\s*(?:\"|[\w\.]+\.)?(\w+)\"?'`
+3. Fetch DDL from `TABLE_REPAIR_SCRIPTS`
+4. Execute repair
+5. Retry original operation once
+
+#### `database/schema.py` - Schema Management
+
+**Schema Version:** 3
+
+**Core Tables (17 total):**
+- `jobs` - Job lifecycle
+- `job_items` - Granular step tracking
+- `job_logs` - Structured logs
+- `broadcast_batches` - Batch metadata
+- `scraped_articles` - Raw content
+- `scraped_articles_vec` - Vector embeddings
+- `pdf_parsed_pages` - PDF content
+- `pdf_parsed_pages_vec` - PDF vectors
+- `token_usage` - LLM cost tracking
+- Plus 8 additional support tables
+
+**Critical Migration: Migration from `step_identifier` to `item_metadata`**
+
+**Old Schema (Legacy):**
+```sql
+CREATE TABLE job_items (
+    item_id TEXT PRIMARY KEY,
+    job_id TEXT,
+    step_identifier TEXT,  -- Flat string: 'trans_ulid', 'pub_a_ulid'
+    status TEXT,
+    ...
+);
+```
+
+**New Schema (Current):**
+```sql
+CREATE TABLE job_items (
+    item_id TEXT PRIMARY KEY,
+    job_id TEXT,
+    item_metadata TEXT,    -- JSON: {"step":"translate","ulid":"...","retry":0}
+    status TEXT,
+    ...
+);
+
+CREATE INDEX idx_job_items_meta_step ON job_items(json_extract(item_metadata, '$.step'));
+CREATE INDEX idx_job_items_meta_ulid ON job_items(json_extract(item_metadata, '$.ulid'));
+```
+
+**Automated Migration in `init_db()` (lines 541-592):**
+```python
+# Zero-downtime migration using table duplication
+INSERT INTO job_items_new (item_id, job_id, status, input_data, output_data, updated_at, item_metadata)
+SELECT item_id, job_id, status, input_data, output_data, updated_at,
+    CASE
+        WHEN step_identifier LIKE 'trans_%' THEN 
+            json_object('step', 'translate', 'ulid', REPLACE(step_identifier, 'trans_', ''), 'retry', 0)
+        WHEN step_identifier LIKE 'pub_a_%' THEN 
+            json_object('step', 'publish_briefing', 'ulid', REPLACE(step_identifier, 'pub_a_', ''), 'is_top10', json('true'), 'retry', 0)
+        WHEN step_identifier LIKE 'pub_b_%' THEN 
+            json_object('step', 'publish_archive', 'ulid', REPLACE(step_identifier, 'pub_b_', ''), 'retry', 0)
+        ELSE 
+            json_object('step', 'legacy', 'ulid', step_identifier, 'retry', 0)
+    END
+FROM job_items;
+```
+
+**JSON Extraction Fallback System:**
+`TABLE_REPAIR_SCRIPTS` dictionary contains 17 table definitions with automatic fallback to BLOB storage when `sqlite-vec` is unavailable.
+
+#### `database/job_queue.py` - Job Operations
+
+**Signature Changes:**
+```python
+# OLD
+def add_job_item(job_id: str, step_identifier: str, input_data: str) -> None: ...
+
+# NEW
+def add_job_item(job_id: str, item_metadata: str, input_data: str) -> None: ...
+```
+
+**Updated Functions:**
+- `create_job()` - Creates job with tool name and args
+- `add_job_item()` - Persists JSON metadata
+- `update_item_status()` - Updates status with JSON
+- `get_interrupted_job()` - Resume discovery
+
+#### `database/reader.py` - Read Operations
+
+**New Functions:**
+```python
+def get_top10_items(job_id: str) -> List[Dict[str, Any]]:
+    # SELECT json_extract(item_metadata, '$.ulid') as ulid
+    # FROM job_items 
+    # WHERE job_id=? AND json_extract(item_metadata, '$.is_top10')=true
+    
+def get_all_translated_items(job_id: str) -> List[Dict[str, Any]]:
+    # SELECT json_extract(item_metadata, '$.ulid') as ulid, output_data
+    # FROM job_items
+    # WHERE job_id=? AND json_extract(item_metadata, '$.step')='translate'
+```
+
+**Updated Functions:**
+- `get_job_with_steps()` - Parses JSON for legacy compatibility
+- Returns structured steps with metadata
+
+#### `database/blackboard.py` - State Tracking
+
+**Method Updates:**
+```python
+# OLD
+claim_step(job_id: str, step_identifier: str): 
+    "INSERT... WHERE step_identifier=?"
+
+# NEW  
+claim_step(job_id: str, step_identifier: str):
+    # Converts legacy identifier to JSON
+    metadata = make_metadata(step=..., ulid=...)
+    "INSERT... WHERE json_extract(item_metadata, '$.step')=?" 
+```
+
+**BlackboardService Methods:**
+- `initialize_checklist()` - Creates step entries
+- `claim_step()` - Atomic step claim
+- `complete_step()` - Mark complete with output
+- `fail_step()` - Record error
+- `get_state()` - Returns parsed state
+
+---
+
+## 3. Utilities and Core Modules
+
+### 3.1 Configuration (`config.py`)
+
+**Critical Parameters:**
+```python
+TELEGRAM_MESSAGE_DELAY: float = 3.1  # Enforced rate limiting
+TELEGRAM_BRIEFING_CHAT_ID: str | None  # Top-10 delivery
+TELEGRAM_ARCHIVE_CHAT_ID: str | None   # Full inventory
+ANYTHINGLLM_BASE_URL: str              # Callback destination
+CHROME_USER_DATA_DIR: str              # Browser profile
+```
+
+### 3.2 Metadata Helpers (`utils/metadata_helpers.py`)
+
+**Centralized JSON Structure:**
+```python
+def make_metadata(
+    step_type: str,      # "translate", "publish_briefing", "publish_archive"
+    ulid: str,
+    retry: int = 0,
+    model: Optional[str] = None,
+    error: Optional[str] = None,
+    is_top10: bool = False,
+    **extra: Any
+) -> str  # Returns JSON string
+```
+
+**Parsing Functions:**
+```python
+def parse_metadata(metadata_json: str) -> Dict[str, Any]:
+    # Validates JSON and applies defaults
+    # Prevents destructive dictionary recreation
+    
+def increment_retry(metadata_json: str) -> str:
+    # Thread-safe retry increment
+    
+def add_error(metadata_json: str, error_msg: str) -> str:
+    # Attaches error without losing context
+```
+
+**Usage Pattern:**
+```python
+# Creating metadata
+metadata = make_metadata(STEP_TRANSLATE, article_ulid, is_top10=True)
+
+# Querying with JSON extraction
+sql = "SELECT * FROM job_items WHERE json_extract(item_metadata, '$.step') = ?"
+cursor.execute(sql, (STEP_TRANSLATE,))
+```
+
+### 3.3 Telegram Publisher (`utils/telegram_publisher.py`)
+
+**Complete Pipeline Rewrite (3-Phase):**
+
+**Phase 1: Translation (Producer)**
+```python
+async def _phase1_translate_all(self):
+    # 1. Query job_items for completed translations
+    # 2. Skip cached (resume capability)
+    # 3. Call LLM for new translations
+    # 4. Persist to job_items with status=COMPLETED
+```
+
+**Phase 2: Briefing Upload (Consumer)**
+```python
+async def _phase2_upload_briefing(self):
+    # 1. Build Top-10 list
+    # 2. Query job_items for pub_a_{ulid}
+    # 3. Skip sent messages
+    # 4. Send via _send_msg() with rate limit
+    # 5. Persist delivery status
+```
+
+**Phase 3: Archive Upload (Consumer)**
+```python
+async def _phase3_upload_archive(self):
+    # 1. Build full inventory
+    # 2. Query job_items for pub_b_{ulid}
+    # 3. Batch messages with smart splitting
+    # 4. Rate-limited delivery
+    # 5. Persist status
+```
+
+**Critical Safety Features:**
+- **Boolean return from `_send_msg()`**: Detects failures
+- **Silent failure becomes `PARTIAL` status**: Never data loss
+- **3.1s enforced delay**: Prevents Telegram rate limits
+- **Job items deduplication**: Idempotent operations
+
+### 3.4 Browser Management
+
+**`utils/browser_lock.py`:**
+- `threading.Lock` (NOT asyncio.Lock)
+- Prevents concurrent browser access
+- Safe release pattern
+
+**`utils/browser_daemon.py`:**
+- Driver lifecycle management
+- Lazy initialization
+- Zombie cleanup on startup
+
+**`utils/som_utils.py`:**
+- Single-tab enforcement
+- State-of-mind synchronization
+
+### 3.5 Vector Search (`utils/vector_search.py`)
+
+**Embedding Generation:**
+```python
+# Direct Snowflake client (no wrapper)
+_emb = snowflake_client.embed(text)
+_eb = struct.pack(f"{len(_emb)}f", *_emb)
+```
+
+**Pattern:**
+- **Resume path**: Direct `snowflake_client.embed()` calls
+- **No fallback wrappers**: Removed `generate_embedding_sync()`
+- **SQLite-vec integration**: Fallback to BLOB storage
+
+---
+
+## 4. Tool Specifications
+
+### 4.1 Scraper (`tools/scraper/`)
+
+**Purpose:** Web scouting with Intelligent Manifest generation
+
+**Input:**
+```json
+{
+  "target_site": "FT"  // FT, Bloomberg, Technoz
+}
+```
+
+**Output:**
+```json
+{
+  "batch_id": "01J8XYZ...",
+  "top_10": [{"ulid": "...", "title": "...", "summary": "..."}],
+  "inventory": [{"ulid": "...", "title": "..."}],
+  "total_count": 42
+}
+```
+
+**Execution Flow:**
+1. Validate target against `VALID_TARGET_NAMES`
+2. Launch Botasaurus browser
+3. Extract links (deduplicated)
+4. Process articles (3 retry validation → 3 retry summary)
+5. **Direct embeddings**: `snowflake_client.embed()` per article
+6. Store in `scraped_articles` + `scraped_articles_vec`
+7. LLM curation for Top 10
+8. Atomic save of `top_10_{batch_id}.json`
+9. Generate Intelligent Manifest
+10. Persist to `broadcast_batches`
+
+**Resume Capability:**
+- Checks `job_items` for `validation_passed=True` and `summary_generated=True`
+- If found: Skips scraping, reads existing articles, regenerates embeddings only
+
+**Manifest Format:**
+```
+### Scout Intelligence Briefing
+**Target Site:** FT
+**Batch ID:** 01J8XYZ...
+
+#### Top 10 Articles
+1. **Title**
+   *URL:* ...
+   *Conclusion:* ...
+   *ULID:* ...
+
+#### Extended Inventory (Next 50)
+- Title (ULID: ...)
+
+⚠️ NOTICE: Use batch_reader for remaining articles
+```
+
+### 4.2 Draft Editor (`tools/draft_editor/`)
+
+**Purpose:** Atomic Top-10 list modification (SWAP-only)
+
+**Input:**
+```json
+{
+  "batch_id": "01J8XYZ...",
+  "operations": [
+    {"index_top10": 0, "target_identifier": "01J8ABC..."}  // ULID or index
+  ]
+}
+```
+
+**Output:**
+```json
+{
+  "batch_id": "...",
+  "status": "SUCCESS",
+  "top_10": [...]
+}
+```
+
+**Constraints:**
+- **Status validation**: Only allows modification if `broadcast_batches.status == 'PENDING'`
+- **Returns error**: If status is `PUBLISHING`, `PARTIAL`, `COMPLETED`, or `FAILED`
+- **Atomic writes**: Uses `tempfile.NamedTemporaryFile` + `os.replace`
+
+**Operations:**
+1. **Internal SWAP**: Swap two items within Top-10 (by index)
+2. **External SWAP**: Replace item with inventory article (by ULID)
+
+**Validation:**
+```python
+if row["status"] != "PENDING":
+    return json.dumps({
+        "status": "FAILED", 
+        "error": f"Cannot modify batch {batch_id} because its status is {row['status']}."
+    })
+```
+
+### 4.3 Batch Reader (`tools/batch_reader/`)
+
+**Purpose:** Semantic search filtered by batch
+
+**Input:**
+```json
+{
+  "batch_id": "01J8XYZ...",
+  "query": "semiconductor supply chain",
+  "limit": 5
+}
+```
+
+**Output:**
+```json
+{
+  "batch_id": "...",
+  "query": "...",
+  "results": [
+    {
+      "ulid": "...",
+      "title": "...",
+      "summary": "...",
+      "conclusion": "...",
+      "similarity": 0.923
+    }
+  ]
+}
+```
+
+**Execution:**
+1. Validate `sqlite_vec` availability
+2. Read batch raw JSON to extract valid ULIDs
+3. Generate query embedding via `generate_embedding()`
+4. Execute filtered vector search:
+```sql
+SELECT a.title, a.summary, a.conclusion, a.id as ulid, (1 - v.distance) AS sim
+FROM scraped_articles_vec v
+JOIN scraped_articles a ON v.rowid = a.vec_rowid
+WHERE v.embedding MATCH ? AND k = ?
+  AND a.id IN (?, ?, ...)  -- Batch filter
+ORDER BY v.distance ASC
+```
+5. Return top N results
+
+### 4.4 Publisher (`tools/publisher/`)
+
+**Purpose:** Translation and Telegram delivery
+
+**Input:**
+```json
+{
+  "batch_id": "01J8XYZ..."
+}
+```
+
+**Output:**
+```json
+{"status": "SUCCESS", "message": "Batch ... published successfully."}
+```
+
+**Execution Flow:**
+1. Check `broadcast_batches.status` → early return if `COMPLETED`
+2. Set status to `PUBLISHING`
+3. Spawn `PublisherPipeline(batch_id, top_10, inventory, job_id)`
+4. Run 3-phase pipeline
+5. On success: Set status `COMPLETED`
+6. On exception: Set status `PARTIAL`, re-raise
+
+---
+
+## 5. Database Architecture
+
+### 5.1 Schema v3 Complete Structure
+
+```sql
+-- Core Tables
+jobs                    -- Job lifecycle
+job_items               -- Step tracking (JSON metadata)
+job_logs                -- Structured logs
+broadcast_batches       -- Batch metadata
+
+-- Scraper Tables
+scraped_articles        -- Raw content
+scraped_articles_vec    -- Vector embeddings
+
+-- PDF Processing
+pdf_parsed_pages        -- Text content
+pdf_parsed_pages_vec    -- Vector embeddings
+
+-- Token Usage
+token_usage             -- LLM cost tracking
+
+-- Support Tables (10 more)
+```
+
+### 5.2 Job Lifecycle State Machine
+
+```
+QUEUED → RUNNING → COMPLETED/FAILED
+         ↓
+   INTERRUPTED (recovery)
+         ↓
+   PAUSED_FOR_HITL (manual)
+         ↓
+   ABANDONED (3 failures)
+```
+
+### 5.3 Job Items Tracking
+
+**Granular State Pipeline:**
+```
+PENDING → RUNNING → COMPLETED/FAILED
+```
+
+**Step Types:**
+- `translate` - Article translation
+- `publish_briefing` - Top-10 delivery
+- `publish_archive` - Full inventory delivery
+
+**Metadata Structure:**
+```json
+{
+  "step": "translate",
+  "ulid": "01J8ABC...",
+  "retry": 2,
+  "timestamp": "2026-04-17T03:45:00.123Z",
+  "model": "gpt-5.4-mini",
+  "is_top10": true,
+  "error": "Timeout after 3 attempts"
+}
+```
+
+### 5.4 Auto-Repair Dictionary
+
+**17 Tables with Repair Scripts:**
+
+Example for `job_items`:
+```python
+"job_items": """
+CREATE TABLE job_items (
+    item_id TEXT PRIMARY KEY,
+    job_id TEXT,
+    item_metadata TEXT,
+    status TEXT,
+    input_data TEXT,
+    output_data TEXT,
+    updated_at TEXT
+);
+CREATE INDEX idx_job_items_job ON job_items(job_id);
+CREATE INDEX idx_job_items_meta_step ON job_items(json_extract(item_metadata, '$.step'));
+CREATE INDEX idx_job_items_meta_ulid ON job_items(json_extract(item_metadata, '$.ulid'));
+"""
+```
+
+**Fallback Pattern:**
+- If `sqlite-vec` unavailable → BLOB storage
+- If table missing → Auto-repair on first access
+- If schema mismatch → No automatic migration (requires `SUMANAL_ALLOW_SCHEMA_RESET=1`)
+
+---
+
+## 6. Data Flows & Pipelines
+
+### 6.1 Scraper → Publisher Pipeline
+
+```
+1. Scraper creates batch
+   ↓
+2. Batch stored in broadcast_batches (PENDING)
+   ↓
+3. Publisher tool invoked
+   ↓
+4. Translation phase (job_items tracking)
+   ↓
+5. Briefing delivery (Top-10)
+   ↓
+6. Archive delivery (Full inventory)
+   ↓
+7. Status: COMPLETED
+```
+
+### 6.2 Resume Capability Flow
+
+**Scraper Resume:**
+```python
+existing = {
+    (json_extract(item_metadata, '$.step'), json_extract(item_metadata, '$.ulid'))
+    for row in query_job_items
+    if row['status'] == 'COMPLETED'
+}
+
+if ('validation', ulid) in existing and ('summary', ulid) in existing:
+    # Skip scraping, regenerate embeddings only
+    _emb = _sf.embed(article_text)
+    _eb = struct.pack(...)
+```
+
+**Publisher Resume:**
+```python
+# Producer
+translated = get_all_translated_items(job_id)  # Cached translations
+if ulid in [t['ulid'] for t in translated]:
+    continue  # Skip LLM call
+
+# Consumer  
+sent_briefing = query "pub_a_{ulid}"  # Sent messages
+if found:
+    continue  # Skip Telegram send
+```
+
+### 6.3 AnythingLLM Callback
+
+**Trigger:** Job completion (`COMPLETED` status)
+
+**Endpoint:** `POST {ANYTHINGLLM_BASE_URL}/api/v1/workspace/{SLUG}/chat`
+
+**Payload:**
+```json
+{
+  "message": "TOOL_RESULT_CORRELATION_ID:{job_id}\n\n{result}",
+  "mode": "chat",
+  "attachments": [
+    {
+      "name": "top_10_01J8XYZ.json",
+      "mime": "application/json",
+      "contentString": "data:application/json;base64,..."
+    }
+  ],
+  "reset": false
+}
+```
+
+**Error Handling:** Failures logged, don't break worker.
+
+---
+
+## 7. Failure Modes & Safety
+
+### 7.1 Error Recovery Matrix
+
+| Failure Type | Detection | Recovery | Limit |
+|-------------|-----------|----------|-------|
+| Missing Table | `no such table` | Auto-repair DDL | 1 retry |
+| Job Crash | Exception | `INTERRUPTED` → `QUEUED` | 3 strikes |
+| Telegram API | HTTP error | Log + `PARTIAL` status | Bounded |
+| Callback | HTTP error | Silent log | N/A |
+| Schema Mismatch | Version check | `SUMANAL_ALLOW_SCHEMA_RESET` | Manual |
+| FK Constraint | SQL error | Abort + log details | Immediate |
+
+### 7.2 Sandboxing & Constraints
+
+**Browser Operations:**
+- Single `threading.Lock` prevents concurrent access
+- Zombie chrome cleanup on startup
+- Tab enforcement via `enforce_single_tab()`
+
+**Database:**
+- Single-writer prevents corruption
+- WAL mode for concurrency
+- BLOB fallback for missing vec0 extension
+
+**Rate Limiting:**
+- Telegram: 3.1s between messages
+- LLM: Bounded by Azure deployment
+- Browser: Lock-based serialization
+
+### 7.3 Data Integrity
+
+**Atomic Operations:**
+- File writes: `tempfile` + `os.replace`
+- DB writes: Single-writer thread
+- JSON parsing: Validation with defaults
+
+**No Silent Failures:**
+- Telegram sends return boolean
+- Publisher sets `PARTIAL` on exception
+- Job items track every step
+- Logs include full context
+
+---
+
+## 8. Configuration & Environment
+
+### 8.1 Required Variables
+
+```env
+# API Security
+API_KEY=dev_default_key_change_me_in_production
+ANYTHINGTOOLS_PORT=8000
+
+# AnythingLLM Integration
+ANYTHINGLLM_API_KEY=...
+ANYTHINGLLM_BASE_URL=http://localhost:3001
+ANYTHINGLLM_WORKSPACE_SLUG=my-workspace
+
+# Telegram (Publisher)
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_BRIEFING_CHAT_ID=...
+TELEGRAM_ARCHIVE_CHAT_ID=...
+TELEGRAM_MESSAGE_DELAY=3.1  # Rate limit
+
+# Browser
+CHROME_USER_DATA_DIR=chrome_profile
+
+# Azure OpenAI (Publisher translations)
+AZURE_KEY=...
+AZURE_ENDPOINT=...
+AZURE_DEPLOYMENT=gpt-5.4-mini
+
+# Snowflake (Embeddings)
+SNOWFLAKE_ACCOUNT=...
+SNOWFLAKE_USER=...
+SNOWFLAKE_WAREHOUSE=...
+SNOWFLAKE_DATABASE=...
+SNOWFLAKE_SCHEMA=...
+SNOWFLAKE_PRIVATE_KEY_PATH=snowflake_private_key.p8
+
+# Schema Management
+SUMANAL_ALLOW_SCHEMA_RESET=0  # Set 1 for destructive migration
+
+# Paths
+ARTIFACTS_ROOT=artifacts
+```
+
+### 8.2 Optional Variables
+
+```env
+# Logging
+TELEMETRY_DRY_RUN=false
+
+# Job Watchdog
+JOB_WATCH_INTERVAL_SECONDS=300
+JOB_STALE_THRESHOLD_SECONDS=28800  # 8 hours
+
+# Chutes (Alternative LLM provider)
+CHUTES_API_TOKEN=...
+CHUTES_MODEL=meta-llama/Llama-3.3-70B-Instruct
+```
+
+---
+
+## 9. Installation & Deployment
+
+### 9.1 Prerequisites
+
 - Python 3.11+
-- `PLAYWRIGHT_BROWSERS_PATH` (via `playwright install chromium`).
-- Optional: `sqlite-vec` extension for native vector search.
+- Playwright Chromium (`playwright install chromium`)
+- Optional: `sqlite-vec` extension
 
-### Installation
-1. `pip install -r requirements.txt`
-2. `playwright install chromium`
-3. Configure `.env`:
-    ```env
-    AZURE_KEY=...
-    AZURE_ENDPOINT=...
-    AZURE_DEPLOYMENT=...
-    ANYTHINGLLM_BASE_URL=...  # Critical for Callback
-    TELEGRAM_BOT_TOKEN=...
-    TELEGRAM_ARCHIVE_CHAT_ID=...
-    SUMANAL_ALLOW_SCHEMA_RESET=0  # Set to 1 for destructive v3 migration
-    ```
-4. Run: `uvicorn app:app --reload --port 8000`
+### 9.2 Installation Steps
 
-### Database Initialization
-- **First Run**: Creates v3 schema with all 17 tables
-- **Subsequent Runs**: Validates version, applies auto-repair if needed
-- **Migration**: Requires `SUMANAL_ALLOW_SCHEMA_RESET=1` for major version changes
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Install browser
+playwright install chromium
+
+# 3. Configure environment
+cp .env.example .env
+# Edit .env with your credentials
+
+# 4. Start application
+uvicorn app:app --reload --port 8000
+```
+
+### 9.3 Database Initialization
+
+**First Run:**
+- Creates v3 schema
+- All 17 tables initialized
+- Writer thread started
+
+**Subsequent Runs:**
+- Validates `PRAGMA user_version`
+- Applies auto-repair if needed
+- Skips destructive changes
+
+**Schema Migration:**
+```bash
+# For major version changes
+export SUMANAL_ALLOW_SCHEMA_RESET=1
+uvicorn app:app --reload --port 8000
+# WARNING: Destructive - deletes existing data
+```
+
+### 9.4 Production Checklist
+
+- [ ] Change `API_KEY` from default
+- [ ] Set `TELEGRAM_MESSAGE_DELAY` >= 3.0
+- [ ] Configure all credential variables
+- [ ] Set `SUMANAL_ALLOW_SCHEMA_RESET=0`
+- [ ] Mount `artifacts/` directory
+- [ ] Configure log rotation
+- [ ] Monitor `logs/` directory
+- [ ] Verify `sqlite-vec` availability (optional)
+
+---
 
 ## 10. Testing & Validation
 
-- **`tests/test_browser_e2e.py`**: Minimal browser check.
-- No formal unit test suite exists for the deterministic tools.
-- Validation is achieved by inspecting the `jobs` table and `logs/` directory.
-- **Schema Validation**: Check `PRAGMA user_version` returns 3
+### 10.1 E2E Tests
 
-## 11. Known Limitations & Non-Goals
+**`tests/test_browser_e2e.py`:**
+- Minimal browser health check
+- Verifies Chrome launch
+- Checks Google navigation
 
-- **Strict Whitelist**: Only 4 tools exist.
-- **No Autonomous Logic**: The engine waits for specific instructions.
-- **No Legacy Features**: Finance, Research, etc., are in `deprecated/` and cannot run.
-- **No Concurrency**: Single-writer DB prevents concurrent job execution per session.
-- **Manual Migration Required**: Schema version changes require `SUMANAL_ALLOW_SCHEMA_RESET=1` (destructive).
-- **Bounded Auto-Repair**: Only 1 retry per missing table (prevents infinite loops).
+### 10.2 Manual Validation
 
-## 12. Change Sensitivity
+**Schema Check:**
+```sql
+PRAGMA user_version;  -- Should return 3
+```
 
-### Fragile Components
-- **`tools/registry.py`**: Modifying the hardcoded list risks loading non-existent or deprecated tools.
-- **`bot/engine/worker.py`**: The `AnythingLLM` callback payload format must match the receiving system. The cancellation flag propagation logic is critical.
-- **`utils/telegram_publisher.py`**: Rate limiting logic is critical to avoid API bans. The producer-consumer coordination handles failure gracefully but requires the `try/except` pattern to be maintained.
-- **`utils/browser_lock.py`**: Mixing `asyncio.Lock` with threading causes RuntimeErrors. Must remain as `threading.Lock`.
-- **`database/writer.py`**: Repair loop logic must maintain `MAX_REPAIR_RETRIES = 1` and include both FK and missing table detection.
-- **`database/schema.py`**: `get_repair_script()` must return identical patterns to `get_init_script()` fallback replacements for consistency.
+**Tool Registry:**
+```bash
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/api/manifest
+# Should return 4 tools
+```
 
-## 13. Changes (Evolutionary Analysis from Current Code)
+**Metrics:**
+```bash
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/api/metrics
+# Should show write_queue_size, active_jobs, registered_tools
+```
 
-This section identifies significant architectural refactors based on observable evidence within the current codebase. Each change is inferred from code patterns, deprecated file locations, and structural inconsistencies.
+**Job Lifecycle:**
+```bash
+# 1. Enqueue scraper
+curl -X POST -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"args": {"target_site": "FT"}}' \
+  http://localhost:8000/api/tools/scraper
 
-### 13.1 Publisher Pipeline Resume Capability
+# 2. Check status
+curl -H "X-API-Key: $API_KEY" \
+  http://localhost:8000/api/jobs/{job_id}
 
-**Pain Point Addressed**: The publisher pipeline had no mechanism to recover from interruptions. If a job crashed during translation or delivery, it would restart from zero, causing duplicate LLM API calls (expensive) and duplicate Telegram messages (poor user experience).
+# 3. Monitor logs
+tail -f logs/application.log
+```
 
-**Solution Implemented**:
-1. **`utils/telegram_publisher.py`**:
-   - Added `job_id: str | None = None` parameter to `PublisherPipeline.__init__()` (line 21)
-   - `producer()` queries `job_items` for `trans_{ulid}` entries with `COMPLETED` status before calling LLM
-   - `consumer()` queries `pub_a_{ulid}` / `pub_b_{ulid}` to prevent duplicate Telegram sends
-   - Both methods call `add_job_item()` and `update_item_status()` to persist progress
+### 10.3 Database Inspection
 
-2. **`tools/publisher/tool.py`**:
-   - `run()` method accepts `job_id` from kwargs
-   - Manages `broadcast_batches.status` lifecycle: `PUBLISHING` → `PARTIAL`/`COMPLETED`
-   - Passes `job_id` to pipeline and checks for `COMPLETED` status to skip already-published batches
+**Check Migration Success:**
+```sql
+-- Old column should not exist
+SELECT name FROM pragma_table_info('job_items') WHERE name = 'step_identifier';
 
-**Evidence**: Direct code additions in publisher files show explicit `job_items` queries and status tracking.
+-- New metadata column exists
+SELECT name FROM pragma_table_info('job_items') WHERE name = 'item_metadata';
 
-### 13.2 Scraper Embedding Generation Refactor
+-- Verify indexes
+SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='job_items';
+```
 
-**Pain Point Addressed**: `utils/vector_search.py` contained `generate_embedding_sync()` with complex event loop detection logic, redundant with async path, causing issues in resume paths.
+**Inspect Job Items:**
+```sql
+-- View parsed metadata
+SELECT 
+    item_id,
+    json_extract(item_metadata, '$.step') as step,
+    json_extract(item_metadata, '$.ulid') as ulid,
+    json_extract(item_metadata, '$.retry') as retry,
+    json_extract(item_metadata, '$.is_top10') as is_top10,
+    status
+FROM job_items
+WHERE job_id = '01J8XYZ...';
+```
 
-**Solution Implemented**:
-- **Deleted**: `generate_embedding_sync()` from `utils/vector_search.py` (23 lines removed)
-- **Modified**: `tools/scraper/task.py` resume path directly uses `snowflake_client.embed()` + `struct.pack()`
+---
 
-**Evidence**: Function deletion from file and direct synchronous calls in scraper task resume path.
+## 11. Monitoring & Operations
 
-### 13.3 Draft Editor State Enforcement (Swap-Only Constraint)
+### 11.1 Key Metrics
 
-**Pain Point Addressed**: Draft editor could modify batches mid-publication, causing race conditions and breaking Top-10 cardinality.
+**Application Metrics (`GET /metrics`):**
+- `write_queue_size`: Number of pending DB writes
+- `active_jobs`: Currently running jobs
+- `registered_tools`: Tools loaded in registry
+- `schema_version`: Current DB schema (3)
 
-**Solution Implemented**:
-- **Modified**: `tools/draft_editor/tool.py` `run()` method checks `broadcast_batches.status == 'PENDING'`
-- Returns error JSON if status is `PUBLISHING`, `PARTIAL`, `COMPLETED`, or `FAILED`
+**Job Metrics:**
+- Queue depth (`SELECT COUNT(*) FROM jobs WHERE status='QUEUED'`)
+- Success rate (COMPLETED / TOTAL)
+- Average duration
+- Retry counts per step
 
-**Evidence**: Direct status check addition with explicit error return.
+**Resource Metrics:**
+- WAL file size
+- Lock wait times
+- Thread pool utilization
 
-### 13.4 Batch Reader Vector Ordering Fix
+### 11.2 Log Structure
 
-**Pain Point Addressed**: Results appeared in arbitrary order, making curation difficult.
+**Dual Logging (Console + File):**
+```
+logs/
+├── application.log      # Main application
+├── database.log         # DB operations
+├── scraper.log          # Scraper tool
+└── publisher.log        # Publisher pipeline
+```
 
-**Solution Implemented**:
-- **Modified**: `tools/batch_reader/tool.py` SQL query adds `ORDER BY v.distance ASC`
+**Log Format:**
+```
+[TIMESTAMP] [LEVEL] [TAG] MESSAGE | payload: {...}
+```
 
-**Evidence**: SQL modification in batch reader file.
+**Critical Tags:**
+- `DB:Repair` - Schema auto-repair
+- `DB:Recovery` - Job resumption
+- `Worker:Job:Crash` - Job failure
+- `Publisher:Send` - Telegram delivery
+- `Worker:Callback` - AnythingLLM callback
 
-### 13.5 Infrastructure Pre-existing
+### 11.3 Health Checks
 
-The base resume capability exists but was extended:
-- **`app.py`** lines 284-296: Startup recovery scans for `RUNNING`/`INTERRUPTED` jobs
-- **`bot/engine/worker.py`**: Handles `INTERRUPTED` status with recovery message
-- **`tools/base.py`**: Resets `_last_artifacts` on each execution
+**Startup Health:**
+1. Vec0 extension loaded (or fallback)
+2. Chrome launchable
+3. DB writer started
+4. Schema validated
+5. Registry loaded
 
-**Inference**: Recent changes extended job-level recovery to granular `job_items` tracking specifically for publisher pipeline.
+**Runtime Health:**
+1. Writer queue not growing
+2. No stuck jobs (RUNNING > 24h)
+3. Telegram rate limit respected
+4. Callback endpoint reachable
 
-**Confidence Level**: **High** for all changes (direct code evidence exists in current files)
+---
 
-### Summary
+## 12. Known Limitations & Non-Goals
 
-Architectural evolution: Stateless execution → Resume-capable → Enforced constraints → Direct synchronous calls → Ranked results. The system matured toward reliability, cost-efficiency, and user safety.
+### 12.1 Explicit Limitations
+
+| Limitation | Reason | Workaround |
+|-----------|--------|------------|
+| **Single-writer DB** | SQLite limitation | N/A (by design) |
+| **4 tools only** | Lockdown architecture | Add to whitelist manually |
+| **No concurrency** | Database integrity | Job-level parallelism |
+| **Manual schema migration** | Data safety | `SUMANAL_ALLOW_SCHEMA_RESET` |
+| **Bounded auto-repair** | Prevent infinite loops | Manual intervention required |
+| **No embedded vector search** | Extension dependency | BLOB fallback mode |
+| **Silent callback failures** | Don't break worker | Monitor logs |
+
+### 12.2 Non-Goals (Wontfix)
+
+- **Autonomous agent loops** → Architecture is deterministic
+- **Dynamic tool loading** → Security lockdown
+- **Real-time streaming** → Batch-oriented design
+- **Multi-tenant isolation** → Single-session focus
+- **Automatic schema upgrades** → Requires explicit consent
+- **Infinite retry** → Bounded retry prevents cascading failures
+
+### 12.3 Design Rationale
+
+**Why "Deterministic"?**
+- Predictable execution path
+- No uncontrolled LLM interaction
+- Clear state transitions
+- Resume without side effects
+
+**Why "Single-writer"?**
+- Prevents database corruption
+- Simplifies concurrency model
+- Enables WAL checkpointing
+- Forces clear write boundaries
+
+**Why "Whitelist"?**
+- Security lockdown
+- Resource control
+- Quality assurance
+- Support boundaries

@@ -13,6 +13,7 @@ from typing import List, Dict, Any
 from database.writer import enqueue_write
 from database.connection import DatabaseManager
 from utils.logger.core import get_dual_logger
+from utils.metadata_helpers import make_metadata
 
 log = get_dual_logger(__name__)
 
@@ -26,9 +27,10 @@ class BlackboardService:
         """
         log.dual_log(tag="SYS:BLACKBOARD:INIT", message=f"Initializing {len(steps)} steps", payload={"steps": steps})
         for step in steps:
+            meta = make_metadata("blackboard", step)
             enqueue_write(
-                "INSERT INTO job_items (job_id, step_identifier, status, updated_at) VALUES (?, ?, 'PENDING', ?)",
-                (job_id, step, datetime.now(timezone.utc).isoformat()),
+                "INSERT INTO job_items (job_id, item_metadata, status, updated_at) VALUES (?, ?, 'PENDING', ?)",
+                (job_id, meta, datetime.now(timezone.utc).isoformat()),
             )
 
     @staticmethod
@@ -39,7 +41,9 @@ class BlackboardService:
         """
         log.dual_log(tag="SYS:BLACKBOARD:CLAIM", message=f"Claiming step {step_identifier}", payload={"job_id": job_id, "step": step_identifier})
         enqueue_write(
-            "UPDATE job_items SET status = 'RUNNING', updated_at = ? WHERE job_id = ? AND step_identifier = ?",
+            "UPDATE job_items SET status = 'RUNNING', updated_at = ? WHERE job_id = ? "
+            "AND json_extract(item_metadata, '$.step') = 'blackboard' "
+            "AND json_extract(item_metadata, '$.ulid') = ?",
             (datetime.now(timezone.utc).isoformat(), job_id, step_identifier),
         )
 
@@ -51,7 +55,9 @@ class BlackboardService:
         """
         log.dual_log(tag="DB:WRITE:START", message=f"Saving results for {step_identifier}", payload=output_data)
         enqueue_write(
-            "UPDATE job_items SET status = 'COMPLETED', output_data = ?, updated_at = ? WHERE job_id = ? AND step_identifier = ?",
+            "UPDATE job_items SET status = 'COMPLETED', output_data = ?, updated_at = ? WHERE job_id = ? "
+            "AND json_extract(item_metadata, '$.step') = 'blackboard' "
+            "AND json_extract(item_metadata, '$.ulid') = ?",
             (json.dumps(output_data), datetime.now(timezone.utc).isoformat(), job_id, step_identifier),
         )
         log.dual_log(tag="DB:WRITE:END", message=f"Step {step_identifier} persisted successfully")
@@ -64,7 +70,9 @@ class BlackboardService:
         """
         log.dual_log(tag="SYS:BLACKBOARD:FAILURE", message=f"Step {step_identifier} failed", level="ERROR", payload={"error": error})
         enqueue_write(
-            "UPDATE job_items SET status = 'FAILED', output_data = ?, updated_at = ? WHERE job_id = ? AND step_identifier = ?",
+            "UPDATE job_items SET status = 'FAILED', output_data = ?, updated_at = ? WHERE job_id = ? "
+            "AND json_extract(item_metadata, '$.step') = 'blackboard' "
+            "AND json_extract(item_metadata, '$.ulid') = ?",
             (json.dumps({"error": error}), datetime.now(timezone.utc).isoformat(), job_id, step_identifier),
         )
 
@@ -74,7 +82,18 @@ class BlackboardService:
         """
         conn = DatabaseManager.get_read_connection()
         rows = conn.execute(
-            "SELECT step_identifier, status, output_data FROM job_items WHERE job_id = ?",
+            "SELECT item_metadata, status, output_data FROM job_items WHERE job_id = ?",
             (job_id,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                meta = json.loads(d.get("item_metadata") or "{}")
+                d["step_identifier"] = meta.get("ulid") or meta.get("step") or "unknown"
+            except Exception:
+                d["step_identifier"] = "unknown"
+            d.pop("item_metadata", None)
+            result.append(d)
+        return result

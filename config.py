@@ -60,4 +60,4 @@ ANYTHINGLLM_WORKSPACE_SLUG: str = os.getenv("ANYTHINGLLM_WORKSPACE_SLUG", "my-wo
 # --- Telegram Destination Routing ---
 TELEGRAM_BRIEFING_CHAT_ID: str | None = os.getenv("TELEGRAM_BRIEFING_CHAT_ID")
 TELEGRAM_ARCHIVE_CHAT_ID: str | None = os.getenv("TELEGRAM_ARCHIVE_CHAT_ID")
-TELEGRAM_MESSAGE_DELAY: float = float(os.getenv("TELEGRAM_MESSAGE_DELAY", "2.0"))
+TELEGRAM_MESSAGE_DELAY: float = float(os.getenv("TELEGRAM_MESSAGE_DELAY", "3.1"))

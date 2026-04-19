@@ -67,10 +67,29 @@ def get_job_with_steps(job_id: str) -> Optional[Dict[str, Any]]:
     except Exception:
         job['args'] = {}
     job.pop('args_json', None)
-    cur.execute("SELECT step_identifier, status, COALESCE(output_data, '{}') as output_data FROM job_items WHERE job_id = ?", (job_id,))
+    cur.execute("SELECT item_metadata, status, COALESCE(output_data, '{}') as output_data FROM job_items WHERE job_id = ?", (job_id,))
     steps = []
     for s in cur.fetchall():
         sr = dict(s)
+        
+        metadata_str = sr.get('item_metadata')
+        if metadata_str:
+            try:
+                sr['metadata'] = json.loads(metadata_str)
+                sr['step'] = sr['metadata'].get('step', 'unknown')
+                sr['ulid'] = sr['metadata'].get('ulid', '')
+                sr['retry'] = sr['metadata'].get('retry', 0)
+                sr['error'] = sr['metadata'].get('error')
+                sr['is_top10'] = sr['metadata'].get('is_top10', False)
+            except json.JSONDecodeError:
+                sr['metadata'] = {}
+                sr['step'] = 'unknown'
+                sr['ulid'] = ''
+        else:
+            sr['metadata'] = {}
+            sr['step'] = 'unknown'
+            sr['ulid'] = ''
+            
         try:
             sr['output'] = json.loads(sr.get('output_data') or '{}')
         except Exception:
@@ -78,4 +97,58 @@ def get_job_with_steps(job_id: str) -> Optional[Dict[str, Any]]:
         sr.pop('output_data', None)
         steps.append(sr)
     job['steps'] = steps
-    return job
+
+
+def get_top10_items(job_id: str) -> List[Dict[str, Any]]:
+    cur = _get_cursor()
+    cur.execute("""
+        SELECT item_metadata, status, COALESCE(output_data, '{}') as output_data
+        FROM job_items
+        WHERE job_id = ?
+        AND json_extract(item_metadata, '$.is_top10') = 1
+        AND json_extract(item_metadata, '$.step') = 'translate'
+        AND status = 'COMPLETED'
+        ORDER BY item_id
+        LIMIT 10
+    """, (job_id,))
+    
+    results = []
+    for row in cur.fetchall():
+        try:
+            metadata = json.loads(row['item_metadata'] or '{}')
+            output = json.loads(row['output_data'] or '{}')
+            results.append({
+                'ulid': metadata.get('ulid', ''),
+                'metadata': metadata,
+                'output': output
+            })
+        except json.JSONDecodeError:
+            continue
+    return results
+
+
+def get_all_translated_items(job_id: str) -> List[Dict[str, Any]]:
+    cur = _get_cursor()
+    cur.execute("""
+        SELECT item_metadata, status, COALESCE(output_data, '{}') as output_data
+        FROM job_items
+        WHERE job_id = ?
+        AND json_extract(item_metadata, '$.step') = 'translate'
+        AND status = 'COMPLETED'
+        ORDER BY item_id
+    """, (job_id,))
+    
+    results = []
+    for row in cur.fetchall():
+        try:
+            metadata = json.loads(row['item_metadata'] or '{}')
+            output = json.loads(row['output_data'] or '{}')
+            results.append({
+                'ulid': metadata.get('ulid', ''),
+                'metadata': metadata,
+                'is_top10': metadata.get('is_top10', False),
+                'output': output
+            })
+        except json.JSONDecodeError:
+            continue
+    return results

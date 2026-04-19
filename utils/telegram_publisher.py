@@ -13,6 +13,13 @@ from database.connection import DatabaseManager
 import sqlite3
 import config
 from utils.logger import get_dual_logger
+from utils.metadata_helpers import (
+    make_metadata,
+    parse_metadata,
+    STEP_TRANSLATE,
+    STEP_PUBLISH_BRIEFING,
+    STEP_PUBLISH_ARCHIVE,
+)
 
 log = get_dual_logger(__name__)
 
@@ -23,187 +30,183 @@ class PublisherPipeline:
         self.top_10 = top_10
         self.inventory = inventory
         self.job_id = job_id
-        self.queue = asyncio.Queue()
-        
-    async def _translate_chunk(self, items: List[Dict]) -> List[Dict]:
-        llm = get_llm_client("azure")
-        
-        prompt = "Translate the following JSON array of articles into Bahasa Indonesia. Return EXACTLY a JSON array of objects, preserving the 'ulid' key, and providing 'translated_title', 'translated_conclusion', and 'translated_summary'.\n\n"
-        prompt += json.dumps(items, ensure_ascii=False)
-        
-        try:
-            resp = await llm.complete_chat(LLMRequest(
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"}
-            ))
-            
-            # Basic JSON extraction
-            content = resp.content
-            start = content.find("[")
-            end = content.rfind("]")
-            if start != -1 and end != -1:
-                parsed = json.loads(content[start:end+1])
-                return parsed
-            elif "{" in content:
-                parsed = json.loads(content)
-                # Return explicit keys if present, otherwise return the first value safely
-                if isinstance(parsed, dict):
-                    if parsed.get("articles"):
-                        return parsed.get("articles")
-                    if parsed.get("data"):
-                        return parsed.get("data")
-                    return list(parsed.values())[0] if len(parsed) > 0 else []
-                # Fallback for unexpected types
-                return []
-        except Exception as e:
-            log.dual_log(tag="Publisher:Translator", message=f"Translation failed: {e}", level="ERROR")
-            
-        return []
+        self.translated_map: Dict[str, Dict] = {}
+        self.bot_token = getattr(config, 'TELEGRAM_BOT_TOKEN', None)
+        self.briefing_chat = getattr(config, 'TELEGRAM_BRIEFING_CHAT_ID', None)
+        self.archive_chat = getattr(config, 'TELEGRAM_ARCHIVE_CHAT_ID', None)
+        self.message_delay = getattr(config, 'TELEGRAM_MESSAGE_DELAY', 3.1)
+        self._build_article_list()
 
-    async def producer(self):
-        """Translates articles in chunks of 10 and pushes to queue."""
-        all_articles = self.top_10 + self.inventory
-        
+    def _build_article_list(self):
+        self.all_articles = []
+        top_10_ulids = {a.get("ulid") for a in self.top_10}
+        for article in self.top_10:
+            a_copy = article.copy()
+            a_copy["_is_top10"] = True
+            self.all_articles.append(a_copy)
+        for article in self.inventory:
+            if article.get("ulid") not in top_10_ulids:
+                a_copy = article.copy()
+                a_copy["_is_top10"] = False
+                self.all_articles.append(a_copy)
+
+    async def run_pipeline(self) -> str:
+        log.dual_log(tag="Publisher:Pipeline", message=f"Starting pipeline for batch {self.batch_id}")
+        await self._phase1_translate_all()
+        await self._phase2_upload_briefing()
+        await self._phase3_upload_archive()
+        return "Publisher Pipeline Complete."
+
+    async def _get_uncached_articles(self) -> List[Dict]:
+        if not self.job_id: return self.all_articles
         conn = DatabaseManager.get_read_connection()
         conn.row_factory = sqlite3.Row
         uncached = []
-        trans_map = {}
-        
-        if self.job_id:
-            for article in all_articles:
-                ulid = article.get("ulid")
-                row = conn.execute(
-                    "SELECT output_data FROM job_items WHERE job_id = ? AND step_identifier = ? AND status = 'COMPLETED'",
-                    (self.job_id, f"trans_{ulid}")
-                ).fetchone()
-                if row and row["output_data"]:
-                    try:
-                        trans_map[ulid] = json.loads(row["output_data"])
-                    except Exception:
-                        uncached.append(article)
-                else:
-                    uncached.append(article)
-        else:
-            uncached = all_articles
-
-        chunk_size = 10
-        for i in range(0, len(uncached), chunk_size):
-            chunk = uncached[i:i+chunk_size]
-            translated = await self._translate_chunk(chunk)
-            
-            for t in translated:
-                if isinstance(t, dict) and t.get("ulid"):
-                    ulid = t["ulid"]
-                    trans_map[ulid] = t
-                    if self.job_id:
-                        add_job_item(self.job_id, f"trans_{ulid}", "")
-                        update_item_status(self.job_id, f"trans_{ulid}", "COMPLETED", json.dumps(t))
-            
-        for article in all_articles:
+        for article in self.all_articles:
             ulid = article.get("ulid")
-            is_top10 = any(t.get("ulid") == ulid for t in self.top_10)
-            trans_data = trans_map.get(ulid, {})
-            
-            enriched = {
-                "ulid": ulid,
-                "url": article.get("normalized_url", article.get("url", "")),
-                "is_top10": is_top10,
-                "title": trans_data.get("translated_title", article.get("title", "")),
-                "conclusion": trans_data.get("translated_conclusion", article.get("conclusion", "")),
-                "summary": trans_data.get("translated_summary", article.get("summary", ""))
-            }
-            await self.queue.put(enriched)
-            
-        await self.queue.put(None)
+            row = conn.execute(
+                "SELECT output_data FROM job_items WHERE job_id = ? AND json_extract(item_metadata, '$.step') = 'translate' AND json_extract(item_metadata, '$.ulid') = ? AND status = 'COMPLETED'",
+                (self.job_id, ulid)
+            ).fetchone()
+            if row and row["output_data"]:
+                try:
+                    self.translated_map[ulid] = json.loads(row["output_data"])
+                except Exception:
+                    uncached.append(article)
+            else:
+                uncached.append(article)
+        return uncached
 
-    async def consumer(self):
-        """Uploads articles to Telegram respecting rate limits and destinations."""
-        token = getattr(config, "TELEGRAM_BOT_TOKEN", None)
-        chat_a = getattr(config, "TELEGRAM_BRIEFING_CHAT_ID", None)
-        chat_b = getattr(config, "TELEGRAM_ARCHIVE_CHAT_ID", None)
-        delay = getattr(config, "TELEGRAM_MESSAGE_DELAY", 2.0)
+    async def _phase1_translate_all(self) -> None:
+        MAX_RETRIES = 3
+        for attempt in range(MAX_RETRIES):
+            uncached = await self._get_uncached_articles()
+            if not uncached:
+                break
+            log.dual_log(tag="Publisher:Phase1", message=f"Translation pass {attempt+1}/{MAX_RETRIES}. {len(uncached)} remaining.")
+            for i in range(0, len(uncached), 10):
+                batch = uncached[i:i+10]
+                await self._translate_batch(batch, attempt, MAX_RETRIES)
+
+    async def _translate_batch(self, batch: List[Dict], current_attempt: int, max_retries: int) -> None:
+        if not batch: return
+        model_name = getattr(config, 'AZURE_DEPLOYMENT', 'gpt-4o-mini')
         
-        if not token:
-            log.dual_log(tag="Publisher:Consumer", message="Missing Telegram token", level="ERROR")
-            # Consume queue to prevent deadlock
-            while await self.queue.get() is not None:
-                self.queue.task_done()
-            return
-            
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        input_batch = [{"ulid": a.get("ulid", ""), "title": a.get("title", ""), "summary": a.get("summary", ""), "conclusion": a.get("conclusion", "")} for a in batch]
+        prompt = "Translate the following JSON array of articles into Bahasa Indonesia. Return EXACTLY a JSON object with a 'translations' key containing an array of objects. Preserve 'ulid', and translate to 'translated_title', 'translated_summary', 'translated_conclusion'.\n" + json.dumps(input_batch, ensure_ascii=False)
         
-        async with httpx.AsyncClient() as client:
-            while True:
-                article = await self.queue.get()
-                if article is None:
-                    self.queue.task_done()
-                    break
-                    
-                target_url = article["url"]
-                is_top10 = article["is_top10"]
-                title = article["title"]
-                conclusion = article["conclusion"]
-                summary = article["summary"]
-                
-                # Helper to send and delay
-                async def send_msg(chat_id, text):
-                    if not chat_id: return
-                    try:
-                        await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False})
-                    except Exception as e:
-                        log.dual_log(tag="Publisher:Consumer", message=f"Telegram API error: {e}", level="WARNING")
-                    await asyncio.sleep(delay)
-
-                # Format messages
-                msg1_url = target_url
-                msg2_briefing = f"<b>{title}</b>\n\n{conclusion}"
-                msg2_archive = f"<b>{title}</b>\n\n<b>Conclusion:</b> {conclusion}\n\n<b>Summary:</b>\n{summary}"
-
-                conn = DatabaseManager.get_read_connection()
-                conn.row_factory = sqlite3.Row
-                ulid = article.get("ulid")
-
-                sent_a = False
-                if self.job_id and is_top10 and chat_a:
-                    row_a = conn.execute("SELECT status FROM job_items WHERE job_id = ? AND step_identifier = ?", (self.job_id, f"pub_a_{ulid}")).fetchone()
-                    if row_a and row_a["status"] == "COMPLETED":
-                        sent_a = True
-
-                sent_b = False
-                if self.job_id and chat_b:
-                    row_b = conn.execute("SELECT status FROM job_items WHERE job_id = ? AND step_identifier = ?", (self.job_id, f"pub_b_{ulid}")).fetchone()
-                    if row_b and row_b["status"] == "COMPLETED":
-                        sent_b = True
-
-                if is_top10 and chat_a and not sent_a:
-                    if self.job_id:
-                        add_job_item(self.job_id, f"pub_a_{ulid}", "")
-                    await send_msg(chat_a, msg1_url)
-                    await send_msg(chat_a, msg2_briefing)
-                    if self.job_id:
-                        update_item_status(self.job_id, f"pub_a_{ulid}", "COMPLETED", "{}")
-                    
-                if chat_b and not sent_b:
-                    if self.job_id:
-                        add_job_item(self.job_id, f"pub_b_{ulid}", "")
-                    await send_msg(chat_b, msg1_url)
-                    await send_msg(chat_b, msg2_archive)
-                    if self.job_id:
-                        update_item_status(self.job_id, f"pub_b_{ulid}", "COMPLETED", "{}")
-                
-                self.queue.task_done()
-
-    async def run_pipeline(self):
-        prod_task = asyncio.create_task(self.producer())
-        cons_task = asyncio.create_task(self.consumer())
+        translations = {}
         try:
-            await prod_task
-        except Exception:
-            # Ensure consumer receives sentinel so it can terminate cleanly
-            try:
-                await self.queue.put(None)
-            except Exception:
-                pass
-            raise
-        await cons_task
-        return "Publisher Pipeline Complete."
+            llm = get_llm_client("azure")
+            resp = await llm.complete_chat(LLMRequest(messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"}))
+            content = resp.content
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start != -1 and end > start:
+                parsed = json.loads(content[start:end])
+                t_list = parsed.get("translations", parsed.get("articles", []))
+                if not t_list and isinstance(parsed, dict) and len(parsed) > 0:
+                    t_list = list(parsed.values())[0]
+                if isinstance(t_list, list):
+                    for t in t_list:
+                        if isinstance(t, dict) and "ulid" in t:
+                            translations[t["ulid"]] = {"translated_title": t.get("translated_title", ""), "translated_summary": t.get("translated_summary", ""), "translated_conclusion": t.get("translated_conclusion", "")}
+        except Exception as e:
+            log.dual_log(tag="Publisher:Translate", message=f"API/Parse Error: {e}", level="WARNING")
+
+        for article in batch:
+            ulid = article.get("ulid")
+            is_top10 = article.get("_is_top10", False)
+            if ulid in translations and translations[ulid].get("translated_title"):
+                trans_data = translations[ulid]
+                self.translated_map[ulid] = trans_data
+                if self.job_id:
+                    meta = make_metadata(STEP_TRANSLATE, ulid, retry=current_attempt, model=model_name, is_top10=is_top10)
+                    add_job_item(self.job_id, meta, json.dumps(article))
+                    update_item_status(self.job_id, meta, "COMPLETED", json.dumps(trans_data, ensure_ascii=False))
+            else:
+                if current_attempt >= max_retries - 1:
+                    log.dual_log(tag="Publisher:Translate", message=f"Giving up on {ulid}", level="ERROR")
+                    if self.job_id:
+                        meta = make_metadata(STEP_TRANSLATE, ulid, retry=current_attempt+1, model=model_name, error="Max retries reached", is_top10=is_top10)
+                        add_job_item(self.job_id, meta, json.dumps(article))
+                        update_item_status(self.job_id, meta, "FAILED", "{}")
+                else:
+                    log.dual_log(tag="Publisher:Translate", message=f"Translation missing for {ulid}, will retry.", level="WARNING")
+
+    async def _send_msg(self, client, chat_id, text) -> bool:
+        if not chat_id: return False
+        success = False
+        try:
+            resp = await client.post(f"https://api.telegram.org/bot{self.bot_token}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False})
+            resp.raise_for_status()
+            success = True
+        except Exception as e:
+            log.dual_log(tag="Publisher:Send", message=f"Telegram API error: {e}", level="WARNING")
+        await asyncio.sleep(self.message_delay)
+        return success
+
+    async def _phase2_upload_briefing(self) -> None:
+        if not self.top_10 or not self.briefing_chat: return
+        async with httpx.AsyncClient() as client:
+            for article in self.top_10:
+                ulid = article.get("ulid")
+                
+                if self.job_id:
+                    conn = DatabaseManager.get_read_connection()
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute("SELECT status FROM job_items WHERE job_id = ? AND json_extract(item_metadata, '$.step') = 'publish_briefing' AND json_extract(item_metadata, '$.ulid') = ?", (self.job_id, ulid)).fetchone()
+                    if row and row["status"] == "COMPLETED":
+                        continue
+
+                trans_data = self.translated_map.get(ulid, {})
+                title = trans_data.get("translated_title", article.get("title", ""))
+                conclusion = trans_data.get("translated_conclusion", article.get("conclusion", ""))
+                link = article.get("normalized_url", article.get("url", ""))
+                if not title and not conclusion: continue
+
+                if self.job_id:
+                    meta = make_metadata(STEP_PUBLISH_BRIEFING, ulid, is_top10=True)
+                    add_job_item(self.job_id, meta, "")
+                
+                s1 = await self._send_msg(client, self.briefing_chat, link)
+                s2 = await self._send_msg(client, self.briefing_chat, f"<b>{title}</b>\n\n{conclusion}")
+                
+                if self.job_id:
+                    if s1 and s2:
+                        update_item_status(self.job_id, meta, "COMPLETED", "{}")
+                    else:
+                        update_item_status(self.job_id, meta, "FAILED", "{}")
+
+    async def _phase3_upload_archive(self) -> None:
+        if not self.all_articles or not self.archive_chat: return
+        async with httpx.AsyncClient() as client:
+            for article in self.all_articles:
+                ulid = article.get("ulid")
+                
+                if self.job_id:
+                    conn = DatabaseManager.get_read_connection()
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute("SELECT status FROM job_items WHERE job_id = ? AND json_extract(item_metadata, '$.step') = 'publish_archive' AND json_extract(item_metadata, '$.ulid') = ?", (self.job_id, ulid)).fetchone()
+                    if row and row["status"] == "COMPLETED":
+                        continue
+
+                trans_data = self.translated_map.get(ulid, {})
+                title = trans_data.get("translated_title", article.get("title", ""))
+                summary = trans_data.get("translated_summary", article.get("summary", ""))
+                conclusion = trans_data.get("translated_conclusion", article.get("conclusion", ""))
+                link = article.get("normalized_url", article.get("url", ""))
+                if not title and not conclusion and not summary: continue
+
+                if self.job_id:
+                    meta = make_metadata(STEP_PUBLISH_ARCHIVE, ulid)
+                    add_job_item(self.job_id, meta, "")
+                
+                s1 = await self._send_msg(client, self.archive_chat, link)
+                s2 = await self._send_msg(client, self.archive_chat, f"<b>{title}</b>\n\n<b>Conclusion:</b> {conclusion}\n\n<b>Summary:</b>\n{summary}")
+                
+                if self.job_id:
+                    if s1 and s2:
+                        update_item_status(self.job_id, meta, "COMPLETED", "{}")
+                    else:
+                        update_item_status(self.job_id, meta, "FAILED", "{}")
