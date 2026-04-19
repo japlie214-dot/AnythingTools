@@ -55,7 +55,7 @@ from utils.logger.core import get_dual_logger
 from tools.registry import REGISTRY
 from database.schema import get_init_script
 
-MIGRATIONS_DIR = Path(__file__).parent / "database" / "migrations"
+# MIGRATIONS_DIR is now managed by database.migrations; removed from app.py
 
 log = get_dual_logger(__name__)
 
@@ -219,25 +219,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logging.exception("Failed to start DB writer thread: %s", e)
 
-    # Enqueue authoritative schema init via writer execscript and wait for completion
+    # Perform authoritative schema initialization and migration execution
     try:
-        from database.schema import ALLOW_DESTRUCTIVE_RESET, init_db
-        if ALLOW_DESTRUCTIVE_RESET:
-            try:
-                init_db()
-                log.dual_log(tag="DB:Schema", message="Schema initialization completed via init_db() (destructive reset enabled).")
-            except Exception as e:
-                log.dual_log(tag="DB:Schema", message=f"init_db() failed: {e}", level="ERROR", exc_info=e)
-        else:
-            script = get_init_script()
-            enqueue_execscript(script)
-            try:
-                await wait_for_writes()
-                log.dual_log(tag="DB:Schema", message="Schema initialization completed via writer.")
-            except Exception as e:
-                log.dual_log(tag="DB:Schema", message=f"wait_for_writes failed: {e}", level="WARNING", exc_info=e)
+        from database.schema import init_db
+        try:
+            # init_db() natively handles both fresh initialization and the migration pipeline
+            # as well as internally respecting the ALLOW_DESTRUCTIVE_RESET flag.
+            init_db()
+            log.dual_log(tag="DB:Schema", message="Schema initialization and migrations completed via init_db().")
+        except Exception as e:
+            log.dual_log(tag="DB:Schema", message=f"init_db() failed: {e}", level="ERROR", exc_info=e)
     except Exception as e:
-        log.dual_log(tag="DB:Schema", message=f"Failed to enqueue/initialize schema: {e}", level="ERROR", exc_info=e)
+        log.dual_log(tag="DB:Schema", message=f"Failed to initialize schema: {e}", level="ERROR", exc_info=e)
 
     # 3) Truncate transient PDF cache after ensuring schema is ready
     try:

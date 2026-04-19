@@ -39,7 +39,7 @@ def _is_foreign_key_error(error: Exception) -> bool:
 
 def _attempt_table_repair(conn, table_name: str) -> bool:
     """Strictly executes DDL repair script. Returns True on success."""
-    from database.schema import get_repair_script
+    from database.schemas import get_repair_script
     script = get_repair_script(table_name)
     if not script:
         return False

@@ -1,14 +1,15 @@
 # AnythingTools - Deterministic Tool Hosting Service
-  
+
 ## Executive Summary
 
 **AnythingTools** is a deterministic tool-hosting service that executes four whitelisted tools via HTTP API. The system has evolved from autonomous agent architecture into a direct execution engine with robust state management, automatic database recovery, and resume-capable pipelines.
 
-**Current Schema Version:** 3  
-**Architecture:** Single-writer SQLite with WAL mode  
+**Current Schema Version:** 3 via migration system (target: 4)  
+**Architecture:** Single-writer SQLite with WAL mode, autonomous migration management  
 **Tool Count:** 4 (scraper, draft_editor, batch_reader, publisher)  
 **Resume Capability:** Full granular tracking via job_items table  
 **Auto-Repair:** Schema-aware automatic recovery for 17 core tables  
+**Migration System:** Domain-driven schema, auto-folding to 3-file limit, transaction safety with rollback guards
 
 ---
 
@@ -29,6 +30,7 @@ The system transitioned from autonomous agent loops to deterministic execution:
 - Hardcoded tool whitelist (4 tools only)
 - Controlled LLM usage (Publisher translation only)
 - State machine with resume capability
+- **Database Migration System** (NEW) - Autonomous migration management
 
 ### 1.2 High-Level Data Flow
 
@@ -42,6 +44,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Anyt
 - **Single-writer database:** Prevents concurrent write conflicts
 - **Background writer thread:** Async DB operations with batching
 - **Lifecycle hooks:** Startup recovery, zombie cleanup, reconciliation
+- **Autonomous migrations:** Auto-folding with transaction safety
 
 ---
 
@@ -155,74 +158,131 @@ core_tools = ["scraper", "draft_editor", "publisher", "batch_reader"]
 
 **Auto-Repair Flow:**
 1. Catch `no such table` error
-2. Extract table name via regex: `r'no such table:\s*(?:\"|[\w\.]+\.)?(\w+)\"?'`
+2. Extract table name via regex
 3. Fetch DDL from `TABLE_REPAIR_SCRIPTS`
 4. Execute repair
 5. Retry original operation once
 
-#### `database/schema.py` - Schema Management
+#### `database/schema.py` - Schema Management (Proxy Layer)
 
-**Schema Version:** 3
+**Updated Architecture:** Migration system replaces monolithic schema
 
-**Core Tables (17 total):**
-- `jobs` - Job lifecycle
-- `job_items` - Granular step tracking
-- `job_logs` - Structured logs
-- `broadcast_batches` - Batch metadata
-- `scraped_articles` - Raw content
-- `scraped_articles_vec` - Vector embeddings
-- `pdf_parsed_pages` - PDF content
-- `pdf_parsed_pages_vec` - PDF vectors
-- `token_usage` - LLM cost tracking
-- Plus 8 additional support tables
-
-**Critical Migration: Migration from `step_identifier` to `item_metadata`**
-
-**Old Schema (Legacy):**
-```sql
-CREATE TABLE job_items (
-    item_id TEXT PRIMARY KEY,
-    job_id TEXT,
-    step_identifier TEXT,  -- Flat string: 'trans_ulid', 'pub_a_ulid'
-    status TEXT,
-    ...
-);
-```
-
-**New Schema (Current):**
-```sql
-CREATE TABLE job_items (
-    item_id TEXT PRIMARY KEY,
-    job_id TEXT,
-    item_metadata TEXT,    -- JSON: {"step":"translate","ulid":"...","retry":0}
-    status TEXT,
-    ...
-);
-
-CREATE INDEX idx_job_items_meta_step ON job_items(json_extract(item_metadata, '$.step'));
-CREATE INDEX idx_job_items_meta_ulid ON job_items(json_extract(item_metadata, '$.ulid'));
-```
-
-**Automated Migration in `init_db()` (lines 541-592):**
+**Proxy Functions:**
 ```python
-# Zero-downtime migration using table duplication
-INSERT INTO job_items_new (item_id, job_id, status, input_data, output_data, updated_at, item_metadata)
-SELECT item_id, job_id, status, input_data, output_data, updated_at,
-    CASE
-        WHEN step_identifier LIKE 'trans_%' THEN 
-            json_object('step', 'translate', 'ulid', REPLACE(step_identifier, 'trans_', ''), 'retry', 0)
-        WHEN step_identifier LIKE 'pub_a_%' THEN 
-            json_object('step', 'publish_briefing', 'ulid', REPLACE(step_identifier, 'pub_a_', ''), 'is_top10', json('true'), 'retry', 0)
-        WHEN step_identifier LIKE 'pub_b_%' THEN 
-            json_object('step', 'publish_archive', 'ulid', REPLACE(step_identifier, 'pub_b_', ''), 'retry', 0)
-        ELSE 
-            json_object('step', 'legacy', 'ulid', step_identifier, 'retry', 0)
-    END
-FROM job_items;
+def get_schema_version() -> int:
+    """Returns current schema version (discovers from migrations)"""
+    
+def get_init_script() -> str:
+    """Proxy to database.schemas.get_init_script()"""
+    
+def get_repair_script(table_name: str) -> Optional[str]:
+    """Proxy to database.schemas.get_repair_script()"""
+    
+def init_db() -> None:
+    """Main entry point: runs migrations, handles recovery"""
 ```
 
-**JSON Extraction Fallback System:**
-`TABLE_REPAIR_SCRIPTS` dictionary contains 17 table definitions with automatic fallback to BLOB storage when `sqlite-vec` is unavailable.
+**Critical Change:** No longer contains embedded migration logic. Delegates to `database/migrations/`.
+
+#### `database/migrations/` - NEW Migration System
+
+**Purpose:** Autonomous migration management with safety guarantees
+
+**Components:**
+
+**`__init__.py` - Migration Runner:**
+- `perform_auto_fold()` - Reduces migrations to ≤ 3 files
+- `run_migrations(conn)` - Safe execution with backup/restore
+- `_discover_migrations()` - Sequential version validation
+- `get_latest_version()` - Migration version discovery
+
+**Safety Mechanisms:**
+- **WAL Checkpoint:** `PRAGMA wal_checkpoint(TRUNCATE)` before migration
+- **DB Backup:** File-level backup using `shutil.copy2()`
+- **Exclusive Transaction:** `BEGIN EXCLUSIVE` locks all connections
+- **FK Disable:** `PRAGMA foreign_keys=OFF` during migration
+- **Per-Statement Execute:** Individual `conn.execute()` (NOT `executescript()`)
+- **FK Validation:** `PRAGMA foreign_key_check` after migration
+- **Safe Rollback Guard:** Try/except around `ROLLBACK`
+
+**`v004_step_to_metadata.py` - Initial Migration:**
+- **Version:** 4
+- **Purpose:** Convert `step_identifier` → `item_metadata`
+- **Design:** Individual `execute()` calls maintain transaction atomicity
+- **SQL:**
+  ```sql
+  CREATE TABLE job_items_new (...)
+  INSERT INTO job_items_new ...
+  DROP TABLE job_items
+  ALTER TABLE job_items_new RENAME TO job_items
+  CREATE INDEX ...
+  ```
+
+#### `database/schemas/` - Domain Schema Registry (NEW)
+
+**Purpose:** Atomized schema modules replacing monolithic definition
+
+**Structure:**
+```
+database/schemas/
+├── __init__.py          # Registry: BASE_SCHEMA_VERSION=3, MAX_MIGRATION_SCRIPTS=3
+├── jobs.py              # Job/queue tables (Version 3 state)
+├── finance.py           # Financial tables (Not used in current pipeline)
+├── vector.py            # Vector embedding tables (+sqlite-vec fallback)
+├── pdf.py               # PDF parsing tables
+└── token.py             # Token usage tables
+```
+
+**Registry Pattern:**
+```python
+# database/schemas/__init__.py
+BASE_SCHEMA_VERSION = 3
+MAX_MIGRATION_SCRIPTS = 3
+
+def get_init_script() -> str:
+    """Composes canonical schema from all domain modules"""
+    
+def get_repair_script(table_name: str) -> Optional[str]:
+    """Returns specific table DDL"""
+```
+
+**Domain Module Examples:**
+
+**`jobs.py` (Version 3 - Current State):**
+```python
+TABLES = {
+    "job_queue": """CREATE TABLE job_queue (
+        id TEXT PRIMARY KEY,
+        tool_name TEXT,
+        args TEXT,
+        status TEXT,
+        created_at TEXT
+    )""",
+    "job_items": """CREATE TABLE job_items (
+        id INTEGER PRIMARY KEY,
+        job_id INTEGER NOT NULL REFERENCES job_queue(id),
+        step_identifier TEXT NOT NULL,  # ← Version 3 column
+        created_at TEXT NOT NULL
+    )"""
+}
+```
+
+**`vector.py` (SQLite-vec compatibility):**
+```python
+TABLES = {
+    "article_embeddings": """
+        -- sqlite-vec virtual table (if available)
+        CREATE VIRTUAL TABLE article_embeddings USING vec0(
+            embedding float[768]
+        );
+        -- Fallback: CREATE TABLE ... (BLOB storage)
+    """
+}
+```
+
+#### `database/migrations_archive/` - Historical Storage
+- Stores folded migrations
+- `README.md` documents purpose
 
 #### `database/job_queue.py` - Job Operations
 
@@ -231,7 +291,7 @@ FROM job_items;
 # OLD
 def add_job_item(job_id: str, step_identifier: str, input_data: str) -> None: ...
 
-# NEW
+# NEW (after v004 migration)
 def add_job_item(job_id: str, item_metadata: str, input_data: str) -> None: ...
 ```
 
@@ -268,9 +328,8 @@ def get_all_translated_items(job_id: str) -> List[Dict[str, Any]]:
 claim_step(job_id: str, step_identifier: str): 
     "INSERT... WHERE step_identifier=?"
 
-# NEW  
+# NEW (uses JSON extraction)
 claim_step(job_id: str, step_identifier: str):
-    # Converts legacy identifier to JSON
     metadata = make_metadata(step=..., ulid=...)
     "INSERT... WHERE json_extract(item_metadata, '$.step')=?" 
 ```
@@ -600,7 +659,41 @@ token_usage             -- LLM cost tracking
 -- Support Tables (10 more)
 ```
 
-### 5.2 Job Lifecycle State Machine
+### 5.2 Migration System Architecture
+
+**State Machine:**
+```
+BASE_SCHEMA_VERSION = 3
+    ↓
+Discover migrations (v004_*, v005_*, etc.)
+    ↓
+Check limit (MAX_MIGRATION_SCRIPTS = 3)
+    ↓
+If > 3: perform_auto_fold()
+    ↓
+run_migrations(conn)
+    ├─> WAL checkpoint
+    ├─> Backup to .bak
+    ├─> BEGIN EXCLUSIVE
+    ├─> Disable FK constraints
+    ├─> Execute migrations (individual execute() calls)
+    ├─> Enable FK constraints
+    ├─> Validate FK integrity
+    ├─> COMMIT
+    └─> Safe rollback guard
+```
+
+**Auto-Fold Process:**
+1. Count active migrations
+2. If > 3, select oldest (sorted by version)
+3. Extract tables definitions
+4. Merge into `database/schemas/__init__.py`
+5. Update `BASE_SCHEMA_VERSION`
+6. Delete migration file
+7. Refresh module state
+8. Re-scan (now ≤ 3 migrations)
+
+### 5.3 Job Lifecycle State Machine
 
 ```
 QUEUED → RUNNING → COMPLETED/FAILED
@@ -612,7 +705,7 @@ QUEUED → RUNNING → COMPLETED/FAILED
    ABANDONED (3 failures)
 ```
 
-### 5.3 Job Items Tracking
+### 5.4 Job Items Tracking
 
 **Granular State Pipeline:**
 ```
@@ -624,7 +717,7 @@ PENDING → RUNNING → COMPLETED/FAILED
 - `publish_briefing` - Top-10 delivery
 - `publish_archive` - Full inventory delivery
 
-**Metadata Structure:**
+**Metadata Structure (Version 4):**
 ```json
 {
   "step": "translate",
@@ -637,32 +730,32 @@ PENDING → RUNNING → COMPLETED/FAILED
 }
 ```
 
-### 5.4 Auto-Repair Dictionary
+### 5.5 Auto-Repair Dictionary
 
 **17 Tables with Repair Scripts:**
 
 Example for `job_items`:
 ```python
 "job_items": """
-CREATE TABLE job_items (
-    item_id TEXT PRIMARY KEY,
-    job_id TEXT,
-    item_metadata TEXT,
-    status TEXT,
-    input_data TEXT,
-    output_data TEXT,
-    updated_at TEXT
-);
-CREATE INDEX idx_job_items_job ON job_items(job_id);
-CREATE INDEX idx_job_items_meta_step ON job_items(json_extract(item_metadata, '$.step'));
-CREATE INDEX idx_job_items_meta_ulid ON job_items(json_extract(item_metadata, '$.ulid'));
+    CREATE TABLE job_items (
+        item_id TEXT PRIMARY KEY,
+        job_id TEXT,
+        item_metadata TEXT,
+        status TEXT,
+        input_data TEXT,
+        output_data TEXT,
+        updated_at TEXT
+    );
+    CREATE INDEX idx_job_items_job ON job_items(job_id);
+    CREATE INDEX idx_job_items_meta_step ON job_items(json_extract(item_metadata, '$.step'));
+    CREATE INDEX idx_job_items_meta_ulid ON job_items(json_extract(item_metadata, '$.ulid'));
 """
 ```
 
 **Fallback Pattern:**
 - If `sqlite-vec` unavailable → BLOB storage
 - If table missing → Auto-repair on first access
-- If schema mismatch → No automatic migration (requires `SUMANAL_ALLOW_SCHEMA_RESET=1`)
+- If schema mismatch → Requires explicit reset
 
 ---
 
@@ -715,7 +808,30 @@ if found:
     continue  # Skip Telegram send
 ```
 
-### 6.3 AnythingLLM Callback
+### 6.3 Migration Resume
+
+**Auto-Fold Safety:**
+- Non-recursive scan prevents infinite loops
+- Module state refresh ensures fresh version reads
+- Table deletion handled by assignment (not merge)
+
+**Transaction Rollback:**
+```python
+try:
+    # Migration executed
+    conn.commit()
+except Exception as e:
+    # Restore from backup
+    shutil.copy2(backup_path, db_path)
+    # Safe rollback (guards against closed transaction)
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.OperationalError:
+        pass  # Transaction already closed
+    raise
+```
+
+### 6.4 AnythingLLM Callback
 
 **Trigger:** Job completion (`COMPLETED` status)
 
@@ -751,8 +867,10 @@ if found:
 | Job Crash | Exception | `INTERRUPTED` → `QUEUED` | 3 strikes |
 | Telegram API | HTTP error | Log + `PARTIAL` status | Bounded |
 | Callback | HTTP error | Silent log | N/A |
-| Schema Mismatch | Version check | `SUMANAL_ALLOW_SCHEMA_RESET` | Manual |
+| Schema Mismatch | Version check | Requires explicit reset | Manual |
 | FK Constraint | SQL error | Abort + log details | Immediate |
+| Migration Transaction | Exception | Restore backup + safe rollback | Auto |
+| Stale Version Reference | Module state | Dynamic reload | Auto |
 
 ### 7.2 Sandboxing & Constraints
 
@@ -765,6 +883,11 @@ if found:
 - Single-writer prevents corruption
 - WAL mode for concurrency
 - BLOB fallback for missing vec0 extension
+- **Migration transaction safety:**
+  - `BEGIN EXCLUSIVE` for isolation
+  - Individual `execute()` calls (no `executescript()`)
+  - Backup before migration
+  - Safe rollback guards
 
 **Rate Limiting:**
 - Telegram: 3.1s between messages
@@ -777,12 +900,14 @@ if found:
 - File writes: `tempfile` + `os.replace`
 - DB writes: Single-writer thread
 - JSON parsing: Validation with defaults
+- **Migrations:** Transaction-level atomicity with rollback
 
 **No Silent Failures:**
 - Telegram sends return boolean
 - Publisher sets `PARTIAL` on exception
 - Job items track every step
 - Logs include full context
+- Migration failures restore backup
 
 ---
 
@@ -871,24 +996,35 @@ cp .env.example .env
 uvicorn app:app --reload --port 8000
 ```
 
-### 9.3 Database Initialization
+### 9.3 Database Initialization & Migration
 
 **First Run:**
-- Creates v3 schema
-- All 17 tables initialized
+- Creates v3 schema from domain modules
+- All 17 tables initialized via `database/schemas/`
+- Migration runner activated
 - Writer thread started
 
 **Subsequent Runs:**
-- Validates `PRAGMA user_version`
-- Applies auto-repair if needed
-- Skips destructive changes
+- Validates schema version via migrations
+- Discovers new migration scripts
+- Applies auto-fold if > 3 migrations exist
+- Runs `run_migrations()` with safety mechanisms
+- Validates foreign keys after migration
 
 **Schema Migration:**
 ```bash
-# For major version changes
-export SUMANAL_ALLOW_SCHEMA_RESET=1
-uvicorn app:app --reload --port 8000
-# WARNING: Destructive - deletes existing data
+# For version upgrades (e.g., v3 → v4)
+# 1. Create migration script: database/migrations/v004_descriptive_name.py
+# 2. Ensure up() function uses individual execute() calls
+# 3. Restart application - migrations auto-run
+# 4. If > 3 migrations exist, oldest folds into BASE_SCHEMA_VERSION
+```
+
+**Emergency Rollback:**
+```bash
+# Migration failed? Database restored from .bak automatically
+# Check logs for details
+# Correct migration script and restart
 ```
 
 ### 9.4 Production Checklist
@@ -901,6 +1037,9 @@ uvicorn app:app --reload --port 8000
 - [ ] Configure log rotation
 - [ ] Monitor `logs/` directory
 - [ ] Verify `sqlite-vec` availability (optional)
+- [ ] **Migration system:** Test auto-fold with ≥3 migrations
+- [ ] **Transaction safety:** Verify backup/restore on failure
+- [ ] **Version alignment:** Confirm `BASE_SCHEMA_VERSION` matches modules
 
 ---
 
@@ -913,11 +1052,27 @@ uvicorn app:app --reload --port 8000
 - Verifies Chrome launch
 - Checks Google navigation
 
+**`tests/test_migration_pipeline.py` (NEW, outlined):**
+- **Spec 1:** Migration discovery and validation
+- **Spec 2:** Transaction rollback simulation
+- **Spec 3:** Auto-fold with 4 migrations
+- **Spec 4:** Version alignment verification
+- **Spec 5:** Vector index preservation
+
 ### 10.2 Manual Validation
 
 **Schema Check:**
 ```sql
-PRAGMA user_version;  -- Should return 3
+PRAGMA user_version;  -- Should return current migration version
+```
+
+**Migration Status:**
+```bash
+# List migrations
+ls database/migrations/v*.py
+
+# Verify registry
+python -c "from database.schemas import BASE_SCHEMA_VERSION, get_init_script; print(BASE_SCHEMA_VERSION)"
 ```
 
 **Tool Registry:**
@@ -952,14 +1107,17 @@ tail -f logs/application.log
 
 **Check Migration Success:**
 ```sql
--- Old column should not exist
+-- Verify old column removed
 SELECT name FROM pragma_table_info('job_items') WHERE name = 'step_identifier';
+-- Should return empty
 
--- New metadata column exists
+-- Verify new column exists
 SELECT name FROM pragma_table_info('job_items') WHERE name = 'item_metadata';
+-- Should return item_metadata
 
 -- Verify indexes
 SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='job_items';
+-- Should show idx_job_items_meta_step, idx_job_items_meta_ulid
 ```
 
 **Inspect Job Items:**
@@ -976,6 +1134,15 @@ FROM job_items
 WHERE job_id = '01J8XYZ...';
 ```
 
+**Verify Auto-Fold:**
+```sql
+-- Check BASE_SCHEMA_VERSION updated
+-- In Python: from database.schemas import BASE_SCHEMA_VERSION; print(BASE_SCHEMA_VERSION)
+
+-- Check migration directory (should be ≤ 3 files)
+-- ls database/migrations/
+```
+
 ---
 
 ## 11. Monitoring & Operations
@@ -986,13 +1153,18 @@ WHERE job_id = '01J8XYZ...';
 - `write_queue_size`: Number of pending DB writes
 - `active_jobs`: Currently running jobs
 - `registered_tools`: Tools loaded in registry
-- `schema_version`: Current DB schema (3)
+- `schema_version`: Current DB schema
 
 **Job Metrics:**
 - Queue depth (`SELECT COUNT(*) FROM jobs WHERE status='QUEUED'`)
 - Success rate (COMPLETED / TOTAL)
 - Average duration
 - Retry counts per step
+
+**Migration Metrics:**
+- Active migration count
+- Last fold timestamp
+- Transaction success/failure rate
 
 **Resource Metrics:**
 - WAL file size
@@ -1005,7 +1177,7 @@ WHERE job_id = '01J8XYZ...';
 ```
 logs/
 ├── application.log      # Main application
-├── database.log         # DB operations
+├── database.log         # DB operations (+ migrations)
 ├── scraper.log          # Scraper tool
 └── publisher.log        # Publisher pipeline
 ```
@@ -1018,9 +1190,12 @@ logs/
 **Critical Tags:**
 - `DB:Repair` - Schema auto-repair
 - `DB:Recovery` - Job resumption
+- `DB:Migration` - Migration execution
 - `Worker:Job:Crash` - Job failure
 - `Publisher:Send` - Telegram delivery
 - `Worker:Callback` - AnythingLLM callback
+- `Migration:Fold` - Auto-fold process
+- `Migration:Rollback` - Transaction rollback
 
 ### 11.3 Health Checks
 
@@ -1028,14 +1203,17 @@ logs/
 1. Vec0 extension loaded (or fallback)
 2. Chrome launchable
 3. DB writer started
-4. Schema validated
-5. Registry loaded
+4. **Migration system loaded**
+5. **Schema version validated**
+6. Registry loaded
 
 **Runtime Health:**
 1. Writer queue not growing
 2. No stuck jobs (RUNNING > 24h)
 3. Telegram rate limit respected
 4. Callback endpoint reachable
+5. **Migration count ≤ 3**
+6. **Transaction log clean**
 
 ---
 
@@ -1052,6 +1230,8 @@ logs/
 | **Bounded auto-repair** | Prevent infinite loops | Manual intervention required |
 | **No embedded vector search** | Extension dependency | BLOB fallback mode |
 | **Silent callback failures** | Don't break worker | Monitor logs |
+| **Migration file limit (3)** | Prevent uncontrolled growth | Auto-folding mechanism |
+| **Transaction breaks if executescript()** | SQLite auto-commit | Individual execute() calls |
 
 ### 12.2 Non-Goals (Wontfix)
 
@@ -1061,6 +1241,7 @@ logs/
 - **Multi-tenant isolation** → Single-session focus
 - **Automatic schema upgrades** → Requires explicit consent
 - **Infinite retry** → Bounded retry prevents cascading failures
+- **Complex migration dependencies** → Linear versioning only
 
 ### 12.3 Design Rationale
 
@@ -1081,3 +1262,10 @@ logs/
 - Resource control
 - Quality assurance
 - Support boundaries
+
+**Why "Migration System"?**
+- **Domain segregation:** Monolithic schema → maintainable modules
+- **Autonomous management:** No manual intervention required
+- **Transaction safety:** BEGIN EXCLUSIVE + rollback guards prevent corruption
+- **Version discipline:** 3-file limit forces cleanup
+- **Environment agnostic:** Works across dev/staging/production
