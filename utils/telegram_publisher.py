@@ -129,11 +129,26 @@ class PublisherPipeline:
                     update_item_status(self.job_id, meta, "FAILED", "{}")
         log.dual_log(tag="Publisher:Validate:Complete", message=f"Validation: {len(self.valid_articles)} valid, {len(self.skipped_articles)} skipped")
 
-    async def _send_msg(self, client, chat_id, text) -> TelegramErrorInfo:
+    @staticmethod
+    def _validate_markdown_v2(text: str) -> bool:
+        if not text: return True
+        for marker in ['*', '_', '__', '~', '||']:
+            if text.count(marker) % 2 != 0: return False
+        if text.count('[') != text.count(']'): return False
+        if text.count('(') != text.count(')'): return False
+        return True
+
+    async def _send_msg(self, client, chat_id, text, parse_mode="MarkdownV2") -> TelegramErrorInfo:
         from utils.text_processing import smart_split_message
+        import re
         if not chat_id: return TelegramErrorInfo(success=False, is_permanent=True, description="No chat_id")
         
-        chunks = smart_split_message(text, self.max_message_length, "MarkdownV2")
+        if parse_mode == "MarkdownV2" and not self._validate_markdown_v2(text):
+            log.dual_log(tag="Publisher:Send:Fallback", level="WARNING", message="MarkdownV2 validation failed; falling back to plain text")
+            parse_mode = None
+            text = re.sub(r'[*_~|]', '', text)
+
+        chunks = smart_split_message(text, self.max_message_length, parse_mode)
         for chunk in chunks:
             retries = 0
             chunk_success = False
@@ -141,7 +156,7 @@ class PublisherPipeline:
                 try:
                     resp = await client.post(
                         f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
-                        json={"chat_id": chat_id, "text": chunk, "parse_mode": "MarkdownV2", "disable_web_page_preview": False}
+                        json={"chat_id": chat_id, "text": chunk, "parse_mode": parse_mode, "disable_web_page_preview": False}
                     )
                     if resp.status_code == 429:
                         retry_after = int(resp.headers.get("Retry-After", 5))
@@ -283,29 +298,29 @@ class PublisherPipeline:
         update_item_status(self.job_id, meta, "FAILED", "{}")
 
     async def _call_llm_translate_batch(self, batch: List[Dict]) -> Dict[str, Dict[str, str]]:
+        from tools.publisher.prompt import TRANSLATION_PROMPT
+        from utils.text_processing import parse_llm_json
+        
         input_batch = [{"ulid": a.get("ulid", ""), "title": a.get("title", ""), "summary": a.get("summary", ""), "conclusion": a.get("conclusion", "")} for a in batch]
-        prompt = "Translate the following JSON array of articles into Bahasa Indonesia. Return EXACTLY a JSON object with a 'translations' key containing an array of objects. Preserve 'ulid', and translate to 'translated_title', 'translated_summary', 'translated_conclusion'.\n" + json.dumps(input_batch, ensure_ascii=False)
+        prompt = TRANSLATION_PROMPT.format(input_json=json.dumps(input_batch, ensure_ascii=False))
         
         translations: Dict[str, Dict[str, str]] = {}
         try:
             llm = get_llm_client("azure")
             resp = await llm.complete_chat(LLMRequest(messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"}))
-            content = resp.content
-            start = content.find("{")
-            end = content.rfind("}") + 1
-            if start != -1 and end > start:
-                parsed = json.loads(content[start:end])
-                t_list = parsed.get("translations", parsed.get("articles", []))
-                if not t_list and isinstance(parsed, dict) and len(parsed) > 0:
-                    t_list = list(parsed.values())[0]
-                if isinstance(t_list, list):
-                    for t in t_list:
-                        if isinstance(t, dict) and "ulid" in t:
-                            translations[t["ulid"]] = {
-                                "translated_title": t.get("translated_title", ""),
-                                "translated_summary": t.get("translated_summary", ""),
-                                "translated_conclusion": t.get("translated_conclusion", "")
-                            }
+            
+            parsed = parse_llm_json(resp.content)
+            t_list = parsed.get("translations", parsed.get("articles", []))
+            if not t_list and isinstance(parsed, dict) and len(parsed) > 0:
+                t_list = list(parsed.values())[0]
+            if isinstance(t_list, list):
+                for t in t_list:
+                    if isinstance(t, dict) and "ulid" in t:
+                        translations[t["ulid"]] = {
+                            "translated_title": t.get("translated_title", ""),
+                            "translated_summary": t.get("translated_summary", ""),
+                            "translated_conclusion": t.get("translated_conclusion", "")
+                        }
         except Exception as e:
             log.dual_log(tag="Publisher:Translate:Error", message=f"LLM API/Parse Error: {e}", level="WARNING")
         return translations
@@ -344,7 +359,7 @@ class PublisherPipeline:
                 raw_text = f"*{title}*\n\n{summary}\n\n*Kesimpulan:* {conclusion}"
                 body_text = escape_markdown_v2(raw_text)
                 
-                err1 = await self._send_msg(client, self.briefing_chat, link)
+                err1 = await self._send_msg(client, self.briefing_chat, link, parse_mode=None)
                 if not err1.success and err1.retry_after > self.max_retry_after:
                     raise Exception(f"Aborting batch due to extreme rate limit ({err1.retry_after}s)")
                 
@@ -354,10 +369,18 @@ class PublisherPipeline:
                 
                 if err1.success and err2.success:
                     self.phase_state["publish_briefing"][ulid] = {"status": "COMPLETED"}
+                    enqueue_write(
+                        "UPDATE broadcast_batches SET phase_state = ?, updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
+                        (json.dumps(self.phase_state, ensure_ascii=False), self.batch_id)
+                    )
                     if self.job_id:
                         update_item_status(self.job_id, meta, "COMPLETED", "{}")
                 else:
                     self.phase_state["publish_briefing"][ulid] = {"status": "FAILED"}
+                    enqueue_write(
+                        "UPDATE broadcast_batches SET phase_state = ?, updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
+                        (json.dumps(self.phase_state, ensure_ascii=False), self.batch_id)
+                    )
                     err_desc = err1.description if not err1.success else err2.description
                     log.dual_log(tag="Publisher:Briefing:Failed", message=f"Briefing upload failed for {ulid}: {err_desc}", level="WARNING")
                     if self.job_id:
@@ -400,7 +423,7 @@ class PublisherPipeline:
                 raw_text = f"*{title}*\n\n*Kesimpulan:* {conclusion}\n\n*Ringkasan:*\n{summary}"
                 body_text = escape_markdown_v2(raw_text)
                 
-                err1 = await self._send_msg(client, self.archive_chat, link)
+                err1 = await self._send_msg(client, self.archive_chat, link, parse_mode=None)
                 if not err1.success and err1.retry_after > self.max_retry_after:
                     raise Exception(f"Aborting batch due to extreme rate limit ({err1.retry_after}s)")
                 
@@ -410,10 +433,18 @@ class PublisherPipeline:
                 
                 if err1.success and err2.success:
                     self.phase_state["publish_archive"][ulid] = {"status": "COMPLETED"}
+                    enqueue_write(
+                        "UPDATE broadcast_batches SET phase_state = ?, updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
+                        (json.dumps(self.phase_state, ensure_ascii=False), self.batch_id)
+                    )
                     if self.job_id:
                         update_item_status(self.job_id, meta, "COMPLETED", "{}")
                 else:
                     self.phase_state["publish_archive"][ulid] = {"status": "FAILED"}
+                    enqueue_write(
+                        "UPDATE broadcast_batches SET phase_state = ?, updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
+                        (json.dumps(self.phase_state, ensure_ascii=False), self.batch_id)
+                    )
                     err_desc = err1.description if not err1.success else err2.description
                     log.dual_log(tag="Publisher:Archive:Failed", message=f"Archive upload failed for {ulid}: {err_desc}", level="WARNING")
                     if self.job_id:

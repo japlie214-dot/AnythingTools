@@ -221,14 +221,28 @@ async def lifespan(app: FastAPI):
 
     # Perform authoritative schema initialization and migration execution
     try:
-        from database.schema import init_db
+        from database.schema import get_init_script, get_schema_version
+        from database.writer import enqueue_execscript
+        import sqlite3
+        conn = DatabaseManager.get_read_connection()
         try:
-            # init_db() natively handles both fresh initialization and the migration pipeline
-            # as well as internally respecting the ALLOW_DESTRUCTIVE_RESET flag.
+            current_v = conn.execute("PRAGMA user_version").fetchone()[0]
+        except sqlite3.DatabaseError:
+            current_v = 0
+        
+        if current_v == 0:
+            # Fresh DB Fast Path via single-writer
+            schema_version = get_schema_version()
+            enqueue_execscript(get_init_script())
+            enqueue_write(f"PRAGMA user_version = {schema_version}")
+            await asyncio.wait_for(wait_for_writes(), timeout=10.0)
+            log.dual_log(tag="DB:Schema", message=f"Fresh database; schema created and stamped to v{schema_version} via writer queue.")
+        else:
+            from database.schema import init_db
             init_db()
-            log.dual_log(tag="DB:Schema", message="Schema initialization and migrations completed via init_db().")
-        except Exception as e:
-            log.dual_log(tag="DB:Schema", message=f"init_db() failed: {e}", level="ERROR", exc_info=e)
+            log.dual_log(tag="DB:Schema", message="Schema migrations completed via init_db().")
+    except asyncio.TimeoutError:
+        log.dual_log(tag="DB:Schema", message="Database initialization timed out after 10s.", level="ERROR")
     except Exception as e:
         log.dual_log(tag="DB:Schema", message=f"Failed to initialize schema: {e}", level="ERROR", exc_info=e)
 

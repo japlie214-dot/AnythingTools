@@ -28,35 +28,48 @@ def escape_prompt_separators(text: str) -> str:
 
 def escape_markdown_v2(text: str) -> str:
     """
-    Global MarkdownV2 parser and escaper.
-    Splits text by MarkdownV2 structural entities and escapes the reserved
-    characters in the plaintext segments to prevent Telegram 400 errors.
+    Telegram MarkdownV2 escaper with entity awareness.
+    Identifies structural entities and escapes reserved characters in plaintext.
+    Note: Highly hallucinated nested markdown from LLMs may break this regex.
     """
     if not text:
         return ""
     
-    # Matches markdown entities: links, code blocks, inline code, bold, italic, strikethrough, spoiler
-    pattern = re.compile(r'(\[[^\]]+\]\([^)]+\)|```[\s\S]+?```|`[^`]+`|\*[^*]+\*|_[^_]+_|~[^~]+~|\|\|[\s\S]+?\|\|)')
-    parts = pattern.split(text)
-    escaped_parts = []
+    # Use r'...' and place hyphen at the end to avoid creating an ASCII range (+ to =)
+    _ESC = re.compile(r'([\\_*\[\]()~`>#+=|{}.!\-])')
+    # Match entities: code blocks, inline code, links, spoilers, bold, italic, strikethrough
+    pat = re.compile(
+        r'(```[\s\S]+?```|`[^`]+`'
+        r'|\[[^\]]+\]\([^)]+\)'
+        r'|\|\|[\s\S]+?\|\|'
+        r'|\*[^*]+\*|_[^_]+_|~[^~]+~)'
+    )
+    parts = pat.split(text)
+    result = []
     
     for i, part in enumerate(parts):
         if i % 2 == 0:
-            # Plaintext: escape all reserved characters strictly (including backslash)
-            escaped = re.sub(r'([\\_*\[\]()~`>#+\-=|{}.!])', r'\\\1', part)
-            escaped_parts.append(escaped)
+            # Plaintext: escape ALL reserved chars using single backslash in replacement
+            result.append(_ESC.sub(r'\\\1', part))
         else:
-            # Markdown Entity: preserve boundaries but escape inner text for inline styles
-            if part.startswith('```') or part.startswith('`') or part.startswith('['):
-                escaped_parts.append(part)
+            if part.startswith('```') or part.startswith('`'):
+                result.append(part)  # Code: no inner escape
+            elif part.startswith('['):
+                m = re.match(r'\[([^\]]+)\]\(([^)]+)\)', part)
+                if m:
+                    disp = _ESC.sub(r'\\\1', m.group(1))
+                    result.append(f'[{disp}]({m.group(2)})')
+                else:
+                    result.append(part)
+            elif part.startswith('||'):
+                inner = part[2:-2]
+                result.append(f'||{_ESC.sub(r"\\\1", inner)}||')
             else:
-                boundary_len = 2 if part.startswith('||') else 1
-                boundary = part[:boundary_len]
-                inner_text = part[boundary_len:-boundary_len]
-                inner_escaped = re.sub(r'([\\_*\[\]()~`>#+\-=|{}.!])', r'\\\1', inner_text)
-                escaped_parts.append(f"{boundary}{inner_escaped}{boundary}")
-                
-    return "".join(escaped_parts)
+                b = part[0]
+                inner = part[1:-1]
+                esc = _ESC.sub(r'\\\1', inner)
+                result.append(f'{b}{esc}{b}')
+    return "".join(result)
 
 
 def normalize_url(url: str) -> str:

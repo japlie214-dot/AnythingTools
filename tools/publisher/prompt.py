@@ -8,11 +8,15 @@ TRANSLATION_PROMPT = """
 Translate the following JSON array of articles into Bahasa Indonesia.
 
 CRITICAL FORMATTING RULES:
-- The output will be parsed using Telegram's MarkdownV2.
-- Use *italic* or _italic_ for emphasis.
-- Do NOT use HTML tags. 
-- Replace the heading "Conclusion:" entirely with "Kesimpulan:"
+- The output will be sent via Telegram MarkdownV2 parser.
+- Use *bold* for titles and _italic_ for emphasis ONLY.
+- Do NOT use HTML tags.
+- Replace "Conclusion:" entirely with "Kesimpulan:"
 - Preserve all structural line breaks.
+- Do NOT use these chars outside Markdown: _ * [ ] ( ) ~ ` > # + - = | { } . !.
+- If needed in plain text, escape with backslash (e.g. \. \! \-)
+- For URLs, use [text](url) format. Do NOT leave bare URLs.
+- Avoid nested formatting and multi-line bold/italic blocks.
 
 Return EXACTLY a JSON object with this structure:
 {
