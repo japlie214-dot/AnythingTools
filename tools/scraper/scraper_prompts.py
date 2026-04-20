@@ -46,7 +46,7 @@ OUTPUT FORMAT (Strict - Exactly These Three Sections):
 ### Title:
 [Catchy, informative headline that captures the article's main point]
 
-### Conclusion:
+### Kesimpulan:
 [One sentence stating why this matters to an executive reader - the "so what"]
 
 ### Summary:

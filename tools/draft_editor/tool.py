@@ -51,7 +51,7 @@ class DraftEditorTool(BaseTool):
             raise ValueError("Batch not found or missing curated data.")
 
         if row["status"] != "PENDING":
-            return json.dumps({"status": "FAILED", "error": f"Cannot modify batch {batch_id} because its status is {row['status']}. Modifications are only allowed before publishing begins."})
+            return json.dumps({"status": "FAILED", "error": f"CRITICAL LOCK: Cannot execute SWAP on batch {batch_id}. The batch status is '{row['status']}'. Draft Editor modifications are strictly locked to 'PENDING' batches to prevent state corruption."})
             
         try:
             with open(row["curated_json_path"], "r", encoding="utf-8") as f:

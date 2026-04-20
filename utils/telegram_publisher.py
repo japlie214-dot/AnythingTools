@@ -7,6 +7,7 @@ import asyncio
 import json
 import httpx
 from collections import deque
+from dataclasses import dataclass
 from typing import List, Dict, Any, Set, Tuple
 from clients.llm import get_llm_client, LLMRequest
 from database.job_queue import add_job_item, update_item_status
@@ -28,6 +29,16 @@ log = get_dual_logger(__name__)
 MAX_TRANSLATION_RETRIES = 3
 BATCH_SIZE = 10
 
+
+@dataclass
+class TelegramErrorInfo:
+    success: bool
+    is_permanent: bool = False
+    is_transient: bool = False
+    status_code: int = 0
+    description: str = ""
+    retry_after: int = 0
+
 def _is_valid_article(article: Dict) -> Tuple[bool, str]:
     ulid = article.get("ulid")
     if ulid is None or ulid == "" or ulid == "None":
@@ -38,24 +49,47 @@ def _is_valid_article(article: Dict) -> Tuple[bool, str]:
     return True, ""
 
 class PublisherPipeline:
-    def __init__(self, batch_id: str, top_10: List[Dict], inventory: List[Dict], job_id: str | None = None):
+    def __init__(self, batch_id: str, top_10: List[Dict], inventory: List[Dict], job_id: str | None = None, resume: bool = False, reset: bool = False):
         self.batch_id = batch_id
         self.top_10 = top_10
         self.inventory = inventory
         self.job_id = job_id
+        self.resume = resume
+        self.reset = reset
         self.translated_map: Dict[str, Dict] = {}
+        
         self.bot_token = getattr(config, 'TELEGRAM_BOT_TOKEN', None)
         self.briefing_chat = getattr(config, 'TELEGRAM_BRIEFING_CHAT_ID', None)
         self.archive_chat = getattr(config, 'TELEGRAM_ARCHIVE_CHAT_ID', None)
         self.message_delay = getattr(config, 'TELEGRAM_MESSAGE_DELAY', 3.1)
+        self.max_message_length = getattr(config, 'TELEGRAM_MAX_MESSAGE_LENGTH', 4000)
+        self.max_retry_after = getattr(config, 'TELEGRAM_MAX_RETRY_AFTER', 120)
         
-        self.briefing_posted_ulids: Set[str] = set()
-        self.archive_posted_ulids: Set[str] = set()
+        self.phase_state = {
+            "validate": {}, "translate": {}, "publish_briefing": {}, "publish_archive": {}
+        }
+        
         self.translation_failed_ulids: Set[str] = set()
         self.valid_articles: List[Dict] = []
         self.skipped_articles: List[Dict] = []
         
         self._build_article_list()
+        self._load_phase_state()
+
+    def _load_phase_state(self):
+        if self.reset:
+            return
+        conn = DatabaseManager.get_read_connection()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT phase_state FROM broadcast_batches WHERE batch_id = ?", (self.batch_id,)).fetchone()
+        if row and row["phase_state"]:
+            try:
+                loaded = json.loads(row["phase_state"])
+                for phase in self.phase_state:
+                    if phase in loaded:
+                        self.phase_state[phase].update(loaded[phase])
+            except Exception:
+                pass
 
     def _build_article_list(self):
         self.all_articles = []
@@ -95,17 +129,44 @@ class PublisherPipeline:
                     update_item_status(self.job_id, meta, "FAILED", "{}")
         log.dual_log(tag="Publisher:Validate:Complete", message=f"Validation: {len(self.valid_articles)} valid, {len(self.skipped_articles)} skipped")
 
-    async def _send_msg(self, client, chat_id, text) -> bool:
-        if not chat_id: return False
-        success = False
-        try:
-            resp = await client.post(f"https://api.telegram.org/bot{self.bot_token}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False})
-            resp.raise_for_status()
-            success = True
-        except Exception as e:
-            log.dual_log(tag="Publisher:Send", message=f"Telegram API error: {e}", level="WARNING")
-        await asyncio.sleep(self.message_delay)
-        return success
+    async def _send_msg(self, client, chat_id, text) -> TelegramErrorInfo:
+        from utils.text_processing import smart_split_message
+        if not chat_id: return TelegramErrorInfo(success=False, is_permanent=True, description="No chat_id")
+        
+        chunks = smart_split_message(text, self.max_message_length, "MarkdownV2")
+        for chunk in chunks:
+            retries = 0
+            chunk_success = False
+            while retries < 3:
+                try:
+                    resp = await client.post(
+                        f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
+                        json={"chat_id": chat_id, "text": chunk, "parse_mode": "MarkdownV2", "disable_web_page_preview": False}
+                    )
+                    if resp.status_code == 429:
+                        retry_after = int(resp.headers.get("Retry-After", 5))
+                        if retry_after > self.max_retry_after:
+                            return TelegramErrorInfo(success=False, is_transient=True, retry_after=retry_after, description="Extreme Rate Limit")
+                        await asyncio.sleep(retry_after)
+                        retries += 1
+                        continue
+                    if resp.status_code in (400, 403):
+                        log.dual_log(tag="Publisher:Send:Error", message=f"Permanent error: {resp.text}", level="ERROR")
+                        return TelegramErrorInfo(success=False, is_permanent=True, status_code=resp.status_code, description=resp.text)
+                    
+                    resp.raise_for_status()
+                    chunk_success = True
+                    break
+                except httpx.HTTPStatusError as e:
+                    return TelegramErrorInfo(success=False, is_transient=True, status_code=e.response.status_code, description=str(e))
+                except Exception as e:
+                    return TelegramErrorInfo(success=False, is_transient=True, description=str(e))
+            
+            if not chunk_success:
+                return TelegramErrorInfo(success=False, is_transient=True, description="Max retries exhausted")
+                
+            await asyncio.sleep(self.message_delay)
+        return TelegramErrorInfo(success=True)
 
     async def _phase1_translate_all(self) -> None:
         self._load_cached_translations()
@@ -178,14 +239,14 @@ class PublisherPipeline:
         log.dual_log(tag="Publisher:Translate:Complete", message=f"Translation phase done: {len(self.translated_map)} succeeded, {len(self.translation_failed_ulids)} failed")
 
     def _load_cached_translations(self) -> None:
-        if not self.job_id: return
         conn = DatabaseManager.get_read_connection()
         conn.row_factory = sqlite3.Row
         for article in self.valid_articles:
             ulid = article.get("ulid")
+            # Query independently of job_id to allow cross-job resumes
             row = conn.execute(
-                "SELECT output_data FROM job_items WHERE job_id = ? AND json_extract(item_metadata, '$.step') = 'translate' AND json_extract(item_metadata, '$.ulid') = ? AND status = 'COMPLETED'",
-                (self.job_id, ulid)
+                "SELECT output_data FROM job_items WHERE json_extract(item_metadata, '$.step') = 'translate' AND json_extract(item_metadata, '$.ulid') = ? AND status = 'COMPLETED' ORDER BY updated_at DESC LIMIT 1",
+                (ulid,)
             ).fetchone()
             if row and row["output_data"]:
                 try:
@@ -250,6 +311,7 @@ class PublisherPipeline:
         return translations
 
     async def _phase2_upload_briefing(self) -> None:
+        from utils.text_processing import escape_markdown_v2
         if not self.briefing_chat: return
         top_10_translated = [a for a in self.valid_articles if a.get("_is_top10") and a.get("ulid") in self.translated_map]
         
@@ -262,13 +324,8 @@ class PublisherPipeline:
             for article in top_10_translated:
                 ulid = article.get("ulid")
                 
-                if self.job_id:
-                    conn = DatabaseManager.get_read_connection()
-                    conn.row_factory = sqlite3.Row
-                    row = conn.execute("SELECT status FROM job_items WHERE job_id = ? AND json_extract(item_metadata, '$.step') = 'publish_briefing' AND json_extract(item_metadata, '$.ulid') = ? AND status = 'COMPLETED'", (self.job_id, ulid)).fetchone()
-                    if row and row["status"] == "COMPLETED":
-                        self.briefing_posted_ulids.add(ulid)
-                        continue
+                if self.phase_state["publish_briefing"].get(ulid, {}).get("status") == "COMPLETED":
+                    continue
 
                 trans_data = self.translated_map.get(ulid, {})
                 title = trans_data.get("translated_title", article.get("title", ""))
@@ -283,22 +340,34 @@ class PublisherPipeline:
                     meta = make_metadata(STEP_PUBLISH_BRIEFING, ulid, is_top10=True)
                     add_job_item(self.job_id, meta, "")
                 
-                s1 = await self._send_msg(client, self.briefing_chat, link)
-                body_text = f"<b>{title}</b>\n\n{summary}\n\n<b>Conclusion:</b> {conclusion}"
-                s2 = await self._send_msg(client, self.briefing_chat, body_text)
+                # Assemble text with intended structural formatting (MarkdownV2) and localized "Kesimpulan:"
+                raw_text = f"*{title}*\n\n{summary}\n\n*Kesimpulan:* {conclusion}"
+                body_text = escape_markdown_v2(raw_text)
                 
-                if s1 and s2:
-                    self.briefing_posted_ulids.add(ulid)
+                err1 = await self._send_msg(client, self.briefing_chat, link)
+                if not err1.success and err1.retry_after > self.max_retry_after:
+                    raise Exception(f"Aborting batch due to extreme rate limit ({err1.retry_after}s)")
+                
+                err2 = await self._send_msg(client, self.briefing_chat, body_text)
+                if not err2.success and err2.retry_after > self.max_retry_after:
+                    raise Exception(f"Aborting batch due to extreme rate limit ({err2.retry_after}s)")
+                
+                if err1.success and err2.success:
+                    self.phase_state["publish_briefing"][ulid] = {"status": "COMPLETED"}
                     if self.job_id:
                         update_item_status(self.job_id, meta, "COMPLETED", "{}")
                 else:
-                    log.dual_log(tag="Publisher:Briefing:Failed", message=f"Briefing upload failed for {ulid}", level="WARNING")
+                    self.phase_state["publish_briefing"][ulid] = {"status": "FAILED"}
+                    err_desc = err1.description if not err1.success else err2.description
+                    log.dual_log(tag="Publisher:Briefing:Failed", message=f"Briefing upload failed for {ulid}: {err_desc}", level="WARNING")
                     if self.job_id:
                         update_item_status(self.job_id, meta, "FAILED", "{}")
 
-        log.dual_log(tag="Publisher:Briefing:Complete", message=f"Briefing: {len(self.briefing_posted_ulids)} posted")
+        posted_count = sum(1 for v in self.phase_state["publish_briefing"].values() if v.get("status") == "COMPLETED")
+        log.dual_log(tag="Publisher:Briefing:Complete", message=f"Briefing: {posted_count} posted")
 
     async def _phase3_upload_archive(self) -> None:
+        from utils.text_processing import escape_markdown_v2
         if not self.archive_chat: return
         archive_items = [a for a in self.valid_articles if a.get("ulid") in self.translated_map]
         
@@ -311,13 +380,8 @@ class PublisherPipeline:
             for article in archive_items:
                 ulid = article.get("ulid")
                 
-                if self.job_id:
-                    conn = DatabaseManager.get_read_connection()
-                    conn.row_factory = sqlite3.Row
-                    row = conn.execute("SELECT status FROM job_items WHERE job_id = ? AND json_extract(item_metadata, '$.step') = 'publish_archive' AND json_extract(item_metadata, '$.ulid') = ? AND status = 'COMPLETED'", (self.job_id, ulid)).fetchone()
-                    if row and row["status"] == "COMPLETED":
-                        self.archive_posted_ulids.add(ulid)
-                        continue
+                if self.phase_state["publish_archive"].get(ulid, {}).get("status") == "COMPLETED":
+                    continue
 
                 trans_data = self.translated_map.get(ulid, {})
                 title = trans_data.get("translated_title", article.get("title", ""))
@@ -332,32 +396,44 @@ class PublisherPipeline:
                     meta = make_metadata(STEP_PUBLISH_ARCHIVE, ulid, is_top10=article.get("_is_top10", False))
                     add_job_item(self.job_id, meta, "")
                 
-                s1 = await self._send_msg(client, self.archive_chat, link)
-                body_text = f"<b>{title}</b>\n\n<b>Conclusion:</b> {conclusion}\n\n<b>Summary:</b>\n{summary}"
-                s2 = await self._send_msg(client, self.archive_chat, body_text)
+                # Assemble text with intended structural formatting (MarkdownV2) and localized Indonesian labels
+                raw_text = f"*{title}*\n\n*Kesimpulan:* {conclusion}\n\n*Ringkasan:*\n{summary}"
+                body_text = escape_markdown_v2(raw_text)
                 
-                if s1 and s2:
-                    self.archive_posted_ulids.add(ulid)
+                err1 = await self._send_msg(client, self.archive_chat, link)
+                if not err1.success and err1.retry_after > self.max_retry_after:
+                    raise Exception(f"Aborting batch due to extreme rate limit ({err1.retry_after}s)")
+                
+                err2 = await self._send_msg(client, self.archive_chat, body_text)
+                if not err2.success and err2.retry_after > self.max_retry_after:
+                    raise Exception(f"Aborting batch due to extreme rate limit ({err2.retry_after}s)")
+                
+                if err1.success and err2.success:
+                    self.phase_state["publish_archive"][ulid] = {"status": "COMPLETED"}
                     if self.job_id:
                         update_item_status(self.job_id, meta, "COMPLETED", "{}")
                 else:
-                    log.dual_log(tag="Publisher:Archive:Failed", message=f"Archive upload failed for {ulid}", level="WARNING")
+                    self.phase_state["publish_archive"][ulid] = {"status": "FAILED"}
+                    err_desc = err1.description if not err1.success else err2.description
+                    log.dual_log(tag="Publisher:Archive:Failed", message=f"Archive upload failed for {ulid}: {err_desc}", level="WARNING")
                     if self.job_id:
                         update_item_status(self.job_id, meta, "FAILED", "{}")
 
-        log.dual_log(tag="Publisher:Archive:Complete", message=f"Archive: {len(self.archive_posted_ulids)} posted")
+        posted_count = sum(1 for v in self.phase_state["publish_archive"].values() if v.get("status") == "COMPLETED")
+        log.dual_log(tag="Publisher:Archive:Complete", message=f"Archive: {posted_count} posted")
 
     def _finalize(self) -> Dict[str, Any]:
         total = len(self.all_articles)
         skipped = len(self.skipped_articles)
         translated = len(self.translated_map)
         trans_failed = len(self.translation_failed_ulids)
-        briefing_posted = len(self.briefing_posted_ulids)
-        archive_posted = len(self.archive_posted_ulids)
+        
+        briefing_posted = sum(1 for v in self.phase_state["publish_briefing"].values() if v.get("status") == "COMPLETED")
+        archive_posted = sum(1 for v in self.phase_state["publish_archive"].values() if v.get("status") == "COMPLETED")
         
         all_valid_translated = translated == len(self.valid_articles)
-        all_briefing_posted = all(a.get("ulid") in self.briefing_posted_ulids for a in self.valid_articles if a.get("_is_top10"))
-        all_archive_posted = all(a.get("ulid") in self.archive_posted_ulids for a in self.valid_articles)
+        all_briefing_posted = all(self.phase_state["publish_briefing"].get(a.get("ulid"), {}).get("status") == "COMPLETED" for a in self.valid_articles if a.get("_is_top10"))
+        all_archive_posted = all(self.phase_state["publish_archive"].get(a.get("ulid"), {}).get("status") == "COMPLETED" for a in self.valid_articles)
         
         if len(self.valid_articles) == 0:
             batch_status = "FAILED"
@@ -369,8 +445,8 @@ class PublisherPipeline:
             batch_status = "PARTIAL"
             
         enqueue_write(
-            "UPDATE broadcast_batches SET status = ?, posted_research_ulids = ?, posted_summary_ulids = ?, updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
-            (batch_status, json.dumps(sorted(list(self.briefing_posted_ulids)), ensure_ascii=False), json.dumps(sorted(list(self.archive_posted_ulids)), ensure_ascii=False), self.batch_id)
+            "UPDATE broadcast_batches SET status = ?, phase_state = ?, updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
+            (batch_status, json.dumps(self.phase_state, ensure_ascii=False), self.batch_id)
         )
         
         failed_items = sorted(list(self.translation_failed_ulids))

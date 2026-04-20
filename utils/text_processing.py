@@ -26,6 +26,39 @@ def escape_prompt_separators(text: str) -> str:
     return text.replace("###", "---")
 
 
+def escape_markdown_v2(text: str) -> str:
+    """
+    Global MarkdownV2 parser and escaper.
+    Splits text by MarkdownV2 structural entities and escapes the reserved
+    characters in the plaintext segments to prevent Telegram 400 errors.
+    """
+    if not text:
+        return ""
+    
+    # Matches markdown entities: links, code blocks, inline code, bold, italic, strikethrough, spoiler
+    pattern = re.compile(r'(\[[^\]]+\]\([^)]+\)|```[\s\S]+?```|`[^`]+`|\*[^*]+\*|_[^_]+_|~[^~]+~|\|\|[\s\S]+?\|\|)')
+    parts = pattern.split(text)
+    escaped_parts = []
+    
+    for i, part in enumerate(parts):
+        if i % 2 == 0:
+            # Plaintext: escape all reserved characters strictly (including backslash)
+            escaped = re.sub(r'([\\_*\[\]()~`>#+\-=|{}.!])', r'\\\1', part)
+            escaped_parts.append(escaped)
+        else:
+            # Markdown Entity: preserve boundaries but escape inner text for inline styles
+            if part.startswith('```') or part.startswith('`') or part.startswith('['):
+                escaped_parts.append(part)
+            else:
+                boundary_len = 2 if part.startswith('||') else 1
+                boundary = part[:boundary_len]
+                inner_text = part[boundary_len:-boundary_len]
+                inner_escaped = re.sub(r'([\\_*\[\]()~`>#+\-=|{}.!])', r'\\\1', inner_text)
+                escaped_parts.append(f"{boundary}{inner_escaped}{boundary}")
+                
+    return "".join(escaped_parts)
+
+
 def normalize_url(url: str) -> str:
     """Return a canonical, lowercase URL with query parameters, fragments, and
     trailing slashes removed. Scheme, host, and full path are preserved intact.

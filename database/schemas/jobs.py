@@ -51,8 +51,7 @@ TABLES = {
             curated_json_path TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'PENDING'
                 CHECK(status IN ('PENDING','PUBLISHING','PARTIAL','COMPLETED','FAILED')),
-            posted_research_ulids TEXT NOT NULL DEFAULT '[]',
-            posted_summary_ulids TEXT NOT NULL DEFAULT '[]',
+            phase_state TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
