@@ -1,60 +1,39 @@
 # AnythingTools - Deterministic Tool Hosting Service
 
-## Executive Summary
+## 1. Project Overview
 
-**AnythingTools** is a deterministic tool-hosting service that executes four whitelisted tools via HTTP API. The system has evolved from autonomous agent architecture into a direct execution engine with robust state management, automatic database recovery, and resume-capable pipelines.
+**AnythingTools** is a deterministic tool-hosting service that executes exactly four whitelisted tools via HTTP API. The system operates as a direct execution engine with robust state management, automatic database recovery, and resume-capable pipelines.
 
-**Current Schema Version:** 6 (via migration system, auto-fold mechanism)  
-**Architecture:** Single-writer SQLite with WAL mode, autonomous migration management  
-**Tool Count:** 4 (scraper, draft_editor, batch_reader, publisher)  
-**Resume Capability:** Full granular tracking via job_items table  
-**Auto-Repair:** Schema-aware automatic recovery for 17 core tables  
-**Migration System:** Domain-driven schema, auto-folding to 3-file limit, transaction safety with rollback guards  
-**Publisher Status:** Queue-with-requeue architecture, PARTIAL status support, item-centric tracking with phase_state JSON  
-**Database Fast-Path:** Fresh DB initialization uses background writer queue exclusively  
-**MarkdownV2 Hardening:** Entity-aware escaping with critical bug fixes
+### What It Does
+- Provides REST API endpoints for four tools: `scraper`, `draft_editor`, `batch_reader`, and `publisher`
+- Executes tools in isolated threads with single-writer SQLite database guarantees
+- Scrapes web content with Botasaurus, generates embeddings via Snowflake, and publishes translated content to Telegram channels
+- Maintains granular job state with automatic resume capability after interruptions
+- Automatically manages database schema migrations with auto-folding mechanism
+
+### What It Does NOT Do
+- Does not execute autonomous agent loops or reasoning chains
+- Does not dynamically discover or load tools beyond the hardcoded whitelist
+- Does not support concurrent browser operations (single browser lock)
+- Does not provide real-time streaming responses
+- Does not offer multi-tenancy or user isolation
 
 ---
 
-## 1. High-Level Architecture
+## 2. High-Level Architecture
 
-### 1.1 System Evolution (Evidence-Based Analysis)
-
-The system transitioned from autonomous agent loops to deterministic execution:
-
-**Legacy (Deprecated - Evidence in `deprecated/` directory):**
-- UnifiedAgent with reasoning loops
-- Dynamic tool discovery
-- Uncontrolled LLM interaction
-- Finance, Research, Polymarket, Quiz tools
-
-**Current (Observable from codebase):**
-- Direct tool execution via worker poller (`bot/engine/worker.py`)
-- Hardcoded tool whitelist in `tools/registry.py` (line 48)
-- Controlled LLM usage (Publisher translation only)
-- State machine with resume capability
-- **Migration System** - Introduced in `database/migrations/` (evident from v004_step_to_metadata.py, v005_jobs_partial.py, v006_publisher_phase_state.py)
-- **Publisher Queue Architecture** - Complete rewrite in `utils/telegram_publisher.py` with 3-phase pipeline
-- **Phase State** JSON column replaces legacy `posted_*_ulids` arrays
-- **Database Fast-Path** - Fresh DBs use background writer queue via `enqueue_execscript()` (observed in `app.py` lines 222-233)
-- **MarkdownV2 Escaping** - Critical bugs fixed in `utils/text_processing.py` (character range + double-backslash)
-
-### 1.2 High-Level Data Flow
-
+### 2.1 Data Flow
 ```
-API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → AnythingLLM Callback → COMPLETED
+API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Callback → COMPLETED
 ```
 
-**Key Characteristics:**
-- **Event-driven polling:** 1-second interval in `bot/engine/worker.py`
-- **No autonomous loops:** Direct execution only
-- **Single-writer database:** Prevents concurrent write conflicts (`database/connection.py`)
-- **Background writer thread:** Async DB operations with batching (`database/writer.py`)
-- **Lifecycle hooks:** Startup recovery, zombie cleanup, reconciliation (lines 276-307 in `app.py`)
-- **Autonomous migrations:** Auto-folding with transaction safety (`database/migrations/__init__.py`)
-- **Fresh DB Fast-Path:** Bypasses migration runner for completely new databases
+### 2.2 Runtime Model
+**Event-driven polling**: Polling interval 1 second in `bot/engine/worker.py`  
+**Execution model**: Direct tool invocation, no autonomous loops  
+**Concurrency**: Single-writer database, thread-based job execution  
+**Architecture**: FastAPI + Background Writer Thread + Worker Manager  
 
-### 1.3 Architecture Components Map
+### 2.3 System Components
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -64,54 +43,47 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Anyt
 │  • Schema initialization (fast-path for fresh DBs)          │
 │  • Writer thread startup (single-writer guarantee)          │
 └──────────────────┬──────────────────────────────────────────┘
-                   │
-                   ├──────────────┬──────────────┬──────────────┐
-                   │              │              │              │
-            ┌──────▼──────┐  ┌────▼──────┐  ┌────▼──────┐  ┌────▼──────┐
-            │ API Routes  │  │  Writer   │  │  Worker   │  │  Tools    │
-            │ /api/tools  │  │  Thread   │  │  Manager  │  │  Registry │
-            │ /api/jobs   │  └────┬──────┘  └────┬──────┘  └────┬──────┘
-            └─────────────┘       │              │              │
-                                  │              │              │
-                                  └───────┬──────┴──────┬───────┘
-                                          │             │
-                                     ┌────▼──────┐   ┌───▼────┐
-                                     │  SQLite   │   │ Tools  │
-                                     │  WAL DB   │   │ Scraper│
-                                     │           │   │ etc.   │
-                                     └───────────┘   └────────┘
+                    │
+                    ├──────────────┬──────────────┬──────────────┐
+                    │              │              │              │
+             ┌──────▼──────┐  ┌────▼──────┐  ┌────▼──────┐  ┌────▼──────┐
+             │ API Routes  │  │  Writer   │  │  Worker   │  │  Tools    │
+             │ /api/tools  │  │  Thread   │  │  Manager  │  │  Registry │
+             │ /api/jobs   │  └────┬──────┘  └────┬──────┘  └────┬──────┘
+             └─────────────┘       │              │              │
+                                   │              │              │
+                              ┌────▼──────┐   ┌───▼────┐
+                              │  SQLite   │   │ Tools  │
+                              │  WAL DB   │   │ Scraper│
+                              │           │   │ etc.   │
+                              └───────────┘   └────────┘
 ```
 
 ---
 
-## 2. Repository Structure
+## 3. Repository Structure
 
-### 2.1 Root Directory
+### 3.1 Root Directory
+- **`app.py`** - FastAPI entrypoint with lifespan lifecycle (Vec0 validation, Chrome cleanup, DB initialization, writer thread startup, recovery scan)
+- **`config.py`** - Configuration reading from environment variables
+- **`requirements.txt`** - Dependencies including Botasaurus, Snowflake, PaddleOCR
+- **`.env`** - Environment variables (Telegram credentials, schema reset flag)
 
-- **`app.py`** - FastAPI entrypoint with lifespan lifecycle:
-  - Vec0 validation, Chrome cleanup
-  - **Database initialization**: Fresh DB fast-path via `enqueue_execscript()`, existing DB uses `init_db()`
-  - Writer thread startup, recovery scan
-- **`config.py`** - Configuration reading from environment
-- **`requirements.txt`** - All dependencies including Botasaurus, Snowflake, PaddleOCR
-- **`.env`** - Environment variables (newly migrated: Telegram credentials, schema reset flag)
-
-### 2.2 Database Layer (`database/`)
-
+### 3.2 Database Layer (`database/`)
 #### Core Modules:
 - **`connection.py`** - `DatabaseManager` with thread-local connections, WAL mode, sqlite_vec detection
 - **`writer.py`** - Background writer thread with queue:
-  - Auto-repair logic, 1-retry limit for missing tables
-  - **EXEC_SCRIPT marker** for batch script execution
-- **`schema.py`** - Proxy layer delegating to `database/schemas/` and `database/migrations/`
-  - `get_init_script()` - Returns canonical schema DDL
-  - `get_schema_version()` - Dynamic version detection
-- **`job_queue.py`** - Job operations with JSON metadata in v005+
-- **`reader.py`** - Read operations with JSON extraction queries
+  - Auto-repair logic (1 retry for missing tables)
+  - `EXEC_SCRIPT` marker for batch script execution
+  - `TRANSACTION_MARKER` for atomic transaction bundles
+  - `enqueue_transaction()` for dual-table updates
+- **`schema.py`** - Proxy layer to schemas and migrations
+- **`job_queue.py`** - Job operations with JSON metadata
+- **`reader.py`** - Read operations with JSON extraction
 - **`blackboard.py`** - State tracking using JSON metadata
 
 #### Migration System (`database/migrations/`):
-- **`__init__.py`** - Autonomous runner with:
+- **`__init__.py`** - Autonomous runner:
   - Auto-fold logic for >3 migrations
   - Transaction safety (`BEGIN EXCLUSIVE`)
   - Backup/restore on failure
@@ -121,30 +93,27 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Anyt
 - **`v006_publisher_phase_state.py`** - Migrates `posted_*_ulids` → `phase_state` JSON (v5 → v6)
 
 #### Schema Registry (`database/schemas/`):
-- **`__init__.py`** - Domain registry pattern, `BASE_SCHEMA_VERSION = 3`, `MAX_MIGRATION_SCRIPTS = 3`
-- **`jobs.py`** - Jobs, job_items, job_logs, broadcast_batches
+- **`__init__.py`** - Domain registry pattern, `BASE_SCHEMA_VERSION = 6`, `MAX_MIGRATION_SCRIPTS = 3`
+- **`jobs.py`** - Jobs, job_items (with `item_metadata` JSON), job_logs, broadcast_batches (with `phase_state` JSON)
 - **`finance.py`** - Financial tables (unused in current pipeline)
 - **`vector.py`** - Vector tables with sqlite-vec fallback
 - **`pdf.py`** - PDF parsing tables
 - **`token.py`** - Token usage tracking
 
 #### Migration Archive (`database/migrations_archive/`):
-- Stores folded migrations
-- `README.md` explains purpose
+- Stores folded migrations for historical reference
 
-### 2.3 Tools (`tools/`)
-
+### 3.3 Tools (`tools/`)
 #### Registry & Base:
 - **`registry.py`** - Whitelist enforcement (4 tools only), dynamic loading, manifest generation
 - **`base.py`** - `BaseTool` abstract class
 
 #### Active Tools:
-
 **Scraper (`tools/scraper/`):**
 - **`tool.py`** - Scout Mode, Botasaurus integration, Intelligent Manifest generation
 - **`task.py`** - Botasaurus scraper implementation
 - **`prompt.py`** - Scraping prompts
-- **`scraper_prompts.py`** - **Changed `Conclusion:` → `Kesimpulan:`** (observable)
+- **`scraper_prompts.py`** - Contains `Conclusion:` → `Kesimpulan:` localization
 - **`summary_prompts.py`** - Summarization prompts
 - **`targets.py`** - Valid target site configuration
 - **Resume behavior**: Skips if both validation and summary exist in job_items
@@ -156,16 +125,15 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Anyt
 - **`tool.py`** - Semantic search filtered by batch_id
 
 **Publisher (`tools/publisher/`):**
-- **`tool.py`** - Translation and Telegram delivery orchestrator
+- **`tool.py`** - Orchestrates `utils.telegram.pipeline.PublisherPipeline`
 - **`Skill.py`** - Skill wrapper
-- **`prompt.py`** - **NEW: Contains `TRANSLATION_PROMPT` with strict MarkdownV2 rules**:
+- **`prompt.py`** - Contains `TRANSLATION_PROMPT` with strict MarkdownV2 rules:
   - Specifies `*bold*` for titles, `_italic_` for emphasis
-  - Defines forbidden chars: `_*[]()~`>#+=|{}.!\-` (with hyphen at end to avoid range)
+  - Defines forbidden chars: `_*[]()~`>#+=|{}.!\-` (hyphen at end)
   - Requires `Kesimpulan:` replacement
   - Prompts for JSON structure compliance
 
-### 2.4 Bot/Execution Layer (`bot/`)
-
+### 3.4 Execution Layer (`bot/`)
 #### Engine (`bot/engine/`):
 - **`worker.py`** - `UnifiedWorkerManager` with 1-second polling loop
   - Polls jobs prioritizing `INTERRUPTED`
@@ -174,8 +142,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Anyt
   - AnythingLLM callback on `COMPLETED`/`PARTIAL`
 - **`tool_runner.py`** - `run_tool_safely` wrapper with timeout
 
-### 2.5 API Layer (`api/`)
-
+### 3.5 API Layer (`api/`)
 - **`routes.py`** - Endpoints:
   - `POST /api/tools/{tool_name}` - Enqueue job (202)
   - `GET /api/jobs/{job_id}` - Status + logs
@@ -184,25 +151,25 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Anyt
   - `GET /api/metrics` - System metrics
 - **`schemas.py`** - Pydantic models for input validation
 
-### 2.6 Utilities (`utils/`)
+### 3.6 Utilities (`utils/`)
+#### Telegram Package (New Modular Architecture):
+- **`__init__.py`** - Exports all classes
+- **`types.py`** - `TelegramErrorInfo`, `PhaseState` dataclasses
+- **`rate_limiter.py`** - Global `threading.Lock`-based rate limiter with wait-and-block strategy
+- **`telegram_client.py`** - PTB 22.7 compliant async client
+- **`state_manager.py`** - Atomic state + DB updates via `enqueue_transaction()`
+- **`validator.py`** - Article validation with job logging
+- **`translator.py`** - LLM batch translation with caching/retry
+- **`publisher.py`** - Channel delivery with atomic phase-state updates
+- **`pipeline.py`** - Orchestrator with exact parity resume logic
 
 #### Core Utilities:
-- **`telegram_publisher.py`** - **COMPLETE REWRITE**:
-  - **3-phase pipeline**: Validation → Translation → Briefing → Archive → Finalization
-  - **`TelegramErrorInfo`** dataclass with retry_after tracking
-  - **`escape_markdown_v2()`** integration (entity-aware with critical bug fixes)
-  - **Kesimpulan localization** in assembly (lines 343-344, 398-399)
-  - **Cross-job translation loading** - No job_id filter
-  - **Extreme rate-limit abort logic** - Configurable threshold
-  - **Incremental state persistence**: `enqueue_write()` after each article
-  - **Plain-text fallback**: Validation + marker stripping
-  - **Link routing**: `parse_mode=None` for URLs
 - **`text_processing.py`** - **Updated `escape_markdown_v2()`** with two critical bug fixes:
-  1. **Character range bug**: Fixed regex from `[\\_*\[\]()~`>#+\-=|{}.!]` to `[\\_*\[\]()~`>#+=|{}.!\-]`
-  2. **Double-backslash bug**: Fixed replacement from `r'\\\\\1'` to `r'\\\1'`
-  - **Entity-aware regex**: Preserves code blocks, links, spoilers, bold/italic/strikethrough
-  - **Selective escaping**: Only plaintext segments get escaped
-- **`browser_lock.py`** - `threading.Lock` for browser exclusivity
+  1. Character range: Fixed regex from `[\\_*\[\]()~`>#+\-=|{}.!]` to `[\\_*\[\]()~`>#+=|{}.!\-]`
+  2. Double-backslash: Fixed replacement from `r'\\\\\1'` to `r'\\\1'`
+  - Entity-aware regex: Preserves code blocks, links, spoilers, bold/italic/strikethrough
+  - Selective escaping: Only plaintext segments get escaped
+- **`browser_lock.py** - `threading.Lock` for browser exclusivity
 - **`browser_daemon.py`** - Driver lifecycle management
 - **`browser_utils.py`** - Safe navigation utilities
 - **`som_utils.py`** - State-of-mind synchronization
@@ -212,26 +179,22 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Anyt
 #### Logging:
 - **`logger/`** - Dual logging (console + file) with structured payloads
 
-### 2.7 Clients (`clients/`)
-
+### 3.7 Clients (`clients/`)
 - **`snowflake_client.py`** - Direct Snowflake connection
 - **`llm/`** - Azure OpenAI wrapper
 
-### 2.8 Deprecated (`deprecated/`)
+### 3.8 Deprecated (`deprecated/`)
+- **Legacy architecture evidence** - UnifiedAgent, dynamic tools, unused tool types (`bot/`, `tools/`)
 
-- **Legacy architecture evidence** - UnifiedAgent, dynamic tools, unused tool types
-
-### 2.9 Tests (`tests/`)
-
+### 3.9 Tests (`tests/`)
 - **`test_browser_e2e.py`** - Browser health check
 - **`test_migration_pipeline.py`** - Migration test outline
 
 ---
 
-## 3. Core Concepts & Domain Model
+## 4. Core Concepts & Domain Model
 
-### 3.1 Job Lifecycle State Machine
-
+### 4.1 Job Lifecycle State Machine
 ```
 QUEUED → RUNNING → COMPLETED/FAILED
          ↓
@@ -244,8 +207,7 @@ QUEUED → RUNNING → COMPLETED/FAILED
 
 **Global Statuses:** `QUEUED`, `RUNNING`, `COMPLETED`, `PARTIAL`, `FAILED`, `CANCELLING`, `INTERRUPTED`, `PAUSED_FOR_HITL`, `ABANDONED`
 
-### 3.2 Job Items (Granular Tracking)
-
+### 4.2 Job Items (Granular Tracking)
 **Table:** `job_items` (after v004 migration)
 ```sql
 CREATE TABLE job_items (
@@ -273,17 +235,7 @@ CREATE TABLE job_items (
 }
 ```
 
-**Query Pattern:**
-```sql
-SELECT json_extract(item_metadata, '$.step') as step,
-       json_extract(item_metadata, '$.ulid') as ulid,
-       status, output_data
-FROM job_items
-WHERE job_id = ? AND status = 'COMPLETED'
-```
-
-### 3.3 Broadcast Batches (Publisher State)
-
+### 4.3 Broadcast Batches (Publisher State)
 **Table:** `broadcast_batches` (after v006 migration)
 ```sql
 CREATE TABLE broadcast_batches (
@@ -309,13 +261,12 @@ CREATE TABLE broadcast_batches (
 }
 ```
 
-**Batch Status Logic (Publisher):**
+**Batch Status Logic:**
 - `COMPLETED`: 100% of valid items translated AND all briefings and archives posted
-- `PARTIAL`: Mixed outcomes (some success, some failures)
+- `PARTIAL`: Mixed outcomes
 - `FAILED`: All invalid or complete failure
 
-### 3.4 Migration Version Chain
-
+### 4.4 Migration Version Chain
 **BASE_SCHEMA_VERSION = 3** (in `database/schemas/__init__.py`)
 
 **Active Migrations (as of current):**
@@ -333,9 +284,9 @@ CREATE TABLE broadcast_batches (
 
 ---
 
-## 4. Detailed Behavior & Key Workflows
+## 5. Detailed Behavior & Key Workflows
 
-### 4.1 Scraper Execution Flow
+### 5.1 Scraper Execution Flow
 
 1. **Initialization**
    - Validate target site against `VALID_TARGET_NAMES`
@@ -360,70 +311,113 @@ CREATE TABLE broadcast_batches (
    - Raw JSON → `artifacts/scrapes/scraper_output_{ts}.json`
    - Top 10 → `artifacts/scrapes/top_10_{batch_id}.json`
    - Write `broadcast_batch` record (status: PENDING)
-
-6. **Manifest Generation**
    - Intelligent Manifest stored in `broadcast_batches`
-   - Format includes Top 10 + Extended Inventory
 
-### 4.2 Publisher Pipeline (Complete Rewrite - 3 Phases)
+### 5.2 Publisher Pipeline (New Modular Architecture)
 
 #### Phase 0: Validation
-- Validates all articles for ULID and title
-- Records skipped items in `job_items` (FAILED)
-- Populates `valid_articles` and `skipped_articles`
+```python
+validator = ArticleValidator(job_id)
+valid_articles, skipped = validator.validate_batch(all_articles)
+```
+- Validates ULID and title presence
+- Records skipped items in `job_items` (FAILED) if job_id present
+- Returns filtered lists
 
 #### Phase 1: Translation (Queue-with-Requeue)
 ```python
-# Producer: Queue-based translation with retry
-queue: deque = deque()
-# Load from job_items cache (cross-job aware)
-# Process batches of 10
-# Requeue failed items up to MAX_TRANSLATION_RETRIES=3
+translator = BatchTranslator(job_id)
+translated_map = await translator.translate_all(valid_articles)
 ```
 
-**Key Changes:**
-- **Cross-job resumption**: `job_id` filter removed from `_load_cached_translations()`
-- **LLM prompt**: Now uses `TRANSLATION_PROMPT` from `tools/publisher/prompt.py`
-- **Robust JSON parsing**: Uses `parse_llm_json()` instead of manual string slicing
-- **Prompt includes**: MarkdownV2 rules, Kesimpulan requirement, JSON structure enforcement
+**Key Features:**
+```python
+# Load from job_items cache (cross-job aware, no job_id filter)
+queue: deque[Dict] = deque([a for a in articles if a.get("ulid") not in translated_map])
+
+# Process batches of 10
+translations = await self._call_llm(current_batch)
+
+# Requeue failed items up to MAX_TRANSLATION_RETRIES=3
+retry_count[ulid] += 1
+if retry_count[ulid] >= MAX_TRANSLATION_RETRIES:
+    failed_ulids.add(ulid)
+    _record_failure(article, retry_count[ulid])
+else:
+    queue.append(article)
+```
+
+**LLM Integration:**
+- Uses `TRANSLATION_PROMPT` from `tools/publisher/prompt.py`
+- Response format: `{"translations": [{"ulid": "...", "translated_title": "...", ...}]}`
+- Parses via `parse_llm_json()` for robustness
 
 #### Phase 2: Briefing Upload (Top-10)
-- **Target**: `TELEGRAM_BRIEFING_CHAT_ID`
-- **Messages per article**: 2 (link + body)
-- **Body format**: `*{title}*\n\n{summary}\n\n*Kesimpulan:* {conclusion}`
-- **Idempotent**: Skips if `phase_state["publish_briefing"][ulid] == "COMPLETED"`
-- **Link routing**: Sent with `parse_mode=None` (no Markdown parsing)
-
-#### Phase 3: Archive Upload (Inventory)
-- **Target**: `TELEGRAM_ARCHIVE_CHAT_ID`
-- **Messages per article**: 2 (link + body)
-- **Body format**: `*{title}*\n\n*Kesimpulan:* {conclusion}\n\n*Ringkasan:*\n{summary}`
-- **Idempotent**: Skips if `phase_state["publish_archive"][ulid] == "COMPLETED"`
-- **Link routing**: Sent with `parse_mode=None`
-
-#### Phase 4: Finalization
-- Calculates accurate `batch_status` based on all phases
-- Updates `broadcast_batches` with `phase_state` JSON
-- **Incremental persistence**: `enqueue_write()` after each article completes
-- Logs metrics
-
-**Rate Limit Safety:**
-- 3.1s enforced delay between messages
-- `_send_msg()` returns `TelegramErrorInfo`
-- **Validation**: Checks for balanced MarkdownV2 markers before sending
-- **Fallback**: Plain-text mode if validation fails, strips invalid markers
-- Extreme rate limits (>config) → `raise Exception()` → Batch aborts → Status becomes `PARTIAL`
-
-**MarkdownV2 Escaping (Fixed):**
 ```python
-# Bug 1: Character range - fixed by moving hyphen to end
-_ESC = re.compile(r'([\\_*\[\]()~`>#+=|{}.!\-])')  # NOT: [\\_*\[\]()~`>#+\-=|{}.!]
-
-# Bug 2: Double backslash - fixed by single backslash in replacement
-result.append(_ESC.sub(r'\\\1', part))  # NOT: r'\\\\\1'
+publisher = ChannelPublisher(client, state_mgr, job_id)
+await publisher.publish_briefing(valid_articles, translated_map)
 ```
 
-### 4.3 Resume Capability
+**Per Article:**
+```python
+# Skip if already completed
+if self.state_mgr.state.is_completed("publish_briefing", ulid):
+    continue
+
+# Message assembly
+body_text = f"*{title}*\n\n{summary}\n\n*Kesimpulan:* {conclusion}"
+body_text = escape_markdown_v2(body_text)
+
+# Send link (plain)
+err1 = await client.send_message(briefing_chat, link, parse_mode=None)
+
+# Send body (MarkdownV2 with smart_split_message)
+for chunk in smart_split_message(body_text, 4000, ParseMode.MARKDOWN_V2):
+    err2 = await client.send_message(briefing_chat, chunk, parse_mode=ParseMode.MARKDOWN_V2)
+
+# Atomic update
+if err1.success and err2.success:
+    state_mgr.state.mark_completed("publish_briefing", ulid)
+    state_mgr.persist_atomic(job_id, meta, "COMPLETED")
+```
+
+**Target:** `TELEGRAM_BRIEFING_CHAT_ID`  
+**Idempotent:** Skips if `phase_state["publish_briefing"][ulid] == "COMPLETED"`  
+**Link routing:** Sent with `parse_mode=None`
+
+#### Phase 3: Archive Upload (Inventory)
+```python
+await publisher.publish_archive(valid_articles, translated_map)
+```
+
+**Per Article:**
+```python
+body_text = f"*{title}*\n\n*Kesimpulan:* {conclusion}\n\n*Ringkasan:*\n{summary}"
+# (Same send + atomic update logic as Phase 2)
+```
+
+**Target:** `TELEGRAM_ARCHIVE_CHAT_ID`  
+**Idempotent:** Skips if `phase_state["publish_archive"][ulid] == "COMPLETED"`  
+**Link routing:** Sent with `parse_mode=None`
+
+#### Phase 4: Finalization
+```python
+batch_status = calculate_status(...)
+enqueue_write("UPDATE broadcast_batches SET status = ?, phase_state = ?", 
+              (batch_status, json.dumps(state_mgr.state.to_dict())))
+```
+
+**Status Calculation:**
+```python
+if len(valid_articles) == 0:
+    batch_status = "FAILED"
+elif all_valid_translated and all_briefing_posted and all_archive_posted:
+    batch_status = "COMPLETED"
+else:
+    batch_status = "PARTIAL"
+```
+
+### 5.3 Resume Capability
 
 #### Scraper Resume:
 ```python
@@ -441,7 +435,7 @@ if existing_validation AND existing_summary:
 #### Publisher Resume:
 ```python
 # Translation (Phase 1)
-translated = get_all_translated_items(job_id)  # Cross-job aware now
+translated = get_all_translated_items(job_id)  # Cross-job aware
 if ulid in [t['ulid'] for t in translated]:
     continue  # Skip LLM call
 
@@ -456,7 +450,7 @@ if phase_state["publish_briefing"][ulid] == "COMPLETED":
 - Individual `execute()` calls maintain atomicity
 - Restore from backup on failure
 
-### 4.4 Auto-Repair Logic
+### 5.4 Auto-Repair Logic
 
 **In `database/writer.py`:**
 ```python
@@ -474,11 +468,10 @@ for attempt in range(MAX_REPAIR_RETRIES + 1):
 
 **Table Repair Scripts:** Stored in `database/schemas/` via `get_repair_script()`
 
-### 4.5 Database Fast-Path Initialization (NEW)
+### 5.5 Database Fast-Path Initialization
 
 **Fresh DB Detection:**
 ```python
-from database.schema import get_init_script, get_schema_version
 conn = DatabaseManager.get_read_connection()
 try:
     current_v = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -491,11 +484,6 @@ if current_v == 0:
     enqueue_execscript(get_init_script())
     enqueue_write(f"PRAGMA user_version = {schema_version}")
     await asyncio.wait_for(wait_for_writes(), timeout=10.0)
-    log.dual_log(tag="DB:Schema", message=f"Fresh database; schema created and stamped to v{schema_version} via writer queue.")
-else:
-    # Existing DB - use migration system
-    from database.schema import init_db()
-    init_db()
 ```
 
 **Benefits:**
@@ -506,78 +494,15 @@ else:
 
 ---
 
-## 5. Configuration & Environment
-
-### 5.1 Critical Variables - Now in `.env`
-
-**Migrated from `config.py` hardcodes to `.env` (NEW):**
-```bash
-# Telegram Publisher (NEW location)
-TELEGRAM_BOT_TOKEN=8615387588:AAEuKWyN_Jwhgms8z6poq6rtwPUmxhreRzA
-TELEGRAM_BRIEFING_CHAT_ID=-1001832461600
-TELEGRAM_ARCHIVE_CHAT_ID=-1002574049512
-
-# Schema Management (NEW documentation)
-SUMANAL_ALLOW_SCHEMA_RESET=1  # Enable destructive resets
-```
-
-**Updated `config.py` reads from env without defaults:**
-```python
-# --- Telegram Push Notifications (Optional) ---
-TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")  # No default
-# --- Telegram Destination Routing ---
-TELEGRAM_BRIEFING_CHAT_ID: str | None = os.getenv("TELEGRAM_BRIEFING_CHAT_ID")
-TELEGRAM_ARCHIVE_CHAT_ID: str | None = os.getenv("TELEGRAM_ARCHIVE_CHAT_ID")
-```
-
-### 5.2 Other Critical Variables
-
-```python
-# Telegram Publisher Behavior
-TELEGRAM_MESSAGE_DELAY: float = 3.1  # Enforced
-TELEGRAM_MAX_MESSAGE_LENGTH: int = 4000  # Global limit
-TELEGRAM_MAX_RETRY_AFTER: int = 120  # Extreme threshold
-
-# Azure OpenAI
-AZURE_KEY: str
-AZURE_ENDPOINT: str
-AZURE_DEPLOYMENT: str = "gpt-5.4-mini"
-
-# Snowflake
-SNOWFLAKE_ACCOUNT: str
-SNOWFLAKE_USER: str
-SNOWFLAKE_PRIVATE_KEY_PATH: str = "snowflake_private_key.p8"
-
-# Paths
-ARTIFACTS_ROOT: str = "artifacts"
-```
-
-### 5.3 Optional Variables
-
-```python
-# Logging
-TELEMETRY_DRY_RUN: bool = False
-
-# Job Watchdog
-JOB_WATCH_INTERVAL_SECONDS: int = 300
-JOB_STALE_THRESHOLD_SECONDS: int = 28800  # 8 hours
-
-# Chutes (Alternative LLM provider)
-CHUTES_API_TOKEN: str
-CHUTES_MODEL: str = "meta-llama/Llama-3.3-70B-Instruct"
-```
-
----
-
-## 6. API Interfaces
+## 6. Public Interfaces
 
 ### 6.1 POST /api/tools/{tool_name}
 
 **Input:** (Validated by tool's `INPUT_MODEL`)
 ```json
 {
-  "args": "{\"target_site\": \"FT\"}",  // Generic dict
-  "client_metadata": {}  // Optional
+  "args": "{\"target_site\": \"FT\"}",
+  "client_metadata": {}
 }
 ```
 
@@ -727,10 +652,10 @@ CHUTES_MODEL: str = "meta-llama/Llama-3.3-70B-Instruct"
 - `async_embed()` and `embed()` methods
 - Used in scraper and publisher
 
-**Telegram API (Evidence in `utils/telegram_publisher.py`):**
+**Telegram API (Evidence in new modular files):**
 - `https://api.telegram.org/bot{TOKEN}/sendMessage`
 - Uses `parse_mode="MarkdownV2"` (or None for links/fallback)
-- Rate-limited with 3.1s delay
+- Rate-limited with 3.1s delay via `GlobalRateLimiter`
 
 ---
 
@@ -948,7 +873,7 @@ sqlite3 data/sumanal.db "SELECT json_extract(item_metadata, '$.step') as step FR
 
 **Telegram Publisher Pipeline:**
 - **Fragility**: `escape_markdown_v2()` regex patterns must match Telegram spec
-- **Evidence**: `utils/telegram_publisher.py` lines 343-344, 398-399
+- **Evidence**: `utils/telegram/publisher.py` message assembly
 - **Impact**: 400 errors from malformed MarkdownV2
 - **Easiest extension**: Add new target chat (beyond briefing/archive)
 - **Critical fix**: Character range and double-backslash bugs must remain fixed
@@ -982,7 +907,7 @@ sqlite3 data/sumanal.db "SELECT json_extract(item_metadata, '$.step') as step FR
 5. Test auto-fold behavior
 
 **Publisher Phase Addition:**
-1. Update `utils/telegram_publisher.py` pipeline sequence
+1. Update `utils/telegram/publisher.py` pipeline sequence
 2. Update `broadcast_batches.phase_state` schema
 3. Update `database/schemas/jobs.py`
 4. Create migration for phase_state structure
@@ -1007,7 +932,7 @@ sqlite3 data/sumanal.db "SELECT json_extract(item_metadata, '$.step') as step FR
 - **Safety**: Can be tested independently
 
 **Updating Telegram Formats:**
-- **Location**: `utils/telegram_publisher.py` lines 343-344, 398-399
+- **Location**: `utils/telegram/publisher.py` lines in publish_briefing/publish_archive
 - **Impact**: Only affects Telegram output
 - **Safety**: Localized change, easy to revert
 

@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+STEP_VALIDATE = "validate"
 STEP_TRANSLATE = "translate"
 STEP_PUBLISH_BRIEFING = "publish_briefing"
 STEP_PUBLISH_ARCHIVE = "publish_archive"

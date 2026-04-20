@@ -20,7 +20,7 @@ TABLES = {
         CREATE TABLE IF NOT EXISTS job_items (
             item_id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id TEXT NOT NULL,
-            step_identifier TEXT,
+            item_metadata TEXT,
             status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','RUNNING','COMPLETED','FAILED')),
             input_data TEXT,
             output_data TEXT,
@@ -28,6 +28,12 @@ TABLES = {
             FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_job_items_job_id ON job_items(job_id, status);
+        CREATE INDEX IF NOT EXISTS idx_job_items_metadata ON job_items(
+            job_id,
+            json_extract(item_metadata, '$.step'),
+            json_extract(item_metadata, '$.is_top10'),
+            json_extract(item_metadata, '$.ulid')
+        );
     """,
     "job_logs": """
         CREATE TABLE IF NOT EXISTS job_logs (

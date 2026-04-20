@@ -2,7 +2,7 @@
 import queue
 import threading
 import re
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import config
 from database.connection import DatabaseManager
@@ -20,6 +20,8 @@ _write_generation: int = 0
 
 # Special marker for execute-script tasks enqueued to the writer.
 EXEC_SCRIPT = "__EXEC_SCRIPT__"
+# Special marker for transaction bundles
+TRANSACTION_MARKER = "__TRANSACTION__"
 MAX_REPAIR_RETRIES = 1
 
 
@@ -64,9 +66,10 @@ _STOP = object()
 def db_writer_worker() -> None:
     """Background thread that consumes write tasks sequentially.
 
-    Supports two task shapes on the queue:
+    Supports three task shapes on the queue:
       - (sql: str, params: tuple)  -> executed via conn.execute(sql, params)
       - (EXEC_SCRIPT, (script_text,)) -> executed via conn.executescript(script_text)
+      - (TRANSACTION_MARKER, [(stmt, binds), ...]) -> BEGIN + execute each + COMMIT
     """
     global _write_generation
     conn = DatabaseManager.create_write_connection()
@@ -85,6 +88,18 @@ def db_writer_worker() -> None:
                     conn.commit()
                     with _writer_lock:
                         _write_generation += 1
+                elif sql == TRANSACTION_MARKER:
+                    # params is a list of (statement, bindings)
+                    statements = params
+                    try:
+                        for stmt, binds in statements:
+                            conn.execute(stmt, binds)
+                        conn.commit()
+                        with _writer_lock:
+                            _write_generation += 1
+                    except Exception as tx_err:
+                        conn.rollback()
+                        log.dual_log(tag="DB:Writer:TxError", message=f"Transaction failed: {tx_err}", level="ERROR")
                 else:
                     for attempt in range(MAX_REPAIR_RETRIES + 1):
                         try:
@@ -196,6 +211,20 @@ def enqueue_execscript(script_text: str) -> None:
         )
 
 
+def enqueue_transaction(statements: list[tuple[str, tuple]]) -> None:
+    """Enqueue a batch of parameterized statements to be executed within a single transaction."""
+    global _writer_thread
+    if _writer_thread is None or not _writer_thread.is_alive():
+        try:
+            start_writer()
+        except Exception:
+            return
+    try:
+        write_queue.put_nowait((TRANSACTION_MARKER, statements))
+    except queue.Full:
+        log.dual_log(tag="DB:Writer", message="Write queue full; dropping transaction.", level="WARNING")
+
+
 def start_writer() -> threading.Thread:
     global _writer_thread
     with _writer_lock:
@@ -205,7 +234,6 @@ def start_writer() -> threading.Thread:
         _writer_thread = threading.Thread(target=db_writer_worker, name="sqlite-writer", daemon=False)
         _writer_thread.start()
         return _writer_thread
-
 
 
 async def wait_for_writes(timeout: float | None = None) -> bool:
@@ -223,7 +251,6 @@ async def wait_for_writes(timeout: float | None = None) -> bool:
     except Exception as e:
         log.dual_log(tag="DB:Writer", message=f"wait_for_writes failed: {e}", level="WARNING", exc_info=e)
         return False
-
 
 
 def shutdown_writer() -> None:

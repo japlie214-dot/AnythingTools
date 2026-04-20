@@ -5,8 +5,13 @@ from typing import Dict, Optional
 from database.connection import SQLITE_VEC_AVAILABLE
 from database.schemas import jobs, finance, vector, pdf, token
 
-BASE_SCHEMA_VERSION = 3
+BASE_SCHEMA_VERSION = 6
 MAX_MIGRATION_SCRIPTS = 3
+
+# ⚠️ DEVELOPER NOTE: BASE_SCHEMA_VERSION is now 6.
+# Migrations v004, v005, and v006 have been permanently folded into the base schemas.
+# These migrations remain in the migrations directory for runtime execution until the 
+# 3-versions limit is reached, after which they should be archived.
 
 ALL_TABLES: Dict[str, str] = {
     **jobs.TABLES, **finance.TABLES, **vector.TABLES, **pdf.TABLES, **token.TABLES

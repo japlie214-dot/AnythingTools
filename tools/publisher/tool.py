@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from tools.base import BaseTool
 from database.connection import DatabaseManager
-from utils.telegram_publisher import PublisherPipeline
+from utils.telegram.pipeline import PublisherPipeline
 
 
 class PublisherInput(BaseModel):
