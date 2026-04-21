@@ -13,31 +13,31 @@ log = get_dual_logger(__name__)
 
 
 def _parse_article_result(raw_result: dict, url: str) -> dict:
-    """Parse SUMMARIZATION_PROMPT output into structured fields."""
+    """Parse JSON structured output into fields."""
     if raw_result.get("status") != "SUCCESS":
         return raw_result
 
-    summary_content = raw_result.get("summary", "")
-    if not summary_content:
-        # Guard: propagate failure rather than returning an empty SUCCESS record.
-        return {"status": "FAILED", "reason": "Empty summary content"}
+    parsed_json = raw_result.get("parsed_json", {})
+    if not parsed_json:
+        return {"status": "FAILED", "reason": "Empty parsed_json content"}
 
-    title_match      = re.search(r"### Title:\s*\n([^\n]+)",    summary_content, re.IGNORECASE)
-    conclusion_match = re.search(r"### Conclusion:\s*\n([^\n]+)", summary_content, re.IGNORECASE)
-    summary_match    = re.search(r"### Summary:\s*\n(.+)",       summary_content, re.IGNORECASE | re.DOTALL)
+    title = str(parsed_json.get("title") or "").strip()
+    conclusion = str(parsed_json.get("conclusion") or "").strip()
+    summary_raw = parsed_json.get("summary", [])
+    
+    if isinstance(summary_raw, list):
+        summary = "\n".join(f"- {item}" for item in summary_raw if item)
+    else:
+        summary = str(summary_raw or "").strip()
 
-    title      = title_match.group(1).strip()      if title_match      else ""
-    conclusion = conclusion_match.group(1).strip() if conclusion_match else ""
-    summary    = summary_match.group(1).strip()    if summary_match    else summary_content
-
-    # SUCCESS_NO_PARSE when either mandatory section is absent.
-    status = "SUCCESS" if (title and conclusion) else "SUCCESS_NO_PARSE"
+    if not title or not conclusion:
+        return {"status": "FAILED", "reason": "Missing mandatory JSON fields (title or conclusion)"}
 
     ulid_str = ULID.generate()
     _id = int(ulid_str[:8], 36) % (2 ** 63)
 
     return {
-        "status":         status,
+        "status":         "SUCCESS",
         "url":            url,
         "normalized_url": normalize_url(url),
         "id":             _id,
@@ -45,7 +45,7 @@ def _parse_article_result(raw_result: dict, url: str) -> dict:
         "title":          title,
         "conclusion":     conclusion,
         "summary":        summary,
-        "raw_summary":    summary_content,  # preserved for full-fidelity JSON output
+        "raw_summary":    json.dumps(parsed_json, ensure_ascii=False),
     }
 
 

@@ -10,6 +10,7 @@
 - Scrapes web content with Botasaurus, generates embeddings via Snowflake, and publishes translated content to Telegram channels
 - Maintains granular job state with automatic resume capability after interruptions
 - Automatically manages database schema migrations with auto-folding mechanism
+- Implements hybrid search combining SQLite FTS5 keyword indexing and vector embeddings using Application-Layer Reciprocal Rank Fusion (RRF)
 
 ### What It Does NOT Do
 - Does not execute autonomous agent loops or reasoning chains
@@ -17,6 +18,7 @@
 - Does not support concurrent browser operations (single browser lock)
 - Does not provide real-time streaming responses
 - Does not offer multi-tenancy or user isolation
+- Does not implement dynamic tool loading or runtime tool discovery
 
 ---
 
@@ -43,20 +45,20 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 │  • Schema initialization (fast-path for fresh DBs)          │
 │  • Writer thread startup (single-writer guarantee)          │
 └──────────────────┬──────────────────────────────────────────┘
-                     │
-                     ├──────────────┬──────────────┬──────────────┐
-                     │              │              │              │
-              ┌──────▼──────┐  ┌────▼──────┐  ┌────▼──────┐  ┌────▼──────┐
-              │ API Routes  │  │  Writer   │  │  Worker   │  │  Tools    │
-              │ /api/tools  │  │  Thread   │  │  Manager  │  │  Registry │
-              │ /api/jobs   │  └────┬──────┘  └────┬──────┘  └────┬──────┘
-              └─────────────┘       │              │              │
-                                    │              │              │
-                               ┌────▼──────┐   ┌───▼────┐
-                               │  SQLite   │   │ Tools  │
-                               │  WAL DB   │   │ Scraper│
-                               │           │   │ etc.   │
-                               └───────────┘   └────────┘
+                      │
+                      ├──────────────┬──────────────┬──────────────┐
+                      │              │              │              │
+               ┌──────▼──────┐  ┌────▼──────┐  ┌────▼──────┐  ┌────▼──────┐
+               │ API Routes  │  │  Writer   │  │  Worker   │  │  Tools    │
+               │ /api/tools  │  │  Thread   │  │  Manager  │  │  Registry │
+               │ /api/jobs   │  └────┬──────┘  └────┬──────┘  └────┬──────┘
+               └─────────────┘       │              │              │
+                                     │              │              │
+                                ┌────▼──────┐   ┌───▼────┐
+                                │  SQLite   │   │ Tools  │
+                                │  WAL DB   │   │ Scraper│
+                                │           │   │ etc.   │
+                                └───────────┘   └────────┘
 ```
 
 ---
@@ -70,6 +72,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 - **`.env`** - Environment variables (Telegram credentials, schema reset flag)
 
 ### 3.2 Database Layer (`database/`)
+
 #### Core Modules:
 - **`connection.py`** - `DatabaseManager` with thread-local connections, WAL mode, sqlite_vec detection
 - **`writer.py`** - Background writer thread with queue:
@@ -77,29 +80,31 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
   - `EXEC_SCRIPT` marker for batch script execution
   - `TRANSACTION_MARKER` for atomic transaction bundles
   - `enqueue_transaction()` for dual-table updates
-- **`health.py`** - *NEW* Isolated health checks, orphaned backup recovery
-- **`lifecycle.py`** - *NEW* Async coordinator for initialization and migration
-- **`schema.py`** - Proxy layer to schemas and migrations (legacy functions removed)
+- **`health.py`** - Isolated health checks, orphaned backup recovery
+- **`lifecycle.py`** - Async coordinator for initialization and migration
+- **`schema.py`** - Proxy layer to schemas and migrations
 - **`job_queue.py`** - Job operations with JSON metadata
 - **`reader.py`** - Read operations with JSON extraction
 - **`blackboard.py`** - State tracking using JSON metadata
 
 #### Migration System (`database/migrations/`):
-- **`__init__.py`** - Autonomous runner with refactored logic:
-  - Monotonically increasing version validation (detached from BASE_SCHEMA_VERSION)
+- **`__init__.py`** - Autonomous runner with:
+  - Monotonically increasing version validation
   - Transaction safety (`BEGIN EXCLUSIVE`)
   - Backup/restore on failure
   - Version alignment with BASE_SCHEMA_VERSION
-  - *FIXED*: Future-version detection prevents downgrade
-- **`v004_step_to_metadata.py`** - Converts `step_identifier` → `item_metadata` JSON (v3 → v4)
-- **`v005_jobs_partial.py`** - Adds `PARTIAL` status to jobs (v4 → v5)
-- **`v006_publisher_phase_state.py`** - Migrates `posted_*_ulids` → `phase_state` JSON (v5 → v6)
+  - Future-version detection prevents downgrade
+  - Auto-fold mechanism when migrations exceed 3 files
+- **`v004_step_to_metadata.py`** - Converts `step_identifier` → `item_metadata` JSON
+- **`v005_jobs_partial.py`** - Adds `PARTIAL` status to jobs
+- **`v006_publisher_phase_state.py`** - Migrates `posted_*_ulids` → `phase_state` JSON
+- **`v007_fts5_hybrid.py`** - Creates FTS5 virtual table, triggers, and `vec_rowid` index
 
 #### Schema Registry (`database/schemas/`):
 - **`__init__.py`** - Domain registry pattern, `BASE_SCHEMA_VERSION = 6`, `MAX_MIGRATION_SCRIPTS = 3`
 - **`jobs.py`** - Jobs, job_items (with `item_metadata` JSON), job_logs, broadcast_batches (with `phase_state` JSON)
 - **`finance.py`** - Financial tables (unused in current pipeline)
-- **`vector.py`** - Vector tables with sqlite-vec fallback
+- **`vector.py`** - Vector tables with sqlite-vec fallback, includes `scraped_articles_fts` and triggers
 - **`pdf.py`** - PDF parsing tables
 - **`token.py`** - Token usage tracking
 
@@ -107,6 +112,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 - Stores folded migrations for historical reference
 
 ### 3.3 Tools (`tools/`)
+
 #### Registry & Base:
 - **`registry.py`** - Whitelist enforcement (4 tools only), dynamic loading, manifest generation
 - **`base.py`** - `BaseTool` abstract class
@@ -116,16 +122,19 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 - **`tool.py`** - Scout Mode, Botasaurus integration, Intelligent Manifest generation
 - **`task.py`** - Botasaurus scraper implementation
 - **`prompt.py`** - Scraping prompts
-- **`scraper_prompts.py`** - Contains `Conclusion:` → `Kesimpulan:` localization
+- **`scraper_prompts.py`** - Contains `SUMMARIZATION_SCHEMA` for structured outputs, JSON schema fallback
 - **`summary_prompts.py`** - Summarization prompts
 - **`targets.py`** - Valid target site configuration
+- **`extraction.py`** - JSON schema attempt with fallback to `json_object`
+- **`persistence.py`** - Structured JSON parsing with null handling
 - **Resume behavior**: Skips if both validation and summary exist in job_items
 
 **Draft Editor (`tools/draft_editor/`):**
 - **`tool.py`** - Atomic SWAP operations, PENDING status lock
 
 **Batch Reader (`tools/batch_reader/`):**
-- **`tool.py`** - Semantic search filtered by batch_id
+- **`tool.py`** - Semantic search using hybrid RRF, filtered by batch_id
+- **New Hybrid Search**: Uses `utils/hybrid_search.py` for vector + keyword fusion
 
 **Publisher (`tools/publisher/`):**
 - **`tool.py`** - Orchestrates `utils.telegram.pipeline.PublisherPipeline`
@@ -133,6 +142,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 - **`prompt.py`** - Contains `TRANSLATION_PROMPT` with strict MarkdownV2 rules
 
 ### 3.4 Execution Layer (`bot/`)
+
 #### Engine (`bot/engine/`):
 - **`worker.py`** - `UnifiedWorkerManager` with 1-second polling loop
   - Polls jobs prioritizing `INTERRUPTED`
@@ -151,6 +161,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 - **`schemas.py`** - Pydantic models for input validation
 
 ### 3.6 Utilities (`utils/`)
+
 #### Telegram Package (New Modular Architecture):
 - **`__init__.py`** - Exports all classes
 - **`types.py`** - `TelegramErrorInfo`, `PhaseState` dataclasses
@@ -174,6 +185,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 - **`som_utils.py`** - State-of-mind synchronization
 - **`metadata_helpers.py`** - JSON metadata construction/parsing
 - **`vector_search.py`** - Direct Snowflake client calls, SQLite-vec fallback
+- **`hybrid_search.py`** - NEW: FTS5 sanitization, Weighted RRF, orchestration for hybrid search
 
 #### Logging:
 - **`logger/`** - Dual logging (console + file) with structured payloads
@@ -273,8 +285,9 @@ CREATE TABLE broadcast_batches (
 1. **v004** - `step_identifier` → `item_metadata` JSON
 2. **v005** - Adds `PARTIAL` status to jobs, updates job_items metadata persistence
 3. **v006** - Migrates `posted_*_ulids` → `phase_state` JSON
+4. **v007** - Creates FTS5 virtual table, triggers, and `vec_rowid` index for hybrid search
 
-**Current DB Version:** 6 (with 3 migration files active)
+**Current DB Version:** 6 (with 3 migration files active, v007 added)
 
 **Auto-Fold Mechanism:**
 - If active migrations > 3 (`MAX_MIGRATION_SCRIPTS`), oldest folds into BASE_SCHEMA_VERSION
@@ -296,6 +309,9 @@ CREATE TABLE broadcast_batches (
 2. **Scraping (via Botasaurus)**
    - Run `_run_botasaurus_scraper()` in thread
    - Per-article: validate → summarize → embed
+   - **New**: Uses `json_schema` with fallback to `json_object` for summarization
+   - **New**: Parses structured JSON directly (`title`, `conclusion`, `summary` array)
+   - **New**: Emits `PARTIAL` status if any embeddings fail
    - Resume check: Skip if `validation_passed` and `summary_generated` exist in `job_items`
 
 3. **Embedding Generation**
@@ -331,21 +347,9 @@ translated_map = await translator.translate_all(valid_articles)
 ```
 
 **Key Features:**
-```python
-# Load from job_items cache (cross-job aware, no job_id filter)
-queue: deque[Dict] = deque([a for a in articles if a.get("ulid") not in translated_map])
-
-# Process batches of 10
-translations = await self._call_llm(current_batch)
-
-# Requeue failed items up to MAX_TRANSLATION_RETRIES=3
-retry_count[ulid] += 1
-if retry_count[ulid] >= MAX_TRANSLATION_RETRIES:
-    failed_ulids.add(ulid)
-    _record_failure(article, retry_count[ulid])
-else:
-    queue.append(article)
-```
+- Load from job_items cache (cross-job aware, no job_id filter)
+- Process batches of 10
+- Requeue failed items up to `MAX_TRANSLATION_RETRIES=3`
 
 **LLM Integration:**
 - Uses `TRANSLATION_PROMPT` from `tools/publisher/prompt.py`
@@ -477,73 +481,60 @@ await run_database_lifecycle()
 ```
 
 **New `run_database_lifecycle()` Flow:**
-```python
-# 1. Recover orphaned backups
-restore_orphaned_backup()
+1. Recover orphaned backups
+2. Probe state: `exists, current_version = check_database_file_state()`
+3. Fresh init if not exists
+4. Destructive reset if corrupted (with flag)
+5. Migrate if version outdated
+6. Verify health and repair if needed
 
-# 2. Probe state
-exists, current_version = check_database_file_state()
-
-if not exists:
-    await initialize()  # Fresh init
-elif current_version is None:
-    if ALLOW_DESTRUCTIVE_RESET:
-        _remove_db_files()
-        await initialize()
-    else:
-        raise RuntimeError("Database file corrupted")
-elif current_version < target_v:
-    await migrate(current_version)
-elif current_version == target_v:
-    check_tables_exist()  # Verify health, repair if needed
-```
-
-#### **Critical Fixes Applied (User-Reported Bugs):**
+#### **Critical Fixes Applied:**
 
 **Fix 1: Async Table Repair (database/lifecycle.py line 86)**
-```python
-# BEFORE: asyncio.create_task(_repair_missing_tables(missing))
-# AFTER:  await _repair_missing_tables(missing)
-```
-*Reasoning*: Using `create_task` allows startup to complete before tables exist, causing runtime errors.
+- `await _repair_missing_tables(missing)` instead of `create_task`
+- Prevents startup completing before tables exist
 
 **Fix 2: Corrupted File State (database/health.py lines 46-48, 57-60)**
+- 0-byte files → `True, None` (not `False, None`)
+- DatabaseError → `True, None` (not `False, None`)
+- Forces lifecycle to handle corruption properly
+
+**Fix 3: Version Alignment (database/migrations/__init__.py)**
+- Uses authoritative `get_latest_version()` for target
+- Adds final version stamp if base > migrations[-1]
+
+### 5.6 Hybrid Search Implementation (New)
+
+#### **FTS5 Sanitization:**
 ```python
-# BEFORE: return False, None for 0-byte files
-# AFTER:  return True, None for 0-byte files
-
-# BEFORE: return False, None for DatabaseError
-# AFTER:  return True, None for DatabaseError
+def sanitize_fts_query(query: str) -> str:
+    sanitized = re.sub(r'[^\w\s]', ' ', query)
+    return re.sub(r'\s+', ' ', sanitized).strip()
 ```
-*Reasoning*: `False` treats as fresh file without deletion. `True` forces lifecycle to handle corruption properly (destructive reset or hard stop).
+- Removes FTS5 reserved characters
+- Prevents SQLite syntax errors
 
-**Fix 3: Version Alignment (database/migrations/__init__.py lines 297-302, 346-347)**
+#### **Weighted RRF:**
 ```python
-# BEFORE: target_v = migrations[-1].version (overwrites authoritative value)
-# AFTER:  target_v = get_latest_version() (remains authoritative max(base, migrations))
-
-# BEFORE: Missing final version stamp if base > migrations[-1]
-# AFTER:  Adds: if migrations[-1].version < target_v: execute(f"PRAGMA user_version = {target_v}")
+def weighted_rrf(vector_results, keyword_results, w_vec, w_kw, k=60):
+    scores: Dict[str, float] = {}
+    for rank, item in enumerate(vector_results, start=1):
+        ulid = item['ulid']
+        scores[ulid] = scores.get(ulid, 0.0) + (w_vec / (k + rank))
+    # Similar for keyword results
+    # Sort by fusion score descending
 ```
-*Reasoning*: Prevents incorrect version stamping when BASE_SCHEMA_VERSION > highest migration version.
+- Application-layer fusion (not SQL-level)
+- Configurable weights via `config.BATCH_READER_VECTOR_WEIGHT` and `BATCH_READER_KEYWORD_WEIGHT`
 
-#### **Isolated Diagnostic Probes:**
-```python
-# In check_database_file_state()
-conn = sqlite3.connect(str(DB_PATH))  # Raw connection, bypasses DatabaseManager
-# Prevents poisoning thread-local cache
-```
-
-#### **Single-Writer Queue for Repairs:**
-```python
-# In _repair_missing_tables()
-start_writer()
-for table_name in missing:
-    script = get_repair_script(table_name)
-    if script:
-        enqueue_execscript(script)  # Routes through writer queue
-await wait_for_writes()
-```
+#### **Execution Flow:**
+1. Acquire batch_id and query
+2. Extract valid ULIDs for batch
+3. Parallel execute:
+   - Vector search: `embedding MATCH ?` (if sqlite-vec available)
+   - Keyword search: `scraped_articles_fts MATCH ?` (sanitized query)
+4. Apply RRF with weights
+5. Return fused results
 
 ---
 
@@ -554,7 +545,7 @@ await wait_for_writes()
 **Input:** (Validated by tool's `INPUT_MODEL`)
 ```json
 {
-  "args": "{\"target_site\": \"FT\"}",
+  "args": {"target_site": "FT"},
   "client_metadata": {}
 }
 ```
@@ -626,6 +617,7 @@ await wait_for_writes()
 - `broadcast_batches` - Publisher batches (JSON phase_state)
 - `scraped_articles` - Raw content
 - `scraped_articles_vec` - Vector embeddings
+- `scraped_articles_fts` - FTS5 keyword index (virtual table)
 - `pdf_parsed_pages` - PDF text
 - `pdf_parsed_pages_vec` - PDF vectors
 - `token_usage` - LLM cost tracking
@@ -743,6 +735,8 @@ TELEGRAM_BOT_TOKEN=your_token_here
 TELEGRAM_BRIEFING_CHAT_ID=your_chat_id
 TELEGRAM_ARCHIVE_CHAT_ID=your_chat_id
 SUMANAL_ALLOW_SCHEMA_RESET=0  # Set 1 for development
+BATCH_READER_VECTOR_WEIGHT=0.6
+BATCH_READER_KEYWORD_WEIGHT=0.4
 ```
 
 ### 9.3 Database First Run
@@ -773,6 +767,7 @@ DB:Lifecycle - Recover from v004, migrating...
 DB:Migration - Applying migration v4: Convert job_items.step_identifier to item_metadata JSON
 DB:Migration - Applying migration v5: Add PARTIAL status to jobs table
 DB:Migration - Applying migration v6: Deprecate posted_*_ulids and add phase_state to broadcast_batches
+DB:Migration - Applying migration v7: Create FTS5 table and vec_rowid index
 DB:Migration - All migrations applied. Schema version: 6
 ```
 
@@ -835,9 +830,10 @@ sqlite3 data/sumanal.db "PRAGMA user_version;"
 ```bash
 ls database/migrations/v*.py
 # Should show v005 and v006 only (v004 folded)
+# And v007 (new hybrid search)
 ```
 
-**Table Structure (Post v006):**
+**Table Structure (Post v007):**
 ```bash
 sqlite3 data/sumanal.db "PRAGMA table_info(broadcast_batches);"
 # Should show phase_state TEXT column
@@ -851,7 +847,7 @@ sqlite3 data/sumanal.db "SELECT json_extract(item_metadata, '$.step') as step FR
 ```
 
 **Writer Queue Health:**
-```bash
+```
 # In logs: DB:WriterStart, DB:WriterStop should appear
 # On fresh install: "Fresh database; schema created and stamped to v6 via writer queue"
 ```

@@ -41,30 +41,38 @@ CROSS-REFERENCE PROTOCOL:
 5. If screenshot shows content (chart, image text) not in HTML, describe it
 6. If HTML contains ads, navigation, or forms, ignore them
 
-OUTPUT FORMAT (Strict - Exactly These Three Sections):
-
-### Title:
-[Catchy, informative headline that captures the article's main point]
-
-### Kesimpulan:
-[One sentence stating why this matters to an executive reader - the "so what"]
-
-### Summary:
-[Comprehensive summary using bullet points or paragraphs. Include:]
-[• All key facts, data points, and statistics with exact numbers from HTML]
-[• Names of people, companies, and organizations mentioned]
-[• Dates and timelines]
-[• Key quotes (verbatim from HTML)]
-[• Any visual information from screenshots (charts, image content)]
-
-ABSENCE HANDLING:
-- If BOTH the screenshot AND HTML show only a paywall, CAPTCHA, or empty page:
-  Respond ONLY with: INSUFFICIENT_CONTENT
-- If content is readable but too short to summarize meaningfully:
-  Respond ONLY with: INSUFFICIENT_CONTENT
+OUTPUT INSTRUCTIONS:
+Respond strictly in JSON matching the requested schema. Ensure all keys are present.
+If the page is empty, a paywall, CAPTCHA, or unreadable, set the "error" key to "INSUFFICIENT_CONTENT".
+Otherwise, provide the "title", "conclusion" (the executive "so what"), and "summary" (as an array of bullet points).
 
 ### RAW EXTRACTED HTML:
 """
+
+SUMMARIZATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": "Catchy, informative headline capturing the article's main point"
+        },
+        "conclusion": {
+            "type": "string",
+            "description": "One sentence stating why this matters to an executive reader - the 'so what'"
+        },
+        "summary": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Bullet points of key facts, data, exact numbers, and quotes"
+        },
+        "error": {
+            "type": ["string", "null"],
+            "description": "Set to 'INSUFFICIENT_CONTENT' if content is unreadable or empty, otherwise null"
+        }
+    },
+    "required": ["title", "conclusion", "summary", "error"],
+    "additionalProperties": False
+}
 
 CURATOR_GLOBAL_INTELLIGENCE_PROMPT = """You are a financial intelligence curator. Your task is to analyze scraped articles and select the top 10 most valuable articles for executive consumption.
 

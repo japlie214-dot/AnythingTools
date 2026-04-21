@@ -212,43 +212,72 @@ def process_article(
             # slim_sum is computed once and refreshed only after re-navigation.
             slim_sum = raw_html
 
+            from tools.scraper.scraper_prompts import SUMMARIZATION_SCHEMA
             for sum_attempt in range(1, 4):
                 from utils.text_processing import escape_prompt_separators
+
                 sum_msgs = _build_multimodal_messages(
-                    SUMMARIZATION_PROMPT, 
-                    escape_prompt_separators(slim_sum) + "\n###", 
+                    SUMMARIZATION_PROMPT,
+                    escape_prompt_separators(slim_sum) + "\n###",
                     b64_image
                 )
-                sum_resp = sync_llm_chat(sum_msgs)
+
+                try:
+                    sum_resp = sync_llm_chat(
+                        sum_msgs,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {"name": "summary", "strict": True, "schema": SUMMARIZATION_SCHEMA}
+                        }
+                    )
+                    used_format = "json_schema"
+                except Exception as format_exc:
+                    log.dual_log(
+                        tag="Scraper:Summarize:Fallback",
+                        message=f"json_schema rejected or failed, falling back to json_object: {format_exc}",
+                        level="WARNING",
+                    )
+                    sum_resp = sync_llm_chat(sum_msgs, response_format={"type": "json_object"})
+                    used_format = "json_object"
+
+                sum_data = parse_llm_json(sum_resp.content or "{}")
+
                 # Phase 2: Boundary log — raw LLM summarization response.
                 log.dual_log(
                     tag="Scraper:Summarize:Response",
-                    message="LLM summarization response received",
+                    message=f"LLM summarization response received via {used_format}",
                     payload={
                         "url": url,
                         "raw_content": sum_resp.content,
                         "raw_len": len(sum_resp.content or ""),
                         "sum_attempt": sum_attempt,
+                        "parsed_keys": list(sum_data.keys()),
                     },
                 )
-                content  = (sum_resp.content or "").strip()
 
-                if content and content != "INSUFFICIENT_CONTENT" and len(content) > 50:
+                if sum_data.get("error") == "INSUFFICIENT_CONTENT":
                     log.dual_log(
                         tag="Scraper:Summarize",
-                        message=f"Generated summary for {url}",
-                        payload={"url": url, "summary": content},
+                        message=f"Insufficient content. Attempt {sum_attempt}/3.",
+                        level="WARNING",
+                    )
+                elif sum_data.get("title") and sum_data.get("conclusion"):
+                    log.dual_log(
+                        tag="Scraper:Summarize",
+                        message=f"Generated structured summary for {url}",
+                        payload={"url": url, "title": sum_data.get("title", "")[:50]},
                     )
                     # Phase 2: Local state update first, then fire-and-forget DB persist.
                     local_meta["summary_generated"] = True
                     _sync_meta("RUNNING")
-                    return {"status": "SUCCESS", "summary": content}
-
-                log.dual_log(
-                    tag="Scraper:Summarize",
-                    message=f"Insufficient summary. Attempt {sum_attempt}/3.",
-                    level="WARNING",
-                )
+                    return {"status": "SUCCESS", "parsed_json": sum_data}
+                else:
+                    log.dual_log(
+                        tag="Scraper:Summarize",
+                        message=f"Missing mandatory fields in JSON. Attempt {sum_attempt}/3.",
+                        level="WARNING",
+                        payload={"parsed": sum_data}
+                    )
 
                 # Re-navigate on attempts 1 and 2; attempt 3 falls through to FAILED.
                 if sum_attempt < 3:

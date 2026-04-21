@@ -5,8 +5,12 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from tools.base import BaseTool
-from database.connection import DatabaseManager, SQLITE_VEC_AVAILABLE
-from utils.vector_search import generate_embedding
+from database.connection import DatabaseManager
+from utils.logger import get_dual_logger
+import config
+from utils.hybrid_search import execute_hybrid_search
+
+log = get_dual_logger(__name__)
 
 class BatchReaderInput(BaseModel):
     batch_id: str = Field(..., description="The batch ID to query.")
@@ -18,9 +22,6 @@ class BatchReaderTool(BaseTool):
     INPUT_MODEL = BatchReaderInput
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
-        if not SQLITE_VEC_AVAILABLE:
-            return json.dumps({"error": "Vector search unavailable: sqlite_vec extension not loaded."})
-
         batch_id = args.get("batch_id")
         query = args.get("query")
         limit = min(int(args.get("limit", 5)), 50)
@@ -51,29 +52,34 @@ class BatchReaderTool(BaseTool):
         if not valid_ulids:
             return json.dumps({"error": "No valid articles found in batch."})
 
-        # 3. Vector search filtered by batch ULIDs
-        query_embedding = await generate_embedding(query)
-        pl = ",".join("?" for _ in valid_ulids)
+        # 3. Execute Hybrid Search
+        w_vec = getattr(config, 'BATCH_READER_VECTOR_WEIGHT', 0.6)
+        w_kw = getattr(config, 'BATCH_READER_KEYWORD_WEIGHT', 0.4)
+
+        results = await execute_hybrid_search(
+            query=query,
+            valid_ulids=valid_ulids,
+            limit=limit,
+            w_vec=w_vec,
+            w_kw=w_kw
+        )
         
-        sql = f"""
-            SELECT a.title, a.summary, a.conclusion, a.id as ulid, (1 - v.distance) AS sim
-            FROM scraped_articles_vec v
-            JOIN scraped_articles a ON v.rowid = a.vec_rowid
-            WHERE v.embedding MATCH ? AND k = ?
-            AND a.id IN ({pl})
-            ORDER BY v.distance ASC
-        """
-        
-        rows = conn.execute(sql, [query_embedding, limit * 3] + valid_ulids).fetchall()
-        
-        results = []
-        for r in rows[:limit]:
-            results.append({
-                "ulid": r["ulid"],
-                "title": r["title"],
-                "summary": r["summary"],
-                "conclusion": r["conclusion"],
-                "similarity": round(r["sim"], 3)
-            })
+        # 4. Final Logging
+        log.dual_log(
+            tag="Search:Hybrid:Complete",
+            message="Batch Reader delivered hybrid search results",
+            payload={
+                "batch_id": batch_id,
+                "query": query,
+                "returned_count": len(results),
+                "limit_requested": limit
+            }
+        )
             
-        return json.dumps({"batch_id": batch_id, "query": query, "results": results}, ensure_ascii=False)
+        return json.dumps({
+            "batch_id": batch_id,
+            "query": query,
+            "method": "hybrid_rrf",
+            "weights": {"vector": w_vec, "keyword": w_kw},
+            "results": results
+        }, ensure_ascii=False)

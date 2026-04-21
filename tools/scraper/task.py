@@ -242,7 +242,30 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                 f"{link}: {parsed_result.get('reason', 'Unknown')}"
             )
 
+    total_attempted = _stats["new"] + _stats["resumed_retried"]
+    
+    # Job is COMPLETED only if all attempted embeddings were successful
+    # and there are no hard failures in the current run.
+    # _stats["success"] increments when embedding_synced becomes True.
+    all_embedded = (_stats["success"] == total_attempted) and (total_attempted > 0)
+
+    job_final_status = "COMPLETED"
+    if _stats["fail"] > 0 or (total_attempted > 0 and not all_embedded):
+        job_final_status = "PARTIAL"
+
+    log.dual_log(
+        tag="Scraper:Job:Status",
+        message=f"Job finalization status: {job_final_status}",
+        payload={
+            "final_status": job_final_status,
+            "total_attempted": total_attempted,
+            "success": _stats["success"],
+            "fail": _stats["fail"],
+        },
+    )
+
     results["_stats"] = _stats
+    results["_job_final_status"] = job_final_status
     return results
 
 
