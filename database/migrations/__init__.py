@@ -10,8 +10,6 @@ from pathlib import Path
 from typing import Protocol, List
 
 from database.connection import DB_PATH, DatabaseManager, SQLITE_VEC_AVAILABLE
-# We will dynamically access BASE_SCHEMA_VERSION from the reloaded module
-# to avoid stale local values after auto-fold.
 import database.schemas
 from utils.logger import get_dual_logger
 
@@ -208,13 +206,14 @@ def _discover_migrations() -> List[MigrationProtocol]:
 
     migrations.sort(key=lambda m: m.version)
 
-    # Validate sequential versioning
-    # NOTE: We get BASE_SCHEMA_VERSION from the module to avoid stale local reference
-    current_base = database.schemas.BASE_SCHEMA_VERSION
+    # Validate sequential versioning (strictly increasing check, detached from BASE_SCHEMA_VERSION)
     for i, m in enumerate(migrations):
-        expected = current_base + i + 1
-        if m.version != expected:
-            raise RuntimeError(f"Migration version gap: expected v{expected}, found v{m.version}")
+        if i > 0 and m.version <= migrations[i - 1].version:
+            prev = migrations[i - 1].version
+            raise RuntimeError(
+                f"Migration version must be strictly increasing: "
+                f"v{prev} followed by v{m.version} in {m.__name__}"
+            )
 
     # Enforce strict 3-file limit — attempt automatic folding if exceeded
     if len(migrations) > database.schemas.MAX_MIGRATION_SCRIPTS:
@@ -257,9 +256,10 @@ def _discover_migrations() -> List[MigrationProtocol]:
 
 def get_latest_version() -> int:
     migrations = _discover_migrations()
+    base = database.schemas.BASE_SCHEMA_VERSION
     if not migrations:
-        return database.schemas.BASE_SCHEMA_VERSION
-    return migrations[-1].version
+        return base
+    return max(base, migrations[-1].version)
 
 
 def _perform_destructive_reset(conn: sqlite3.Connection):
@@ -288,22 +288,16 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         current_v = 0
 
     BASE_SCHEMA_VERSION = database.schemas.BASE_SCHEMA_VERSION
-    if 0 < current_v < BASE_SCHEMA_VERSION:
-        log.dual_log(tag="DB:Migration", message=f"Stranded database detected (v{current_v} < base v{BASE_SCHEMA_VERSION}). Performing destructive reset.", level="CRITICAL")
-        _perform_destructive_reset(conn)
-        current_v = 0
+    
+    # Future-version detection
+    target_v = get_latest_version()
+    if current_v > target_v:
+        raise RuntimeError(f"Database at v{current_v} exceeds target v{target_v}. Downgrade is not supported.")
 
-    if not migrations:
-        if current_v < BASE_SCHEMA_VERSION:
-            conn.execute(f"PRAGMA user_version = {BASE_SCHEMA_VERSION}")
-            conn.commit()
-        return
-
-    target_v = migrations[-1].version
     pending = [m for m in migrations if m.version > current_v]
     if not pending:
-        if current_v < BASE_SCHEMA_VERSION:
-            conn.execute(f"PRAGMA user_version = {BASE_SCHEMA_VERSION}")
+        if current_v < target_v:
+            conn.execute(f"PRAGMA user_version = {target_v}")
             conn.commit()
         return
 
@@ -348,6 +342,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             conn.execute(f"PRAGMA user_version = {migration.version}")
             elapsed = time.monotonic() - start
             log.dual_log(tag="DB:Migration", message=f"Migration v{migration.version} applied successfully in {elapsed:.3f}s")
+
+        if migrations[-1].version < target_v:
+            conn.execute(f"PRAGMA user_version = {target_v}")
 
         conn.execute("COMMIT")
         migration_success = True

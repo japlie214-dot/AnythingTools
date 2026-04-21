@@ -53,7 +53,6 @@ from database.writer import (
 )
 from utils.logger.core import get_dual_logger
 from tools.registry import REGISTRY
-from database.schema import get_init_script
 
 # MIGRATIONS_DIR is now managed by database.migrations; removed from app.py
 
@@ -210,7 +209,20 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-    # === Step 2: Start DB writer early and initialize schema via the single-writer ===
+    # === Step 2: Perform authoritative schema initialization and migration execution FIRST
+    try:
+        from database.lifecycle import run_database_lifecycle
+        await run_database_lifecycle()
+    except Exception as e:
+        log.dual_log(
+            tag="DB:Lifecycle",
+            message=f"Database lifecycle failed — application cannot start: {e}",
+            level="CRITICAL",
+            exc_info=e,
+        )
+        raise RuntimeError(f"Database initialization failed: {e}") from e
+
+    # === Step 3: Start DB writer after migrations to prevent lock contention ===
     try:
         start_writer()
         log.dual_log(tag="DB:WriterStart", message="Database writer started.")
@@ -218,33 +230,6 @@ async def lifespan(app: FastAPI):
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception as e:
         logging.exception("Failed to start DB writer thread: %s", e)
-
-    # Perform authoritative schema initialization and migration execution
-    try:
-        from database.schema import get_init_script, get_schema_version
-        from database.writer import enqueue_execscript
-        import sqlite3
-        conn = DatabaseManager.get_read_connection()
-        try:
-            current_v = conn.execute("PRAGMA user_version").fetchone()[0]
-        except sqlite3.DatabaseError:
-            current_v = 0
-        
-        if current_v == 0:
-            # Fresh DB Fast Path via single-writer
-            schema_version = get_schema_version()
-            enqueue_execscript(get_init_script())
-            enqueue_write(f"PRAGMA user_version = {schema_version}")
-            await asyncio.wait_for(wait_for_writes(), timeout=10.0)
-            log.dual_log(tag="DB:Schema", message=f"Fresh database; schema created and stamped to v{schema_version} via writer queue.")
-        else:
-            from database.schema import init_db
-            init_db()
-            log.dual_log(tag="DB:Schema", message="Schema migrations completed via init_db().")
-    except asyncio.TimeoutError:
-        log.dual_log(tag="DB:Schema", message="Database initialization timed out after 10s.", level="ERROR")
-    except Exception as e:
-        log.dual_log(tag="DB:Schema", message=f"Failed to initialize schema: {e}", level="ERROR", exc_info=e)
 
     # 3) Truncate transient PDF cache after ensuring schema is ready
     try:

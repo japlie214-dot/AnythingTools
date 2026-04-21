@@ -31,7 +31,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 **Event-driven polling**: Polling interval 1 second in `bot/engine/worker.py`  
 **Execution model**: Direct tool invocation, no autonomous loops  
 **Concurrency**: Single-writer database, thread-based job execution  
-**Architecture**: FastAPI + Background Writer Thread + Worker Manager  
+**Architecture**: FastAPI + Background Writer Thread + Worker Manager
 
 ### 2.3 System Components
 
@@ -43,20 +43,20 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 │  • Schema initialization (fast-path for fresh DBs)          │
 │  • Writer thread startup (single-writer guarantee)          │
 └──────────────────┬──────────────────────────────────────────┘
-                    │
-                    ├──────────────┬──────────────┬──────────────┐
-                    │              │              │              │
-             ┌──────▼──────┐  ┌────▼──────┐  ┌────▼──────┐  ┌────▼──────┐
-             │ API Routes  │  │  Writer   │  │  Worker   │  │  Tools    │
-             │ /api/tools  │  │  Thread   │  │  Manager  │  │  Registry │
-             │ /api/jobs   │  └────┬──────┘  └────┬──────┘  └────┬──────┘
-             └─────────────┘       │              │              │
-                                   │              │              │
-                              ┌────▼──────┐   ┌───▼────┐
-                              │  SQLite   │   │ Tools  │
-                              │  WAL DB   │   │ Scraper│
-                              │           │   │ etc.   │
-                              └───────────┘   └────────┘
+                     │
+                     ├──────────────┬──────────────┬──────────────┐
+                     │              │              │              │
+              ┌──────▼──────┐  ┌────▼──────┐  ┌────▼──────┐  ┌────▼──────┐
+              │ API Routes  │  │  Writer   │  │  Worker   │  │  Tools    │
+              │ /api/tools  │  │  Thread   │  │  Manager  │  │  Registry │
+              │ /api/jobs   │  └────┬──────┘  └────┬──────┘  └────┬──────┘
+              └─────────────┘       │              │              │
+                                    │              │              │
+                               ┌────▼──────┐   ┌───▼────┐
+                               │  SQLite   │   │ Tools  │
+                               │  WAL DB   │   │ Scraper│
+                               │           │   │ etc.   │
+                               └───────────┘   └────────┘
 ```
 
 ---
@@ -64,7 +64,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 ## 3. Repository Structure
 
 ### 3.1 Root Directory
-- **`app.py`** - FastAPI entrypoint with lifespan lifecycle (Vec0 validation, Chrome cleanup, DB initialization, writer thread startup, recovery scan)
+- **`app.py`** - FastAPI entrypoint with lifespan lifecycle
 - **`config.py`** - Configuration reading from environment variables
 - **`requirements.txt`** - Dependencies including Botasaurus, Snowflake, PaddleOCR
 - **`.env`** - Environment variables (Telegram credentials, schema reset flag)
@@ -77,17 +77,20 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
   - `EXEC_SCRIPT` marker for batch script execution
   - `TRANSACTION_MARKER` for atomic transaction bundles
   - `enqueue_transaction()` for dual-table updates
-- **`schema.py`** - Proxy layer to schemas and migrations
+- **`health.py`** - *NEW* Isolated health checks, orphaned backup recovery
+- **`lifecycle.py`** - *NEW* Async coordinator for initialization and migration
+- **`schema.py`** - Proxy layer to schemas and migrations (legacy functions removed)
 - **`job_queue.py`** - Job operations with JSON metadata
 - **`reader.py`** - Read operations with JSON extraction
 - **`blackboard.py`** - State tracking using JSON metadata
 
 #### Migration System (`database/migrations/`):
-- **`__init__.py`** - Autonomous runner:
-  - Auto-fold logic for >3 migrations
+- **`__init__.py`** - Autonomous runner with refactored logic:
+  - Monotonically increasing version validation (detached from BASE_SCHEMA_VERSION)
   - Transaction safety (`BEGIN EXCLUSIVE`)
   - Backup/restore on failure
-  - Version alignment (`PRAGMA user_version`)
+  - Version alignment with BASE_SCHEMA_VERSION
+  - *FIXED*: Future-version detection prevents downgrade
 - **`v004_step_to_metadata.py`** - Converts `step_identifier` → `item_metadata` JSON (v3 → v4)
 - **`v005_jobs_partial.py`** - Adds `PARTIAL` status to jobs (v4 → v5)
 - **`v006_publisher_phase_state.py`** - Migrates `posted_*_ulids` → `phase_state` JSON (v5 → v6)
@@ -127,11 +130,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 **Publisher (`tools/publisher/`):**
 - **`tool.py`** - Orchestrates `utils.telegram.pipeline.PublisherPipeline`
 - **`Skill.py`** - Skill wrapper
-- **`prompt.py`** - Contains `TRANSLATION_PROMPT` with strict MarkdownV2 rules:
-  - Specifies `*bold*` for titles, `_italic_` for emphasis
-  - Defines forbidden chars: `_*[]()~`>#+=|{}.!\-` (hyphen at end)
-  - Requires `Kesimpulan:` replacement
-  - Prompts for JSON structure compliance
+- **`prompt.py`** - Contains `TRANSLATION_PROMPT` with strict MarkdownV2 rules
 
 ### 3.4 Execution Layer (`bot/`)
 #### Engine (`bot/engine/`):
@@ -169,7 +168,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
   2. Double-backslash: Fixed replacement from `r'\\\\\1'` to `r'\\\1'`
   - Entity-aware regex: Preserves code blocks, links, spoilers, bold/italic/strikethrough
   - Selective escaping: Only plaintext segments get escaped
-- **`browser_lock.py** - `threading.Lock` for browser exclusivity
+- **`browser_lock.py`** - `threading.Lock` for browser exclusivity
 - **`browser_daemon.py`** - Driver lifecycle management
 - **`browser_utils.py`** - Safe navigation utilities
 - **`som_utils.py`** - State-of-mind synchronization
@@ -185,6 +184,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 
 ### 3.8 Deprecated (`deprecated/`)
 - **Legacy architecture evidence** - UnifiedAgent, dynamic tools, unused tool types (`bot/`, `tools/`)
+- *Evolutionary marker*: File structure shows migration from monolithic to modular design
 
 ### 3.9 Tests (`tests/`)
 - **`test_browser_e2e.py`** - Browser health check
@@ -267,7 +267,7 @@ CREATE TABLE broadcast_batches (
 - `FAILED`: All invalid or complete failure
 
 ### 4.4 Migration Version Chain
-**BASE_SCHEMA_VERSION = 3** (in `database/schemas/__init__.py`)
+**Base:** `BASE_SCHEMA_VERSION = 6` (in `database/schemas/__init__.py`)
 
 **Active Migrations (as of current):**
 1. **v004** - `step_identifier` → `item_metadata` JSON
@@ -468,29 +468,82 @@ for attempt in range(MAX_REPAIR_RETRIES + 1):
 
 **Table Repair Scripts:** Stored in `database/schemas/` via `get_repair_script()`
 
-### 5.5 Database Fast-Path Initialization
+### 5.5 Database Architecture Changes (New Lifecycle System)
 
-**Fresh DB Detection:**
+#### **Fresh DB Fast-Path Initialization** (app.py lines 212-224):
 ```python
-conn = DatabaseManager.get_read_connection()
-try:
-    current_v = conn.execute("PRAGMA user_version").fetchone()[0]
-except sqlite3.DatabaseError:
-    current_v = 0
-
-if current_v == 0:
-    # Fresh DB Fast Path via single-writer
-    schema_version = get_schema_version()
-    enqueue_execscript(get_init_script())
-    enqueue_write(f"PRAGMA user_version = {schema_version}")
-    await asyncio.wait_for(wait_for_writes(), timeout=10.0)
+from database.lifecycle import run_database_lifecycle
+await run_database_lifecycle()
 ```
 
-**Benefits:**
-- No migration runner overhead for fresh installs
-- Single-writer guarantee maintained
-- 10s timeout prevents hangs
-- Prevents unnecessary migration execution
+**New `run_database_lifecycle()` Flow:**
+```python
+# 1. Recover orphaned backups
+restore_orphaned_backup()
+
+# 2. Probe state
+exists, current_version = check_database_file_state()
+
+if not exists:
+    await initialize()  # Fresh init
+elif current_version is None:
+    if ALLOW_DESTRUCTIVE_RESET:
+        _remove_db_files()
+        await initialize()
+    else:
+        raise RuntimeError("Database file corrupted")
+elif current_version < target_v:
+    await migrate(current_version)
+elif current_version == target_v:
+    check_tables_exist()  # Verify health, repair if needed
+```
+
+#### **Critical Fixes Applied (User-Reported Bugs):**
+
+**Fix 1: Async Table Repair (database/lifecycle.py line 86)**
+```python
+# BEFORE: asyncio.create_task(_repair_missing_tables(missing))
+# AFTER:  await _repair_missing_tables(missing)
+```
+*Reasoning*: Using `create_task` allows startup to complete before tables exist, causing runtime errors.
+
+**Fix 2: Corrupted File State (database/health.py lines 46-48, 57-60)**
+```python
+# BEFORE: return False, None for 0-byte files
+# AFTER:  return True, None for 0-byte files
+
+# BEFORE: return False, None for DatabaseError
+# AFTER:  return True, None for DatabaseError
+```
+*Reasoning*: `False` treats as fresh file without deletion. `True` forces lifecycle to handle corruption properly (destructive reset or hard stop).
+
+**Fix 3: Version Alignment (database/migrations/__init__.py lines 297-302, 346-347)**
+```python
+# BEFORE: target_v = migrations[-1].version (overwrites authoritative value)
+# AFTER:  target_v = get_latest_version() (remains authoritative max(base, migrations))
+
+# BEFORE: Missing final version stamp if base > migrations[-1]
+# AFTER:  Adds: if migrations[-1].version < target_v: execute(f"PRAGMA user_version = {target_v}")
+```
+*Reasoning*: Prevents incorrect version stamping when BASE_SCHEMA_VERSION > highest migration version.
+
+#### **Isolated Diagnostic Probes:**
+```python
+# In check_database_file_state()
+conn = sqlite3.connect(str(DB_PATH))  # Raw connection, bypasses DatabaseManager
+# Prevents poisoning thread-local cache
+```
+
+#### **Single-Writer Queue for Repairs:**
+```python
+# In _repair_missing_tables()
+start_writer()
+for table_name in missing:
+    script = get_repair_script(table_name)
+    if script:
+        enqueue_execscript(script)  # Routes through writer queue
+await wait_for_writes()
+```
 
 ---
 
@@ -695,22 +748,20 @@ SUMANAL_ALLOW_SCHEMA_RESET=0  # Set 1 for development
 ### 9.3 Database First Run
 
 **What happens:**
-1. `app.py` lifespan checks `PRAGMA user_version`
-2. **Fresh DB**: `enqueue_execscript()` + `enqueue_write()` with 10s timeout
-3. Writer thread writes schema and version
-4. Migration system skipped
-5. `broadcast_batches` table created
+1. `app.py` lifespan calls `await run_database_lifecycle()`
+2. Detects fresh state, calls `initialize()`
+3. Writer thread writes schema via `enqueue_execscript()`
+4. Version stamped via `enqueue_write("PRAGMA user_version = 6")`
+5. 10s timeout prevents hangs
 
 **Expected logs:**
 ```
-DB:WriterStart - Database writer started
+DB:Health - All expected tables verified.
+DB:Lifecycle - No database found, running fresh init.
+DB:WriterStart - Database writer started.
+DB:Lifecycle - Initializing fresh database to v6
 DB:Schema - Fresh database; schema created and stamped to v6 via writer queue.
 API:Worker:Start - Unified WorkerManager started
-```
-
-**Old behavior (existing DB):**
-```
-DB:Schema - Schema migrations completed via init_db().
 ```
 
 ### 9.4 Migration Execution
@@ -718,6 +769,7 @@ DB:Schema - Schema migrations completed via init_db().
 **Automatic on startup for existing DBs:**
 ```bash
 # Logs show:
+DB:Lifecycle - Recover from v004, migrating...
 DB:Migration - Applying migration v4: Convert job_items.step_identifier to item_metadata JSON
 DB:Migration - Applying migration v5: Add PARTIAL status to jobs table
 DB:Migration - Applying migration v6: Deprecate posted_*_ulids and add phase_state to broadcast_batches
