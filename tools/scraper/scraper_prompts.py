@@ -66,7 +66,10 @@ SUMMARIZATION_SCHEMA = {
             "description": "Bullet points of key facts, data, exact numbers, and quotes"
         },
         "error": {
-            "type": ["string", "null"],
+            "anyOf": [
+                {"type": "string", "description": "Set to 'INSUFFICIENT_CONTENT' if content is unreadable or empty"},
+                {"type": "null", "description": "No error"}
+            ],
             "description": "Set to 'INSUFFICIENT_CONTENT' if content is unreadable or empty, otherwise null"
         }
     },

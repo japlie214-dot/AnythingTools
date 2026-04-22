@@ -45,20 +45,20 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 │  • Schema initialization (fast-path for fresh DBs)          │
 │  • Writer thread startup (single-writer guarantee)          │
 └──────────────────┬──────────────────────────────────────────┘
-                      │
-                      ├──────────────┬──────────────┬──────────────┐
-                      │              │              │              │
-               ┌──────▼──────┐  ┌────▼──────┐  ┌────▼──────┐  ┌────▼──────┐
-               │ API Routes  │  │  Writer   │  │  Worker   │  │  Tools    │
-               │ /api/tools  │  │  Thread   │  │  Manager  │  │  Registry │
-               │ /api/jobs   │  └────┬──────┘  └────┬──────┘  └────┬──────┘
-               └─────────────┘       │              │              │
-                                     │              │              │
-                                ┌────▼──────┐   ┌───▼────┐
-                                │  SQLite   │   │ Tools  │
-                                │  WAL DB   │   │ Scraper│
-                                │           │   │ etc.   │
-                                └───────────┘   └────────┘
+                       │
+                       ├──────────────┬──────────────┬──────────────┐
+                       │              │              │              │
+                ┌──────▼──────┐  ┌────▼──────┐  ┌────▼──────┐  ┌────▼──────┐
+                │ API Routes  │  │  Writer   │  │  Worker   │  │  Tools    │
+                │ /api/tools  │  │  Thread   │  │  Manager  │  │  Registry │
+                │ /api/jobs   │  └────┬──────┘  └────┬──────┘  └────┬──────┘
+                └─────────────┘       │              │              │
+                                      │              │              │
+                                 ┌────▼──────┐   ┌───▼────┐
+                                 │  SQLite   │   │ Tools  │
+                                 │  WAL DB   │   │ Scraper│
+                                 │           │   │ etc.   │
+                                 └───────────┘   └────────┘
 ```
 
 ---
@@ -122,10 +122,10 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 - **`tool.py`** - Scout Mode, Botasaurus integration, Intelligent Manifest generation
 - **`task.py`** - Botasaurus scraper implementation
 - **`prompt.py`** - Scraping prompts
-- **`scraper_prompts.py`** - Contains `SUMMARIZATION_SCHEMA` for structured outputs, JSON schema fallback
+- **`scraper_prompts.py`** - Contains `SUMMARIZATION_SCHEMA` with anyOf syntax for nullable `error` field
 - **`summary_prompts.py`** - Summarization prompts
 - **`targets.py`** - Valid target site configuration
-- **`extraction.py`** - JSON schema attempt with fallback to `json_object`
+- **`extraction.py`** - JSON schema attempt with fallback to `json_object`, hardened exception handling
 - **`persistence.py`** - Structured JSON parsing with null handling
 - **Resume behavior**: Skips if both validation and summary exist in job_items
 
@@ -139,7 +139,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 **Publisher (`tools/publisher/`):**
 - **`tool.py`** - Orchestrates `utils.telegram.pipeline.PublisherPipeline`
 - **`Skill.py`** - Skill wrapper
-- **`prompt.py`** - Contains `TRANSLATION_PROMPT` with strict MarkdownV2 rules
+- **`prompt.py`** - Contains `TRANSLATION_PROMPT` with strict MarkdownV2 rules (raw string literal)
 
 ### 3.4 Execution Layer (`bot/`)
 
@@ -192,7 +192,10 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 
 ### 3.7 Clients (`clients/`)
 - **`snowflake_client.py`** - Direct Snowflake connection
-- **`llm/`** - Azure OpenAI wrapper
+- **`llm/`** - Azure OpenAI wrapper with **critical updates:**
+  - `_build_responses_payload()` maps `json_schema` to flat Azure Responses API format
+  - `_apply_common_payload()` remains untouched (Chutes AI preserved)
+  - Architectural comments added explaining Azure API structure
 
 ### 3.8 Deprecated (`deprecated/`)
 - **Legacy architecture evidence** - UnifiedAgent, dynamic tools, unused tool types (`bot/`, `tools/`)
@@ -310,6 +313,9 @@ CREATE TABLE broadcast_batches (
    - Run `_run_botasaurus_scraper()` in thread
    - Per-article: validate → summarize → embed
    - **New**: Uses `json_schema` with fallback to `json_object` for summarization
+     - Validates schema syntax with `anyOf` for nullable fields
+     - Hardened exception handling: only `BadRequestError` triggers fallback
+     - Context-length errors propagate immediately
    - **New**: Parses structured JSON directly (`title`, `conclusion`, `summary` array)
    - **New**: Emits `PARTIAL` status if any embeddings fail
    - Resume check: Skip if `validation_passed` and `summary_generated` exist in `job_items`

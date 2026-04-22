@@ -4,7 +4,7 @@ Input: {"batch_id": "<ulid>", "target_channels": ["@channel1"]}
 Output (JSON): {"status": "COMPLETED|PARTIAL", "messages_sent": 0}
 """
 
-TRANSLATION_PROMPT = """
+TRANSLATION_PROMPT = r"""
 Translate the following JSON array of articles into Bahasa Indonesia.
 
 CRITICAL FORMATTING RULES:

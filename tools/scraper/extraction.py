@@ -232,13 +232,27 @@ def process_article(
                     )
                     used_format = "json_schema"
                 except Exception as format_exc:
-                    log.dual_log(
-                        tag="Scraper:Summarize:Fallback",
-                        message=f"json_schema rejected or failed, falling back to json_object: {format_exc}",
-                        level="WARNING",
-                    )
-                    sum_resp = sync_llm_chat(sum_msgs, response_format={"type": "json_object"})
-                    used_format = "json_object"
+                    from openai import BadRequestError
+                    from clients.llm.utils import is_context_length_error
+                    
+                    if is_context_length_error(format_exc):
+                        log.dual_log(
+                            tag="Scraper:Summarize:ContextLength",
+                            message=f"Context length exceeded during json_schema call: {format_exc}",
+                            level="WARNING"
+                        )
+                        raise
+                        
+                    if isinstance(format_exc, BadRequestError):
+                        log.dual_log(
+                            tag="Scraper:Summarize:Fallback",
+                            message=f"json_schema format rejected, falling back to json_object: {format_exc}",
+                            level="WARNING",
+                        )
+                        sum_resp = sync_llm_chat(sum_msgs, response_format={"type": "json_object"})
+                        used_format = "json_object"
+                    else:
+                        raise
 
                 sum_data = parse_llm_json(sum_resp.content or "{}")
 

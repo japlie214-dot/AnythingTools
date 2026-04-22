@@ -345,6 +345,22 @@ def _build_responses_payload(
                     elif isinstance(c, list):
                         c.append({"type": "input_text", "text": "\n\nOutput strictly in JSON."})
         elif fmt_type == "json_schema":
-            payload["text"] = {"format": request.response_format}
+            # [AZURE RESPONSES API KNOWLEDGE]
+            # Per official Migration Guide: In the Responses API, structured outputs
+            # have moved from `response_format` to `text.format`.
+            # The nested `json_schema` wrapping key is REMOVED.
+            # `name`, `strict`, `schema`, and `description` must be mapped as
+            # direct top-level siblings under the `format` object.
+            js_dict = request.response_format.get("json_schema", {})
+            format_payload = {
+                "type": "json_schema",
+                "name": js_dict.get("name", "response"),
+                "strict": js_dict.get("strict", False),
+                "schema": js_dict.get("schema", {})
+            }
+            if "description" in js_dict:
+                format_payload["description"] = js_dict["description"]
+                
+            payload["text"] = {"format": format_payload}
 
     return payload
