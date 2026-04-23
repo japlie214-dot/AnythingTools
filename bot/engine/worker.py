@@ -24,6 +24,8 @@ import httpx
 import base64
 import os
 import mimetypes
+import shutil
+from pathlib import Path
 
 log = get_dual_logger(__name__)
 
@@ -38,69 +40,121 @@ def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: l
     Returns True if callback succeeds (2xx), False otherwise.
     """
     if not getattr(config, "ANYTHINGLLM_BASE_URL", None) or not getattr(config, "ANYTHINGLLM_API_KEY", None):
-        return True  # Skip if not configured
+        return True
 
     url = f"{config.ANYTHINGLLM_BASE_URL.rstrip('/')}/api/v1/workspace/{config.ANYTHINGLLM_WORKSPACE_SLUG}/chat"
     headers = {"Authorization": f"Bearer {config.ANYTHINGLLM_API_KEY}", "Content-Type": "application/json"}
 
-    attachments_payload = []
-    for path in (attachment_paths or []):
-        if not os.path.exists(path):
-            enqueue_write(
-                "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-                (ULID.generate(), job_id, "Worker:Callback:FileMissing", "WARNING", f"Attachment missing from disk: {path}", now_iso())
-            )
-            continue
-        try:
-            mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-            with open(path, "rb") as f:
-                b64_data = base64.b64encode(f.read()).decode("utf-8")
-            attachments_payload.append({
-                "name": os.path.basename(path),
-                "mime": mime,
-                "contentString": f"data:{mime};base64,{b64_data}",
-            })
-        except Exception as e:
-            enqueue_write(
-                "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-                (ULID.generate(), job_id, "Worker:Callback:FileError", "WARNING", f"Failed to encode {path}: {e}", now_iso())
-            )
+    # -------------------------------------------------------------------------
+    # ⚠️ MANDATORY ARCHITECTURE RULE: THE "CUSTOM-DOCUMENTS" DIRECTIVE
+    # -------------------------------------------------------------------------
+    # Do NOT send artifact files (like top10.json) as Base64 attachments via 
+    # the AnythingLLM Chat API. 
+    # Dropping the file directly into AnythingLLM's `custom-documents/` folder 
+    # (via artifact_manager.py) is the ONLY right way to expose files to the LLM. 
+    #
+    # The `attachments` payload below MUST remain empty for markdown-based 
+    # tool callbacks.
+    # -------------------------------------------------------------------------
+    
+    # Construct structured markdown callback
+    tool_name = "unknown"
+    status = "COMPLETED"
+    summary = ""
+    details = None
+    artifacts = None
+    status_overrides = None
 
+    if isinstance(tool_output, dict):
+        if tool_output.get("_callback_format") == "structured":
+            tool_name = tool_output.get("tool_name", tool_name)
+            status = tool_output.get("status", status)
+            summary = tool_output.get("summary", "")
+            details = tool_output.get("details")
+            artifacts = tool_output.get("artifacts")
+            status_overrides = tool_output.get("status_overrides")
+        else:
+            tool_name = tool_output.get("tool_name", tool_name)
+            status = tool_output.get("status", status)
+            summary = f"Job {job_id} finished with status: {status}"
+            details = tool_output
+    elif isinstance(tool_output, str):
+        summary = tool_output[:500]
+        details = {"raw_output": tool_output[:2000]}
+
+    # Get artifacts directory if available
+    artifacts_dir = None
     try:
-        payload_body = json.dumps(tool_output, ensure_ascii=False) if not isinstance(tool_output, str) else tool_output
+        from utils.artifact_manager import get_artifacts_root
+        artifacts_dir = str(get_artifacts_root())
     except Exception:
-        payload_body = str(tool_output)
+        pass
+
+    from utils.callback_helper import format_callback_message, truncate_message
+
+    callback_message = format_callback_message(
+        job_id=job_id,
+        status=status,
+        tool_name=tool_name,
+        summary=summary,
+        details=details,
+        artifacts=artifacts,
+        artifacts_dir=artifacts_dir,
+        status_overrides=status_overrides
+    )
+
+    callback_message = truncate_message(callback_message, max_chars=12000)
 
     callback_payload = {
-        "message": f"TOOL_RESULT_CORRELATION_ID:{job_id}\n\n{payload_body}",
+        "message": f"TOOL_RESULT_CORRELATION_ID:{job_id}\n\n{callback_message}",
         "mode": "chat",
-        "attachments": attachments_payload,
+        "attachments": [],  # ENFORCED: No Base64 attachments.
         "reset": False,
     }
 
-    try:
-        with httpx.Client(timeout=config.ANYTHINGLLM_CALLBACK_TIMEOUT) as client:
-            resp = client.post(url, json=callback_payload, headers=headers)
-            resp.raise_for_status()
-        
-        enqueue_write(
-            "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (ULID.generate(), job_id, "Worker:Callback:Success", "INFO", f"Callback delivered (Files: {len(attachments_payload)})", now_iso())
-        )
-        return True
-    except httpx.HTTPError as e:
-        status_code = getattr(getattr(e, "response", None), "status_code", None)
-        enqueue_write(
-            "INSERT INTO job_logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ULID.generate(), job_id, "Worker:Callback:Error", "ERROR", f"HTTP callback failed: {str(e)}", json.dumps({"status_code": status_code}), now_iso())
-        )
-        return False
-    except Exception as e:
-        enqueue_write(
-            "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (ULID.generate(), job_id, "Worker:Callback:Error", "ERROR", f"Unexpected callback failure: {str(e)}", now_iso())
-        )
-        return False
+    max_retries = 3
+    base_delay = 2.0
+    attempt = 0
+
+    while attempt < max_retries:
+        attempt += 1
+        try:
+            with httpx.Client(timeout=config.ANYTHINGLLM_CALLBACK_TIMEOUT) as client:
+                resp = client.post(url, json=callback_payload, headers=headers)
+                resp.raise_for_status()
+
+            enqueue_write(
+                "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                (ULID.generate(), job_id, "Worker:Callback:Success", "INFO", f"Callback delivered (attempt {attempt})", now_iso())
+            )
+            return True
+
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code
+            if 400 <= status_code < 500:
+                enqueue_write(
+                    "INSERT INTO job_logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (ULID.generate(), job_id, "Worker:Callback:ClientError", "ERROR", f"HTTP {status_code} (no retry)", json.dumps({"status_code": status_code}), now_iso())
+                )
+                return False
+            enqueue_write(
+                "INSERT INTO job_logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (ULID.generate(), job_id, "Worker:Callback:ServerError", "WARNING", f"HTTP {status_code} (retry)", json.dumps({"status_code": status_code}), now_iso())
+            )
+        except Exception as e:
+            enqueue_write(
+                "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                (ULID.generate(), job_id, "Worker:Callback:Transient", "WARNING", f"Transient error: {str(e)[:200]}", now_iso())
+            )
+
+        if attempt < max_retries:
+            time.sleep(base_delay * (2 ** (attempt - 1)))
+
+    enqueue_write(
+        "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        (ULID.generate(), job_id, "Worker:Callback:MaxRetries", "ERROR", f"Callback failed after {max_retries} attempts", now_iso())
+    )
+    return False
 
 
 class UnifiedWorkerManager:

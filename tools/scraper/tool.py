@@ -25,6 +25,8 @@ from tools.scraper.task import _run_botasaurus_scraper
 from tools.scraper.targets import VALID_TARGET_NAMES
 from utils.id_generator import ULID
 from database.writer import enqueue_write
+from utils.callback_helper import format_callback_message
+from utils.artifact_manager import write_artifact, get_artifacts_root
 
 log = get_dual_logger(__name__)
 
@@ -47,15 +49,30 @@ class ScraperTool(BaseTool):
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Main entry point for Scout execution."""
+        def _fail(status: str, summary: str, next_steps: str) -> str:
+            return json.dumps({
+                "_callback_format": "structured",
+                "tool_name": self.name,
+                "status": status,
+                "summary": summary,
+                "status_overrides": {
+                    status: {
+                        "description": "Scraper execution aborted early.",
+                        "next_steps": next_steps,
+                        "rerunnable": True
+                    }
+                }
+            }, ensure_ascii=False)
+
         cancellation_flag = kwargs.pop("cancellation_flag", None)
         if cancellation_flag is None:
             cancellation_flag = threading.Event()
             
         if cancellation_flag.is_set():
-            return "__CANCELED__"
+            return _fail("CANCELLING", "Scraper execution canceled.", "Job canceled. No further action needed unless you wish to resubmit.")
 
         if browser_lock.locked():
-            return "System busy: another browser task is running."
+            return _fail("FAILED", "System busy: another browser task is running.", "Wait a few minutes and call the `scraper` tool again.")
         
         browser_lock.acquire()
         try:
@@ -65,16 +82,31 @@ class ScraperTool(BaseTool):
 
     async def _run_internal(self, args: dict[str, Any], telemetry: Any, cancellation_flag: threading.Event, **kwargs) -> str:
         """Internal implementation with full pipeline."""
+        def _fail_internal(summary: str, next_steps: str) -> str:
+            return json.dumps({
+                "_callback_format": "structured",
+                "tool_name": self.name,
+                "status": "FAILED",
+                "summary": summary,
+                "status_overrides": {
+                    "FAILED": {
+                        "description": "Scraper validation failed.",
+                        "next_steps": next_steps,
+                        "rerunnable": False
+                    }
+                }
+            }, ensure_ascii=False)
+
         dry_run = kwargs.get("dry_run", config.TELEMETRY_DRY_RUN)
         if dry_run:
-            return "[DRY RUN] Scraper tool execution skipped."
+            return _fail_internal("[DRY RUN] Scraper tool execution skipped.", "Disable dry run to execute.")
 
         job_id = kwargs.get("job_id")
         session_id = str(kwargs.get("session_id") or kwargs.get("chat_id", "0"))
         target_site = args.get("target_site")
         
         if not target_site:
-            return "Error: target_site argument is required."
+            return _fail_internal("Error: target_site argument is required.", "Provide a valid 'target_site' argument.")
 
         if target_site not in VALID_TARGET_NAMES:
             valid_list = ", ".join(sorted(VALID_TARGET_NAMES))
@@ -84,7 +116,7 @@ class ScraperTool(BaseTool):
                 level="ERROR",
                 payload={"received": target_site, "valid_options": list(VALID_TARGET_NAMES)},
             )
-            return f"Error: '{target_site}' is not a valid target site. Valid options: {valid_list}"
+            return _fail_internal(f"Error: '{target_site}' is not a valid target site. Valid options: {valid_list}", f"Use one of the valid options: {valid_list}")
 
         # Scout initialization (legacy ledger removed) — log for auditing
         if job_id and session_id != "0":
@@ -127,14 +159,12 @@ class ScraperTool(BaseTool):
                 },
             )
 
-            # Persist raw results
-            artifacts_root: Path = Path(config.ARTIFACTS_ROOT)
-            output_dir: Path = artifacts_root / "scrapes"
-            output_dir.mkdir(parents=True, exist_ok=True)
-
+            # Persist raw results to hidden data/temp
+            temp_dir = Path("data/temp")
+            temp_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            filepath = output_dir / f"scraper_output_{ts}.json"
-            with open(filepath, "w", encoding="utf-8") as fh:
+            raw_filepath = temp_dir / f"scraper_output_{ts}.json"
+            with open(raw_filepath, "w", encoding="utf-8") as fh:
                 json.dump(results, fh, indent=2, ensure_ascii=False)
 
             # Extract statistics and slim results
@@ -172,15 +202,20 @@ class ScraperTool(BaseTool):
                 except Exception:
                     top_10_list = slim_list[:10]
 
-            # Atomic save of Top 10
-            top_10_path = output_dir / f"top_10_{batch_id}.json"
-            with tempfile.NamedTemporaryFile("w", dir=output_dir, delete=False, suffix=".tmp", encoding="utf-8") as _tf:
-                json.dump(top_10_list, _tf, indent=2, ensure_ascii=False)
-                _tmp_name = _tf.name
-            os.replace(_tmp_name, top_10_path)
-            
-            # Store artifact path for ToolResult
-            self._last_artifacts = [str(Path("artifacts") / "scrapes" / top_10_path.name)]
+            # Save Top 10 directly to AnythingLLM custom-documents
+            try:
+                top_10_path = write_artifact(
+                    tool_name="scraper",
+                    job_id=batch_id,
+                    artifact_type="top10",
+                    ext="json",
+                    content=json.dumps(top_10_list, indent=2, ensure_ascii=False)
+                )
+                self._last_artifacts = [str(top_10_path)]
+            except Exception as e:
+                log.dual_log(tag="Scraper:Artifact", message=f"Failed to write artifact: {e}", level="WARNING")
+                self._last_artifacts = []
+                top_10_path = raw_filepath
 
             # 📝 Generate Intelligent Manifest
             manifest_lines = [
@@ -225,23 +260,53 @@ class ScraperTool(BaseTool):
                 manifest_content = "\n".join(manifest_lines)
                 log.dual_log(tag="Scraper:Manifest", message="Intelligent manifest generated.", payload={"job_id": job_id, "manifest": manifest_content})
 
-            # Save to broadcast_batches
+            # Save to broadcast_batches (raw_json_path points to data/temp)
             try:
                 enqueue_write(
                     "INSERT INTO broadcast_batches (batch_id, target_site, raw_json_path, curated_json_path, status) VALUES (?, ?, ?, ?, 'PENDING')",
-                    (batch_id, target_site, str(filepath), str(top_10_path))
+                    (batch_id, target_site, str(raw_filepath), str(top_10_path))
                 )
             except Exception:
                 pass
 
             await telemetry(self.status("Scraper and curation finished.", "SUCCESS"))
             
+            job_final_status = _stats.get("job_final_status", "COMPLETED")
+            
             payload = {
-                "message": f"### Scout Extraction Complete\n**Batch ID:** `{batch_id}`\nUse `batch_reader` to query inventory.",
-                "batch_id": batch_id,
-                "top_10": [{"title": item.get("title", ""), "summary": item.get("conclusion", ""), "ulid": item.get("ulid", "")} for item in top_10_list],
-                "inventory": [{"title": item.get("title", ""), "ulid": item.get("ulid", "")} for item in next_50],
-                "total_count": total
+                "_callback_format": "structured",
+                "tool_name": self.name,
+                "status": job_final_status,
+                "summary": f"Scraped **{total}** articles from **{target_site}**. Curated **{len(top_10_list)}** top articles.",
+                "details": {
+                    "batch_id": batch_id,
+                    "target_site": target_site,
+                    "total_articles": total,
+                    "top_10_count": len(top_10_list),
+                    "inventory_count": len(next_50)
+                },
+                "artifacts": [{
+                    "filename": Path(top_10_path).name,
+                    "type": "json",
+                    "description": f"Curated Top 10 for {target_site}."
+                }],
+                "status_overrides": {
+                    "PARTIAL": {
+                        "description": "Some URLs failed validation, extraction, or embedding.",
+                        "next_steps": f"Call the `scraper` tool again using exactly: {{\"target_site\": \"{target_site}\"}}. The system will skip completed URLs and retry only the failed ones.",
+                        "rerunnable": True
+                    },
+                    "COMPLETED": {
+                        "description": "Scrape successful and batch generated.",
+                        "next_steps": f"To query this batch's inventory, call `batch_reader` with {{\"batch_id\": \"{batch_id}\", \"query\": \"<your search>\"}}. To publish the Top 10 to Telegram, call `publisher` with {{\"batch_id\": \"{batch_id}\"}}.",
+                        "rerunnable": False
+                    },
+                    "FAILED": {
+                        "description": "Scraping failed entirely. Target site might be blocking access.",
+                        "next_steps": "Check the error details. Call the `scraper` tool again but use a different site, e.g., {\"target_site\": \"Bloomberg\"}.",
+                        "rerunnable": True
+                    }
+                }
             }
             return json.dumps(payload, ensure_ascii=False)
 
@@ -249,7 +314,21 @@ class ScraperTool(BaseTool):
             if str(exc).startswith("PAUSED_FOR_HITL:"):
                 raise
             await telemetry(self.status("Scraper failed.", "ERROR"))
-            return f"Scout Mode failed: {exc}"
+            
+            err_payload = {
+                "_callback_format": "structured",
+                "tool_name": self.name,
+                "status": "FAILED",
+                "summary": f"Scraper execution crashed: {exc}",
+                "status_overrides": {
+                    "FAILED": {
+                        "description": "Scraping crashed fatally.",
+                        "next_steps": "Do NOT retry the exact same parameters. Use a different target_site or review system logs.",
+                        "rerunnable": False
+                    }
+                }
+            }
+            return json.dumps(err_payload, ensure_ascii=False)
 
     async def execute(self, args, telemetry, **kwargs) -> ToolResult:
         """Override to include artifacts in result."""

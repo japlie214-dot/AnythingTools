@@ -14,7 +14,7 @@ from utils.logger.core import get_dual_logger
 from utils.id_generator import ULID
 from database.writer import start_writer, enqueue_write
 from database.connection import DatabaseManager
-from utils.artifacts import artifact_url_from_request
+from utils.artifact_manager import artifact_url_from_request
 from bot.engine.worker import get_manager
 from utils.security import scan_args_for_urls
 from pydantic import ValidationError
@@ -193,7 +193,6 @@ async def delete_job(job_id: str, request: Request):
     else:
         # Job not actively running yet; we marked it in DB and manager will honor it.
         return {"job_id": job_id, "status": "CANCELLING"}
-
 
 
 

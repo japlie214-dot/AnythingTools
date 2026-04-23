@@ -7,9 +7,9 @@ class TestTracker:
     def __init__(self, job_id: str, enabled: bool):
         self.job_id = job_id
         self.enabled = enabled
-        self.ledger_path = f"artifacts/test_runs/ledger_{job_id}.json"
+        self.ledger_path = f"data/temp/ledger_{job_id}.json"
         if self.enabled:
-            os.makedirs("artifacts/test_runs", exist_ok=True)
+            os.makedirs("data/temp", exist_ok=True)
             with open(self.ledger_path, "w", encoding="utf-8") as f:
                 json.dump({"job_id": job_id, "steps": []}, f, indent=2)
                 f.flush()

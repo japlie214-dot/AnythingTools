@@ -37,21 +37,49 @@ class DraftEditorTool(BaseTool):
         return False
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
+        def _fail(summary: str, next_steps: str) -> str:
+            return json.dumps({
+                "_callback_format": "structured",
+                "tool_name": self.name,
+                "status": "FAILED",
+                "summary": summary,
+                "status_overrides": {
+                    "FAILED": {
+                        "description": "Draft Editor encountered a validation error.",
+                        "next_steps": next_steps,
+                        "rerunnable": False
+                    }
+                }
+            }, ensure_ascii=False)
+
         batch_id = args.get("batch_id")
         operations = args.get("operations", [])
         
         if not batch_id:
-            raise ValueError("batch_id is required.")
+            return _fail("batch_id is required.", "Provide a valid 'batch_id' parameter.")
 
         conn = DatabaseManager.get_read_connection()
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT raw_json_path, curated_json_path, status FROM broadcast_batches WHERE batch_id = ?", (batch_id,)).fetchone()
         
         if not row or not row["curated_json_path"]:
-            raise ValueError("Batch not found or missing curated data.")
+            return _fail("Batch not found or missing curated data.", " Verify the batch_id is valid. If lost, use the `scraper` tool to generate a new batch.")
 
         if row["status"] != "PENDING":
-            return json.dumps({"status": "FAILED", "error": f"CRITICAL LOCK: Cannot execute SWAP on batch {batch_id}. The batch status is '{row['status']}'. Draft Editor modifications are strictly locked to 'PENDING' batches to prevent state corruption."})
+            payload = {
+                "_callback_format": "structured",
+                "tool_name": self.name,
+                "status": "FAILED",
+                "summary": f"CRITICAL LOCK: Cannot execute SWAP on batch {batch_id}. Status is '{row['status']}'.",
+                "status_overrides": {
+                    "FAILED": {
+                        "description": "Draft Editor modifications are strictly locked to 'PENDING' batches to prevent state corruption.",
+                        "next_steps": "Do NOT retry. You must call `scraper` to generate an entirely new batch if you need different curation.",
+                        "rerunnable": False
+                    }
+                }
+            }
+            return json.dumps(payload, ensure_ascii=False)
             
         try:
             with open(row["curated_json_path"], "r", encoding="utf-8") as f:
@@ -59,7 +87,7 @@ class DraftEditorTool(BaseTool):
             with open(row["raw_json_path"], "r", encoding="utf-8") as f:
                 raw_data = json.load(f)
         except Exception as e:
-            raise ValueError(f"File read error: {e}")
+            return _fail(f"File read error: {e}", "Data may have been purged. Use the `scraper` tool to generate a new batch.")
 
         # Process SWAP operations
         for op in operations:
@@ -103,7 +131,21 @@ class DraftEditorTool(BaseTool):
                 tmp_name = tf.name
             os.replace(tmp_name, row["curated_json_path"])
         except Exception as e:
-            raise ValueError(f"Save failed: {e}")
+            return _fail(f"Save failed: {e}", "Disk write error. Check system resources.")
 
         # Return updated state
-        return json.dumps({"batch_id": batch_id, "status": "SUCCESS", "top_10": top_10}, ensure_ascii=False)
+        payload = {
+            "_callback_format": "structured",
+            "tool_name": self.name,
+            "status": "COMPLETED",
+            "summary": f"Successfully applied SWAP operations to batch {batch_id}.",
+            "details": {"batch_id": batch_id, "top_10": top_10},
+            "status_overrides": {
+                "COMPLETED": {
+                    "description": "The Top 10 list has been successfully reordered/swapped.",
+                    "next_steps": f"You can now publish this edited batch using the `publisher` tool with {{\"batch_id\": \"{batch_id}\"}}.",
+                    "rerunnable": True
+                }
+            }
+        }
+        return json.dumps(payload, ensure_ascii=False)

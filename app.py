@@ -182,6 +182,17 @@ async def reconcile_pending_embeddings() -> None:
 async def lifespan(app: FastAPI):
     logging.info("AnythingTools startup: lifecycle beginning")
 
+    # Enforce AnythingLLM artifacts directory - critical startup check
+    if not config_module.ANYTHINGLLM_ARTIFACTS_DIR:
+        raise RuntimeError("CRITICAL: ANYTHINGLLM_ARTIFACTS_DIR is not set. Application cannot start.")
+
+    # Purge transient data/temp/ directory on startup
+    import shutil
+    temp_dir = Path("data/temp")
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
     # 0) Vec0 validation (best-effort; non-fatal)
     try:
         await validate_vec0_extension()
@@ -365,15 +376,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-ARTIFACTS_DIR = Path(__file__).parent / config_module.ARTIFACTS_ROOT
+from utils.artifact_manager import get_artifacts_root
 try:
+    ARTIFACTS_DIR = get_artifacts_root()
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/artifacts", StaticFiles(directory=str(ARTIFACTS_DIR)), name="artifacts")
 except Exception as e:
-    try:
-        log.dual_log(tag="Sys:Artifacts", message=f"Failed to create artifacts dir {ARTIFACTS_DIR}: {e}", level="WARNING", exc_info=e)
-    except Exception:
-        pass
-app.mount("/artifacts", StaticFiles(directory=str(ARTIFACTS_DIR)), name="artifacts")
+    log.dual_log(tag="Sys:Artifacts", message=f"Failed to mount artifacts dir: {e}", level="WARNING")
 
 # Include API routes if available
 try:

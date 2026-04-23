@@ -28,7 +28,7 @@ JOB_WATCH_INTERVAL_SECONDS: int = int(os.getenv("JOB_WATCH_INTERVAL_SECONDS", "3
 JOB_STALE_THRESHOLD_SECONDS: int = int(os.getenv("JOB_STALE_THRESHOLD_SECONDS", str(8 * 3600)))
 
 # --- Artifacts Root ---
-ARTIFACTS_ROOT: str = os.getenv("ARTIFACTS_ROOT", "artifacts")
+ANYTHINGLLM_ARTIFACTS_DIR: str | None = os.getenv("ANYTHINGLLM_ARTIFACTS_DIR")
 
 # --- Azure OpenAI (for LLM client) ---
 AZURE_OPENAI_KEY: str | None = os.getenv("AZURE_OPENAI_KEY")
