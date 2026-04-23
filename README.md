@@ -11,6 +11,7 @@
 - Maintains granular job state with automatic resume capability after interruptions
 - Automatically manages database schema migrations with auto-folding mechanism
 - Implements hybrid search combining SQLite FTS5 keyword indexing and vector embeddings using Application-Layer Reciprocal Rank Fusion (RRF)
+- **Robust callback system**: Atomic HTTP callbacks to AnythingLLM with durable logging, PENDING_CALLBACK state, and database-driven retry (max 3 attempts)
 
 ### What It Does NOT Do
 - Does not execute autonomous agent loops or reasoning chains
@@ -26,7 +27,12 @@
 
 ### 2.1 Data Flow
 ```
-API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Callback → COMPLETED
+API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution
+  ↓
+  ├─ Success → _do_callback_with_logging()
+  │            ├─ HTTP 2xx → COMPLETED
+  │            └─ HTTP error → PENDING_CALLBACK → Database Retry Loop (max 3) → PARTIAL
+  └─ Tool Failure → FAILED
 ```
 
 ### 2.2 Runtime Model
@@ -210,17 +216,44 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution → Call
 ## 4. Core Concepts & Domain Model
 
 ### 4.1 Job Lifecycle State Machine
+
+#### Normal Flow:
 ```
-QUEUED → RUNNING → COMPLETED/FAILED
+QUEUED → RUNNING
          ↓
-   INTERRUPTED (recovery on startup)
-         ↓
-   PAUSED_FOR_HITL (manual intervention)
-         ↓
-   ABANDONED (after 3 crashes)
+   ┌─── COMPLETED (callback succeeded)
+   ↓
+   └─── PENDING_CALLBACK (callback failed, retry scheduled)
+           ↓ (polling after delay)
+   ┌─── COMPLETED (retry succeeded)
+   ↓
+   └─── PARTIAL (max 3 retries exceeded)
 ```
 
-**Global Statuses:** `QUEUED`, `RUNNING`, `COMPLETED`, `PARTIAL`, `FAILED`, `CANCELLING`, `INTERRUPTED`, `PAUSED_FOR_HITL`, `ABANDONED`
+#### Failure/Recovery Paths:
+```
+RUNNING → FAILED (tool execution failed)
+         ↓
+   INTERRUPTED (worker crash, recover on startup)
+         ↓
+   PAUSED_FOR_HITL (manual intervention required)
+         ↓
+   ABANDONED (after 3 consecutive system crashes)
+```
+
+**Global Statuses:** `QUEUED`, `RUNNING`, `COMPLETED`, `PARTIAL`, `FAILED`, `CANCELLING`, `INTERRUPTED`, `PAUSED_FOR_HITL`, `PENDING_CALLBACK`, `ABANDONED`
+
+**PENDING_CALLBACK Flow:**
+1. Tool execution succeeds, but `_do_callback_with_logging()` returns `False`
+2. `_run_job()` sets status = `PENDING_CALLBACK`, `retry_count = 1`, preserves `result_json`
+3. Polling loop (every 1s) picks up jobs where `updated_at < now - {delay}`
+4. `_retry_callback_only()` runs in thread:
+   - Reads `result_json` (contains `result` and `attachment_paths`)
+   - Calls `_do_callback_with_logging()` again
+   - Success → `COMPLETED`
+   - Failure → Increment `retry_count`, check if `>= 3`
+     - Yes → `PARTIAL` + log "Max retries exceeded"
+     - No → Update `retry_count` and `updated_at`, wait for next poll
 
 ### 4.2 Job Items (Granular Tracking)
 **Table:** `job_items` (after v004 migration)
@@ -289,8 +322,9 @@ CREATE TABLE broadcast_batches (
 2. **v005** - Adds `PARTIAL` status to jobs, updates job_items metadata persistence
 3. **v006** - Migrates `posted_*_ulids` → `phase_state` JSON
 4. **v007** - Creates FTS5 virtual table, triggers, and `vec_rowid` index for hybrid search
+5. **v008** - Adds `PENDING_CALLBACK` status to jobs table for callback retry mechanism
 
-**Current DB Version:** 6 (with 3 migration files active, v007 added)
+**Current DB Version:** 6 (with 4 migration files active, v008 added)
 
 **Auto-Fold Mechanism:**
 - If active migrations > 3 (`MAX_MIGRATION_SCRIPTS`), oldest folds into BASE_SCHEMA_VERSION
@@ -509,7 +543,96 @@ await run_database_lifecycle()
 - Uses authoritative `get_latest_version()` for target
 - Adds final version stamp if base > migrations[-1]
 
-### 5.6 Hybrid Search Implementation (New)
+### 5.6 Callback Mechanism (Robust Atomic Operations)
+
+#### **System Architecture:**
+```python
+# bot/engine/worker.py - UnifiedWorkerManager
+
+# 1. Tool execution completes
+status_str = normal.get("status", "FAILED")  # "COMPLETED" or "PARTIAL"
+
+# 2. Atomic callback with durable logging
+if status_str in ("COMPLETED", "PARTIAL"):
+    success = _do_callback_with_logging(job_id, normal.get("result"), attachments)
+    if success:
+        enqueue_write("UPDATE jobs SET status = 'COMPLETED' ...")
+    else:
+        enqueue_write("UPDATE jobs SET status = 'PENDING_CALLBACK', retry_count = 1 ...")
+```
+
+#### **_do_callback_with_logging() Function:**
+- **Purpose**: Execute HTTP callback and log all operations atomically via `enqueue_write()`
+- **Returns**: `True` on 2xx status, `False` otherwise
+
+**Execution Flow:**
+1. **Attachment Processing**
+   - Skip missing files and log `WARNING` to `job_logs`
+   - Base64-encode valid files
+   - Never fails entire callback on individual file errors
+
+2. **HTTP Request**
+   ```python
+   with httpx.Client(timeout=config.ANYTHINGLLM_CALLBACK_TIMEOUT) as client:
+       resp = client.post(url, json=callback_payload, headers=headers)
+       resp.raise_for_status()
+   ```
+
+3. **Durable Logging** (All via `enqueue_write()`)
+   - Success: `Worker:Callback:Success` with attachment count
+   - HTTP Error: `Worker:Callback:Error` with status_code in payload_json
+   - File Error: `Worker:Callback:FileError` or `Worker:Callback:FileMissing`
+
+**Configuration:**
+- `ANYTHINGLLM_CALLBACK_TIMEOUT`: HTTP timeout in seconds (default: 120)
+- `ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS`: Delay between retry attempts (default: 30)
+
+#### **Database-Driven Retry Loop:**
+
+**Polling Query (worker.py _run_loop):**
+```python
+delay = config.ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS
+rows = conn.execute(
+    f"SELECT job_id, session_id, tool_name, args_json, status, result_json, retry_count FROM jobs "
+    f"WHERE status IN ('QUEUED', 'INTERRUPTED') "
+    f"   OR (status = 'PENDING_CALLBACK' AND updated_at < datetime('now', '-{delay} seconds')) "
+    f"ORDER BY status ASC, created_at ASC LIMIT 5"
+).fetchall()
+```
+
+**Retry Handler (`_retry_callback_only()`):**
+```python
+# In separate thread, no tool re-execution
+attachments = result_data.get("attachment_paths", [])
+tool_output = result_data.get("result", result_data)
+success = _do_callback_with_logging(job_id, tool_output, attachments)
+
+if success:
+    enqueue_write("UPDATE jobs SET status = 'COMPLETED' ...")
+else:
+    new_retry_count = retry_count + 1
+    if new_retry_count >= 3:
+        enqueue_write("UPDATE jobs SET status = 'PARTIAL' ...")
+        enqueue_write("INSERT INTO job_logs ... 'Max callback retries exceeded'")
+    else:
+        enqueue_write("UPDATE jobs SET retry_count = ?, updated_at = ? ...")
+```
+
+#### **PENDING_CALLBACK State Behavior:**
+- **Trigger**: Tool execution succeeded but callback HTTP failed
+- **Storage**: `jobs` table with `status = 'PENDING_CALLBACK'`, `retry_count = N`, `result_json` preserved
+- **Polling**: Database loop (1-second interval) checks `updated_at < now - {delay}`
+- **Retry**: Spawns thread with `_retry_callback_only()` - no tool execution
+- **Terminal**: After 3 failures, status → `PARTIAL`, logged to `job_logs`
+
+#### **Golden Rules Enforced:**
+1. ✅ No in-memory retry queues - Database is single source of truth
+2. ✅ All writes via `enqueue_write()` - No concurrent write connections
+3. ✅ No terminal state until HTTP 2xx - Jobs remain in `PENDING_CALLBACK`
+4. ✅ Failed attachments logged as `WARNING` - Don't drop entire payload
+5. ✅ Max 3 retries - Prevents infinite loops
+
+### 5.7 Hybrid Search Implementation (New)
 
 #### **FTS5 Sanitization:**
 ```python
@@ -743,6 +866,13 @@ TELEGRAM_ARCHIVE_CHAT_ID=your_chat_id
 SUMANAL_ALLOW_SCHEMA_RESET=0  # Set 1 for development
 BATCH_READER_VECTOR_WEIGHT=0.6
 BATCH_READER_KEYWORD_WEIGHT=0.4
+
+# Callback Configuration
+ANYTHINGLLM_BASE_URL=http://localhost:3001
+ANYTHINGLLM_API_KEY=your_api_key_here
+ANYTHINGLLM_WORKSPACE_SLUG=my-workspace
+ANYTHINGLLM_CALLBACK_TIMEOUT=120
+ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS=30
 ```
 
 ### 9.3 Database First Run
@@ -835,15 +965,25 @@ sqlite3 data/sumanal.db "PRAGMA user_version;"
 **Migration Status:**
 ```bash
 ls database/migrations/v*.py
-# Should show v005 and v006 only (v004 folded)
-# And v007 (new hybrid search)
+# Should show v005, v006, v007, v008
+# v004 is in archive (folded), v008 is callback retry
 ```
 
-**Table Structure (Post v007):**
+**Table Structure (Post v008):**
 ```bash
+# 1. Broadcast batches phase_state (unchanged from v006)
 sqlite3 data/sumanal.db "PRAGMA table_info(broadcast_batches);"
 # Should show phase_state TEXT column
 # Should NOT show posted_research_ulids or posted_summary_ulids
+
+# 2. Jobs table includes PENDING_CALLBACK status
+sqlite3 data/sumanal.db "PRAGMA table_info(jobs);"
+# Should show: status column with CHECK constraint including 'PENDING_CALLBACK'
+# Should show: retry_count INTEGER NOT NULL DEFAULT 0
+
+# 3. Jobs status from current data
+sqlite3 data/sumanal.db "SELECT DISTINCT status FROM jobs;"
+# Should include: PENDING_CALLBACK (if any callback retries pending)
 ```
 
 **Job Items Metadata:**
@@ -856,6 +996,25 @@ sqlite3 data/sumanal.db "SELECT json_extract(item_metadata, '$.step') as step FR
 ```
 # In logs: DB:WriterStart, DB:WriterStop should appear
 # On fresh install: "Fresh database; schema created and stamped to v6 via writer queue"
+```
+
+**Callback System Validation:**
+```bash
+# Check config values exist
+grep -E "ANYTHINGLLM_CALLBACK_TIMEOUT|ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS" config.py
+# Should show both with int(os.getenv(...)) patterns
+
+# View callback logs in database
+sqlite3 data/sumanal.db "SELECT timestamp, tag, level, message FROM job_logs WHERE tag LIKE '%Callback%' ORDER BY timestamp DESC LIMIT 5;"
+# Should show: Worker:Callback:Success, Worker:Callback:Error, etc.
+```
+
+**Migration v008 Verification:**
+```bash
+cat database/migrations/v008_pending_callback.py
+# Should show: version = 8
+# Should show: PENDING_CALLBACK added to CHECK constraint
+# Should show: CREATE TABLE jobs_new with status CHECK including PENDING_CALLBACK
 ```
 
 ---
@@ -873,6 +1032,10 @@ sqlite3 data/sumanal.db "SELECT json_extract(item_metadata, '$.step') as step FR
 | **Bounded auto-repair** | Infinite loop prevention | Manual intervention |
 | **Migration limit (3)** | Version discipline | Auto-fold mechanism |
 | **Callback silence** | Fail-fast design | Monitor logs |
+| **Database-driven retry only** | No in-memory queues | Polling loop checks PENDING_CALLBACK |
+| **Max 3 callback retries** | Prevents cascades | Job → PARTIAL after 3 failures |
+| **Callback timeout (120s)** | Prevents hangs | Configurable via ANYTHINGLLM_CALLBACK_TIMEOUT |
+| **Retry delay (30s)** | Rate limiting | Configurable via ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS |
 | **No sqlite-vec fallback** | Extension dependency | BLOB storage |
 | **Fresh DB fast-path only** | Optimization strategy | N/A (performance gain) |
 | **MarkdownV2 strict validation** | Prevent API 400 errors | Plain-text fallback |
@@ -944,6 +1107,17 @@ sqlite3 data/sumanal.db "SELECT json_extract(item_metadata, '$.step') as step FR
 - **Impact**: Incorrect version stamping causes migration chaos
 - **Safety**: 10s timeout prevents infinite waits
 
+**Callback Retry System:**
+- **Fragility**: `PENDING_CALLBACK` state logic and retry behavior
+- **Evidence**: `bot/engine/worker.py` lines 138-147 (SQL query), 213-241 (`_retry_callback_only`)
+- **Impact**: Wrong delay values cause storm of retries; no retry_count increment → infinite loop
+- **Easiest extension**: Add new callback endpoint (requires updating `_do_callback_with_logging` URL)
+- **Critical invariants**:
+  - Must use `enqueue_write()` only (no direct writes)
+  - Must preserve `result_json` in PENDING_CALLBACK state
+  - Must check `updated_at < datetime('now', '-{delay} seconds')` for retry eligibility
+  - Cannot exceed max 3 retries before PARTIAL
+
 ### 12.2 Changes Requiring Widespread Refactoring
 
 **Adding New Tool Type:**
@@ -997,3 +1171,8 @@ sqlite3 data/sumanal.db "SELECT json_extract(item_metadata, '$.step') as step FR
   - Character range: `[\\_*\[\]()~`>#+=|{}.!\-]` (hyphen at end)
   - Replacement: `r'\\\1'` (single backslash)
 - **Test**: Send messages with special chars to verify
+
+**Adding New Callback Configuration:**
+- **Location**: `config.py` (add `ANYTHINGLLM_CALLBACK_TIMEOUT`, `ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS`)
+- **Impact**: Affects all callback operations
+- **Safety**: Must update README and .env.example

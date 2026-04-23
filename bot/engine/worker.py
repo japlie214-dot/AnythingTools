@@ -32,6 +32,77 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: list[str]) -> bool:
+    """Execute HTTP callback and log all operations via enqueue_write.
+    
+    Returns True if callback succeeds (2xx), False otherwise.
+    """
+    if not getattr(config, "ANYTHINGLLM_BASE_URL", None) or not getattr(config, "ANYTHINGLLM_API_KEY", None):
+        return True  # Skip if not configured
+
+    url = f"{config.ANYTHINGLLM_BASE_URL.rstrip('/')}/api/v1/workspace/{config.ANYTHINGLLM_WORKSPACE_SLUG}/chat"
+    headers = {"Authorization": f"Bearer {config.ANYTHINGLLM_API_KEY}", "Content-Type": "application/json"}
+
+    attachments_payload = []
+    for path in (attachment_paths or []):
+        if not os.path.exists(path):
+            enqueue_write(
+                "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                (ULID.generate(), job_id, "Worker:Callback:FileMissing", "WARNING", f"Attachment missing from disk: {path}", now_iso())
+            )
+            continue
+        try:
+            mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            with open(path, "rb") as f:
+                b64_data = base64.b64encode(f.read()).decode("utf-8")
+            attachments_payload.append({
+                "name": os.path.basename(path),
+                "mime": mime,
+                "contentString": f"data:{mime};base64,{b64_data}",
+            })
+        except Exception as e:
+            enqueue_write(
+                "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                (ULID.generate(), job_id, "Worker:Callback:FileError", "WARNING", f"Failed to encode {path}: {e}", now_iso())
+            )
+
+    try:
+        payload_body = json.dumps(tool_output, ensure_ascii=False) if not isinstance(tool_output, str) else tool_output
+    except Exception:
+        payload_body = str(tool_output)
+
+    callback_payload = {
+        "message": f"TOOL_RESULT_CORRELATION_ID:{job_id}\n\n{payload_body}",
+        "mode": "chat",
+        "attachments": attachments_payload,
+        "reset": False,
+    }
+
+    try:
+        with httpx.Client(timeout=config.ANYTHINGLLM_CALLBACK_TIMEOUT) as client:
+            resp = client.post(url, json=callback_payload, headers=headers)
+            resp.raise_for_status()
+        
+        enqueue_write(
+            "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (ULID.generate(), job_id, "Worker:Callback:Success", "INFO", f"Callback delivered (Files: {len(attachments_payload)})", now_iso())
+        )
+        return True
+    except httpx.HTTPError as e:
+        status_code = getattr(getattr(e, "response", None), "status_code", None)
+        enqueue_write(
+            "INSERT INTO job_logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ULID.generate(), job_id, "Worker:Callback:Error", "ERROR", f"HTTP callback failed: {str(e)}", json.dumps({"status_code": status_code}), now_iso())
+        )
+        return False
+    except Exception as e:
+        enqueue_write(
+            "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (ULID.generate(), job_id, "Worker:Callback:Error", "ERROR", f"Unexpected callback failure: {str(e)}", now_iso())
+        )
+        return False
+
+
 class UnifiedWorkerManager:
     """Poll jobs table and execute tools directly."""
     
@@ -66,9 +137,13 @@ class UnifiedWorkerManager:
                 
                 conn = DatabaseManager.get_read_connection()
                 # Prioritize INTERRUPTED (recovery) jobs, then QUEUED
+                # Also poll PENDING_CALLBACK jobs that are ready for retry
+                delay = config.ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS
                 rows = conn.execute(
-                    "SELECT job_id, session_id, tool_name, args_json, status FROM jobs "
-                    "WHERE status IN ('QUEUED', 'INTERRUPTED') ORDER BY status ASC, created_at ASC LIMIT 5"
+                    f"SELECT job_id, session_id, tool_name, args_json, status, result_json, retry_count FROM jobs "
+                    f"WHERE status IN ('QUEUED', 'INTERRUPTED') "
+                    f"   OR (status = 'PENDING_CALLBACK' AND updated_at < datetime('now', '-{delay} seconds')) "
+                    f"ORDER BY status ASC, created_at ASC LIMIT 5"
                 ).fetchall()
                 
             except Exception as e:
@@ -81,6 +156,23 @@ class UnifiedWorkerManager:
                 session_id = str(r["session_id"])
                 tool_name = r["tool_name"]
                 status = r["status"]
+                
+                if status == "PENDING_CALLBACK":
+                    result_json = r["result_json"] or "{}"
+                    try:
+                        parsed_result = json.loads(result_json)
+                    except Exception:
+                        parsed_result = {"raw": result_json}
+                    
+                    retry_count = r["retry_count"]
+                    t = spawn_thread_with_context(
+                        self._retry_callback_only,
+                        args=(job_id, parsed_result, retry_count),
+                        name=f"callback-retry-{job_id}",
+                        daemon=True
+                    )
+                    self._active_jobs[job_id] = t
+                    continue
                 
                 try:
                     args = json.loads(r["args_json"] or "{}")
@@ -117,6 +209,36 @@ class UnifiedWorkerManager:
                 self._active_jobs[job_id] = t
 
             time.sleep(self.poll_interval)
+
+    def _retry_callback_only(self, job_id: str, result_data: dict, retry_count: int) -> None:
+        try:
+            attachments = result_data.get("attachment_paths", []) if isinstance(result_data, dict) else []
+            tool_output = result_data.get("result", result_data) if isinstance(result_data, dict) else result_data
+            success = _do_callback_with_logging(job_id, tool_output, attachments)
+            if success:
+                enqueue_write(
+                    "UPDATE jobs SET status = 'COMPLETED', updated_at = ? WHERE job_id = ?",
+                    (now_iso(), job_id)
+                )
+            else:
+                new_retry_count = retry_count + 1
+                if new_retry_count >= 3:
+                    enqueue_write(
+                        "UPDATE jobs SET status = 'PARTIAL', retry_count = ?, updated_at = ? WHERE job_id = ?",
+                        (new_retry_count, now_iso(), job_id)
+                    )
+                    enqueue_write(
+                        "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                        (ULID.generate(), job_id, "Worker:Callback:Abandoned", "ERROR", "Max callback retries exceeded, marked as PARTIAL", now_iso())
+                    )
+                else:
+                    enqueue_write(
+                        "UPDATE jobs SET retry_count = ?, updated_at = ? WHERE job_id = ?",
+                        (new_retry_count, now_iso(), job_id)
+                    )
+        finally:
+            if job_id in self._active_jobs:
+                del self._active_jobs[job_id]
 
     def _run_job(self, job_id: str, session_id: str, tool_name: str, args: dict, cancellation_flag: threading.Event) -> None:
         """Execute a single job using direct tool invocation."""
@@ -165,21 +287,30 @@ class UnifiedWorkerManager:
                     # Fallback to a minimal serializable dict
                     normal = {"status": "FAILED", "result": str(result)}
 
+            if attachments:
+                normal["attachment_paths"] = attachments
+
             status_str = normal.get("status", "FAILED")
             payload_json = json.dumps(normal, ensure_ascii=False)
 
-            enqueue_write(
-                "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
-                (status_str, payload_json, now_iso(), job_id),
-            )
-
-            # Invoke AnythingLLM callback for completed and partial jobs (non-blocking best-effort)
+            # We don't set terminal status yet if callback applies.
             if status_str in ("COMPLETED", "PARTIAL"):
-                try:
-                    self._invoke_anythingllm_callback(job_id, normal.get("result"), attachments)
-                except Exception:
-                    # Callback failures must not break worker execution
-                    pass
+                success = _do_callback_with_logging(job_id, normal.get("result"), attachments)
+                if success:
+                    enqueue_write(
+                        "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
+                        (status_str, payload_json, now_iso(), job_id),
+                    )
+                else:
+                    enqueue_write(
+                        "UPDATE jobs SET status = 'PENDING_CALLBACK', result_json = ?, retry_count = 1, updated_at = ? WHERE job_id = ?",
+                        (payload_json, now_iso(), job_id),
+                    )
+            else:
+                enqueue_write(
+                    "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
+                    (status_str, payload_json, now_iso(), job_id),
+                )
             
             # Reset errors on success
             if job_id in self._system_errors:
@@ -205,64 +336,6 @@ class UnifiedWorkerManager:
         finally:
             if job_id in self._active_jobs:
                 del self._active_jobs[job_id]
-
-    def _invoke_anythingllm_callback(self, job_id: str, tool_output: Any, attachment_paths: list[str]) -> None:
-        """Send the tool output and attachments back to AnythingLLM via HTTP POST.
-
-        Files are Base64-encoded and included as data URIs to avoid multipart complexity.
-        """
-        if not getattr(config, "ANYTHINGLLM_BASE_URL", None) or not getattr(config, "ANYTHINGLLM_API_KEY", None):
-            return
-
-        url = f"{config.ANYTHINGLLM_BASE_URL.rstrip('/')}/api/v1/workspace/{config.ANYTHINGLLM_WORKSPACE_SLUG}/chat"
-        headers = {"Authorization": f"Bearer {config.ANYTHINGLLM_API_KEY}", "Content-Type": "application/json"}
-
-        attachments_payload = []
-        for path in (attachment_paths or []):
-            try:
-                if not os.path.exists(path):
-                    continue
-                ext = os.path.splitext(path)[1].lower()
-                mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-                with open(path, "rb") as f:
-                    b64_data = base64.b64encode(f.read()).decode("utf-8")
-                attachments_payload.append({
-                    "name": os.path.basename(path),
-                    "mime": mime,
-                    "contentString": f"data:{mime};base64,{b64_data}",
-                })
-            except Exception as e:
-                try:
-                    log.dual_log(tag="Worker:Callback:File", message=f"Failed to encode {path}: {e}", level="WARNING")
-                except Exception:
-                    pass
-
-        # Construct the payload. TOOL_RESULT_CORRELATION_ID ensures the caller can match callbacks.
-        try:
-            payload_body = json.dumps(tool_output, ensure_ascii=False) if not isinstance(tool_output, str) else tool_output
-        except Exception:
-            payload_body = str(tool_output)
-
-        callback_payload = {
-            "message": f"TOOL_RESULT_CORRELATION_ID:{job_id}\n\n{payload_body}",
-            "mode": "chat",
-            "attachments": attachments_payload,
-            "reset": False,
-        }
-
-        try:
-            with httpx.Client(timeout=60.0) as client:
-                resp = client.post(url, json=callback_payload, headers=headers)
-                resp.raise_for_status()
-            try:
-                log.dual_log(tag="Worker:Callback:Success", message=f"Callback delivered for {job_id} (Files: {len(attachments_payload)})")
-            except Exception:
-                pass
-        except Exception as e:
-            try:
-                log.dual_log(tag="Worker:Callback:Error", message=f"AnythingLLM callback failed: {str(e)}", level="ERROR")
-            except Exception:
-                pass
 
 
 # Module-level singleton
