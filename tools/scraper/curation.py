@@ -79,24 +79,48 @@ class Top10Curator:
         
         return packed, target_count
 
-    def curate(self, candidates: list[dict], sync_llm_chat) -> tuple[list[dict], int]:
+    def _score_curation_quality(self, curated: list[dict], packed_candidates: list[dict], target_count: int) -> dict:
+        candidate_ulids = {item["ulid"] for item in packed_candidates}
+        
+        coverage_ratio = min(len(curated) / target_count, 1.0) if target_count > 0 else 0.0
+        
+        ulids = [item.get("ulid") for item in curated if "ulid" in item]
+        unique_ulids = set(ulids)
+        uniqueness_score = len(unique_ulids) / len(ulids) if ulids else 0.0
+        
+        valid_count = sum(1 for u in ulids if u in candidate_ulids)
+        validity_score = valid_count / len(ulids) if ulids else 0.0
+        
+        conclusion_lengths = [len(str(item.get("conclusion", ""))) for item in curated]
+        if len(conclusion_lengths) > 1:
+            mean_len = sum(conclusion_lengths) / len(conclusion_lengths)
+            variance = sum((l - mean_len) ** 2 for l in conclusion_lengths) / len(conclusion_lengths)
+            diversity_score = min(variance / 1000.0, 1.0)
+        else:
+            diversity_score = 0.0
+        
+        composite = (
+            coverage_ratio * 0.35 +
+            uniqueness_score * 0.25 +
+            validity_score * 0.30 +
+            diversity_score * 0.10
+        )
+        
+        return {
+            "composite": round(composite, 4),
+            "coverage_ratio": round(coverage_ratio, 4),
+            "uniqueness_score": round(uniqueness_score, 4),
+            "validity_score": round(validity_score, 4),
+            "diversity_score": round(diversity_score, 4),
+            "item_count": len(curated),
+            "target_count": target_count,
+        }
+
+    def curate(self, candidates: list[dict], sync_llm_chat, batch_id: str = None) -> tuple[list[dict], int]:
         """
-        Execute validated curation with 3-retry loop.
-        
-        Validation rules:
-        - Exactly target_count items
-        - Zero duplicate ULIDs
-        - Valid candidate ULIDs only
-        
-        Fallback: On retry exhaustion, return sequential slice of packed articles.
-        
-        Args:
-            candidates: List of article dictionaries
-            sync_llm_chat: Synchronous LLM chat function
-            
-        Returns:
-            tuple: (curated_articles, target_count)
+        Execute validated curation with 3-retry loop and quality scoring.
         """
+        log_ctx = {"batch_id": batch_id} if batch_id else {}
         if not candidates:
             return [], 0
 
@@ -105,16 +129,15 @@ class Top10Curator:
         if target_count == 0:
             return [], 0
 
-        # Prepare validation data
         candidate_ulids = {item["ulid"] for item in packed_candidates}
         ulid_to_item = {item["ulid"]: item for item in packed_candidates}
         previous_errors = []
+        best_result = None
+        best_score = -1.0
 
         # Phase 2: Validated curation with 3 retries
         for attempt in range(1, self.MAX_RETRIES + 1):
-            # Build prompt with error context
             prompt = f"Return a JSON object with key 'top_{target_count}' containing an array of EXACTLY {target_count} unique ULIDs.\n"
-            
             if previous_errors:
                 prompt += f"\nWARNINGS from past attempts:\n"
                 for err in previous_errors:
@@ -124,45 +147,67 @@ class Top10Curator:
             prompt += f"\nCandidates:\n{json.dumps(packed_candidates, ensure_ascii=False)}"
 
             try:
-                # Call LLM
+                log.dual_log(
+                    tag="LLM:Azure:Request",
+                    message="Sending request to Azure OpenAI (Curation)",
+                    payload={**log_ctx, "attempt": attempt}
+                )
                 resp = sync_llm_chat(
                     [{"role": "user", "content": prompt}],
                     response_format={"type": "json_object"}
                 )
+                log.dual_log(
+                    tag="LLM:Azure:Response",
+                    message="Received response from Azure OpenAI.",
+                    payload={**log_ctx, "attempt": attempt}
+                )
                 
-                # Parse response (handle dynamic key)
                 parsed = json.loads(resp.content or "{}")
                 key = f"top_{target_count}"
-                
-                # Support both dynamic key and fallback top_10
                 top_ulids = parsed.get(key) or parsed.get("top_10") or []
                 
-                # Validation
-                if len(top_ulids) != target_count:
-                    previous_errors.append(f"Expected {target_count} items, got {len(top_ulids)}")
-                    continue
+                seen = set()
+                valid_ulids = []
+                for u in top_ulids:
+                    if u in candidate_ulids and u not in seen:
+                        seen.add(u)
+                        valid_ulids.append(u)
+                        
+                curated = [ulid_to_item[u] for u in valid_ulids]
+                quality = self._score_curation_quality(curated, packed_candidates, target_count)
                 
-                if len(set(top_ulids)) != len(top_ulids):
-                    previous_errors.append("Output contains duplicate ULIDs.")
-                    continue
+                log.dual_log(
+                    tag="Scraper:Curation:Score",
+                    message=f"Quality score for attempt {attempt}: {quality['composite']}",
+                    payload={**log_ctx, "attempt": attempt, "quality": quality}
+                )
                 
-                invalid = [u for u in top_ulids if u not in candidate_ulids]
-                if invalid:
-                    previous_errors.append(f"Invalid ULIDs provided: {invalid}")
-                    continue
-                
-                # Success - compose curated list
-                curated = [ulid_to_item[u] for u in top_ulids]
-                return curated, target_count
+                if quality["composite"] > best_score:
+                    best_score = quality["composite"]
+                    best_result = (curated, target_count)
+                    
+                if len(valid_ulids) == target_count:
+                    log.dual_log(tag="Scraper:Curation:Selected", message=f"Selected attempt {attempt} as final result.", payload={**log_ctx, "attempt": attempt})
+                    return curated, target_count
+                else:
+                    err_msg = f"Expected {target_count} valid unique items, got {len(valid_ulids)}."
+                    previous_errors.append(err_msg)
+                    log.dual_log(tag="Scraper:Curation:Partial", message=err_msg, level="WARNING", payload={"attempt": attempt})
 
             except Exception as e:
                 previous_errors.append(f"Parse error: {e}")
 
-        # Fallback: Retry exhaustion, use sequential slice
+        # Fallback: Retry exhaustion
         log.dual_log(
-            tag="Scraper:Curation",
-            message="Curation retries exhausted, using fallback slice.",
+            tag="Scraper:Curation:Exhausted",
+            message="Curation retries exhausted.",
             level="WARNING",
-            payload={"errors": previous_errors}
+            payload={"errors": previous_errors, "best_score": best_score if best_score >= 0 else None}
         )
+        
+        if best_result is not None and best_result[0]:
+            log.dual_log(tag="Scraper:Curation:Selected", message=f"Selected highest scoring partial result (score: {best_score}).", payload=log_ctx)
+            return best_result
+
+        log.dual_log(tag="Scraper:Curation:Selected", message="Selected fallback sequential slice.", payload=log_ctx)
         return packed_candidates[:target_count], target_count

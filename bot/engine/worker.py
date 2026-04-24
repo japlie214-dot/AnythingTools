@@ -83,10 +83,13 @@ def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: l
         details = {"raw_output": tool_output[:2000]}
 
     # Get artifacts directory if available
-    artifacts_dir = None
+    artifacts_subdir = None
     try:
-        from utils.artifact_manager import get_artifacts_root
-        artifacts_dir = str(get_artifacts_root())
+        if details and isinstance(details, dict) and details.get("artifacts_directory"):
+            artifacts_subdir = details.get("artifacts_directory")
+        else:
+            from utils.artifact_manager import get_artifacts_root
+            artifacts_subdir = str(get_artifacts_root())
     except Exception:
         pass
 
@@ -99,7 +102,7 @@ def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: l
         summary=summary,
         details=details,
         artifacts=artifacts,
-        artifacts_dir=artifacts_dir,
+        artifacts_subdir=artifacts_subdir,
         status_overrides=status_overrides
     )
 

@@ -85,14 +85,30 @@ class ScraperTool(BaseTool):
 
     async def _run_internal(self, args: dict[str, Any], telemetry: Any, cancellation_flag: threading.Event, **kwargs) -> str:
         """Internal implementation with full pipeline."""
+        
+        job_id = kwargs.get("job_id")
+        session_id = str(kwargs.get("session_id") or kwargs.get("chat_id", "0"))
+        target_site = args.get("target_site")
+        
+        batch_id = ULID.generate()
+        artifacts_written = []
+        
+        def _record_artifact(filepath: Path, artifact_type: str, description: str):
+            artifacts_written.append({
+                "filename": filepath.name,
+                "type": artifact_type,
+                "description": description
+            })
+
         def _fail_internal(summary: str, next_steps: str) -> str:
-            return json.dumps({
+            payload = {
                 "_callback_format": "structured",
                 "tool_name": self.name,
                 "status": "FAILED",
                 "summary": summary,
                 "details": {
-                    "input_args": args
+                    "input_args": args,
+                    "batch_id": batch_id,
                 },
                 "status_overrides": {
                     "FAILED": {
@@ -101,16 +117,20 @@ class ScraperTool(BaseTool):
                         "rerunnable": False
                     }
                 }
-            }, ensure_ascii=False)
+            }
+            try:
+                enqueue_write(
+                    "INSERT INTO job_logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ULID.generate(), job_id, "Scraper:Validation:Failed", "WARNING", "FAILED", summary, json.dumps(payload, ensure_ascii=False), datetime.now(timezone.utc).isoformat())
+                )
+            except Exception:
+                pass
+            return json.dumps(payload, ensure_ascii=False)
 
         dry_run = kwargs.get("dry_run", config.TELEMETRY_DRY_RUN)
         if dry_run:
             return _fail_internal("[DRY RUN] Scraper tool execution skipped.", "Disable dry run to execute.")
 
-        job_id = kwargs.get("job_id")
-        session_id = str(kwargs.get("session_id") or kwargs.get("chat_id", "0"))
-        target_site = args.get("target_site")
-        
         if not target_site:
             return _fail_internal("Error: target_site argument is required.", "Provide a valid 'target_site' argument.")
 
@@ -127,7 +147,7 @@ class ScraperTool(BaseTool):
         # Scout initialization (legacy ledger removed) — log for auditing
         if job_id and session_id != "0":
             msg = f"The Scout: Starting extraction for {target_site}."
-            log.dual_log(tag="Scraper:Init", message=msg, payload={"job_id": job_id, "session_id": session_id})
+            log.dual_log(tag="Scraper:Init", message=msg, payload={"job_id": job_id, "session_id": session_id, "batch_id": batch_id})
 
         loop = asyncio.get_running_loop()
         
@@ -165,19 +185,17 @@ class ScraperTool(BaseTool):
                 },
             )
 
-            # Generate batch ID early so it can be used for artifact directories
-            batch_id = ULID.generate()
-
             # Persist raw results to artifacts directory
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             try:
                 raw_filepath = write_artifact(
                     tool_name="scraper",
-                    job_id=job_id or batch_id,  # Use job_id if available, else batch_id
+                    job_id=job_id or batch_id,
                     artifact_type=f"scraper_output_{ts}",
                     ext="json",
                     content=json.dumps(results, indent=2, ensure_ascii=False)
                 )
+                _record_artifact(raw_filepath, "json", f"Raw scraper output for {target_site} ({len(results)} URLs)")
             except Exception as e:
                 log.dual_log(tag="Scraper:Artifact", message=f"Failed to write raw artifact: {e}", level="WARNING")
                 # Fall back to temp directory
@@ -186,6 +204,7 @@ class ScraperTool(BaseTool):
                 raw_filepath = temp_dir / f"scraper_output_{ts}.json"
                 with open(raw_filepath, "w", encoding="utf-8") as fh:
                     json.dump(results, fh, indent=2, ensure_ascii=False)
+                _record_artifact(raw_filepath, "json", f"Raw scraper output (temp fallback) for {target_site}")
 
             # Extract statistics and slim results
             _stats = results.pop("_stats", {})
@@ -203,71 +222,48 @@ class ScraperTool(BaseTool):
 
             # Curate Top N
             await telemetry(self.status("Curating top articles...", "RUNNING"))
-            batch_id = ULID.generate()
             top_10_list = []
             target_curated_count = 10
             
             if slim_list:
                 from tools.scraper.curation import Top10Curator
                 curator = Top10Curator()
-                top_10_list, target_curated_count = curator.curate(slim_list, sync_llm_chat)
+                top_10_list, target_curated_count = curator.curate(slim_list, sync_llm_chat, batch_id=batch_id)
 
             # Save Top 10 directly to AnythingLLM custom-documents
             try:
                 top_10_path = write_artifact(
                     tool_name="scraper",
-                    job_id=job_id or batch_id,  # Use job_id if available, else batch_id
+                    job_id=job_id or batch_id,
                     artifact_type="top10",
                     ext="json",
                     content=json.dumps(top_10_list, indent=2, ensure_ascii=False)
                 )
                 self._last_artifacts = [str(top_10_path)]
+                _record_artifact(top_10_path, "json", f"Curated Top {target_curated_count} articles for {target_site}")
             except Exception as e:
                 log.dual_log(tag="Scraper:Artifact", message=f"Failed to write artifact: {e}", level="WARNING")
                 self._last_artifacts = []
                 top_10_path = raw_filepath
 
-            # 📝 Generate Intelligent Manifest
+            # 📝 Generate Directory Index Manifest
+            manifest_timestamp = datetime.now(timezone.utc).isoformat()
             manifest_lines = [
-                f"### Scout Intelligence Briefing",
-                f"**Target Site:** {target_site}",
-                f"**Batch ID:** {batch_id}\n",
-                f"#### Top {target_curated_count} Articles"
+                f"# Job Manifest: {self.name}",
+                f"",
+                f"**Tool Name:** {self.name}",
+                f"**Timestamp:** {manifest_timestamp}",
+                f"**Batch ID:** {batch_id}",
+                f"**Input Parameters:** `{{\"target_site\": \"{target_site}\"}}`",
+                f"",
+                f"## Output Files",
+                f"The following artifacts were produced and saved to this batch directory:"
             ]
-            top_10_ulids = set()
-            
-            for i, item in enumerate(top_10_list, 1):
-                manifest_lines.append(
-                    f"{i}. **{item['title']}**\n"
-                    f"   *URL:* {item['normalized_url']}\n"
-                    f"   *Conclusion:* {item['conclusion']}\n"
-                    f"   *ULID:* {item['ulid']}\n"
-                )
-                top_10_ulids.add(item['ulid'])
-
-            # Next 50
-            remaining = [item for item in slim_list if item['ulid'] not in top_10_ulids]
-            next_50 = remaining[:50]
-            
-            if next_50:
-                manifest_lines.append(f"#### Extended Inventory (Next {len(next_50)})")
-                for item in next_50:
-                    manifest_lines.append(f"- {item['title']} (ULID: {item['ulid']})")
-
-            # Batch scaling notice
-            total = len(slim_list)
-            if total > 60:
-                manifest_lines.append(
-                    f"\n⚠️ NOTICE: This batch contains {total} articles. "
-                    f"Only the Top {target_curated_count} (detailed) and the next 50 (titles) are listed here. "
-                    f"To retrieve data from the remaining {total - (target_curated_count + 50)} articles, use the `library:vector_search` tool. "
-                    f"Provide the `batch_id: {batch_id}` and a specific `query: string` "
-                    f"(e.g., 'semiconductor supply chain constraints') to pull relevant article segments into your active context."
-                )
+            for art in artifacts_written:
+                manifest_lines.append(f"- **{art['filename']}** ({art['type']}) - {art['description']}")
 
             manifest_content = "\n".join(manifest_lines)
-            log.dual_log(tag="Scraper:Manifest", message="Intelligent manifest generated.", payload={"manifest": manifest_content})
-
+            
             # Persist manifest as artifact
             try:
                 manifest_path = write_artifact(
@@ -277,6 +273,7 @@ class ScraperTool(BaseTool):
                     ext="md",
                     content=manifest_content
                 )
+                _record_artifact(manifest_path, "md", "Directory index of job artifacts")
                 if getattr(self, "_last_artifacts", None) is not None:
                     self._last_artifacts.append(str(manifest_path))
             except Exception as e:
@@ -291,15 +288,71 @@ class ScraperTool(BaseTool):
             except Exception:
                 pass
 
+            # Construct callback markdown BEFORE finalizing status
+            job_ref = job_id or batch_id
+            safe_job_id = __import__('re').sub(r"[^A-Za-z0-9_-]", "", job_ref)
+            artifact_subdir = f"scraper/{safe_job_id}"
+            
+            callback_artifacts = []
+            for art in artifacts_written:
+                callback_artifacts.append({
+                    "filename": art["filename"],
+                    "type": art["type"],
+                    "description": art["description"],
+                    "path": f"{artifact_subdir}/{art['filename']}"
+                })
+
+            total = len(slim_list)
+            top_10_ulids = {item['ulid'] for item in top_10_list}
+            remaining = [item for item in slim_list if item['ulid'] not in top_10_ulids]
+            next_50 = remaining[:50]
+
+            callback_lines = [
+                f"### Curated Content Preview",
+                f"#### Top {len(top_10_list)} Articles"
+            ]
+            for i, item in enumerate(top_10_list, 1):
+                callback_lines.append(f"{i}. **{item['title']}**\n   - URL: {item['normalized_url']}\n   - Conclusion: {item['conclusion']}\n   - ULID: `{item['ulid']}`")
+            
+            if next_50:
+                callback_lines.append(f"\n#### Extended Inventory (Next {len(next_50)} Articles)")
+                for item in next_50:
+                    callback_lines.append(f"- {item['title']} (ULID: `{item['ulid']}`)")
+            
+            if total > (len(top_10_list) + len(next_50)):
+                remaining_count = total - (len(top_10_list) + len(next_50))
+                callback_lines.append(
+                    f"\n---\n\n"
+                    f"**Extended Content:** This batch contains {total} articles total. "
+                    f"The Top {len(top_10_list)} articles are shown in detail above, "
+                    f"and the next {len(next_50)} article titles are listed as a preview. "
+                    f"To explore the remaining {remaining_count} articles, use the `batch_reader` tool "
+                    f"with `{{\"batch_id\": \"{batch_id}\", \"query\": \"<your semantic search query>\"}}`. "
+                    f"The `batch_reader` performs hybrid semantic search (combining vector similarity "
+                    f"and full-text indexing) to find relevant articles based on meaning, providing summaries and conclusions for deeper insight."
+                )
+            callback_summary_markdown = "\n".join(callback_lines)
+
+            # Update job status BEFORE creating payload
             await telemetry(self.status("Scraper and curation finished.", "SUCCESS"))
             
             job_final_status = _stats.get("job_final_status", "COMPLETED")
+            if len(top_10_list) < target_curated_count and len(top_10_list) > 0:
+                job_final_status = "PARTIAL"
+            elif len(top_10_list) == 0 and total > 0:
+                job_final_status = "PARTIAL"
+
+            log.dual_log(
+                tag="Scraper:Job:Status",
+                message=f"Job finalization status: {job_final_status}",
+                payload={"final_status": job_final_status}
+            )
             
             payload = {
                 "_callback_format": "structured",
                 "tool_name": self.name,
                 "status": job_final_status,
-                "summary": manifest_content,
+                "summary": callback_summary_markdown,
                 "details": {
                     "input_args": args,
                     "batch_id": batch_id,
@@ -307,21 +360,18 @@ class ScraperTool(BaseTool):
                     "total_articles": total,
                     "target_curated_count": target_curated_count,
                     "actual_curated_count": len(top_10_list),
-                    "inventory_count": len(next_50)
+                    "inventory_count": len(next_50),
+                    "artifacts_directory": artifact_subdir
                 },
-                "artifacts": [{
-                    "filename": Path(top_10_path).name,
-                    "type": "json",
-                    "description": f"Curated Top {target_curated_count} for {target_site}."
-                }],
+                "artifacts": callback_artifacts,
                 "status_overrides": {
                     "PARTIAL": {
-                        "description": "Some URLs failed validation, extraction, or embedding.",
-                        "next_steps": f"Call the `scraper` tool again using exactly: {{\"target_site\": \"{target_site}\"}}. The system will skip completed URLs and retry only the failed ones.",
+                        "description": f"Scraper completed but curation selected only {len(top_10_list)}/{target_curated_count} articles. Some URLs may have failed.",
+                        "next_steps": f"Call the `scraper` tool again using exactly: {{\"target_site\": \"{target_site}\"}}. The system will skip completed URLs and retry failed ones.",
                         "rerunnable": True
                     },
                     "COMPLETED": {
-                        "description": "Scrape successful and batch generated.",
+                        "description": "Scrape successful and batch generated with full curation.",
                         "next_steps": f"To query this batch's inventory, call `batch_reader` with {{\"batch_id\": \"{batch_id}\", \"query\": \"<your search>\"}}. To publish the Top 10 to Telegram, call `publisher` with {{\"batch_id\": \"{batch_id}\"}}.",
                         "rerunnable": False
                     },
@@ -332,11 +382,32 @@ class ScraperTool(BaseTool):
                     }
                 }
             }
-            return json.dumps(payload, ensure_ascii=False)
+
+            callback_json = json.dumps(payload, ensure_ascii=False)
+            try:
+                enqueue_write(
+                    "INSERT INTO job_logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ULID.generate(), job_id, "Scraper:Callback:Payload", "INFO", job_final_status,
+                     f"Callback payload prepared with {len(callback_artifacts)} artifacts", callback_json,
+                     datetime.now(timezone.utc).isoformat())
+                )
+            except Exception:
+                pass
+
+            return callback_json
 
         except Exception as exc:
             if str(exc).startswith("PAUSED_FOR_HITL:"):
                 raise
+            
+            log.dual_log(
+                tag="Scraper:Error",
+                message=f"Scraper execution crashed: {exc}",
+                level="ERROR",
+                payload={"batch_id": batch_id if 'batch_id' in locals() else None, "job_id": job_id},
+                exc_info=exc
+            )
+            
             await telemetry(self.status("Scraper failed.", "ERROR"))
             
             err_payload = {
@@ -345,16 +416,28 @@ class ScraperTool(BaseTool):
                 "status": "FAILED",
                 "summary": f"Scraper execution crashed: {exc}",
                 "details": {
-                    "input_args": args
+                    "input_args": args,
+                    "batch_id": batch_id if 'batch_id' in locals() else None,
+                    "error_type": type(exc).__name__,
                 },
                 "status_overrides": {
                     "FAILED": {
                         "description": "Scraping crashed fatally.",
-                        "next_steps": "Do NOT retry the exact same parameters. Use a different target_site or review system logs.",
+                        "next_steps": "Review system logs for the full Traceback. This usually indicates a code error or file system issue.",
                         "rerunnable": False
                     }
                 }
             }
+            try:
+                enqueue_write(
+                    "INSERT INTO job_logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ULID.generate(), job_id, "Scraper:Error:Payload", "ERROR", "FAILED",
+                     f"Scraper crashed: {exc}", json.dumps(err_payload, ensure_ascii=False),
+                     datetime.now(timezone.utc).isoformat())
+                )
+            except Exception:
+                pass
+
             return json.dumps(err_payload, ensure_ascii=False)
 
     async def execute(self, args, telemetry, **kwargs) -> ToolResult:

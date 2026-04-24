@@ -69,7 +69,30 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
             args["_client_metadata"] = req.client_metadata
     except ValidationError as e:
         # Return 422 with structured validation errors
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=e.errors())
+        error_details = []
+        for error in e.errors():
+            error_details.append({
+                "field": " -> ".join(str(loc) for loc in error.get("loc", [])),
+                "message": error.get("msg", ""),
+                "type": error.get("type", ""),
+                "input": str(error.get("input", "N/A"))[:100]
+            })
+            
+        expected_schema = None
+        if InputModel is not None:
+            if hasattr(InputModel, "model_json_schema"):
+                expected_schema = InputModel.model_json_schema()
+            elif hasattr(InputModel, "schema"):
+                expected_schema = InputModel.schema()
+
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": f"Validation failed for tool '{tool_name}'",
+                "errors": error_details,
+                "expected_schema": expected_schema
+            }
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Input validation failed: {e}")
 

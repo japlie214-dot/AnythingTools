@@ -202,18 +202,17 @@ def process_article(
                     reason = val_data.get("reason", "unknown")
                     log.dual_log(
                         tag="Scraper:Validation",
-                        message=f"Page invalid ({reason}). Scraping failed.",
+                        message=f"Page invalid ({reason}). Attempt {val_attempt}/3.",
                         level="WARNING",
                     )
-                    # Agentic recovery removed per Exorcism (PLAN-03): do not invoke deprecated agentic components.
-                    # If validation fails, fail fast. Preserve cancellation semantics.
                     if cancellation_flag is not None and cancellation_flag.is_set():
                         return {"status": "CANCELED", "reason": "User requested stop via Human Help mode."}
+                    if val_attempt < 3:
+                        log.dual_log(tag="Scraper:Paywall:Retry", message=f"Triggering auto-refresh for {url} (Attempt {val_attempt}).", level="INFO")
+                        continue
                     return {
                         "status": "FAILED",
-                        "reason": (
-                            "❌ Scraping failed: Unresolvable blocker encountered. Agentic recovery disabled."
-                        ),
+                        "reason": f"Scraping failed after 3 attempts: {reason}",
                     }
                 # Phase 2: Local state update first, then fire-and-forget DB persist.
                 local_meta["validation_passed"] = True

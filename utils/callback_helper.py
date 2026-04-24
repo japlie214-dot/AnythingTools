@@ -1,6 +1,8 @@
 # utils/callback_helper.py
 
 import json
+import os
+import config
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -63,13 +65,19 @@ def generate_header(job_id: str, status: str, tool_name: str, timestamp: Optiona
 
 """
 
-def format_artifacts_list(artifacts: List[Dict[str, Any]], artifacts_dir: Optional[str] = None) -> str:
+def format_artifacts_list(artifacts: List[Dict[str, Any]], artifacts_subdir: Optional[str] = None) -> str:
     if not artifacts:
         return "### Artifacts\n\n_No artifacts produced for this job._\n\n---\n\n"
     lines = ["### Artifacts\n"]
-    if artifacts_dir:
-        lines.append(f"> **Artifacts Directory:** `{artifacts_dir}`\n")
-    lines.extend(["| # | Filename | Type | Description |", "|---|----------|------|-------------|"])
+    if artifacts_subdir:
+        # Render absolute artifact directory path for AnythingLLM consumers
+        base_dir = getattr(config, "ANYTHINGLLM_ARTIFACTS_DIR", None)
+        if base_dir:
+            full_path = f"{str(base_dir).rstrip('/')}/{str(artifacts_subdir).strip('/')}"
+        else:
+            full_path = f"{artifacts_subdir}"
+        lines.append(f"> **Artifacts Directory:** `{full_path}`\n")
+    lines.extend(["| # | Filename | Type | Description |", "|---|---|----------|------|-------------|"])
     for i, art in enumerate(artifacts, 1):
         lines.append(f"| {i} | `{art.get('filename', 'unknown')}` | {art.get('type', 'file')} | {art.get('description', '')} |")
     return "\n".join(lines) + "\n\n---\n"
@@ -102,16 +110,15 @@ def inject_status_definitions(status: str, overrides: Optional[Dict[str, Dict[st
 def format_callback_message(
     job_id: str, status: str, tool_name: str, summary: str,
     details: Optional[Dict[str, Any]] = None, artifacts: Optional[List[Dict[str, Any]]] = None,
-    artifacts_dir: Optional[str] = None, timestamp: Optional[str] = None,
+    artifacts_subdir: Optional[str] = None, timestamp: Optional[str] = None,
     status_overrides: Optional[Dict[str, Dict[str, Any]]] = None
 ) -> str:
-    sections = [
-        generate_header(job_id, status, tool_name, timestamp),
-        f"### Summary\n\n{summary}\n\n---\n"
-    ]
-    if details:
-        sections.append(f"### Details\n\n```json\n{json.dumps(details, indent=2, ensure_ascii=False)}\n```\n\n---\n")
-    sections.append(format_artifacts_list(artifacts or [], artifacts_dir))
+    sections = [generate_header(job_id, status, tool_name, timestamp)]
+
+    if summary:
+        sections.append(f"### Summary\n\n{summary}\n\n---\n")
+
+    sections.append(format_artifacts_list(artifacts or [], artifacts_subdir))
     sections.append(inject_status_definitions(status, status_overrides))
     return "".join(sections)
 
