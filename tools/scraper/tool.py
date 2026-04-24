@@ -55,6 +55,9 @@ class ScraperTool(BaseTool):
                 "tool_name": self.name,
                 "status": status,
                 "summary": summary,
+                "details": {
+                    "input_args": args
+                },
                 "status_overrides": {
                     status: {
                         "description": "Scraper execution aborted early.",
@@ -88,6 +91,9 @@ class ScraperTool(BaseTool):
                 "tool_name": self.name,
                 "status": "FAILED",
                 "summary": summary,
+                "details": {
+                    "input_args": args
+                },
                 "status_overrides": {
                     "FAILED": {
                         "description": "Scraper validation failed.",
@@ -159,13 +165,27 @@ class ScraperTool(BaseTool):
                 },
             )
 
-            # Persist raw results to hidden data/temp
-            temp_dir = Path("data/temp")
-            temp_dir.mkdir(parents=True, exist_ok=True)
+            # Generate batch ID early so it can be used for artifact directories
+            batch_id = ULID.generate()
+
+            # Persist raw results to artifacts directory
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            raw_filepath = temp_dir / f"scraper_output_{ts}.json"
-            with open(raw_filepath, "w", encoding="utf-8") as fh:
-                json.dump(results, fh, indent=2, ensure_ascii=False)
+            try:
+                raw_filepath = write_artifact(
+                    tool_name="scraper",
+                    job_id=job_id or batch_id,  # Use job_id if available, else batch_id
+                    artifact_type=f"scraper_output_{ts}",
+                    ext="json",
+                    content=json.dumps(results, indent=2, ensure_ascii=False)
+                )
+            except Exception as e:
+                log.dual_log(tag="Scraper:Artifact", message=f"Failed to write raw artifact: {e}", level="WARNING")
+                # Fall back to temp directory
+                temp_dir = Path("data/temp")
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                raw_filepath = temp_dir / f"scraper_output_{ts}.json"
+                with open(raw_filepath, "w", encoding="utf-8") as fh:
+                    json.dump(results, fh, indent=2, ensure_ascii=False)
 
             # Extract statistics and slim results
             _stats = results.pop("_stats", {})
@@ -181,32 +201,22 @@ class ScraperTool(BaseTool):
                         "conclusion": _res.get("conclusion", ""),
                     })
 
-            # Curate Top 10
-            await telemetry(self.status("Curating Top 10 articles...", "RUNNING"))
+            # Curate Top N
+            await telemetry(self.status("Curating top articles...", "RUNNING"))
             batch_id = ULID.generate()
             top_10_list = []
+            target_curated_count = 10
             
             if slim_list:
-                curation_prompt = (
-                    "You are a financial intelligence curator.\nReturn ONLY a JSON object with key 'top_10' which is an array of ulids.\n" + json.dumps(slim_list)
-                )
-                try:
-                    llm = get_llm_client("azure")
-                    curate_res = await llm.complete_chat(LLMRequest(
-                        messages=[{"role": "user", "content": curation_prompt}], 
-                        response_format={"type": "json_object"}
-                    ))
-                    top_10_ulids_res = json.loads(curate_res.content).get("top_10", [])[:10]
-                    slim_index = {item["ulid"]: item for item in slim_list}
-                    top_10_list = [slim_index[u] for u in top_10_ulids_res if u in slim_index]
-                except Exception:
-                    top_10_list = slim_list[:10]
+                from tools.scraper.curation import Top10Curator
+                curator = Top10Curator()
+                top_10_list, target_curated_count = curator.curate(slim_list, sync_llm_chat)
 
             # Save Top 10 directly to AnythingLLM custom-documents
             try:
                 top_10_path = write_artifact(
                     tool_name="scraper",
-                    job_id=batch_id,
+                    job_id=job_id or batch_id,  # Use job_id if available, else batch_id
                     artifact_type="top10",
                     ext="json",
                     content=json.dumps(top_10_list, indent=2, ensure_ascii=False)
@@ -222,7 +232,7 @@ class ScraperTool(BaseTool):
                 f"### Scout Intelligence Briefing",
                 f"**Target Site:** {target_site}",
                 f"**Batch ID:** {batch_id}\n",
-                "#### Top 10 Articles"
+                f"#### Top {target_curated_count} Articles"
             ]
             top_10_ulids = set()
             
@@ -249,18 +259,30 @@ class ScraperTool(BaseTool):
             if total > 60:
                 manifest_lines.append(
                     f"\n⚠️ NOTICE: This batch contains {total} articles. "
-                    f"Only the Top 10 (detailed) and the next 50 (titles) are listed here. "
-                    f"To retrieve data from the remaining {total - 60} articles, use the `library:vector_search` tool. "
+                    f"Only the Top {target_curated_count} (detailed) and the next 50 (titles) are listed here. "
+                    f"To retrieve data from the remaining {total - (target_curated_count + 50)} articles, use the `library:vector_search` tool. "
                     f"Provide the `batch_id: {batch_id}` and a specific `query: string` "
                     f"(e.g., 'semiconductor supply chain constraints') to pull relevant article segments into your active context."
                 )
 
-            # Intelligent Manifest generated — persisted via broadcast_batches; log summary
-            if job_id and session_id != "0":
-                manifest_content = "\n".join(manifest_lines)
-                log.dual_log(tag="Scraper:Manifest", message="Intelligent manifest generated.", payload={"job_id": job_id, "manifest": manifest_content})
+            manifest_content = "\n".join(manifest_lines)
+            log.dual_log(tag="Scraper:Manifest", message="Intelligent manifest generated.", payload={"manifest": manifest_content})
 
-            # Save to broadcast_batches (raw_json_path points to data/temp)
+            # Persist manifest as artifact
+            try:
+                manifest_path = write_artifact(
+                    tool_name="scraper",
+                    job_id=job_id or batch_id,
+                    artifact_type="manifest",
+                    ext="md",
+                    content=manifest_content
+                )
+                if getattr(self, "_last_artifacts", None) is not None:
+                    self._last_artifacts.append(str(manifest_path))
+            except Exception as e:
+                log.dual_log(tag="Scraper:Artifact", message=f"Failed to write manifest: {e}", level="WARNING")
+
+            # Save to broadcast_batches
             try:
                 enqueue_write(
                     "INSERT INTO broadcast_batches (batch_id, target_site, raw_json_path, curated_json_path, status) VALUES (?, ?, ?, ?, 'PENDING')",
@@ -277,18 +299,20 @@ class ScraperTool(BaseTool):
                 "_callback_format": "structured",
                 "tool_name": self.name,
                 "status": job_final_status,
-                "summary": f"Scraped **{total}** articles from **{target_site}**. Curated **{len(top_10_list)}** top articles.",
+                "summary": manifest_content,
                 "details": {
+                    "input_args": args,
                     "batch_id": batch_id,
                     "target_site": target_site,
                     "total_articles": total,
-                    "top_10_count": len(top_10_list),
+                    "target_curated_count": target_curated_count,
+                    "actual_curated_count": len(top_10_list),
                     "inventory_count": len(next_50)
                 },
                 "artifacts": [{
                     "filename": Path(top_10_path).name,
                     "type": "json",
-                    "description": f"Curated Top 10 for {target_site}."
+                    "description": f"Curated Top {target_curated_count} for {target_site}."
                 }],
                 "status_overrides": {
                     "PARTIAL": {
@@ -320,6 +344,9 @@ class ScraperTool(BaseTool):
                 "tool_name": self.name,
                 "status": "FAILED",
                 "summary": f"Scraper execution crashed: {exc}",
+                "details": {
+                    "input_args": args
+                },
                 "status_overrides": {
                     "FAILED": {
                         "description": "Scraping crashed fatally.",

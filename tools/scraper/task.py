@@ -61,9 +61,33 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
         )
         deduped_urls = links
 
+    # Phase 1.5: PARTIAL job resumption - filter to only failed items
+    job_id = data.get("job_id")
+    if job_id:
+        try:
+            _read_conn = DatabaseManager.get_read_connection()
+            failed_rows = _read_conn.execute(
+                "SELECT json_extract(item_metadata, '$.ulid') as norm_url "
+                "FROM job_items WHERE job_id = ? AND status = 'FAILED' "
+                "AND json_extract(item_metadata, '$.step') = 'scrape'",
+                (job_id,)
+            ).fetchall()
+            failed_urls = {r["norm_url"] for r in failed_rows if r["norm_url"]}
+            if failed_urls:
+                deduped_urls = [normalized_to_raw.get(n, n) for n in failed_urls]
+                log.dual_log(
+                    tag="Scraper:Partial",
+                    message=f"PARTIAL resumption: restricting to {len(deduped_urls)} failed links.",
+                )
+        except Exception as e:
+            log.dual_log(
+                tag="Scraper:Partial",
+                message=f"PARTIAL resumption check failed: {e}",
+                level="WARNING",
+            )
+
     # Phase 2: Pre-flight Job Item Generation (idempotent). Create job_items rows for every
     # deduped URL so the relational state machine has authoritative entries before processing.
-    job_id = data.get("job_id")
     if job_id:
         from database.job_queue import add_job_item as _add_ji
         _init_meta = json.dumps({

@@ -60,8 +60,8 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
 
     try:
         if InputModel is not None:
-            validated_args = InputModel.parse_obj(req.args)
-            args = validated_args.dict()
+            validated_args = InputModel.model_validate(req.args)
+            args = validated_args.model_dump()
         else:
             args = req.args
         

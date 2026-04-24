@@ -1,4 +1,4 @@
-# Skill.py
+# tools/scraper/Skill.py
 """
 Tool descriptor for the scraper tool.
 The registry imports `desc` from this module when present and uses it as the
@@ -20,8 +20,8 @@ Output Data
 - Tools MUST also produce artifact paths under `artifacts/scrapes/`.
 
 Artifacts
-- `artifacts/scrapes/scraper_output_<ts>.json` — raw JSON output of per-URL extraction
-- `artifacts/scrapes/top_10_<batch_id>.json` — curated Top 10 list (JSON array of article objects)
+- `{ANYTHINGLLM_ARTIFACTS_DIR}/scraper/{job_id}/scraper_output_<ts>.json` — raw JSON output of per-URL extraction
+- `{ANYTHINGLLM_ARTIFACTS_DIR}/scraper/{job_id}/top10.json` — curated Top 10 list (JSON array of article objects)
 
 Notes
 - The tool is cooperative-cancelable: it accepts a `cancellation_flag` and will stop when it is set.

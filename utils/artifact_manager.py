@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Union
 import config
 
-VALID_ARTIFACT_NAME = re.compile(r"^[a-z_]+_[A-Z0-9]{26}_[a-z0-9_]+\.[a-z]+$")
 
 def get_artifacts_root() -> Path:
     if not config.ANYTHINGLLM_ARTIFACTS_DIR:
@@ -20,17 +19,26 @@ def write_artifact(tool_name: str, job_id: str, artifact_type: str, ext: str, co
     safe_tool = re.sub(r"[^a-z_]", "", tool_name.lower())
     safe_type = re.sub(r"[^a-z0-9_]", "", artifact_type.lower())
     safe_ext = re.sub(r"[^a-z]", "", ext.lower())
-    filename = f"{safe_tool}_{job_id}_{safe_type}.{safe_ext}"
+    safe_job_id = re.sub(r"[^A-Za-z0-9_-]", "", job_id)
     
-    if not VALID_ARTIFACT_NAME.match(filename):
-        raise ValueError(f"Invalid artifact filename: {filename}")
-        
-    filepath = target_dir / filename
+    job_dir = target_dir / safe_tool / safe_job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
     
+    filename = f"{safe_type}.{safe_ext}"
+    filepath = job_dir / filename
+    
+    temp_path = filepath.with_suffix(f".tmp{filepath.suffix}")
     mode = "w" if isinstance(content, str) else "wb"
     encoding = "utf-8" if isinstance(content, str) else None
-    with open(filepath, mode, encoding=encoding) as fh:
-        fh.write(content)
+    
+    try:
+        with open(temp_path, mode, encoding=encoding) as fh:
+            fh.write(content)
+        temp_path.replace(filepath)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
         
     return filepath
 

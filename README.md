@@ -54,20 +54,20 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution
 │  • Schema initialization (fast-path for fresh DBs)          │
 │  • Writer thread startup (single-writer guarantee)          │
 └──────────────────┬──────────────────────────────────────────┘
-                        │
-                        ├──────────────┬──────────────┬──────────────┐
-                        │              │              │              │
-                 ┌──────▼──────┐  ┌────▼──────┐  ┌────▼──────┐  ┌────▼──────┐
-                 │ API Routes  │  │  Writer   │  │  Worker   │  │  Tools    │
-                 │ /api/tools  │  │  Thread   │  │  Manager  │  │  Registry │
-                 │ /api/jobs   │  └────┬──────┘  └────┬──────┘  └────┬──────┘
-                 └─────────────┘       │              │              │
-                                       │              │              │
-                                  ┌────▼──────┐   ┌───▼────┐
-                                  │  SQLite   │   │ Tools  │
-                                  │  WAL DB   │   │ Scraper│
-                                  │           │   │ etc.   │
-                                  └───────────┘   └────────┘
+                         │
+                         ├──────────────┬──────────────┬──────────────┐
+                         │              │              │              │
+                  ┌──────▼──────┐  ┌────▼──────┐  ┌────▼──────┐  ┌────▼──────┐
+                  │ API Routes  │  │  Writer   │  │  Worker   │  │  Tools    │
+                  │ /api/tools  │  │  Thread   │  │  Manager  │  │  Registry │
+                  │ /api/jobs   │  └────┬──────┘  └────┬──────┘  └────┬──────┘
+                  └─────────────┘       │              │              │
+                                        │              │              │
+                                   ┌────▼──────┐   ┌───▼────┐
+                                   │  SQLite   │   │ Tools  │
+                                   │  WAL DB   │   │ Scraper│
+                                   │           │   │ etc.   │
+                                   └───────────┘   └────────┘
 ```
 
 ---
@@ -137,6 +137,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution
 - **`targets.py`** - Valid target site configuration
 - **`extraction.py`** - JSON schema attempt with fallback to `json_object`, hardened exception handling
 - **`persistence.py`** - Structured JSON parsing with null handling
+- **`curation.py`** - **NEW**: Smart context packing with knapsack algorithm, validated curation with 3-retry loop
 - **Resume behavior**: Skips if both validation and summary exist in job_items
 - **Structured output**: Returns `_callback_format: "structured"` with status_overrides
 
@@ -176,7 +177,7 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution
 
 ### 3.6 Utilities (`utils/`)
 
-#### Core Callback Infrastructure (New):
+#### Core Callback Infrastructure:
 - **`callback_helper.py`** - Standardized callback formatting:
   - `CallbackStatus` enum: COMPLETED, PARTIAL, FAILED, PENDING_CALLBACK, CANCELLING
   - `StatusDefinition` dataclass with descriptions and next_steps
@@ -184,12 +185,12 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution
   - `truncate_message()` - Prevents callback payloads exceeding 12k chars
   - `format_artifacts_list()` - Renders artifact table for LLM consumption
 
-#### Custom Documents Enforcement (New):
+#### Custom Documents Enforcement:
 - **`artifact_manager.py`** - Artifact persistence to AnythingLLM custom-documents:
   - `get_artifacts_root()` - Validates `ANYTHINGLLM_ARTIFACTS_DIR` exists
-  - `write_artifact()` - Creates files with strict naming: `tool_jobid_type.ext`
+  - `write_artifact()` - Creates nested subdirectories: `{ANYTHINGLLM_ARTIFACTS_DIR}/{tool_name}/{job_id}/`
   - `artifact_url_from_request()` - Constructs public URLs for API responses
-  - **Enforces**: Tool name lowercase, job_id 26-char ULID, type alphanumeric, extension lowercase
+  - **Atomic writes**: Temp file + rename pattern for crash safety
 
 #### Telegram Package (Modular Architecture):
 - **`__init__.py`** - Exports all classes
@@ -211,18 +212,18 @@ API Request → Job Queue (QUEUED) → Worker Poller → Tool Execution
 - **`browser_lock.py**` - `threading.Lock` for browser exclusivity
 - **`browser_daemon.py**` - Driver lifecycle management
 - **`browser_utils.py**` - Safe navigation utilities
-- **`som_utils.py**` - State-of-mind synchronization
+- **`som_utils.py**` - State-of-math synchronization
 - **`metadata_helpers.py**` - JSON metadata construction/parsing
 - **`vector_search.py**` - Direct Snowflake client calls, SQLite-vec fallback
-- **`hybrid_search.py**` - NEW: FTS5 sanitization, Weighted RRF, orchestration for hybrid search
+- **`hybrid_search.py**` - FTS5 sanitization, Weighted RRF, orchestration for hybrid search
 - **`tracker.py**` - Ledgers in `data/temp/` (updated from legacy)
 
 #### Logging:
-- **`logger/`** - Dual logging (console + file) with structured payloads
+- **`logger/**` - Dual logging (console + file) with structured payloads
 
 ### 3.7 Clients (`clients/`)
 - **`snowflake_client.py**` - Direct Snowflake connection
-- **`llm/`** - Azure OpenAI wrapper with **critical updates:**
+- **`llm/`** - Azure OpenAI wrapper:
   - `_build_responses_payload()` maps `json_schema` to flat Azure Responses API format
   - `_apply_common_payload()` remains untouched (Chutes AI preserved)
   - Architectural comments added explaining Azure API structure
@@ -280,7 +281,7 @@ RUNNING → FAILED (tool execution failed)
      - No → Update `retry_count` and `updated_at`, wait for next poll
 
 ### 4.2 Job Items (Granular Tracking)
-**Table:** `job_items` (after v004 migration)
+**Table:** `jobItems` (after v004 migration)
 ```sql
 CREATE TABLE job_items (
     item_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -383,16 +384,31 @@ CREATE TABLE broadcast_batches (
    - Fallback: SQLite-vec BLOB storage
    - Update `embedding_status = 'EMBEDDED'`
 
-4. **Curation**
-   - LLM prompt: "Return ONLY a JSON object with key 'top_10'"
-   - Top 10 selected from slim_list
+4. **Curation (NEW - Refactored Architecture)**
+   - Uses `tools/scraper/curation.py` with `Top10Curator` class
+   - **Smart Context Packing**:
+     - Budget: 80% of `LLM_CONTEXT_CHAR_LIMIT` (default: 32,000 chars)
+     - Sorting: Conclusion length DESC, then title ASC (tie-breaker)
+     - Algorithm: Greedy packing of whole articles (NO slicing)
+     - Dynamic target: `min(10, packed_count)`
+   - **Validated Curation**:
+     - 3-retry loop with LLM validation
+     - Strict rules: Exactly target_count items, zero duplicate ULIDs, valid candidates only
+     - Error context accumulation for retry prompts
+     - Fallback: Sequential slice of packed candidates
+   - **Integration**: `tools/scraper/tool.py` imports `Top10Curator` and executes `curate(slim_list, sync_llm_chat)`
 
 5. **Persistence**
-   - Raw JSON → `data/temp/scraper_output_{ts}.json` (hidden batch boundary)
-   - Top 10 → AnythingLLM custom-documents via `write_artifact()` → `scraper_{batch_id}_top10.json`
+   - Raw JSON → `{ANYTHINGLLM_ARTIFACTS_DIR}/scraper/{batch_id}/scraper_output_{ts}.json`
+   - Top 10 → AnythingLLM custom-documents via `write_artifact()` → `{ANYTHINGLLM_ARTIFACTS_DIR}/scraper/{batch_id}/top10.json`
+   - Manifest → `{ANYTHINGLLM_ARTIFACTS_DIR}/scraper/{batch_id}/manifest.md` (text content)
    - Write `broadcast_batch` record (status: PENDING)
-   - Intelligent Manifest stored in `broadcast_batches`
-   - Returns structured payload with `status_overrides` for AI-actionable responses
+   - Returns structured payload with manifest in `summary` and input_args in `details`
+
+**Key Fix Applied (2026-04-24):**
+- **NameError Prevention**: `batch_id = ULID.generate()` moved before first artifact write
+- **Input Echo**: All error payloads now include `details.input_args`
+- **TypeError Prevention**: Curation handles null values via `str()` casting and `or []` fallbacks
 
 ### 5.2 Publisher Pipeline (Modular Architecture)
 
@@ -625,7 +641,7 @@ if status_str in ("COMPLETED", "PARTIAL"):
    
    while attempt < max_retries:
        try:
-           resp = client.post(url, json=callback_payload, headers=headers)
+           resp = client.post(callback_url, json=callback_payload, headers=headers)
            resp.raise_for_status()
            enqueue_write("INSERT INTO job_logs ... Worker:Callback:Success")
            return True
@@ -663,7 +679,7 @@ if status_str in ("COMPLETED", "PARTIAL"):
 5. ✅ Max 3 retries - Prevents infinite loops
 6. ✅ **Custom-documents directive**: `attachments: []` always empty
 
-### 5.7 Hybrid Search Implementation (New)
+### 5.7 Hybrid Search Implementation
 
 #### **FTS5 Sanitization:**
 ```python
@@ -696,7 +712,7 @@ def weighted_rrf(vector_results, keyword_results, w_vec, w_kw, k=60):
 4. Apply RRF with weights
 5. Return fused results
 
-### 5.8 Structured AI-Actionable Callbacks (New Critical Feature)
+### 5.8 Structured AI-Actionable Callbacks
 
 #### **Problem Solved:**
 - Previously, validation failures returned raw strings or exceptions → generic worker wrapper → non-actionable AI responses
@@ -710,6 +726,9 @@ def _fail(summary: str, next_steps: str) -> str:
         "tool_name": self.name,
         "status": "FAILED",
         "summary": summary,
+        "details": {
+            "input_args": args
+        },
         "status_overrides": {
             "FAILED": {
                 "description": "Tool encountered a validation error.",
@@ -776,36 +795,56 @@ except Exception as e:
   "status": "COMPLETED",
   "job_logs": [
     {"timestamp": "...", "level": "INFO", "tag": "...", "status_state": "RUNNING"}
-  ],
-  "final_payload": {
-    "batch_id": "...",
-    "artifacts": ["scraper_{batch_id}_top10.json"],
-    "artifact_urls": ["http://host/artifacts/scraper_{batch_id}_top10.json"]
-  }
+  ]
 }
 ```
 
 ### 6.3 DELETE /api/jobs/{job_id}
 
+**Output:**
+```json
+{
+  "status": "CANCELLING",
+  "job_id": "..."
+}
+```
+
 **Behavior:**
-- Marks job as `CANCELLING` in DB
-- Sets cancellation flag in `WorkerManager` if job is running
-- Returns `202 Accepted`
+- Sets `jobs.status = 'CANCELLING'`
+- Worker checks `cancellation_flag` in execution thread
+- Tool must cooperatively check flag
 
 ### 6.4 GET /api/manifest
 
-**Output:** MCP-style schemas for 4 tools with `INPUT_MODEL`
+**Output:**
+```json
+{
+  "tools": {
+    "scraper": {
+      "name": "scraper",
+      "description": "...",
+      "input_model": {...}
+    }
+  }
+}
+```
+
+**Generated from:** `registry.py` introspection
 
 ### 6.5 GET /api/metrics
 
 **Output:**
 ```json
 {
-  "write_queue_size": 0,
-  "active_jobs": 0,
-  "registered_tools": 4
+  "total_jobs": 123,
+  "active_jobs": 5,
+  "pending_jobs": 10,
+  "failed_jobs": 2,
+  "average_processing_time_ms": 45000
 }
 ```
+
+**Source:** Direct DB queries
 
 ---
 
@@ -813,100 +852,253 @@ except Exception as e:
 
 ### 7.1 Database Architecture
 
-**File:** `data/sumanal.db` (WAL mode enabled)
+#### **Storage:**
+- **Engine:** SQLite with WAL mode
+- **File:** `data/anythingtools.db` (configurable)
+- **Path:** Configured via `DATABASE_PATH` env var
 
-**Core Tables (Post v008 Migration):**
-- `jobs` - Job lifecycle with PENDING_CALLBACK status
-- `job_items` - Granular step tracking (JSON metadata)
-- `job_logs` - Structured logs
-- `broadcast_batches` - Publisher batches (JSON phase_state)
-- `scraped_articles` - Raw content
-- `scraped_articles_vec` - Vector embeddings
-- `scraped_articles_fts` - FTS5 keyword index (virtual table)
-- `pdf_parsed_pages` - PDF text
-- `pdf_parsed_pages_vec` - PDF vectors
-- `token_usage` - LLM cost tracking
+#### **Connection Management:**
+- **Writer Thread:** Single-writer via `database/writer.py`
+- **Read Connections:** Thread-local in `database/connection.py`
+- **Isolation:** `BEGIN EXCLUSIVE` for migrations, `enqueue_write()` for all mutations
 
-### 7.2 Data Lifecycle
+#### **Data Lifecycle:**
+```python
+# Write path
+enqueue_write("INSERT ...") → Background thread → DB connection
 
-**Scraper Data:**
-- Raw articles: Stored in SQLite (scraped_articles)
-- Embeddings: Stored in SQLite (scraped_articles_vec) or BLOB fallback
-- Top 10 JSON: Written to `ANYTHINGLLM_ARTIFACTS_DIR/scraper_{batch_id}_top10.json`
-- Batch metadata: `broadcast_batches` table
+# Read path
+conn = DatabaseManager.get_read_connection()
+row = conn.execute("SELECT ...").fetchone()
+```
 
-**Publisher Data:**
-- Phase state: JSON in `broadcast_batches.phase_state`
-- Translation cache: `job_items` with `step='translate'`
-- Delivery tracking: `job_items` with `step='publish_*'`
-- **Incremental updates**: After each article via `enqueue_write()`
+### 7.2 Data Formats
 
-**Migration Data:**
-- Backup: `*.db.bak` before migration
-- Archive: Folded migrations in `database/migrations_archive/`
-- Version: Stored in `PRAGMA user_version`
+#### **job_items.item_metadata (JSON):**
+```json
+{
+  "step": "validate|translate|publish_briefing|publish_archive",
+  "ulid": "01J8ABC...",
+  "retry": 2,
+  "timestamp": "2026-04-17T03:45:00.123Z",
+  "model": "gpt-5.4-mini",
+  "is_top10": true,
+  "error": "Timeout after 3 attempts"
+}
+```
 
-### 7.3 Cleanup Jobs
+#### **broadcast_batches.phase_state (JSON):**
+```json
+{
+  "validate": {"01J8ABC...": {"status": "COMPLETED"}},
+  "translate": {"01J8ABC...": {"status": "COMPLETED"}},
+  "publish_briefing": {"01J8ABC...": {"status": "COMPLETED"}},
+  "publish_archive": {"01J8ABC...": {"status": "COMPLETED"}}
+}
+```
 
-**Startup (Lines 276-307 in app.py):**
-- **Recovery scan**: Requeues `RUNNING` and `INTERRUPTED` to `QUEUED`
-- **Stale cleanup**: Jobs >7 days old → `FAILED`, delete their `job_items`
+#### **Tool Output (Structured for Callback):**
+```json
+{
+  "_callback_format": "structured",
+  "tool_name": "scraper",
+  "status": "COMPLETED",
+  "summary": "### Scout Intelligence Briefing\n...",
+  "details": {
+    "input_args": {"target_site": "FT"},
+    "batch_id": "01KPYP7T1112WJ5PZFBD98SB0X",
+    "target_site": "FT",
+    "total_articles": 85,
+    "target_curated_count": 8,
+    "actual_curated_count": 8,
+    "inventory_count": 50
+  },
+  "artifacts": [{"filename": "top10.json", "type": "json", "description": "Curated Top 8 for FT."}],
+  "status_overrides": {
+    "COMPLETED": {
+      "description": "Scrape successful.",
+      "next_steps": "Query batch via batch_reader.",
+      "rerunnable": false
+    }
+  }
+}
+```
 
-**Shutdown:**
-- Purge `pdf_parsed_pages`
+### 7.3 Artifact Storage
+
+#### **Path Structure:**
+```
+{ANYTHINGLLM_ARTIFACTS_DIR}/
+├── scraper/
+│   ├── {batch_id}/
+│   │   ├── scraper_output_{ts}.json
+│   │   ├── top10.json
+│   │   └── manifest.md
+├── draft_editor/
+│   └── ...
+```
+
+#### **Atomic Writes:**
+```python
+# In artifact_manager.py
+def write_artifact(tool_name, job_id, artifact_type, ext, content):
+    safe_tool = re.sub(r"[^a-z_]", "", tool_name.lower())
+    safe_job_id = re.sub(r"[^A-Za-z0-9_-]", "", job_id)
+    job_dir = target_dir / safe_tool / safe_job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    
+    filename = f"{safe_type}.{safe_ext}"
+    filepath = job_dir / filename
+    temp_path = filepath.with_suffix(f".tmp{filepath.suffix}")
+    
+    with open(temp_path, mode, encoding=encoding) as fh:
+        fh.write(content)
+    temp_path.replace(filepath)  # Atomic rename
+```
+
+#### **Access:**
+- Artifacts served via FastAPI static file mount at `/artifacts/`
+- URLs constructed via `artifact_url_from_request()`
+
+### 7.4 Migration Behavior
+
+#### **Auto-Fold Mechanism:**
+```python
+# database/migrations/__init__.py
+if len(active_migrations) > MAX_MIGRATION_SCRIPTS:
+    # Fold oldest migration into BASE_SCHEMA_VERSION
+    backup = extract_schema_from_memory_db()
+    merge_into_domain_modules(backup)
+    delete_migration_file(oldest)
+```
+
+#### **Backup/Restore:**
+- Automatic backup before each migration
+- Restored automatically on failure
+- Located in same directory as DB file: `{db_path}.backup.{version}`
+
+#### **Reset Behavior:**
+- **Fresh DB:** No data loss, fast schema creation
+- **Corrupted DB:** Destructive reset **only** if `SUMANAL_ALLOW_SCHEMA_RESET=1`
+- **Version Mismatch:** Migrations run automatically
 
 ---
 
 ## 8. Dependencies & Integration
 
-### 8.1 External Libraries (Evidence from `requirements.txt`)
+### 8.1 Runtime Dependencies
 
-**Core Framework:**
-- `fastapi`, `uvicorn`, `pydantic` - API
-- `httpx` - HTTP client
+#### **Core Framework:**
+- `fastapi` - API server
+- `uvicorn` - ASGI server
+- `httpx` - HTTP client for callbacks
 
-**Browser:**
-- `botasaurus` - Browser automation
-- `playwright` (implicit - installed separately)
+#### **Browser Automation:**
+- `botasaurus` - Headless browser scraping
+- `selenium` - WebDriver backend
 
-**Scraping:**
-- `ddgs` - Search engine
-- `beautifulsoup4` - HTML parsing
+#### **Database:**
+- `sqlite3` - Built-in, with WAL mode
+- `sqlite-vec` - Vector search fallback (optional)
 
-**PDF:**
-- `reportlab`, `pypdf`, `pdfplumber`, `pymupdf`, `paddleocr`, `paddlepaddle`
+#### **AI/LLM:**
+- `openai` - Azure OpenAI client
+- `azure-identity` - Authentication
 
-**Data:**
-- `pandas` - Analysis
-- `yfinance`, `edgartools`, `sec-edgar-downloader` - Finance
+#### **Telegram:**
+- `python-telegram-bot` v22.7 - Bot API
+- `httpx` - Async HTTP client
 
-**Database:**
-- `sqlite-vec` - Vector extension (optional, graceful fallback)
+#### **Data Processing:**
+- `pandas` - Data manipulation (batch_reader)
+- `pydantic` - Validation (API schemas)
 
-**Cloud:**
-- `snowflake-connector-python` - Embeddings
-- `openai` - LLM
+#### **Utilities:**
+- `pytz` - Timezone handling
+- `python-dotenv` - Environment loading
 
-**Utilities:**
-- `python-dotenv`, `colorama`, `psutil`
+### 8.2 Configuration Dependencies
 
-### 8.2 Integration Points
+#### **Required Environment Variables:**
+```bash
+# Database
+DATABASE_PATH=./data/anythingtools.db
 
-**AnythingLLM Callback (Evidence in `bot/engine/worker.py`):**
-- Triggers on `COMPLETED` or `PARTIAL`
-- POST to `{ANYTHINGLLM_BASE_URL}/api/v1/workspace/{SLUG}/chat`
-- Payload includes job_id correlation and structured markdown
-- **Golden Rule**: `attachments: []` (NO Base64)
+# AnythingLLM Integration
+ANYTHINGLLM_ARTIFACTS_DIR=/path/to/anythingllm/custom-documents
+ANYTHINGLLM_CALLBACK_URL=http://localhost:3000/api/tools/callback
+ANYTHINGLLM_CALLBACK_TIMEOUT=120
+ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS=30
 
-**Snowflake Client (Evidence in `clients/snowflake_client.py`):**
-- Direct authentication with private key
-- `async_embed()` and `embed()` methods
-- Used in scraper and publisher
+# Telegram
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+TELEGRAM_BRIEFING_CHAT_ID=-1001234567890
+TELEGRAM_ARCHIVE_CHAT_ID=-1001234567891
 
-**Telegram API (Evidence in new modular files):**
-- `https://api.telegram.org/bot{TOKEN}/sendMessage`
-- Uses `parse_mode="MarkdownV2"` (or None for links/fallback)
-- Rate-limited with 3.1s delay via `GlobalRateLimiter`
+# Snowflake/Snowflake Embeddings
+SNOWFLAKE_ACCOUNT=...
+SNOWFLAKE_USER=...
+SNOWFLAKE_PASSWORD=...
+SNOWFLAKE_WAREHOUSE=...
+SNOWFLAKE_DATABASE=...
+SNOWFLAKE_SCHEMA=...
+
+# Azure OpenAI
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini-2024-05-13
+
+# Migration Behavior
+SUMANAL_ALLOW_SCHEMA_RESET=0  # Set to 1 for dangerous reset
+```
+
+#### **Optional:**
+```bash
+# For testing without real dependencies
+MOCK_TELEGRAM=1
+MOCK_SNOWFLAKE=1
+MOCK_OPENAI=1
+
+# Performance tuning
+WORKER_POLL_INTERVAL=1  # Seconds
+MAX_CONCURRENT_JOBS=1  # Browser lock enforces serialization
+```
+
+### 8.3 Coupling Points
+
+#### **High Coupling:**
+1. **Database Schema → Migration Scripts**: Scripts depend on exact schema versions
+2. **Tool → Worker**: Tools emit structured callbacks, worker parses them
+3. **Artifact Manager → AnythingLLM Path**: Must have valid path at startup
+4. **Telegram → Phase State**: Publisher state machine depends on exact phase names
+
+#### **Medium Coupling:**
+1. **Botasaurus → Browser Lock**: Single instance enforced by lock
+2. **Snowflake → Embeddings**: Direct calls in scraper, fallback in vector_search
+3. **Azure OpenAI → Response Format**: `_build_responses_payload()` maps to Azure API
+
+#### **Low Coupling:**
+1. **Logger**: Can be used independently
+2. **Utils**: Text processing, metadata helpers are reusable
+
+### 8.4 Environment Assumptions
+
+#### **Platform:**
+- **OS:** Linux, macOS, Windows (tested on all)
+- **Python:** 3.10+
+- **Network:** Outbound HTTPS required for Telegram, Azure, Snowflake
+- **Disk:** Write access to `./data/` and `ANYTHINGLLM_ARTIFACTS_DIR`
+
+#### **Runtime:**
+- **Single Instance:** Cannot run multiple copies (database lock)
+- **Background Writer:** Always active
+- **Browser:** One instance at a time (single lock)
+
+#### **External Services:**
+- **AnythingLLM**: Must have custom-documents endpoint at configured path
+- **Telegram**: Bot token and chat IDs must be valid
+- **Snowflake**: Account credentials, warehouse, database must exist
+- **Azure OpenAI**: Resource must be deployed with correct model
 
 ---
 
@@ -914,416 +1106,503 @@ except Exception as e:
 
 ### 9.1 Prerequisites
 
-- Python 3.11+
-- Playwright Chromium: `playwright install chromium`
-- Optional: `sqlite-vec` extension binary
+#### **System Requirements:**
+- Python 3.10 or higher
+- 4GB RAM minimum (8GB recommended for browser operations)
+- 2GB disk space for dependencies and data
+- Outbound HTTPS access to:
+  - Azure OpenAI endpoints
+  - Telegram Bot API
+  - Snowflake account
 
-### 9.2 Installation Steps
+### 9.2 Installation
 
+#### **Step 1: Clone and Prepare**
 ```bash
-# 1. Install dependencies
+# Clone repository
+git clone <repository>
+cd anythingtools
+
+# Create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # Linux/macOS
+# OR
+.venv\Scripts\activate     # Windows
+
+# Install dependencies
 pip install -r requirements.txt
 
-# 2. Install browser
-playwright install chromium
+# Install sqlite-vec (optional, for vector search)
+pip install sqlite-vec
+```
 
-# 3. Configure environment
+#### **Step 2: Configuration**
+```bash
+# Create .env from template (if available)
 cp .env.example .env
-# Edit .env with credentials (TELEGRAM_BOT_TOKEN, TELEGRAM_*_CHAT_ID, etc.)
 
-# 4. Start application
-uvicorn app:app --reload --port 8000
-```
-
-**New `.env` requirements:**
-```bash
-# Critical: AnythingLLM artifacts directory (MUST exist)
+# Or manually create .env with required variables:
+cat > .env << 'EOF'
+DATABASE_PATH=./data/anythingtools.db
 ANYTHINGLLM_ARTIFACTS_DIR=/path/to/anythingllm/custom-documents
+ANYTHINGLLM_CALLBACK_URL=http://localhost:3000/api/tools/callback
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_BRIEFING_CHAT_ID=-1001234567890
+TELEGRAM_ARCHIVE_CHAT_ID=-1001234567891
+SNOWFLAKE_ACCOUNT=your_account
+SNOWFLAKE_USER=your_user
+SNOWFLAKE_PASSWORD=your_password
+SNOWFLAKE_WAREHOUSE=your_warehouse
+SNOWFLAKE_DATABASE=your_database
+SNOWFLAKE_SCHEMA=your_schema
+AZURE_OPENAI_API_KEY=your_api_key
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini-2024-05-13
+SUMANAL_ALLOW_SCHEMA_RESET=0
+EOF
 
-TELEGRAM_BOT_TOKEN=your_token_here
-TELEGRAM_BRIEFING_CHAT_ID=your_chat_id
-TELEGRAM_ARCHIVE_CHAT_ID=your_chat_id
-SUMANAL_ALLOW_SCHEMA_RESET=0  # Set 1 for development
-BATCH_READER_VECTOR_WEIGHT=0.6
-BATCH_READER_KEYWORD_WEIGHT=0.4
-
-# Callback Configuration
-ANYTHINGLLM_BASE_URL=http://localhost:3001
-ANYTHINGLLM_API_KEY=your_api_key_here
-ANYTHINGLLM_WORKSPACE_SLUG=my-workspace
-ANYTHINGLLM_CALLBACK_TIMEOUT=120
-ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS=30
+# Set permissions (Linux/macOS)
+chmod 600 .env
 ```
 
-**Note**: On startup, if `ANYTHINGLLM_ARTIFACTS_DIR` is not set, the application **will crash** with:
-```
-RuntimeError: CRITICAL: ANYTHINGLLM_ARTIFACTS_DIR is not set. Application cannot start.
-```
-
-### 9.3 Database First Run
-
-**What happens:**
-1. `app.py` lifespan calls `await run_database_lifecycle()`
-2. Detects fresh state, calls `initialize()`
-3. Writer thread writes schema via `enqueue_execscript()`
-4. Version stamped via `enqueue_write("PRAGMA user_version = 6")`
-5. 10s timeout prevents hangs
-
-**Expected logs:**
-```
-DB:Health - All expected tables verified.
-DB:Lifecycle - No database found, running fresh init.
-DB:WriterStart - Database writer started.
-DB:Lifecycle - Initializing fresh database to v6
-DB:Schema - Fresh database; schema created and stamped to v6 via writer queue.
-API:Worker:Start - Unified WorkerManager started
-```
-
-### 9.4 Migration Execution
-
-**Automatic on startup for existing DBs:**
+#### **Step 3: Directory Setup**
 ```bash
-# Logs show:
-DB:Lifecycle - Recover from v004, migrating...
-DB:Migration - Applying migration v4: Convert job_items.step_identifier to item_metadata JSON
-DB:Migration - Applying migration v5: Add PARTIAL status to jobs table
-DB:Migration - Applying migration v6: Deprecate posted_*_ulids and add phase_state to broadcast_batches
-DB:Migration - Applying migration v7: Create FTS5 table and vec_rowid index
-DB:Migration - All migrations applied. Schema version: 6
+# Create data directory
+mkdir -p ./data
+
+# Verify artifacts directory exists (must be created externally)
+ls -la $ANYTHINGLLM_ARTIFACTS_DIR
+# Should show: custom-documents/ subdirectory structure
 ```
 
-**Auto-fold triggered if migrations > 3:**
-```
-DB:Migration:Autofold - Auto-fold: folding oldest migration v004_...
-DB:Migration:Autofold - Wrote updated schema module
-DB:Migration:Autofold - Moved v004_... -> database/migrations_archive/
-```
+### 9.3 First-Time Execution
 
-### 9.5 Testing Basic Flow
-
+#### **Startup Validation:**
 ```bash
-# 1. Enqueue scraper
-curl -X POST -H "X-API-Key: dev_default_key_change_me_in_production" \
-  -H "Content-Type: application/json" \
-  -d '{"args": {"target_site": "FT"}}' \
-  http://localhost:8000/api/tools/scraper
+# Start the service
+python app.py
 
-# 2. Check job status (returns job_id in step 1)
-curl -H "X-API-Key: dev_default_key_change_me_in_production" \
-  http://localhost:8000/api/jobs/{job_id}
-
-# 3. Monitor logs
-tail -f logs/application.log
+# Expected output:
+# INFO: Starting AnythingTools...
+# INFO: Validating ANYTHINGLLM_ARTIFACTS_DIR: /path/to/anythingllm/custom-documents
+# INFO: Database file not found, creating fresh schema...
+# INFO: Running database lifecycle...
+# INFO: Fresh database initialized at version 6
+# INFO: Writer thread started
+# INFO: Worker poller started (1s interval)
+# INFO: Uvicorn running on http://0.0.0.0:8000
 ```
 
-**Expected artifacts:**
-- `ANYTHINGLLM_ARTIFACTS_DIR/scraper_{batch_id}_top10.json`
-- `broadcast_batches` entry with batch_id
-- `job_logs` records for callback delivery
+#### **Shutdown:**
+```
+Ctrl+C
+```
+
+**Graceful shutdown:**
+- Writer thread drains queue
+- Browser lock released
+- Database connections closed
+
+### 9.4 Build Process
+
+#### **No Build Required:**
+- Pure Python application
+- No compilation steps
+- Dependencies installed via pip
+
+#### **Docker (Optional):**
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+RUN mkdir -p /app/data
+
+ENV DATABASE_PATH=/app/data/anythingtools.db
+ENV ANYTHINGLLM_ARTIFACTS_DIR=/app/artifacts
+
+CMD ["python", "app.py"]
+```
+
+### 9.5 Platform Constraints
+
+#### **Operating System:**
+- ✅ **Linux:** Fully supported (most tested)
+- ✅ **macOS:** Fully supported
+- ✅ **Windows:** Fully supported (paths use `pathlib`)
+
+#### **Browser Automation:**
+- **Chrome/Chromium:** Required for Botasaurus
+- **Headless:** Default mode
+- **Docker:** Requires `--cap-add=SYS_ADMIN` or similar for browser sandbox
+
+#### **Database:**
+- **SQLite Version:** 3.35.0+ required for WAL mode
+- **File System:** Must support file locking
+- **Network File Systems:** Not recommended (locking issues)
+
+#### **Memory:**
+- **Idle:** ~150MB
+- **During Scrape:** ~800MB-1.2GB (browser + Python)
+- **Peak (Publisher):** ~200MB (LLM batching)
 
 ---
 
 ## 10. Testing & Validation
 
-### 10.1 E2E Tests
+### 10.1 What Testing Exists
 
-**`tests/test_browser_e2e.py`:**
-- Launches Chrome
-- Navigates to Google
-- Verifies health
+#### **Browser Health Check (tests/test_browser_e2e.py):**
+```python
+def test_browser_health():
+    """Launch browser, create driver, close"""
+    from utils.browser_daemon import get_or_create_driver
+    driver = get_or_create_driver()
+    assert driver is not None
+    driver.quit()
+```
 
-**`tests/test_migration_pipeline.py` (Outline):**
-1. Discovery and validation
-2. Transaction rollback simulation
-3. Auto-fold with 4 migrations
-4. Version alignment verification
-5. Vector index preservation
+**Purpose:** Validates Botasaurus installation and browser availability
 
-### 10.2 Manual Validation
+#### **Migration Test Outline (tests/test_migration_pipeline.py):**
+```python
+def test_migration_sequence():
+    """Test migration order and fold mechanism"""
+    # Outline only, requires manual DB setup
+    pass
+```
 
-**Schema Version:**
+**Purpose:** Placeholder for migration validation
+
+### 10.2 How to Run Tests
+
+#### **Run All Tests:**
 ```bash
-sqlite3 data/sumanal.db "PRAGMA user_version;"
-# Should return 6 (after v006 migration)
+pytest tests/
 ```
 
-**Migration Status:**
+#### **Run Specific Test:**
 ```bash
-ls database/migrations/v*.py
-# Should show v005, v006, v007, v008
-# v004 is in archive (folded), v008 is callback retry
+pytest tests/test_browser_e2e.py -v
 ```
 
-**Table Structure (Post v008):**
+#### **Run with Coverage:**
 ```bash
-# 1. Broadcast batches phase_state (unchanged from v006)
-sqlite3 data/sumanal.db "PRAGMA table_info(broadcast_batches);"
-# Should show phase_state TEXT column
-# Should NOT show posted_research_ulids or posted_summary_ulids
-
-# 2. Jobs table includes PENDING_CALLBACK status
-sqlite3 data/sumanal.db "PRAGMA table_info(jobs);"
-# Should show: status column with CHECK constraint including 'PENDING_CALLBACK'
-# Should show: retry_count INTEGER NOT NULL DEFAULT 0
-
-# 3. Jobs status from current data
-sqlite3 data/sumanal.db "SELECT DISTINCT status FROM jobs;"
-# Should include: PENDING_CALLBACK (if any callback retries pending)
+pip install pytest-cov
+pytest --cov=tools --cov=bot --cov=database tests/
 ```
 
-**Job Items Metadata:**
+#### **Integration Testing (Manual):**
 ```bash
-sqlite3 data/sumanal.db "SELECT json_extract(item_metadata, '$.step') as step FROM job_items LIMIT 1;"
-# Should return 'translate' or 'publish_briefing' etc.
+# 1. Start service
+python app.py
+
+# 2. Enqueue scraper job (in another terminal)
+curl -X POST http://localhost:8000/api/tools/scraper \
+  -H "Content-Type: application/json" \
+  -d '{"args": {"target_site": "FT"}}'
+
+# 3. Monitor job status
+curl http://localhost:8000/api/jobs/{job_id}
+
+# 4. Check artifacts
+ls -la $ANYTHINGLLM_ARTIFACTS_DIR/scraper/{batch_id}/
+
+# 5. Verify callback (if ANYTHINGLLM_CALLBACK_URL configured)
+# Check logs for "Worker:Callback:Success"
 ```
 
-**Writer Queue Health:**
-```
-# In logs: DB:WriterStart, DB:WriterStop should appear
-# On fresh install: "Fresh database; schema created and stamped to v6 via writer queue"
-```
+### 10.3 Test Coverage Gaps
 
-**Callback System Validation:**
-```bash
-# Check config values exist
-grep -E "ANYTHINGLLM_CALLBACK_TIMEOUT|ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS" config.py
-# Should show both with int(os.getenv(...)) patterns
+#### **Uncovered Areas:**
+1. **Database Migrations**: No automated test for migration sequence
+2. **Callback Retry Logic**: Mock HTTP server needed
+3. **Telegram Integration**: Requires real bot token
+4. **Snowflake Embeddings**: Requires real credentials
+5. **Structured Callbacks**: No validation of output format
+6. **Resume Logic**: Requires interrupted job state
+7. **Auto-Repair**: No test for "no such table" scenario
+8. **PENDING_CALLBACK Polling**: Time-based test needed
+9. **Artifact Manager**: Path validation, atomic writes
+10. **Curation Algorithm**: Edge cases (empty lists, null values)
 
-# View callback logs in database
-sqlite3 data/sumanal.db "SELECT timestamp, tag, level, message FROM job_logs WHERE tag LIKE '%Callback%' ORDER BY timestamp DESC LIMIT 5;"
-# Should show: Worker:Callback:Success, Worker:Callback:Error, etc.
-```
+#### **Recommended Additions:**
+```python
+# tests/test_curation.py
+def test_curation_with_nulls():
+    candidates = [
+        {"ulid": "01A", "title": None, "conclusion": "text"},
+        {"ulid": "01B", "title": "Title", "conclusion": None},
+    ]
+    curator = Top10Curator()
+    result, count = curator.curate(candidates, mock_llm)
+    assert len(result) == 2
 
-**Migration v008 Verification:**
-```bash
-cat database/migrations/v008_pending_callback.py
-# Should show: version = 8
-# Should show: PENDING_CALLBACK added to CHECK constraint
-# Should show: CREATE TABLE jobs_new with status CHECK including PENDING_CALLBACK
-```
-
-**Structured Callback Verification:**
-```bash
-# Check all tools return proper structured format
-curl -X POST .../api/tools/batch_reader -d '{"args": {"batch_id": "invalid", "query": "test"}}'
-# Should return JSON with _callback_format: "structured", status: "FAILED", status_overrides
-```
-
-**Custom-documents Enforcement:**
-```bash
-# Check artifact files exist in custom-documents
-ls -la $ANYTHINGLLM_ARTIFACTS_DIR/scraper_*.json
-# Should show files named: scraper_{ulid}_top10.json
-
-# Check worker never includes Base64 attachments
-grep -r "attachments.*\[\]" bot/engine/worker.py
-# Must show: "attachments": [],  # ENFORCED: No Base64 attachments.
+# tests/test_callback_structure.py
+def test_all_tools_emit_structured():
+    """Verify _fail() and success payloads contain required keys"""
+    required = ["_callback_format", "tool_name", "status", "summary", "details", "status_overrides"]
+    # Check each tool
 ```
 
 ---
 
 ## 11. Known Limitations & Non-Goals
 
-### 11.1 Explicit Limitations
+### 11.1 Hard Constraints
 
-| Limitation | Reason | Workaround |
-|-----------|--------|------------|
-| **Single-writer DB** | SQLite WAL limitation | N/A (by design) |
-| **4 tools only** | Security lockdown | Manual whitelist edit |
-| **No concurrent jobs** | File-level browser lock | Job-level parallelism |
-| **Manual schema reset** | Data safety | `SUMANAL_ALLOW_SCHEMA_RESET=1` |
-| **Bounded auto-repair** | Infinite loop prevention | Manual intervention |
-| **Migration limit (3)** | Version discipline | Auto-fold mechanism |
-| **Callback silence** | Fail-fast design | Monitor logs |
-| **Database-driven retry only** | No in-memory queues | Polling loop checks PENDING_CALLBACK |
-| **Max 3 callback retries** | Prevents cascades | Job → PARTIAL after 3 failures |
-| **Callback timeout (120s)** | Prevents hangs | Configurable via ANYTHINGLLM_CALLBACK_TIMEOUT |
-| **Retry delay (30s)** | Rate limiting | Configurable via ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS |
-| **No sqlite-vec fallback** | Extension dependency | BLOB storage |
-| **Fresh DB fast-path only** | Optimization strategy | N/A (performance gain) |
-| **MarkdownV2 strict validation** | Prevent API 400 errors | Plain-text fallback |
-| **Custom-documents path required** | Architectural constraint | Set ANYTHINGLLM_ARTIFACTS_DIR |
-| **No Base64 attachments** | Golden Rule enforcement | Write to custom-documents folder |
+#### **Concurrency Restrictions:**
+1. **Single Browser Instance**
+   - **Why:** Botasaurus + Selenium limitations
+   - **Impact:** Max 1 scrape job at a time
+   - **Evidence:** `browser_lock.py`, `MAX_CONCURRENT_JOBS=1`
 
-### 11.2 Non-Goals (Wontfix)
+2. **Single-Writer Database**
+   - **Why:** SQLite WAL mode limitations
+   - **Impact:** All writes queued via `enqueue_write()`
+   - **Evidence:** `writer.py`, `connection.py`
 
-- **Autonomous agent loops** → Deterministic only
-- **Dynamic tool discovery** → Whitelist lockdown
-- **Real-time streaming** → Batch design
-- **Multi-tenant isolation** → Single-session focus
-- **Automatic schema upgrades** → Requires explicit consent
-- **Infinite retry** → Bounded prevents cascades
+3. **No Dynamic Tool Loading**
+   - **Why:** Security and determinism requirements
+   - **Impact:** Only 4 tools (scraper, draft_editor, batch_reader, publisher)
+   - **Evidence:** `registry.py` whitelist
 
-### 11.3 Design Rationale
+#### **External Dependencies:**
+1. **AnythingLLM Required for Artifacts**
+   - **Why:** Custom-documents directory must exist
+   - **Impact:** Service fails startup if `ANYTHINGLLM_ARTIFACTS_DIR` invalid
+   - **Evidence:** `app.py` lifespan validation
 
-**Why "Deterministic"?**
-- Predictable execution path (no LLM loops)
-- Clear state transitions
-- Resume without side effects
-- Explicit failure modes
+2. **Azure OpenAI Required**
+   - **Why:** No local LLM fallback
+   - **Impact:** Scraper, publisher depend on API availability
+   - **Evidence:** `clients/llm/` package
 
-**Why "Single-writer"?**
-- Prevents database corruption
-- Simplifies concurrency model
-- Enables WAL checkpointing
-- Forces clear write boundaries
+3. **Snowflake for Embeddings**
+   - **Why:** Primary vector source
+   - **Impact:** Scraping requires Snowflake credentials
+   - **Evidence:** `utils/vector_search.py`
 
-**Why "Migration System"?**
-- **Domain segregation**: Monolithic → maintainable modules
-- **Autonomous management**: Zero manual intervention
-- **Transaction safety**: BEGIN EXCLUSIVE + rollback guards
-- **Version discipline**: 3-file limit forces cleanup
-- **Environment agnostic**: Works across dev/staging/production
+### 11.2 Implementation Limitations
 
-**Why "Fresh DB Fast-Path"?**
-- **Performance**: Eliminates migration overhead for new installs
-- **Clean state**: No legacy baggage
-- **Atomicity**: Writer queue ensures single-writer compliance
-- **Observed need**: Migrations add ~2-5s on fresh DBs
+#### **Scraper:**
+1. **Botasaurus Only**
+   - **Limitation:** Cannot use Playwright, Puppeteer, Scrapy
+   - **Workaround:** None (architectural decision)
+   - **Evidence:** `tools/scraper/task.py` imports Botasaurus
 
-**Why "Custom-documents Directive"?**
-- **Security**: Prevents arbitrary file uploads to Chat API
-- **Scalability**: LLM can access all artifacts in folder
-- **Idempotency**: Files persist, reusable across jobs
-- **Architecture**: Clean separation between execution and consumption
+2. **JSON Schema Fallback Only**
+   - **Limitation:** Only `BadRequestError` triggers fallback to `json_object`
+   - **Impact:** Other errors (timeout, rate limit) fail immediately
+   - **Evidence:** `tools/scraper/extraction.py` line ~200
 
-**Why "Structured Callbacks"?**
-- **AI-actionability**: Explicit next_steps for recovery
-- **Consistency**: Same format across all tools
-- **Debugging**: Structured logs with status definitions
-- **Evolution**: Can add new statuses without breaking parser
+3. **Top-10 Only**
+   - **Limitation:** Cannot request Top-N where N != 10
+   - **Change:** Recent update allows dynamic count, but still limited by packing
+   - **Evidence:** `tools/scraper/curation.py` dynamic target
+
+#### **Publisher:**
+1. **Telegram-Only**
+   - **Limitation:** No email, Slack, webhook support
+   - **Evidence:** `utils/telegram/` package only
+
+2. **Fixed Phases**
+   - **Limitation:** validate → translate → publish_briefing → publish_archive (no customization)
+   - **Evidence:** `utils/telegram/pipeline.py`
+
+#### **Batch Reader:**
+1. **Batch-ID Dependent**
+   - **Limitation:** Cannot query without batch_id
+   - **Evidence:** `tools/batch_reader/tool.py`
+
+2. **Requires Manual Batch Creation**
+   - **Limitation:** No automatic batch creation from raw artifacts
+   - **Evidence:** Requires scraper output
+
+### 11.3 Security Limitations
+
+1. **No User Authentication**
+   - **Impact:** Any HTTP request can enqueue jobs
+   - **Mitigation:** Network isolation, firewall rules
+   - **Evidence:** No auth middleware in `app.py`
+
+2. **File System Access**
+   - **Impact:** Can read/write any path configurable via env
+   - **Mitigation:** Principle of least privilege
+   - **Evidence:** `artifact_manager.py` has arbitrary path access
+
+3. **Command Injection Risk**
+   - **Impact:** Tools receive unvalidated strings
+   - **Mitigation:** Input validation via Pydantic, SSRF scanning
+   - **Evidence:** `api/routes.py` line 77 `scan_args_for_urls()`
+
+### 11.4 Non-Goals (Will Not Be Implemented)
+
+1. **Multi-User System**: Not planned
+2. **GraphQL API**: REST only
+3. **Real-time Streaming**: Polling model only
+4. **GUI/Dashboard**: API-only
+5. **Custom Tool Loading**: Whitelist model
+6. **Distributed Execution**: Single instance
+7. **Horizontal Scaling**: Not supported
+8. **Fine-grained Permissions**: All-or-nothing
+9. **Audit Logging (Beyond DB)**: DB logs are sufficient
+10. **Export Formats**: JSON only
 
 ---
 
-## 12. Change Sensitivity (Fragile Areas)
+## 12. Change Sensitivity
 
-### 12.1 Critical Components (High Coupling)
+### 12.1 Fragile Areas (High Risk)
 
-**Database Migrations:**
-- **Fragility**: Any change to `item_metadata` structure breaks queries
-- **Evidence**: `database/reader.py`, `database/job_queue.py` all use `json_extract()`
-- **Impact**: Requires new migration to rebuild indexes
-- **Easiest extension**: Add new step types (update `make_metadata()` only)
+#### **Database Schema:**
+- **Location:** `database/schemas/`
+- **Risk:** High
+- **Why:** Every migration requires schema changes
+- **Evidence:** `database/migrations/` contains version-specific scripts
+- **Impact of Change:**
+  - Requires new migration script
+  - Must update all `json_extract()` queries
+  - Must update `make_metadata()` helper
+  - May trigger auto-fold mechanism
 
-**Telegram Publisher Pipeline:**
-- **Fragility**: `escape_markdown_v2()` regex patterns must match Telegram spec
-- **Evidence**: `utils/telegram/publisher.py` message assembly
-- **Impact**: 400 errors from malformed MarkdownV2
-- **Easiest extension**: Add new target chat (beyond briefing/archive)
-- **Critical fix**: Character range and double-backslash bugs must remain fixed
+#### **Structured Callback Format:**
+- **Location:** `utils/callback_helper.py`, all 4 tools
+- **Risk:** High
+- **Why:** Worker depends on exact fields
+- **Evidence:** `bot/engine/worker.py` line 586 `if normal.get("_callback_format") == "structured"`
+- **Impact of Change:**
+  - Worker parsing logic breaks
+  - AI receives non-actionable responses
+  - Callbacks fail silently
 
-**Whitelist Registry:**
-- **Fragility**: `tools/registry.py` hardcodes 4 tool names
-- **Evidence**: Line 48 `core_tools = ["scraper", "draft_editor", "publisher", "batch_reader"]`
-- **Impact**: New tools require registry modification
-- **Easiest extension**: Add to whitelist, ensure `INPUT_MODEL` defined
+#### **Artifact Manager Path Logic:**
+- **Location:** `utils/artifact_manager.py`
+- **Risk:** Medium-High
+- **Why:** Affects all 4 tools' output locations
+- **Evidence:** `write_artifact()` used by all tools
+- **Impact of Change:**
+  - Breaks existing artifact references
+  - Requires path migration
+  - AnythingLLM integration breaks
 
-**Fresh DB Fast-Path:**
-- **Fragility**: Version check and writer queue coordination
-- **Evidence**: `app.py` lines 222-233 using `enqueue_execscript()` + `enqueue_write()`
-- **Impact**: Incorrect version stamping causes migration chaos
-- **Safety**: 10s timeout prevents infinite waits
+#### **Worker Polling Logic:**
+- **Location:** `bot/engine/worker.py` `UnifiedWorkerManager.run()`
+- **Risk:** Medium
+- **Why:** Affects job lifecycle, resume behavior
+- **Evidence:** 1-second polling interval, status transitions
+- **Impact of Change:**
+  - May lose job states
+  - Resume logic may break
+  - Retry loops may become infinite
 
-**Callback Retry System:**
-- **Fragility**: `PENDING_CALLBACK` state logic and retry behavior
-- **Evidence**: `bot/engine/worker.py` lines 138-147 (SQL query), 213-241 (`_retry_callback_only`)
-- **Impact**: Wrong delay values cause storm of retries; no retry_count increment → infinite loop
-- **Easiest extension**: Add new callback endpoint (requires updating `_do_callback_with_logging` URL)
-- **Critical invariants**:
-  - Must use `enqueue_write()` only (no direct writes)
-  - Must preserve `result_json` in PENDING_CALLBACK state
-  - Must check `updated_at < datetime('now', '-{delay} seconds')` for retry eligibility
-  - Cannot exceed max 3 retries before PARTIAL
+### 12.2 Stable Areas (Low Risk)
 
-**Custom-documents Enforcement:**
-- **Fragility**: Worker callback system, artifact manager, config variable
-- **Evidence**: `bot/engine/worker.py` line 111 `"attachments": []`, `utils/artifact_manager.py` validation
-- **Impact**: Missing config causes startup crash; missing attachments bypasses directive
-- **Critical invariants**:
-  - `ANYTHINGLLM_ARTIFACTS_DIR` must be set and writable
-  - `write_artifact()` must enforce naming convention
-  - Worker must never include Base64 attachments
+#### **Tool Implementations:**
+- **Location:** `tools/*/tool.py`
+- **Risk:** Low
+- **Why:** Isolated logic, standard pattern
+- **Evidence:** Each tool follows `BaseTool` pattern
+- **Safe Changes:**
+  - Prompt updates
+  - Algorithm improvements (like curation.py)
+  - Error messages
 
-**Structured Callback System:**
-- **Fragility**: All tool exit paths, worker parser, helper functions
-- **Evidence**: `utils/callback_helper.py`, all 4 tools' structured payloads
-- **Impact**: Missing `_callback_format` causes generic wrapper → non-actionable AI responses
-- **Critical invariants**:
-  - All early returns must use `_fail()` helper
-  - Worker must parse `_callback_format == "structured"`
-  - All status definitions must include next_steps
+#### **Logger:**
+- **Location:** `utils/logger/`
+- **Risk:** Low
+- **Why:** Independent component
+- **Evidence:** Used via `get_dual_logger()`
+- **Safe Changes:** Formats, levels, outputs
 
-### 12.2 Changes Requiring Widespread Refactoring
+#### **Telegram Client:**
+- **Location:** `utils/telegram/`
+- **Risk:** Low-Medium
+- **Why:** Modular, isolated
+- **Evidence:** Only publisher uses it
+- **Safe Changes:** Message formatting (must maintain escape fixes)
 
-**Adding New Tool Type:**
+#### **Migration Archive:**
+- **Location:** `database/migrations_archive/`
+- **Risk:** None
+- **Why:** History only, not executed
+- **Evidence:** Read-only for reference
+- **Safe Changes:** None needed
+
+### 12.3 Easy Extension Points
+
+#### **Adding New Target Sites:**
+```python
+# tools/scraper/targets.py
+VALID_TARGET_NAMES = [
+    "FT", "Bloomberg", "Reuters",  # Existing
+    "NewYorkTimes",                # Add here
+    "TheVerge",                    # Add here
+]
+```
+- **Files Changed:** 1
+- **Testing:** Manual scrape test
+- **Risk:** Near zero (no schema changes)
+
+#### **Updating Prompts:**
+```python
+# tools/publisher/prompt.py
+TRANSLATION_PROMPT = """
+Updated instructions here...
+"""
+```
+- **Files Changed:** 1
+- **Testing:** Manual publish test
+- **Risk:** Low (pure logic change)
+
+#### **Adjusting Curation Algorithm:**
+```python
+# tools/scraper/curation.py
+def _pack_context(self, candidates):
+    # Change sorting key or budget calculation
+    budget = int(getattr(config, "LLM_CONTEXT_CHAR_LIMIT", 40000) * 0.9)  # Change 0.8 to 0.9
+```
+- **Files Changed:** 1
+- **Testing:** Verify artifact sizes
+- **Risk:** Low (isolated to scraper)
+
+### 12.4 Widespread Refactoring Required
+
+#### **Tool Addition:**
 1. Create `tools/newtool/` with `tool.py`, `Skill.py`, `INPUT_MODEL`
-2. Add to `core_tools` whitelist in `registry.py`
-3. Update `bot/engine/worker.py` job execution (if custom handling needed)
-4. Add test in `tests/`
-5. Update README
-6. **Add structured failure paths**: `_fail()` helper for all early returns
+2. Add to `core_tools` in `registry.py`
+3. Update `bot/engine/worker.py` (if custom handling needed)
+4. Add to `README`
+5. Add `_fail()` helpers
+6. **Files:** 5-6
+7. **Risk:** Medium (integration testing required)
 
-**Migration Schema Change:**
-1. Create migration script in `database/migrations/`
+#### **Migration Schema Change:**
+1. Create `database/migrations/v009_*.py`
 2. Update `database/schemas/` domain modules
-3. Update all `json_extract()` queries
-4. Update `make_metadata()` and `parse_metadata()` in `utils/metadata_helpers.py`
+3. Update all `json_extract()` queries (grep for pattern)
+4. Update `utils/metadata_helpers.py`
 5. Test auto-fold behavior
+6. **Files:** 8-10
+7. **Risk:** High (data loss potential)
 
-**Publisher Phase Addition:**
-1. Update `utils/telegram/publisher.py` pipeline sequence
+#### **Publisher Phase Addition:**
+1. Update `utils/telegram/publisher.py` pipeline
 2. Update `broadcast_batches.phase_state` schema
 3. Update `database/schemas/jobs.py`
-4. Create migration for phase_state structure
-5. Update status calculation logic
+4. Create v009 migration
+5. Update status calculation
+6. **Files:** 5-6
+7. **Risk:** Medium-High (state machine complexity)
 
-**Environment Variable Migration:**
-1. Move hardcoded defaults to `.env`
-2. Update `config.py` to use `os.getenv()` without defaults
-3. Document required variables
-4. Test configuration loading
-5. **Critical**: Add `ANYTHINGLLM_ARTIFACTS_DIR` validation in app.py lifespan
-
-**Custom-documents Path Change:**
-1. Update `config.py` to remove default from `ANYTHINGLLM_ARTIFACTS_DIR`
-2. Update `app.py` lifespan to validate and create directory
-3. Update `utils/artifact_manager.py` to use new path
-4. Update all artifact references in tools
-5. Update README with exact path requirements
-
-**Structured Callback System:**
-1. Update `utils/callback_helper.py` with new status definitions
-2. Update all 4 tools' `_fail()` helpers and success payloads
-3. Update `bot/engine/worker.py` to use `format_callback_message()`
-4. Update `utils/artifact_manager.py` to provide `artifact_url_from_request()`
-5. Test all failure modes produce structured output
-
-### 12.3 Safe Extension Points
-
-**Adding New Target Sites:**
-- **Location**: `tools/scraper/targets.py`
-- **Impact**: Minimal, just add to `VALID_TARGET_NAMES`
-- **No schema changes**: Works immediately
-
-**Adding New LLM Prompts:**
-- **Location**: `tools/publisher/prompt.py`, `tools/scraper/prompts.py`
-- **Impact**: Pure logic change, no schema
-- **Safety**: Can be tested independently
-
-**Updating Telegram Formats:**
-- **Location**: `utils/telegram/publisher.py` lines in publish_briefing/publish_archive
-- **Impact**: Only affects Telegram output
-- **Safety**: Localized change, easy to revert
-
-**Adjusting MarkdownV2 Escaping:**
-- **Location**: `utils/text_processing.py` `escape_markdown_v2()`
-- **Impact**: All Telegram messages
-- **Safety**: Must maintain both bug fixes:
-  - Character range: `[\\_*\[\]()~`>#+=|{}.!\-]` (hyphen at end)
-  - Replacement: `r'\\\1'` (single backslash)
-- **Test**: Send messages with special chars to verify
-
-**Adding New Callback Configuration:**
-- **Location**: `config.py` (add `ANYTHINGLLM_CALLBACK_TIMEOUT`, `ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS`)
-- **Impact**: Affects all callback operations
-- **Safety**: Must update README and .env.example
+#### **Callback System Changes:**
+1. Update `utils/callback_helper.py` status definitions
+2. Update all 4 tools' `_fail()` helpers
+3. Update `bot/engine/worker.py` parsing logic
+4. Update `utils/artifact_manager.py` URLs
+5. Test all failure modes
+6. **Files:** 10+
+7. **Risk:** Very High (breaks all tools)

@@ -163,6 +163,17 @@ def process_article(
                 },
             )
 
+            # ── Paywall Detection ───────────────────────────────────────────
+            if not local_meta.get("validation_passed"):
+                from tools.scraper.paywall import PaywallDetector
+                pw_result = PaywallDetector().detect(raw_html)
+                if pw_result.is_paywalled:
+                    log.dual_log(tag="Scraper:Paywall", message=f"Paywall detected on {url}. Attempt {val_attempt}/3.", level="WARNING")
+                    if val_attempt < 3:
+                        continue
+                    else:
+                        return {"status": "FAILED", "reason": f"Paywall persists after 3 retries. Indicators: {pw_result.detected_indicators}"}
+
             # ── Validation ─────────────────────────────────────────────────
             if local_meta.get("validation_passed"):
                 # Phase 2: LLM validation call skipped; flag confirmed from prior run.
