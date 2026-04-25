@@ -89,9 +89,12 @@ def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: l
             artifacts_subdir = details.get("artifacts_directory")
         else:
             from utils.artifact_manager import get_artifacts_root
-            artifacts_subdir = str(get_artifacts_root())
+            root = get_artifacts_root()
+            artifacts_subdir = root.as_posix() if hasattr(root, "as_posix") else str(root).replace("\\", "/")
     except Exception:
-        pass
+        artifacts_subdir = getattr(config, "ANYTHINGLLM_ARTIFACTS_DIR", "artifacts")
+        if artifacts_subdir:
+            artifacts_subdir = str(artifacts_subdir).replace("\\", "/")
 
     from utils.callback_helper import format_callback_message, truncate_message
 
@@ -106,7 +109,7 @@ def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: l
         status_overrides=status_overrides
     )
 
-    callback_message = truncate_message(callback_message, max_chars=12000)
+    callback_message = truncate_message(callback_message)
 
     callback_payload = {
         "message": f"TOOL_RESULT_CORRELATION_ID:{job_id}\n\n{callback_message}",

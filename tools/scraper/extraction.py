@@ -163,6 +163,22 @@ def process_article(
                 },
             )
 
+            # ── Pre-Check: Video/Audio Detection ─────────────────────────────
+            if not local_meta.get("validation_passed"):
+                soup_pre = BeautifulSoup(raw_html or "", "html.parser")
+                video_audio_tags = soup_pre.find_all(["video", "audio"])
+                iframe_embeds = soup_pre.find_all("iframe", src=True)
+                video_platforms = ["youtube.com/embed", "youtu.be", "vimeo.com", "dailymotion.com"]
+                has_video_embed = any(
+                    any(platform in (tag.get("src") or "") for platform in video_platforms)
+                    for tag in iframe_embeds
+                )
+                if video_audio_tags or has_video_embed:
+                    paragraph_text = " ".join(p.get_text(strip=True) for p in soup_pre.find_all("p"))
+                    if len(paragraph_text) < 500:
+                        log.dual_log(tag="Scraper:Validation", message=f"Page rejected: video/audio primary content ({url}).", level="WARNING")
+                        return {"status": "FAILED", "reason": "Page primary content is video/audio with insufficient article text."}
+
             # ── Paywall Detection ───────────────────────────────────────────
             if not local_meta.get("validation_passed"):
                 from tools.scraper.paywall import PaywallDetector

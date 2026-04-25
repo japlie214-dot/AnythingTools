@@ -2,7 +2,9 @@
 
 import json
 import os
+import sqlite3
 import config
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -71,16 +73,39 @@ def format_artifacts_list(artifacts: List[Dict[str, Any]], artifacts_subdir: Opt
     lines = ["### Artifacts\n"]
     if artifacts_subdir:
         # Render absolute artifact directory path for AnythingLLM consumers
+        subdir_path = Path(str(artifacts_subdir))
         base_dir = getattr(config, "ANYTHINGLLM_ARTIFACTS_DIR", None)
-        if base_dir:
-            full_path = f"{str(base_dir).rstrip('/')}/{str(artifacts_subdir).strip('/')}"
+        if base_dir and not subdir_path.is_absolute():
+            full_path = Path(base_dir) / str(artifacts_subdir).strip("/")
+            full_path = full_path.as_posix()
         else:
-            full_path = f"{artifacts_subdir}"
+            full_path = subdir_path.as_posix()
         lines.append(f"> **Artifacts Directory:** `{full_path}`\n")
     lines.extend(["| # | Filename | Type | Description |", "|---|---|----------|------|-------------|"])
     for i, art in enumerate(artifacts, 1):
         lines.append(f"| {i} | `{art.get('filename', 'unknown')}` | {art.get('type', 'file')} | {art.get('description', '')} |")
     return "\n".join(lines) + "\n\n---\n"
+
+def _fetch_recent_errors(job_id: str, limit: int = 10) -> str:
+    if not job_id:
+        return ""
+    try:
+        from database.connection import DatabaseManager
+        conn = DatabaseManager.get_read_connection()
+        rows = conn.execute(
+            "SELECT timestamp, tag, level, message FROM job_logs "
+            "WHERE job_id = ? AND level IN ('ERROR', 'WARNING', 'CRITICAL') "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (job_id, limit)
+        ).fetchall()
+        if not rows:
+            return ""
+        lines = ["### Recent Errors & Warnings", ""]
+        for r in rows:
+            lines.append(f"- `{r['timestamp']}` | `{r['level']}` | `{r['tag']}` | {r['message']}")
+        return "\n".join(lines) + "\n\n"
+    except Exception:
+        return ""
 
 def inject_status_definitions(status: str, overrides: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
     local_defs = dict(STATUS_DEFINITIONS)
@@ -115,6 +140,9 @@ def format_callback_message(
 ) -> str:
     sections = [generate_header(job_id, status, tool_name, timestamp)]
 
+    if status.upper() == "FAILED":
+        summary = summary + "\n\n" + _fetch_recent_errors(job_id)
+
     if summary:
         sections.append(f"### Summary\n\n{summary}\n\n---\n")
 
@@ -123,6 +151,13 @@ def format_callback_message(
     return "".join(sections)
 
 def truncate_message(message: str, max_chars: int = 12000) -> str:
-    if len(message) <= max_chars:
+    base_limit = getattr(config, "LLM_CONTEXT_CHAR_LIMIT", 40000)
+    multiplier = getattr(config, "CALLBACK_TRUNCATION_MULTIPLIER", 0.5)
+    dynamic_limit = int(base_limit * multiplier)
+    
+    # Ignore the hardcoded max_chars legacy parameter to truly enforce the dynamic context budget
+    effective_limit = dynamic_limit
+
+    if len(message) <= effective_limit:
         return message
-    return message[:max_chars - 100] + f"\n\n[Message truncated to {max_chars} chars. See full result in job logs.]"
+    return message[:effective_limit - 100] + f"\n\n[Message truncated to {effective_limit} chars. See full result in job logs.]"

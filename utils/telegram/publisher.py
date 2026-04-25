@@ -35,6 +35,8 @@ class ChannelPublisher:
             summary = trans_data.get("translated_summary", article.get("summary", ""))
             conclusion = trans_data.get("translated_conclusion", article.get("conclusion", ""))
             link = article.get("normalized_url", article.get("url", ""))
+            if not link:
+                link = "URL Unavailable"
             
             meta = make_metadata(STEP_PUBLISH_BRIEFING, ulid, is_top10=True)
             if self.job_id: add_job_item(self.job_id, meta, "")
@@ -78,6 +80,8 @@ class ChannelPublisher:
             summary = trans_data.get("translated_summary", article.get("summary", ""))
             conclusion = trans_data.get("translated_conclusion", article.get("conclusion", ""))
             link = article.get("normalized_url", article.get("url", ""))
+            if not link:
+                link = "URL Unavailable"
 
             meta = make_metadata(STEP_PUBLISH_ARCHIVE, ulid, is_top10=article.get("_is_top10", False))
             if self.job_id: add_job_item(self.job_id, meta, "")

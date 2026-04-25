@@ -341,12 +341,6 @@ class ScraperTool(BaseTool):
                 job_final_status = "PARTIAL"
             elif len(top_10_list) == 0 and total > 0:
                 job_final_status = "PARTIAL"
-
-            log.dual_log(
-                tag="Scraper:Job:Status",
-                message=f"Job finalization status: {job_final_status}",
-                payload={"final_status": job_final_status}
-            )
             
             payload = {
                 "_callback_format": "structured",
@@ -383,6 +377,12 @@ class ScraperTool(BaseTool):
                 }
             }
 
+            log.dual_log(
+                tag="Scraper:Job:Status",
+                message=f"Job finalization status: {job_final_status}",
+                payload={"final_status": job_final_status}
+            )
+            
             callback_json = json.dumps(payload, ensure_ascii=False)
             try:
                 enqueue_write(

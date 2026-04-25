@@ -2,11 +2,13 @@
 """Prompts for the Scraper Tool's validation and summarization agents."""
 
 VALIDATION_PROMPT = """You are a Web Content Validator.
-Determine whether the page displays genuine, readable article content or is blocked by CAPTCHA, paywalls, cookie-consent walls, or is empty.
+Determine whether the page displays genuine, readable article content or is blocked by CAPTCHA, paywalls, cookie-consent walls, is empty, or consists primarily of video/audio content with no substantial text.
 
 INSTRUCTIONS:
 1. Evaluate the provided HTML and image for readability.
-2. Respond with a JSON object.
+2. If the page is a video player, podcast page, or audio-only stream with no article text, mark it invalid.
+3. If the page has no article body, no paragraphs, or is purely a navigation/gallery page, mark it invalid.
+4. Respond with a JSON object.
 
 EXPECTED FORMAT:
 {

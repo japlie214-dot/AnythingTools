@@ -56,8 +56,13 @@ class PublisherPipeline:
                 pass
 
     async def run_pipeline(self) -> Dict[str, Any]:
-        validator = ArticleValidator(self.job_id)
-        valid_articles, skipped = validator.validate_batch(self.all_articles)
+        try:
+            validator = ArticleValidator(self.job_id)
+            valid_articles, skipped = validator.validate_batch(self.all_articles)
+        except Exception as e:
+            import traceback
+            log.dual_log(tag="Publisher:Pipeline:Crash", message=f"Validation phase crashed: {e}\n{traceback.format_exc()}", level="ERROR", exc_info=e)
+            raise RuntimeError(f"Publisher validation crashed: {e}") from e
         
         translator = BatchTranslator(self.job_id)
         translated_map = await translator.translate_all(valid_articles)

@@ -124,8 +124,27 @@ class Top10Curator:
         if not candidates:
             return [], 0
 
+        # Phase 0: Strict validation - reject candidates without ulid upfront
+        valid_candidates = [c for c in candidates if c.get("ulid")]
+        if len(valid_candidates) < len(candidates):
+            missing_count = len(candidates) - len(valid_candidates)
+            log.dual_log(
+                tag="Scraper:Curation:Validation",
+                message=f"Filtered out {missing_count} candidates without ulid",
+                level="WARNING",
+                payload={"original_count": len(candidates), "valid_count": len(valid_candidates)}
+            )
+        if not valid_candidates:
+            log.dual_log(
+                tag="Scraper:Curation:Validation",
+                message="No valid candidates with ulid found",
+                level="ERROR",
+                payload={"candidates_sample": [str(c)[:100] for c in candidates[:3]]}
+            )
+            return [], 0
+
         # Phase 1: Smart packing
-        packed_candidates, target_count = self._pack_context(candidates)
+        packed_candidates, target_count = self._pack_context(valid_candidates)
         if target_count == 0:
             return [], 0
 

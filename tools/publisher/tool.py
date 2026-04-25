@@ -15,8 +15,8 @@ from utils.telegram.pipeline import PublisherPipeline
 
 class PublisherInput(BaseModel):
     batch_id: str = Field(..., description="The unique ULID of the batch to publish.")
-    resume: bool = Field(False, description="Resume from last checkpoint.")
     reset: bool = Field(False, description="Force full reset.")
+    finalize: bool = Field(False, description="If true and batch is PARTIAL, mark it COMPLETED without re-publishing.")
 
 
 INPUT_MODEL = PublisherInput
@@ -49,8 +49,8 @@ class PublisherTool(BaseTool):
         if not batch_id:
             return _fail("batch_id is required.", "Provide a valid 'batch_id' parameter.")
 
-        resume = args.get("resume", False)
         reset = args.get("reset", False)
+        finalize = args.get("finalize", False)
 
         from database.writer import enqueue_write
 
@@ -62,7 +62,8 @@ class PublisherTool(BaseTool):
         if not row or not row["curated_json_path"] or not row["raw_json_path"]:
             return _fail("Batch not found or missing data.", "Verify the batch_id is valid. If lost, use the `scraper` tool to generate a new batch.")
 
-        if row["status"] == "COMPLETED" and not reset:
+        batch_status = row["status"]
+        if batch_status == "COMPLETED" and not reset and not finalize:
             payload = {
                 "_callback_format": "structured",
                 "tool_name": self.name,
@@ -77,6 +78,26 @@ class PublisherTool(BaseTool):
                 }
             }
             return json.dumps(payload, ensure_ascii=False)
+
+        if finalize and batch_status == "PARTIAL":
+            enqueue_write(
+                "UPDATE broadcast_batches SET status = 'COMPLETED', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
+                (batch_id,)
+            )
+            payload = {
+                "_callback_format": "structured",
+                "tool_name": self.name,
+                "status": "COMPLETED",
+                "summary": f"Batch {batch_id} finalized to COMPLETED.",
+                "status_overrides": {
+                    "COMPLETED": {
+                        "description": "Batch was manually finalized to COMPLETED.",
+                        "next_steps": "No further actions required for this batch.",
+                        "rerunnable": False
+                    }
+                }
+            }
+            return json.dumps(payload, ensure_ascii=False)
             
         try:
             with open(row["curated_json_path"], "r", encoding="utf-8") as f:
@@ -86,11 +107,32 @@ class PublisherTool(BaseTool):
         except Exception as e:
             return _fail(f"File read error: {e}", "Data may have been purged. Use the `scraper` tool to generate a new batch.")
 
-        top_10_ulids = {item.get("ulid") for item in top_10}
-        inventory = []
-        for v in (raw_data.values() if isinstance(raw_data, dict) else raw_data):
-            if isinstance(v, dict) and v.get("ulid") not in top_10_ulids:
-                inventory.append(v)
+        def _is_article(entry: Any) -> bool:
+            return (
+                isinstance(entry, dict)
+                and entry.get("status") == "SUCCESS"
+                and bool(entry.get("ulid"))
+                and bool(entry.get("title"))
+                and bool(entry.get("conclusion"))
+                and (bool(entry.get("url")) or bool(entry.get("normalized_url")))
+            )
+
+        top_10_ulids = {item.get("ulid") for item in top_10 if item.get("ulid")}
+        inventory = [
+            v for v in (raw_data.values() if isinstance(raw_data, dict) else raw_data)
+            if _is_article(v) and v.get("ulid") not in top_10_ulids
+        ]
+
+        raw_count = len(raw_data) if isinstance(raw_data, dict) else len(raw_data)
+        valid_raw_count = sum(1 for v in (raw_data.values() if isinstance(raw_data, dict) else raw_data) if _is_article(v))
+        
+        from utils.logger import get_dual_logger
+        log = get_dual_logger(__name__)
+        log.dual_log(
+            tag="Publisher:Inventory",
+            message=f"Sanitized raw data: {valid_raw_count}/{raw_count} valid articles, {len(inventory)} inventory items.",
+            payload={"batch_id": batch_id, "valid_articles": valid_raw_count, "inventory": len(inventory)}
+        )
 
         # Atomic check-and-set to establish strict publishing lock
         write_conn = DatabaseManager.create_write_connection()
@@ -118,7 +160,7 @@ class PublisherTool(BaseTool):
         finally:
             write_conn.close()
 
-        pipeline = PublisherPipeline(batch_id, top_10, inventory, job_id, resume=resume, reset=reset)
+        pipeline = PublisherPipeline(batch_id, top_10, inventory, job_id, resume=(batch_status in ("PENDING", "PARTIAL")), reset=reset)
         
         try:
             result = await pipeline.run_pipeline()
@@ -132,7 +174,7 @@ class PublisherTool(BaseTool):
                 "status_overrides": {
                     "PARTIAL": {
                         "description": "Batch publishing was interrupted (likely by Telegram Rate Limits or translation failures).",
-                        "next_steps": f"Call the `publisher` tool again using {{\"batch_id\": \"{batch_id}\", \"resume\": true}}. Do NOT set reset to true.",
+                        "next_steps": f"Call the `publisher` tool again using {{\"batch_id\": \"{batch_id}\"}}. The system will automatically resume from the last checkpoint.",
                         "rerunnable": True
                     },
                     "COMPLETED": {
@@ -142,20 +184,23 @@ class PublisherTool(BaseTool):
                     },
                     "FAILED": {
                         "description": "Fatal error during publication.",
-                        "next_steps": "Review logs. If the issue is transient, you can retry using the resume flag.",
+                        "next_steps": "Review logs. The batch has been reverted to PARTIAL status. Call the publisher again to automatically resume.",
                         "rerunnable": True
                     }
                 }
             }
             return json.dumps(payload, ensure_ascii=False)
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            summary = f"Publisher pipeline crashed: {str(e)[:200]}\n\nTraceback:\n{tb}"
             # Drop lock and revert to PARTIAL if an extreme rate limit or crash aborts the job
             enqueue_write("UPDATE broadcast_batches SET status = 'PARTIAL', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?", (batch_id,))
             payload = {
                 "_callback_format": "structured",
                 "tool_name": self.name,
                 "status": "FAILED",
-                "summary": f"Publisher pipeline crashed: {str(e)[:200]}",
+                "summary": summary,
                 "status_overrides": {
                     "FAILED": {
                         "description": "Pipeline crashed. Review logs.",

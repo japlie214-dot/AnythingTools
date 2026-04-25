@@ -73,3 +73,7 @@ TELEGRAM_MAX_RETRY_AFTER: int = int(os.getenv("TELEGRAM_MAX_RETRY_AFTER", "120")
 # --- Batch Reader / Hybrid Search ---
 BATCH_READER_VECTOR_WEIGHT: float = float(os.getenv("BATCH_READER_VECTOR_WEIGHT", "0.6"))
 BATCH_READER_KEYWORD_WEIGHT: float = float(os.getenv("BATCH_READER_KEYWORD_WEIGHT", "0.4"))
+
+# --- Context Limits & Truncation ---
+LLM_CONTEXT_CHAR_LIMIT: int = int(os.getenv("LLM_CONTEXT_CHAR_LIMIT", "800000"))
+CALLBACK_TRUNCATION_MULTIPLIER: float = float(os.getenv("CALLBACK_TRUNCATION_MULTIPLIER", "0.5"))
