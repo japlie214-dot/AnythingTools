@@ -5,7 +5,7 @@ from typing import Dict, Optional
 from database.connection import SQLITE_VEC_AVAILABLE
 from database.schemas import jobs, finance, vector, pdf, token
 
-BASE_SCHEMA_VERSION = 6
+BASE_SCHEMA_VERSION = 7
 MAX_MIGRATION_SCRIPTS = 3
 
 # ⚠️ DEVELOPER NOTE: BASE_SCHEMA_VERSION is now 6.

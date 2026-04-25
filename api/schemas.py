@@ -26,3 +26,29 @@ class JobStatusResponse(BaseModel):
     status: str
     job_logs: List[JobLogEntry]
     final_payload: Optional[Dict[str, Any]] = None
+
+
+class WatermarkSchema(BaseModel):
+    last_article_id: str = ""
+    last_export_ts: Optional[str] = None
+    total_articles_exported: int = 0
+    total_vectors_exported: int = 0
+
+
+class BackupStatusResponse(BaseModel):
+    enabled: bool
+    backup_dir: str
+    watermark: WatermarkSchema
+    article_files: int
+    vector_files: int
+    total_size_bytes: int
+
+
+class ExportQueuedResponse(BaseModel):
+    status: str = "EXPORT_QUEUED"
+    message: str
+
+
+class RestoreQueuedResponse(BaseModel):
+    status: str = "RESTORE_QUEUED"
+    message: str

@@ -184,6 +184,9 @@ class ScraperTool(BaseTool):
                     "job_id": job_id,
                 },
             )
+            
+            # Release browser lock early so other tools can browse during our heavy I/O/LLM pipeline
+            browser_lock.safe_release()
 
             # Persist raw results to artifacts directory
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -220,31 +223,86 @@ class ScraperTool(BaseTool):
                         "conclusion": _res.get("conclusion", ""),
                     })
 
+            from database.job_queue import add_job_item, update_item_status
+            from database.connection import DatabaseManager
+            from utils.metadata_helpers import make_metadata
+            
+            def _check_step(step_name: str) -> bool:
+                if not job_id: return False
+                row = DatabaseManager.get_read_connection().execute(
+                    "SELECT status FROM job_items WHERE job_id=? AND json_extract(item_metadata, '$.step')=?",
+                    (job_id, step_name)
+                ).fetchone()
+                return row and row["status"] == "COMPLETED"
+                
+            def _get_step_output(step_name: str) -> dict:
+                if not job_id: return {}
+                row = DatabaseManager.get_read_connection().execute(
+                    "SELECT output_data FROM job_items WHERE job_id=? AND json_extract(item_metadata, '$.step')=?",
+                    (job_id, step_name)
+                ).fetchone()
+                return json.loads(row["output_data"]) if row and row["output_data"] else {}
+
             # Curate Top N
-            await telemetry(self.status("Curating top articles...", "RUNNING"))
             top_10_list = []
             target_curated_count = 10
             
-            if slim_list:
-                from tools.scraper.curation import Top10Curator
-                curator = Top10Curator()
-                top_10_list, target_curated_count = curator.curate(slim_list, sync_llm_chat, batch_id=batch_id)
+            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before curation.", "Job canceled.")
+            
+            curate_meta = make_metadata("curate", batch_id)
+            if not _check_step("curate"):
+                await telemetry(self.status("Curating top articles...", "RUNNING"))
+                if job_id: add_job_item(job_id, curate_meta, "{}")
+                if slim_list:
+                    from tools.scraper.curation import Top10Curator
+                    curator = Top10Curator()
+                    top_10_list, target_curated_count = curator.curate(slim_list, sync_llm_chat, batch_id=batch_id)
+                if job_id: update_item_status(job_id, curate_meta, "COMPLETED", json.dumps({"top_10": top_10_list, "target_count": target_curated_count}))
+            else:
+                out = _get_step_output("curate")
+                top_10_list = out.get("top_10", [])
+                target_curated_count = out.get("target_count", 10)
 
-            # Save Top 10 directly to AnythingLLM custom-documents
-            try:
-                top_10_path = write_artifact(
-                    tool_name="scraper",
-                    job_id=job_id or batch_id,
-                    artifact_type="top10",
-                    ext="json",
-                    content=json.dumps(top_10_list, indent=2, ensure_ascii=False)
-                )
+            # Save Top 10 Artifact
+            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before artifact generation.", "Job canceled.")
+            
+            art_meta = make_metadata("artifacts", batch_id)
+            if not _check_step("artifacts"):
+                if job_id: add_job_item(job_id, art_meta, "{}")
+                try:
+                    top_10_path = write_artifact(
+                        tool_name="scraper", job_id=job_id or batch_id, artifact_type="top10", ext="json",
+                        content=json.dumps(top_10_list, indent=2, ensure_ascii=False)
+                    )
+                    self._last_artifacts = [str(top_10_path)]
+                    _record_artifact(top_10_path, "json", f"Curated Top {target_curated_count} articles")
+                    if job_id: update_item_status(job_id, art_meta, "COMPLETED", json.dumps({"path": str(top_10_path)}))
+                except Exception as e:
+                    log.dual_log(tag="Scraper:Artifact", message=f"Failed: {e}", level="WARNING")
+                    top_10_path = raw_filepath
+                    if job_id: update_item_status(job_id, art_meta, "FAILED", "{}")
+            else:
+                out = _get_step_output("artifacts")
+                top_10_path = Path(out.get("path", raw_filepath))
                 self._last_artifacts = [str(top_10_path)]
-                _record_artifact(top_10_path, "json", f"Curated Top {target_curated_count} articles for {target_site}")
-            except Exception as e:
-                log.dual_log(tag="Scraper:Artifact", message=f"Failed to write artifact: {e}", level="WARNING")
-                self._last_artifacts = []
-                top_10_path = raw_filepath
+                _record_artifact(top_10_path, "json", f"Curated Top {target_curated_count} articles (Resumed)")
+
+            # Backup Sync Step
+            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before backup.", "Job canceled.")
+            
+            bak_meta = make_metadata("backup", batch_id)
+            if not _check_step("backup"):
+                await telemetry(self.status("Syncing backup to Parquet...", "RUNNING"))
+                if job_id: add_job_item(job_id, bak_meta, "{}")
+                from tools.backup.storage import export_delta
+                bak_res = export_delta()
+                if not bak_res.success and bak_res.error != "Disabled":
+                    if job_id: update_item_status(job_id, bak_meta, "FAILED", json.dumps({"error": bak_res.error}))
+                    return _fail_internal(f"Backup failed: {bak_res.error}", "Resolve disk/permissions and retry job.")
+                if job_id: update_item_status(job_id, bak_meta, "COMPLETED", json.dumps(bak_res.dict()))
+            else:
+                # Backup already completed, continue
+                pass
 
             # 📝 Generate Directory Index Manifest
             manifest_timestamp = datetime.now(timezone.utc).isoformat()
@@ -287,6 +345,11 @@ class ScraperTool(BaseTool):
                 )
             except Exception:
                 pass
+
+            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before callback.", "Job canceled.")
+            
+            cb_meta = make_metadata("callback", batch_id)
+            if job_id and not _check_step("callback"): add_job_item(job_id, cb_meta, "{}")
 
             # Construct callback markdown BEFORE finalizing status
             job_ref = job_id or batch_id
@@ -394,6 +457,7 @@ class ScraperTool(BaseTool):
             except Exception:
                 pass
 
+            if job_id: update_item_status(job_id, cb_meta, "COMPLETED", callback_json)
             return callback_json
 
         except Exception as exc:

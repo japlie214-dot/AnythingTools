@@ -1,5 +1,5 @@
 # api/routes.py
-from fastapi import APIRouter, HTTPException, status, Request, Depends
+from fastapi import APIRouter, HTTPException, status, Request, Depends, BackgroundTasks
 from typing import Dict, Any
 import threading
 import asyncio
@@ -8,7 +8,7 @@ import json
 from datetime import datetime, timezone
 
 import config
-from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry
+from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry, BackupStatusResponse, ExportQueuedResponse, RestoreQueuedResponse
 from tools.registry import REGISTRY
 from utils.logger.core import get_dual_logger
 from utils.id_generator import ULID
@@ -18,6 +18,12 @@ from utils.artifact_manager import artifact_url_from_request
 from bot.engine.worker import get_manager
 from utils.security import scan_args_for_urls
 from pydantic import ValidationError
+
+# Backup imports
+from tools.backup.storage import export_delta, list_backup_files, read_watermark
+from tools.backup.restore import restore_from_backups
+from tools.backup.config import BackupConfig
+from utils.browser_lock import browser_lock
 
 log = get_dual_logger(__name__)
 router = APIRouter()
@@ -129,6 +135,59 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
         log.dual_log(tag="API:Worker:Start", message=f"Failed to start worker manager: {e}", level="WARNING", exc_info=e)
 
     return {"job_id": job_id, "status": "QUEUED"}
+
+
+# --- Backup Administration Routes ---
+
+@router.post("/backup/export", response_model=ExportQueuedResponse)
+async def trigger_export(background_tasks: BackgroundTasks):
+    config = BackupConfig.from_global_config()
+    if not config.enabled:
+        raise HTTPException(status_code=503, detail="Backup disabled")
+    background_tasks.add_task(export_delta, config)
+    return {"status": "EXPORT_QUEUED", "message": "Delta export started in background"}
+
+
+@router.get("/backup/status", response_model=BackupStatusResponse)
+async def backup_status():
+    config = BackupConfig.from_global_config()
+    wm = read_watermark(config)
+    art_f, vec_f, sz = list_backup_files(config)
+    return {
+        "enabled": config.enabled,
+        "backup_dir": str(config.backup_dir),
+        "watermark": {
+            "last_article_id": wm.last_article_id,
+            "last_export_ts": wm.last_export_ts.isoformat() if wm.last_export_ts else None,
+            "total_articles_exported": wm.total_articles_exported,
+            "total_vectors_exported": wm.total_vectors_exported
+        },
+        "article_files": art_f,
+        "vector_files": vec_f,
+        "total_size_bytes": sz
+    }
+
+
+def _locked_restore(config):
+    if browser_lock.locked():
+        log.dual_log(tag="API:Backup", message="Restore failed: browser_lock held by another job.", level="WARNING")
+        return
+    browser_lock.acquire()
+    try:
+        restore_from_backups(config.backup_dir)
+    finally:
+        browser_lock.safe_release()
+
+
+@router.post("/backup/restore", response_model=RestoreQueuedResponse)
+async def trigger_restore(background_tasks: BackgroundTasks):
+    config = BackupConfig.from_global_config()
+    if not config.enabled:
+        raise HTTPException(status_code=503, detail="Backup disabled")
+    if browser_lock.locked():
+        raise HTTPException(status_code=409, detail="System busy: active scraping job.")
+    background_tasks.add_task(_locked_restore, config)
+    return {"status": "RESTORE_QUEUED", "message": "Restore started in background under browser_lock"}
 
 
 @router.get("/manifest")

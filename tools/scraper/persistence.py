@@ -56,10 +56,17 @@ def _persist_scraped_article(parsed_result: dict) -> None:
     try:
         enqueue_write(
             """
-            INSERT OR REPLACE INTO scraped_articles (
+            INSERT INTO scraped_articles (
                 id, normalized_url, url, title, conclusion, summary,
-                metadata_json, embedding_status, vec_rowid, scraped_at
-            ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, datetime('now'))
+                metadata_json, embedding_status, vec_rowid, scraped_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(normalized_url) DO UPDATE SET
+                url = excluded.url,
+                title = excluded.title,
+                conclusion = excluded.conclusion,
+                summary = excluded.summary,
+                embedding_status = excluded.embedding_status,
+                updated_at = CURRENT_TIMESTAMP
             """,
             (
                 parsed_result["ulid"],
