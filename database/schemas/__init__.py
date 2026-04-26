@@ -5,13 +5,15 @@ from typing import Dict, Optional
 from database.connection import SQLITE_VEC_AVAILABLE
 from database.schemas import jobs, finance, vector, pdf, token
 
-MASTER_TABLES: set[str] = {
+# RULE: MASTER_TABLES must be an ordered list (parents before children) for FK-safe restores.
+# RULE: Derived/External FTS tables (e.g., scraped_articles_fts) must NEVER be included here.
+# They cannot be restored directly and must be rebuilt post-restoration.
+MASTER_TABLES: list[str] = [
     "scraped_articles",
     "scraped_articles_vec",
-    "scraped_articles_fts",
     "long_term_memories",
     "long_term_memories_vec",
-}
+]
 
 ALL_TABLES: Dict[str, str] = {
     **jobs.TABLES, **finance.TABLES, **vector.TABLES, **pdf.TABLES, **token.TABLES

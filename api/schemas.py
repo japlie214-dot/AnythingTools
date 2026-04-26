@@ -34,6 +34,7 @@ class WatermarkSchema(BaseModel):
     last_export_ts: Optional[str] = None
     total_articles_exported: int = 0
     total_vectors_exported: int = 0
+    table_watermarks: Dict[str, str] = Field(default_factory=dict)
 
 
 class BackupMode(str, Enum):

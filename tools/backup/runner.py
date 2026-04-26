@@ -48,11 +48,12 @@ class BackupRunner:
 
         start = time.monotonic()
         try:
-            conn = DatabaseManager.create_write_connection()
+            # Exports only require read access. Do not close the thread-local read connection.
+            conn = DatabaseManager.get_read_connection()
             try:
                 result = export_all_tables(conn, config, mode=mode)
             finally:
-                conn.close()
+                pass
 
             if trigger_type == "manual" and backup_job_id:
                 status = "COMPLETED" if result.success else "FAILED"
@@ -74,21 +75,22 @@ class BackupRunner:
             enqueue_write("UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE job_id = ?", (_utcnow(), manual_job_id))
 
         start = time.monotonic()
-        
+
         # Block in background queue until scraper finishes
         log.dual_log(tag="Backup:Restore", level="INFO", message="Waiting for browser_lock...")
         browser_lock.acquire()
         try:
-            conn = DatabaseManager.create_write_connection()
+            # Restore only requires read access to schema info; writes are routed via enqueue_transaction.
+            conn = DatabaseManager.get_read_connection()
             try:
                 result = restore_master_tables_direct(conn)
             finally:
-                conn.close()
-            
+                pass
+
             if manual_job_id:
                 status = "COMPLETED" if result.success else "FAILED"
                 enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", (status, _utcnow(), manual_job_id))
-                
+
             return result
         except Exception as e:
             log.dual_log(tag="Backup:Restore:Error", message=f"Restore failed: {e}", level="ERROR", exc_info=e)
@@ -106,7 +108,7 @@ class BackupRunner:
         return {
             "enabled": config.enabled,
             "backup_dir": str(config.backup_dir),
-            "watermark": wm.dict(),
+            "watermark": wm.model_dump_compat(),
             "file_counts": counts,
             "total_size_bytes": total_size,
         }

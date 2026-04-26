@@ -9,6 +9,12 @@ class Watermark(BaseModel):
     total_vectors_exported: int = Field(default=0, description="Cumulative count of exported vectors")
     table_watermarks: Dict[str, str] = Field(default_factory=dict, description="Per-table last-export timestamps")
 
+    def model_dump_compat(self) -> dict:
+        """Return dict representation, compatible with both Pydantic v1 and v2."""
+        if hasattr(self, "model_dump"):
+            return self.model_dump()
+        return self.dict()
+
 class BackupStatusResponse(BaseModel):
     enabled: bool
     backup_dir: str

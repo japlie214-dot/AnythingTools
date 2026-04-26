@@ -22,18 +22,21 @@ def export_table_chunks(conn: sqlite3.Connection, table_name: str, config: Backu
     if table_name in ALL_VEC_TABLES:
         query = f"SELECT rowid, embedding FROM {table_name}"
     elif table_name.endswith("_fts"):
-        query = f"SELECT rowid, * FROM {table_name}"
+        # FTS tables are derived and should not be directly backed up; prevent accidental inclusion.
+        raise ValueError(f"FTS tables must not be exported directly: {table_name}")
     else:
         query = f"SELECT * FROM {table_name}"
     
+    params = ()
     # Delta mode strictly handles append/update based on updated_at.
     if mode == "delta" and last_ts:
-        # Check if table has updated_at column
-        cursor = conn.execute(f"PRAGMA table_info({table_name})")
+        # Check if table has updated_at column safely
+        cursor = conn.execute("PRAGMA table_info(?)", (table_name,))
         cols = [r[1] for r in cursor.fetchall()]
         if "updated_at" in cols:
-            query += f" WHERE updated_at > '{last_ts}'"
+            query += " WHERE updated_at > ?"
+            params = (last_ts,)
     
-    chunk_iter = pd.read_sql_query(query, conn, chunksize=500)
+    chunk_iter = pd.read_sql_query(query, conn, chunksize=config.batch_size, params=params)
     for chunk in chunk_iter:
         yield chunk, len(chunk)

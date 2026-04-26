@@ -34,6 +34,9 @@ class BackupConfig:
         return cls(
             enabled=getattr(global_config, "BACKUP_ENABLED", True),
             backup_dir=backup_dir,
-            batch_size=getattr(global_config, "BACKUP_BATCH_SIZE", 500),
+            # Clamp batch size to prevent OOM (max 10000).
+            # RULE: Migration scripts are forbidden outside the backup/hydrate mechanism.
+            # Orphaned state files (like watermarks) must be gracefully overwritten.
+            batch_size=min(getattr(global_config, "BACKUP_BATCH_SIZE", 500), 10000),
             compression=getattr(global_config, "BACKUP_COMPRESSION", "zstd"),
         )

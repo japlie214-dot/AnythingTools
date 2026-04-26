@@ -65,7 +65,7 @@ def _build_insert_sql(table_name: str, desired_cols: List[Dict[str, Any]], file_
 def restore_master_tables_direct(conn: sqlite3.Connection, table_names: Optional[List[str]] = None) -> RestoreResult:
     """
     Intelligent restoration for master tables.
-    Uses PyArrow streaming to avoid OOM, and bulk SQLite inserts with transactions.
+    Uses PyArrow streaming to avoid OOM, and dispatches writes through the single-writer queue.
     """
     start = time.monotonic()
     config = BackupConfig.from_global_config()
@@ -73,12 +73,14 @@ def restore_master_tables_direct(conn: sqlite3.Connection, table_names: Optional
         return RestoreResult(success=False, error="Backup disabled")
 
     from database.schemas import MASTER_TABLES
-    if table_names is None: table_names = list(MASTER_TABLES)
-    
+    if table_names is None:
+        table_names = list(MASTER_TABLES)
+
     restored_counts: Dict[str, int] = {}
 
     for table_name in table_names:
-        if table_name not in MASTER_TABLES: continue
+        if table_name not in MASTER_TABLES:
+            continue
 
         latest_file = _get_latest_parquet_file(config.table_dir(table_name), table_name)
         if not latest_file:
@@ -98,28 +100,58 @@ def restore_master_tables_direct(conn: sqlite3.Connection, table_names: Optional
             continue
 
         build_result = _build_insert_sql(table_name, desired_cols, file_cols)
-        if build_result is None: continue
+        if build_result is None:
+            continue
         sql, matched_cols = build_result
 
         count = 0
+        # Route all writes through the single-writer queue in transaction-sized batches
+        from database.writer import enqueue_transaction, wait_for_writes
+        import asyncio
+
         try:
-            with conn:
-                for batch in parquet_file.iter_batches(batch_size=1000):
-                    pylist = batch.to_pylist()
-                    batch_params = []
-                    for row in pylist:
-                        params = []
-                        for col_name in matched_cols:
-                            params.append(row.get(col_name))
-                        batch_params.append(tuple(params))
-                    
-                    conn.executemany(sql, batch_params)
-                    count += len(batch_params)
+            for batch in parquet_file.iter_batches(batch_size=500):
+                pylist = batch.to_pylist()
+                statements: list[tuple[str, tuple]] = []
+                for row in pylist:
+                    params = []
+                    for col_name in matched_cols:
+                        params.append(row.get(col_name))
+                    statements.append((sql, tuple(params)))
+
+                if statements:
+                    enqueue_transaction(statements)
+                    count += len(statements)
+
+            # Synchronously wait for the background writer to commit transactions for this table
+            try:
+                loop = asyncio.get_running_loop()
+                asyncio.run_coroutine_threadsafe(wait_for_writes(timeout=120.0), loop).result()
+            except RuntimeError:
+                # No running loop in this thread; run synchronously
+                asyncio.run(wait_for_writes(timeout=120.0))
+
         except Exception as e:
             log.dual_log(tag="Backup:Restore", level="ERROR", message=f"Transaction failed during restore of {table_name}: {e}")
             continue
 
         restored_counts[table_name] = count
         log.dual_log(tag="Backup:Restore", level="INFO", message=f"Restored {count} rows into {table_name}")
+
+    # Synchronous FTS rebuild at the tail-end
+    if restored_counts.get("scraped_articles", 0) > 0:
+        log.dual_log(tag="Backup:Restore", level="INFO", message="Rebuilding FTS index synchronously...")
+        from database.writer import enqueue_write, wait_for_writes
+        import asyncio
+        enqueue_write("INSERT INTO scraped_articles_fts(scraped_articles_fts) VALUES('rebuild')")
+        try:
+            try:
+                loop = asyncio.get_running_loop()
+                asyncio.run_coroutine_threadsafe(wait_for_writes(timeout=300.0), loop).result()
+            except RuntimeError:
+                asyncio.run(wait_for_writes(timeout=300.0))
+            log.dual_log(tag="Backup:Restore", level="INFO", message="FTS index rebuilt successfully.")
+        except Exception as e:
+            log.dual_log(tag="Backup:Restore", level="ERROR", message=f"FTS rebuild failed: {e}")
 
     return RestoreResult(success=True, restored_counts=restored_counts, duration_seconds=time.monotonic() - start)
