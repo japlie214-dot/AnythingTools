@@ -12,21 +12,16 @@ class BackupConfig:
     batch_size: int
     compression: str
 
-    @property
-    def articles_dir(self) -> Path:
-        return self.backup_dir / "articles"
+    def table_dir(self, table_name: str) -> Path:
+        return self.backup_dir / table_name
 
-    @property
-    def vectors_dir(self) -> Path:
-        return self.backup_dir / "vectors"
-
-    @property
     def watermark_path(self) -> Path:
         return self.backup_dir / "watermark.json"
 
     def ensure_dirs(self) -> None:
-        self.articles_dir.mkdir(parents=True, exist_ok=True)
-        self.vectors_dir.mkdir(parents=True, exist_ok=True)
+        from database.schemas import MASTER_TABLES
+        for t in MASTER_TABLES:
+            self.table_dir(t).mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def from_global_config(cls) -> "BackupConfig":
@@ -39,6 +34,6 @@ class BackupConfig:
         return cls(
             enabled=getattr(global_config, "BACKUP_ENABLED", True),
             backup_dir=backup_dir,
-            batch_size=getattr(global_config, "BACKUP_BATCH_SIZE", 1000),
+            batch_size=getattr(global_config, "BACKUP_BATCH_SIZE", 500),
             compression=getattr(global_config, "BACKUP_COMPRESSION", "zstd"),
         )

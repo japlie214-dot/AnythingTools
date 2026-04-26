@@ -11,60 +11,29 @@ from tools.backup.schema import FLOAT32_COUNT
 log = get_dual_logger(__name__)
 _VECTOR_STRUCT = struct.Struct(f"<{FLOAT32_COUNT}f")
 
-def _unpack_vector_blob(blob: bytes) -> bytes:
-    if len(blob) != _VECTOR_STRUCT.size:
-        raise ValueError(f"Vector BLOB length mismatch: {len(blob)}")
-    _VECTOR_STRUCT.unpack(blob)
-    return blob
+from database.schemas import MASTER_TABLES, ALL_VEC_TABLES
 
-def _fetch_articles_batch(conn: sqlite3.Connection, watermark_ts: str, watermark_id: str, batch_size: int) -> List[Dict[str, Any]]:
-    cursor = conn.execute(
-        """
-        SELECT
-            id, vec_rowid, normalized_url, url, title, conclusion, summary,
-            metadata_json, embedding_status, scraped_at, updated_at,
-            CASE WHEN updated_at > scraped_at THEN 'UPDATE' ELSE 'INSERT' END AS operation
-        FROM scraped_articles
-        WHERE updated_at > ? OR (updated_at = ? AND id > ?)
-        ORDER BY updated_at ASC, id ASC
-        LIMIT ?
-        """,
-        (watermark_ts, watermark_ts, watermark_id, batch_size)
-    )
-    return [dict(row) for row in cursor.fetchall()]
+def export_table_chunks(conn: sqlite3.Connection, table_name: str, config: BackupConfig, mode: str = "full", last_ts: str = ""):
+    """Stream table data directly into DataFrames, respecting memory limits. Yields (DataFrame, count)."""
+    if table_name not in MASTER_TABLES:
+        raise ValueError(f"Cannot export non-master table: {table_name}")
 
-def _fetch_vectors(conn: sqlite3.Connection, vec_rowids: List[int]) -> List[Dict[str, Any]]:
-    if not vec_rowids: return []
-    placeholders = ",".join("?" * len(vec_rowids))
-    try:
-        cursor = conn.execute(f"SELECT rowid, embedding FROM scraped_articles_vec WHERE rowid IN ({placeholders})", tuple(vec_rowids))
-    except sqlite3.OperationalError:
-        return []
+    # Handle virtual tables explicitly since SELECT * doesn't include rowid
+    if table_name in ALL_VEC_TABLES:
+        query = f"SELECT rowid, embedding FROM {table_name}"
+    elif table_name.endswith("_fts"):
+        query = f"SELECT rowid, * FROM {table_name}"
+    else:
+        query = f"SELECT * FROM {table_name}"
     
-    vectors = []
-    for row in cursor.fetchall():
-        try:
-            vectors.append({"rowid": row["rowid"], "embedding": _unpack_vector_blob(row["embedding"]), "article_id": None})
-        except ValueError:
-            continue
-    return vectors
-
-def export_delta_batches(config: Optional[BackupConfig] = None, watermark_ts: str = "", watermark_id: str = "") -> Iterator[Tuple[pd.DataFrame, Optional[pd.DataFrame], str, str]]:
-    if config is None: config = BackupConfig.from_global_config()
-    conn = DatabaseManager.get_read_connection()
-    conn.row_factory = sqlite3.Row
-
-    cur_ts, cur_id = watermark_ts, watermark_id
-    while True:
-        articles = _fetch_articles_batch(conn, cur_ts, cur_id, config.batch_size)
-        if not articles: break
-
-        new_ts, new_id = articles[-1]["updated_at"], articles[-1]["id"]
-        vec_rowids = [a["vec_rowid"] for a in articles]
-        vectors = _fetch_vectors(conn, vec_rowids)
-        
-        rowid_to_id = {a["vec_rowid"]: a["id"] for a in articles}
-        for v in vectors: v["article_id"] = rowid_to_id.get(v["rowid"], "")
-
-        yield pd.DataFrame(articles), (pd.DataFrame(vectors) if vectors else None), new_ts, new_id
-        cur_ts, cur_id = new_ts, new_id
+    # Delta mode strictly handles append/update based on updated_at.
+    if mode == "delta" and last_ts:
+        # Check if table has updated_at column
+        cursor = conn.execute(f"PRAGMA table_info({table_name})")
+        cols = [r[1] for r in cursor.fetchall()]
+        if "updated_at" in cols:
+            query += f" WHERE updated_at > '{last_ts}'"
+    
+    chunk_iter = pd.read_sql_query(query, conn, chunksize=500)
+    for chunk in chunk_iter:
+        yield chunk, len(chunk)

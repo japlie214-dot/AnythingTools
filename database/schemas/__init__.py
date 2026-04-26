@@ -5,19 +5,24 @@ from typing import Dict, Optional
 from database.connection import SQLITE_VEC_AVAILABLE
 from database.schemas import jobs, finance, vector, pdf, token
 
-BASE_SCHEMA_VERSION = 7
-MAX_MIGRATION_SCRIPTS = 3
-
-# ⚠️ DEVELOPER NOTE: BASE_SCHEMA_VERSION is now 6.
-# Migrations v004, v005, and v006 have been permanently folded into the base schemas.
-# These migrations remain in the migrations directory for runtime execution until the 
-# 3-versions limit is reached, after which they should be archived.
+MASTER_TABLES: set[str] = {
+    "scraped_articles",
+    "scraped_articles_vec",
+    "scraped_articles_fts",
+    "long_term_memories",
+    "long_term_memories_vec",
+}
 
 ALL_TABLES: Dict[str, str] = {
     **jobs.TABLES, **finance.TABLES, **vector.TABLES, **pdf.TABLES, **token.TABLES
 }
+
 ALL_VEC_TABLES: Dict[str, str] = {
     **jobs.VEC_TABLES, **finance.VEC_TABLES, **vector.VEC_TABLES, **pdf.VEC_TABLES, **token.VEC_TABLES
+}
+
+ALL_TRIGGERS: Dict[str, str] = {
+    **vector.TRIGGERS
 }
 
 def get_init_script() -> str:
@@ -33,10 +38,12 @@ def get_init_script() -> str:
                 f"CREATE TABLE IF NOT EXISTS {name} "
                 f"(rowid INTEGER PRIMARY KEY AUTOINCREMENT, embedding BLOB);"
             )
+    for name, ddl in ALL_TRIGGERS.items():
+        parts.append(ddl)
     return "\n".join(parts)
 
 def get_repair_script(table_name: str) -> Optional[str]:
-    """Return repair DDL for a single table with vec0 fallback."""
+    """Return repair DDL for a single table or trigger with vec0 fallback."""
     if table_name in ALL_TABLES:
         return ALL_TABLES[table_name]
     if table_name in ALL_VEC_TABLES:
@@ -46,4 +53,6 @@ def get_repair_script(table_name: str) -> Optional[str]:
             f"CREATE TABLE IF NOT EXISTS {table_name} "
             f"(rowid INTEGER PRIMARY KEY AUTOINCREMENT, embedding BLOB);"
         )
+    if table_name in ALL_TRIGGERS:
+        return ALL_TRIGGERS[table_name]
     return None
