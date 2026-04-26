@@ -5,4 +5,7 @@ Provides watermark-based delta export, immutable Parquet file storage,
 and full restore capability with deduplication.
 """
 
-__all__ = []
+from tools.backup.runner import BackupRunner
+from tools.backup.models import ExportResult, RestoreResult
+
+__all__ = ["BackupRunner", "ExportResult", "RestoreResult"]

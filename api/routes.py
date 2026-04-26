@@ -1,5 +1,5 @@
 # api/routes.py
-from fastapi import APIRouter, HTTPException, status, Request, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, status, Request, Depends, BackgroundTasks, Query
 from typing import Dict, Any
 import threading
 import asyncio
@@ -20,9 +20,8 @@ from utils.security import scan_args_for_urls
 from pydantic import ValidationError
 
 # Backup imports
-from tools.backup.storage import export_delta, list_backup_files, read_watermark
-from tools.backup.restore import restore_from_backups
 from tools.backup.config import BackupConfig
+from tools.backup.runner import BackupRunner
 from utils.browser_lock import browser_lock
 
 log = get_dual_logger(__name__)
@@ -40,7 +39,6 @@ def _ensure_writer_running() -> None:
         start_writer()
     except Exception:
         log.dual_log(tag="API:Writer:Start", message="start_writer() failed (non-fatal)")
-
 
 
 def get_session_id(request: Request) -> str:
@@ -140,43 +138,40 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
 # --- Backup Administration Routes ---
 
 @router.post("/backup/export", response_model=ExportQueuedResponse)
-async def trigger_export(background_tasks: BackgroundTasks):
+async def trigger_export(
+    background_tasks: BackgroundTasks,
+    mode: str = Query("delta", description="Backup mode: 'full' or 'delta'")
+):
     config = BackupConfig.from_global_config()
     if not config.enabled:
         raise HTTPException(status_code=503, detail="Backup disabled")
-    background_tasks.add_task(export_delta, config)
-    return {"status": "EXPORT_QUEUED", "message": "Delta export started in background"}
+    
+    if mode not in ("full", "delta"):
+        raise HTTPException(status_code=400, detail="mode must be 'full' or 'delta'")
+
+    job_id = ULID.generate()
+    created = now_iso()
+    enqueue_write(
+        "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (job_id, "0", "backup", json.dumps({"mode": mode}), "QUEUED", created, created)
+    )
+    _ensure_writer_running()
+
+    background_tasks.add_task(BackupRunner.run, mode=mode, trigger_type="manual", manual_job_id=job_id)
+    return ExportQueuedResponse(status="EXPORT_QUEUED", message=f"{mode.capitalize()} export started in background", job_id=job_id)
 
 
 @router.get("/backup/status", response_model=BackupStatusResponse)
 async def backup_status():
-    config = BackupConfig.from_global_config()
-    wm = read_watermark(config)
-    art_f, vec_f, sz = list_backup_files(config)
-    return {
-        "enabled": config.enabled,
-        "backup_dir": str(config.backup_dir),
-        "watermark": {
-            "last_article_id": wm.last_article_id,
-            "last_export_ts": wm.last_export_ts.isoformat() if wm.last_export_ts else None,
-            "total_articles_exported": wm.total_articles_exported,
-            "total_vectors_exported": wm.total_vectors_exported
-        },
-        "article_files": art_f,
-        "vector_files": vec_f,
-        "total_size_bytes": sz
-    }
-
-
-def _locked_restore(config):
-    if browser_lock.locked():
-        log.dual_log(tag="API:Backup", message="Restore failed: browser_lock held by another job.", level="WARNING")
-        return
-    browser_lock.acquire()
-    try:
-        restore_from_backups(config.backup_dir)
-    finally:
-        browser_lock.safe_release()
+    status = BackupRunner.get_status()
+    return BackupStatusResponse(
+        enabled=status["enabled"],
+        backup_dir=status["backup_dir"],
+        watermark=status["watermark"],
+        file_counts=status["file_counts"],
+        total_size_bytes=status["total_size_bytes"]
+    )
 
 
 @router.post("/backup/restore", response_model=RestoreQueuedResponse)
@@ -186,8 +181,18 @@ async def trigger_restore(background_tasks: BackgroundTasks):
         raise HTTPException(status_code=503, detail="Backup disabled")
     if browser_lock.locked():
         raise HTTPException(status_code=409, detail="System busy: active scraping job.")
-    background_tasks.add_task(_locked_restore, config)
-    return {"status": "RESTORE_QUEUED", "message": "Restore started in background under browser_lock"}
+        
+    job_id = ULID.generate()
+    created = now_iso()
+    enqueue_write(
+        "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (job_id, "0", "backup_restore", "{}", "QUEUED", created, created)
+    )
+    _ensure_writer_running()
+
+    background_tasks.add_task(BackupRunner.restore, manual_job_id=job_id)
+    return RestoreQueuedResponse(status="RESTORE_QUEUED", message="Restore started in background under browser_lock", job_id=job_id)
 
 
 @router.get("/manifest")

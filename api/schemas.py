@@ -1,6 +1,7 @@
 # api/schemas.py
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
+from enum import Enum
 
 
 class JobCreateRequest(BaseModel):
@@ -35,20 +36,26 @@ class WatermarkSchema(BaseModel):
     total_vectors_exported: int = 0
 
 
+class BackupMode(str, Enum):
+    FULL = "full"
+    DELTA = "delta"
+
+
 class BackupStatusResponse(BaseModel):
     enabled: bool
     backup_dir: str
     watermark: WatermarkSchema
-    article_files: int
-    vector_files: int
+    file_counts: Dict[str, int] = Field(default_factory=dict)
     total_size_bytes: int
 
 
 class ExportQueuedResponse(BaseModel):
     status: str = "EXPORT_QUEUED"
     message: str
+    job_id: Optional[str] = None
 
 
 class RestoreQueuedResponse(BaseModel):
     status: str = "RESTORE_QUEUED"
     message: str
+    job_id: Optional[str] = None

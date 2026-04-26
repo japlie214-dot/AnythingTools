@@ -129,5 +129,5 @@ def write_batch(articles_df: pd.DataFrame, vectors_df: Optional[pd.DataFrame], t
     pass
 
 def export_delta(config: Optional[BackupConfig] = None) -> ExportResult:
-    # This function is deprecated, using export_all_tables with mode="delta" instead
-    pass
+    from tools.backup.runner import BackupRunner
+    return BackupRunner.run(mode="delta", trigger_type="manual")

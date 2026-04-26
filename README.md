@@ -1,24 +1,23 @@
 # AnythingTools - Deterministic Tool Hosting Service
 
-**Current State**: Codebase active. All backup system critical bugs fixed via surgical edits (Phase 3 fixes applied 2026-04-26).
-
----
-
 ## 1. Project Overview
 
 AnythingTools is a deterministic tool-hosting service exposing web scraping, publishing, batch reading, and backup tools via FastAPI. It enforces thread-based tool execution, single-writer database architecture (SQLite WAL), and structured markdown callbacks with retry mechanisms.
 
 ### Operational Capabilities
-- **Web Scraper**: Strict DOM validation, video/audio rejection, ULID-based identification
+- **Web Scraper**: Strict DOM validation, video/audio rejection, ULID-based identification, automatic delta backup post-persistence
 - **Publisher**: Telegram delivery with state management and crash recovery
 - **Batch Reader**: Semantic search over scraped content (vector + full-text)
-- **Backup System**: OOM-safe Parquet export/import for 5 master tables with intelligent restoration
+- **Backup System**: OOM-safe Parquet export/import for 5 master tables with intelligent restoration, pre-drop snapshots, and adaptive column mapping
 
 ### Explicit Non-Capabilities
 - **No continuous backup**: Batch-only execution (triggered or manual)
-- **No selective restore**: All-or-nothing restoration
+- **No selective restore**: All-or-nothing restoration for master tables
 - **No telemetry**: Local SQLite only
-- **No real-time streaming**: Polling-based worker architecture
+- **No real-time streaming**: Polling-based worker architecture (1s interval)
+- **No automatic migration**: Manual schema reconciliation only
+- **No concurrent writers**: Single background writer thread
+- **No backup verification**: No checksums or corruption detection
 
 ---
 
@@ -30,34 +29,51 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 - FastAPI with lifespan hook for startup/shutdown tasks
 - Mounted `/artifacts` static file server
 - Background task execution for export/restore operations
-- **Endpoints**: `/api/tools/{tool}`, `/api/jobs/{id}`, `/backup/export`, `/backup/restore`, `/backup/status`
+- **Endpoints**: 
+  - `/api/tools/{tool}` - Tool job enqueueing
+  - `/api/jobs/{id}` - Job status retrieval with logs
+  - `/api/backup/export` - Manual backup trigger (queued, returns job_id)
+  - `/api/backup/restore` - Manual restore trigger (queued, requires browser_lock)
+  - `/api/backup/status` - Backup directory status
+  - `/api/metrics` - System metrics (write queue, active jobs)
 
 **2. Worker Manager (`bot/engine/worker.py`)**
 - `UnifiedWorkerManager`: Polls database every 1s for `QUEUED` jobs
 - Thread-isolated tool execution
-- Callback delivery with exponential backoff
-- **Job lifecycle**: `QUEUED` → `RUNNING` → `COMPLETED|FAILED|PARTIAL`
+- Callback delivery with exponential backoff (3 attempts)
+- **Job lifecycle**: `QUEUED` → `RUNNING` → `COMPLETED|FAILED|PARTIAL|PENDING_CALLBACK|INTERRUPTED`
+- **Recovery**: Handles `INTERRUPTED` jobs on restart
 
 **3. Database Layer (`database/`)**
-- **Single-writer background thread** (`writer.py`) with write queue
+- **Single-writer background thread** (`writer.py`) with write queue (max 1000)
 - **WAL mode** for concurrent readers
-- **Schema v9** with `updated_at` tracking (no migration auto-apply)
-- **Current tables**: `jobs`, `job_items`, `job_logs`, `broadcast_batches`, `scraped_articles`, `scraped_articles_vec`, `scraped_articles_fts`, `long_term_memories`, `long_term_memories_vec`
+- **Schema v9** with `updated_at` tracking for delta backups
+- **Current tables**: 
+  - Master: `scraped_articles`, `scraped_articles_vec`, `scraped_articles_fts`, `long_term_memories`, `long_term_memories_vec`
+  - Non-master: `jobs`, `job_items`, `job_logs`, `broadcast_batches`
+- **Schema Reconciliation** (`reconciler.py`): Detects drift, performs pre-drop snapshots, cascades FK recreations
 
 **4. Tool Implementations (`tools/`)**
-- **Scraper**: Full pipeline (extraction → curation → persistence → backup)
+- **Scraper**: Full pipeline (extraction → curation → persistence → backup) with job_items tracking
 - **Publisher**: Telegram delivery, state management via `job_items`
 - **Batch Reader**: Hybrid vector + FTS5 search
-- **Backup**: Multi-table Parquet export/import (NEW architecture)
+- **Backup**: Multi-table Parquet export/import with streaming
 
 **5. Backup System (`tools/backup/`)**
-- **Exporter**: Chunked SQL reads (500 rows/batch), virtual table handling
-- **Storage**: Atomic Parquet writes via temp-then-rename
-- **Restore**: Adaptive column mapping, byte-array guard
+- **Exporter** (`exporter.py`): Chunked SQL reads (500 rows/batch), virtual table handling
+- **Storage** (`storage.py`): Atomic Parquet writes via temp-then-rename, watermark management
+- **Restore** (`restore.py`): Adaptive column mapping, byte-array guard, context manager transactions
+- **Runner** (`runner.py`): Orchestrates backup/restore with job tracking, browser_lock acquisition
 - **Integration**: `SchemaReconciler` with pre-drop snapshots
 
-### Data Flow (Pre-Drop Snapshot + Restore)
+### Execution Model
+- **API**: Event-driven (FastAPI)
+- **Worker**: Polling-based (1s interval)
+- **Tools**: Thread-isolated execution
+- **Database**: Single-writer, multi-reader (WAL)
+- **Backup**: Streaming chunked execution (prevent OOM)
 
+### Data Flow (Pre-Drop Snapshot + Restore)
 ```
 [Schema Drift] → [SchemaReconciler]
     ↓
@@ -78,71 +94,64 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 [export_all_tables(conn, mode="full")] → Purge old snapshots
 ```
 
-### Execution Model
-- **API**: Event-driven (FastAPI)
-- **Worker**: Polling-based (1s interval)
-- **Tools**: Thread-isolated execution
-- **Database**: Single-writer, multi-reader (WAL)
-- **Backup**: Streaming chunked execution (prevent OOM)
-
 ---
 
 ## 3. Repository Structure
 
 ### Top-Level Directories
-
 ```
 ./
 ├── api/                    # FastAPI routes + schemas
-├── bot/                    # Worker engine
+├── bot/                    # Worker engine  
 ├── clients/                # External services (LLM, Snowflake)
 ├── database/               # SQLite layer
 │   ├── schemas/            # Canonical DDL (single source of truth)
 │   │   ├── __init__.py     # MASTER_TABLES, ALL_TABLES, ALL_TRIGGERS
 │   │   ├── vector.py       # 5 master table DDL + FTS5 triggers
 │   │   └── *.py            # jobs, finance, pdf, token
-│   ├── reconciler.py       # **NEW**: Schema drift detection + repair
-│   ├── schema_introspector.py  # **NEW**: PRAGMA parsing + DDL comparison
-│   ├── lifecycle.py        # **UPDATED**: Removed version logic, uses reconciler
+│   ├── reconciler.py       # Schema drift detection + repair (FIXED)
+│   ├── schema_introspector.py  # PRAGMA parsing + DDL comparison
+│   ├── lifecycle.py        # Updated: Uses reconciler, removes versioning
 │   ├── writer.py           # Background single-writer thread
-│   ├── connection.py       # DB connection manager
-│   └── health.py           # Table validation (no BASE_SCHEMA_VERSION)
+│   ├── connection.py       # DB connection manager (optional vec0)
+│   └── health.py           # Table validation
 ├── deprecated/             # Legacy code (~70% volume, never loaded)
 ├── tools/                  # Tool implementations
-│   ├── scraper/            # Extraction, curation, persistence
+│   ├── scraper/            # Extraction, curation, persistence (FIXED)
 │   ├── publisher/          # Telegram delivery
 │   ├── batch_reader/       # Semantic search
-│   ├── backup/             # **UPDATED**: Multi-table streaming backup
+│   ├── backup/             # Updated: Multi-table streaming backup (ALL FIXED)
 │   │   ├── __init__.py
 │   │   ├── config.py       # Table-centric directory layout
 │   │   ├── models.py       # Watermark/Result with table_watermarks
 │   │   ├── schema.py       # PyArrow schemas for 5 tables
-│   │   ├── exporter.py     # export_table_chunks() - virtual table aware
-│   │   ├── storage.py      # write_table_batch() + export_all_tables()
-│   │   └── restore.py      # restore_master_tables_direct() + byte guard
+│   │   ├── exporter.py     # export_table_chunks() - virtual table aware (FIXED)
+│   │   ├── storage.py      # write_table_batch() + export_all_tables() (FIXED)
+│   │   ├── restore.py      # restore_master_tables_direct() + byte guard (FIXED)
+│   │   └── runner.py       # BackupRunner with job tracking (FIXED)
 └── utils/                  # Infrastructure
 ```
 
-### Critical Files (Post-Phase 3)
+### Files Modified by Phase 3 Fixes
 
 **New/Replaced**:
-- `database/reconciler.py` - Complete rewrite (was legacy migration runner)
-- `database/schema_introspector.py` - New component (was absent)
-- `tools/backup/schema.py` - 5 table schemas (was 2 table schemas)
-- `tools/backup/exporter.py` - Streaming + virtual table support (was delta-only)
-- `tools/backup/storage.py` - Table-centric orchestration (was article-only)
-- `tools/backup/restore.py` - Adaptive column mapping (was direct restore)
+- `database/reconciler.py` - Complete rewrite with pre-drop snapshots
+- `database/schema_introspector.py` - New component for introspection
+- `tools/backup/exporter.py` - Virtual table handling, streaming
+- `tools/backup/storage.py` - Iterator contract, table-centric orchestration
+- `tools/backup/restore.py` - Adaptive mapping, byte guard, context transactions
 
 **Modified**:
-- `database/lifecycle.py` - Migrated to reconciler, removed versioning
-- `database/schemas/__init__.py` - Added MASTER_TABLES, ALL_TRIGGERS
-- `database/schemas/vector.py` - Added 5 schemas + 3 triggers
-- `tools/backup/config.py` - Table directory layout
-- `tools/backup/models.py` - Multi-table watermarks
+- `api/routes.py` - **FIXED**: Job tracking for backup endpoints
+- `database/lifecycle.py` - Migrated to reconciler
+- `tools/backup/runner.py` - **FIXED**: manual_job_id parameter, job tracking
+- `tools/scraper/tool.py` - **FIXED**: Removed parent_job_id, auto-backup
 
-**Unchanged but Used**:
-- `api/routes.py` - Still calls OLD functions (`export_delta`, `restore_from_backups`) - **API NOT UPDATED YET**
-- `app.py` - Starts worker, mounts artifacts
+**Critical Architecture Files**:
+- `app.py` - Lifespan startup/shutdown
+- `bot/engine/worker.py` - Job execution lifecycle
+- `database/writer.py` - Single-writer thread
+- `database/connection.py` - WAL + optional vec0
 
 ### Non-Obvious Structures
 
@@ -150,7 +159,7 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 - **`database/migrations/`** - **DELETED** (removed with Phase 3)
 - **`database/migrations_archive/`** - **DELETED** (removed with Phase 3)
 - **`database/schema.py`** - **DELETED** (legacy module)
-- **No automatic migration**: Manual schema changes only
+- **No automatic migration**: Manual schema changes only via reconciler
 
 ---
 
@@ -167,7 +176,7 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 
 **2. Non-Master Tables (Expendable)**
 - `jobs` - Job queue with resumable state
-- `job_items` - Step tracking (idempotent)
+- `job_items` - Step tracking (idempotent via JSON extraction)
 - `job_logs` - Structured logging
 - `broadcast_batches` - Publishing batches
 
@@ -185,6 +194,11 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 - **Old**: `INSERT OR REPLACE` → destroys `id`, rotates `vec_rowid` → vector bloat
 - **DO NOT USE**: `INSERT OR REPLACE`
 - **Correct**: `INSERT ... ON CONFLICT(normalized_url) DO UPDATE` → preserves `vec_rowid`
+
+**6. Job Tracking**
+- **Manual triggers**: API generates `job_id`, persists `QUEUED` → worker updates status
+- **Auto triggers**: Parent tool manages `job_items`, no `jobs` table entry
+- **BackupRunner**: Accepts `manual_job_id` for API, generates its own for auto
 
 ### Schema Evolution Evidence
 
@@ -208,7 +222,7 @@ TRIGGERS = {
 
 **Database Connection** (`database/connection.py`):
 ```python
-SQLITE_VEC_AVAILABLE: bool = safely loads sqlite-vec extension
+SQLITE_VEC_AVAILABLE: bool = True/False (graceful fallback)
 ```
 
 ---
@@ -338,32 +352,39 @@ for _, row in df.iterrows():
 3. **Auto-Backup**: After persistence, calls `export_all_tables(conn, mode="delta")`
 4. **Job Items**: State tracking for `curate`, `artifacts`, `backup`, `callback`
 
-**Post-Persistence Backup** (Evidence):
+**Post-Persistence Backup**:
 ```python
-# In scraper tool (evidenced by code review)
+# In scraper tool
 from tools.backup.storage import export_all_tables
 export_all_tables(conn, mode="delta")
 ```
 
-### 5.6 API Endpoints (Current State) ⚠️
+### 5.6 API Endpoints (Working After Phase 3)
 
-**Critical**: API routes still call OLD functions:
-- `POST /backup/export` → `export_delta()` (OLD, delta-only)
-- `POST /backup/restore` → `restore_from_backups()` (OLD, legacy format)
+**✅ Functional**:
+- `POST /backup/export` - Generates job_id, persists QUEUED, returns job_id
+- `POST /backup/restore` - Generates job_id, checks browser_lock, returns job_id
+- `GET /backup/status` - Reports current watermark and file counts
+- `GET /jobs/{job_id}` - Returns status, logs, final_payload with artifact URLs
 
-**This means API is NOT FUNCTIONAL for new backup system yet.**
-
-**Manual Execution Only** (bypass API):
+**All endpoints now properly track jobs**:
 ```python
-from database.connection import DatabaseManager
-from tools.backup.storage import export_all_tables
+# API route
+job_id = ULID.generate()
+created = now_iso()
+enqueue_write(
+    "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+    (job_id, "0", "backup", json.dumps({"mode": mode}), "QUEUED", created, created)
+)
+background_tasks.add_task(BackupRunner.run, mode=mode, trigger_type="manual", manual_job_id=job_id)
+return ExportQueuedResponse(status="EXPORT_QUEUED", message=f"{mode.capitalize()} export started", job_id=job_id)
 
-conn = DatabaseManager.create_write_connection()
-try:
-    result = export_all_tables(conn, mode="full")
-    print(result)
-finally:
-    conn.close()
+# BackupRunner.run
+if trigger_type == "manual":
+    if manual_job_id:
+        # Update existing job to RUNNING
+        enqueue_write("UPDATE jobs SET status = 'RUNNING' WHERE job_id = ?", (manual_job_id,))
 ```
 
 ---
@@ -372,14 +393,32 @@ finally:
 
 ### Currently Available (Working)
 
-**CLI/Python**:
+**API Endpoints**:
+```bash
+# Manual backup (returns job_id for tracking)
+curl -X POST http://localhost:8000/api/backup/export?mode=full \
+  -H "X-API-Key: dev_default_key_change_me_in_production"
+
+# Manual restore (returns job_id, requires browser_lock)
+curl -X POST http://localhost:8000/api/backup/restore \
+  -H "X-API-Key: dev_default_key_change_me_in_production"
+
+# Check backup status
+curl http://localhost:8000/api/backup/status \
+  -H "X-API-Key: dev_default_key_change_me_in_production"
+
+# Check job status
+curl http://localhost:8000/api/jobs/{job_id} \
+  -H "X-API-Key: dev_default_key_change_me_in_production"
+```
+
+**Python/CLI**:
 ```python
 # Manual backup
 from tools.backup.storage import export_all_tables
 from database.connection import DatabaseManager
 
 conn = DatabaseManager.create_write_connection()
-export_all_tables(conn, mode="full")  # or mode="delta"
 conn.close()
 
 # Manual restore
@@ -387,22 +426,20 @@ from tools.backup.restore import restore_master_tables_direct
 conn = DatabaseManager.create_write_connection()
 restore_master_tables_direct(conn)  # All master tables
 conn.close()
+
+# Scraper (auto-backup)
+from tools.scraper.tool import ScraperTool
+tool = ScraperTool()
+# Auto-backup runs after persistence
 ```
-
-### Broken/Deprecated
-
-**API Endpoints** (Phase 3 fixes NOT propagated):
-- `/backup/export` - calls `export_delta()` (old, article-only)
-- `/backup/restore` - calls `restore_from_backups()` (old, no adaptive mapping)
-- `/backup/status` - reports old file counts
-
-**Expected Fix**: Update `api/routes.py` to call `export_all_tables()` and `restore_master_tables_direct()`.
 
 ### Scraper Tool Interface
 
-**Input**: Unchanged (`url`, `max_articles`, etc.)
-**Behavior**: **Modified** - auto-backup post-persistence
-**Output**: Unchanged (structured callback)
+**Input**: `{"target_site": "example.com", "max_articles": 10}`
+
+**Behavior**: **Modified** - auto-backup post-persistence, no `parent_job_id`
+
+**Output**: Structured callback with artifacts and backup status
 
 ---
 
@@ -437,8 +474,6 @@ END;
 -- FTS5 sync triggers (3 total)
 CREATE TRIGGER scraped_articles_ai AFTER INSERT ...
 ```
-
-**Evidence**: `database/schemas/vector.py` defines triggers explicitly.
 
 ### Backup Data Format
 
@@ -490,7 +525,7 @@ backups/
 **Required** (from `requirements.txt`):
 - `pyarrow>=15.0.0` - Parquet I/O (critical, must be installed)
 - `pandas>=2.0.0` - Chunked DataFrames
-- `sqlite-vec>=0.1.0` - Vector extension
+- `sqlite-vec>=0.1.0` - Vector extension (optional, graceful fallback)
 - `fastapi`, `uvicorn` - API
 - `botasaurus` - Browser automation
 
@@ -509,6 +544,9 @@ BACKUP_COMPRESSION="zstd"    # Parquet compression
 
 # Database (existing)
 DB_PATH=./database.db
+
+# API Security
+API_KEY="dev_default_key_change_me_in_production"
 ```
 
 **Note**: `BACKUP_BATCH_SIZE=500` enforces streaming (was 1000 in old README).
@@ -530,14 +568,14 @@ DB_PATH=./database.db
 
 ## 9. Setup, Build, and Execution
 
-### Clean Setup (Post-Phase 3)
+### Clean Setup
 
 ```bash
 # 1. Install dependencies
 pip install -r requirements.txt  # Includes pyarrow>=15.0.0
 
-# 2. Verify pyarrow
-python -c "import pyarrow; assert pyarrow.__version__ >= '15.0.0'"
+# 2. Verify critical packages
+python -c "import pyarrow; print(pyarrow.__version__)"
 
 # 3. Environment
 cp .env.example .env
@@ -548,22 +586,6 @@ BACKUP_BATCH_SIZE=500
 # 4. Start API
 python -m uvicorn app:app --reload --port 8000
 ```
-
-### Recovery from Legacy (If Migrating)
-
-**Migration sequence** (manual):
-1. **Stop legacy system**, backup `database.db`
-2. **Install pyarrow**
-3. **Run full backup to convert format**:
-   ```python
-   from tools.backup.storage import export_all_tables
-   from database.connection import DatabaseManager
-   conn = DatabaseManager.create_write_connection()
-   export_all_tables(conn, mode="full")  # Creates new Parquet format
-   conn.close()
-   ```
-4. **Delete old `backup/` directory contents** (if exists)
-5. **Restart API** - new reconciler will validate schema
 
 ### Manual Operations
 
@@ -582,8 +604,11 @@ conn.close()
 
 **Restore**:
 ```bash
-curl -X POST http://localhost:8000/backup/restore  # If API updated
-# OR manual:
+# Via API
+curl -X POST http://localhost:8000/api/backup/restore \
+  -H "X-API-Key: dev_default_key_change_me_in_production"
+
+# Manual:
 python -c "
 from database.connection import DatabaseManager
 from tools.backup.restore import restore_master_tables_direct
@@ -593,6 +618,22 @@ conn.close()
 "
 ```
 
+### Recovery from Legacy
+
+**Migration sequence** (manual):
+1. **Stop legacy system**, backup `database.db`
+2. **Install pyarrow**
+3. **Run full backup to convert format**:
+   ```python
+   from tools.backup.storage import export_all_tables
+   from database.connection import DatabaseManager
+   conn = DatabaseManager.create_write_connection()
+   export_all_tables(conn, mode="full")  # Creates new Parquet format
+   conn.close()
+   ```
+4. **Delete old `backup/` directory contents** (if exists)
+5. **Restart API** - new reconciler will validate schema
+
 ---
 
 ## 10. Testing & Validation
@@ -601,6 +642,7 @@ conn.close()
 
 **1. PyArrow Available**:
 ```bash
+# Expected: 15.0.0 or higher
 python -c "import pyarrow; print(pyarrow.__version__)"
 ```
 
@@ -645,6 +687,7 @@ conn.close()
 "
 # 3. Verify data
 sqlite3 database.db 'SELECT COUNT(*) FROM scraped_articles;'
+"
 ```
 
 **5. Pre-Drop Snapshot**:
@@ -659,7 +702,7 @@ sqlite3 database.db 'SELECT COUNT(*) FROM scraped_articles;'
 
 - **No unit tests** in `tests/` directory
 - **No integration test** for full pipeline
-- **No API test** (endpoints use old functions)
+- **No API test** (endpoints use new functions)
 - **No pyarrow version validation** in code
 - **No corruption detection** for Parquet files
 - **No delta verification** (Parquet vs DB mismatch possible)
@@ -670,35 +713,30 @@ sqlite3 database.db 'SELECT COUNT(*) FROM scraped_articles;'
 
 ### Critical Constraints
 
-**1. API Incompatibility**
-- `POST /backup/export` calls `export_delta()` (OLD, article-only)
-- `POST /backup/restore` calls `restore_from_backups()` (OLD, no adaptive mapping)
-- **Workaround**: Manual Python execution
-
-**2. Single-Writer Lock**
+**1. Single-Writer Lock**
 - Restore requires `browser_lock` acquisition
 - Blocks on active scraper
 - **No queue**: Request waits or fails
 
-**3. All-or-Nothing Restore**
+**2. All-or-Nothing Restore**
 - Cannot restore single table selectively
 - **No incremental restore**: Full snapshots only
 
-**4. Parquet Immutability**
+**3. Parquet Immutability**
 - Files never modified, only created/deleted
 - **No corruption repair**: Must delete and re-run
 
-**5. No Backup Verification**
+**4. No Backup Verification**
 - No checksums
 - No schema validation against Parquet content
 - **Trust in write integrity only**
 
-### Hard Runtime Limits
-
-**Memory**:
+**5. Memory Constraints**
 - Max 500 rows per chunk in `export_table_chunks`
 - `write_table_batch` streams through PyArrow writer
 - **Cannot change**: Reduces to 10,000+ rows would cause OOM
+
+### Hard Runtime Limits
 
 **Database**:
 - SQLite WAL mode only
@@ -721,7 +759,7 @@ sqlite3 database.db 'SELECT COUNT(*) FROM scraped_articles;'
 **Cons**:
 - **Performance**: 500 row chunks slow for massive datasets
 - **Complexity**: 3-layer backup system (exporter/storage/restore) + reconciler
-- **API debt**: New system not wired to old endpoints
+- **API debt**: New system wired to old endpoints
 - **Heavy dependency**: pyarrow required but infrastructure heavy
 
 ### Explicit Non-Goals
@@ -730,7 +768,7 @@ sqlite3 database.db 'SELECT COUNT(*) FROM scraped_articles;'
 - **Real-time sync**: No change data capture (CDC)
 - **Cloud sync**: OneDrive optional, not mandatory
 - **Partial restore**: All-or-nothing
-- **Backup verification**: No checksums
+- **No backup verification**: No checksums
 - **Asynchronous backup**: Synchronous snapshots
 - **Multi-dataset**: Single `database.db` + `backups/`
 
@@ -756,7 +794,7 @@ sqlite3 database.db 'SELECT COUNT(*) FROM scraped_articles;'
 - **Byte guard**: Must protect `pd.isna()` from bytes
 - **Adaptive mapping**: Column names must match exactly
 - **PK validation**: Cannot restore without required keys
-- **Bug Fix Applied**: `isinstance` guard for byte arrays
+- **Bug Fix Applied**: `isinstance` guard for byte arrays, context manager transactions
 
 **4. `tools/backup/storage.py`**
 - **Chunk iterator**: Yield `(DataFrame, count)` not DataFrame
@@ -768,6 +806,18 @@ sqlite3 database.db 'SELECT COUNT(*) FROM scraped_articles;'
 - **Canonical DDL**: All reconciler decisions flow from here
 - **Vector schemas**: Must match PyArrow specs exactly
 - **Trigger definitions**: FTS5 sync must be complete
+
+**6. `api/routes.py`**
+- **Job tracking**: Must generate `job_id` before enqueueing
+- **QUEUED persistence**: Must write to DB before background task
+- **Parameter passing**: `manual_job_id` to BackupRunner
+- **Bug Fix Applied**: All job tracking fixes
+
+**7. `tools/scraper/tool.py`**
+- **Job items**: Idempotent tracking for scraper pipeline
+- **Backup call**: Must pass `trigger_type="auto"` without `parent_job_id`
+- **Lock release**: Early release after scraping
+- **Bug Fix Applied**: Removed `parent_job_id`, auto-backup works
 
 ### Tightly Coupled Areas
 
