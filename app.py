@@ -8,10 +8,14 @@ AnythingTools FastAPI application entrypoint with lifespan hooks:
 python -m uvicorn app:app --reload --port 8000
 """
 
+import os
+import asyncio
+import time
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Depends
 from fastapi.security.api_key import APIKeyHeader
 from fastapi import Security, HTTPException
-from contextlib import asynccontextmanager
 import logging
 
 import config as config_module
@@ -38,52 +42,49 @@ log = get_dual_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    startup_failed = False
     try:
         from utils.startup import run_startup
         await run_startup(app)
         log.dual_log(tag="App:Lifespan", message="Startup completed successfully", level="INFO")
-
         yield
+    except Exception as e:
+        log.dual_log(tag="App:Lifespan", message=f"Startup aborted: {e}", level="CRITICAL")
+        startup_failed = True
     finally:
-        # === Shutdown (ordered: Stop Polling -> Cancel -> Drain -> Browser Driver → DB Writer) ===
+        log.dual_log(tag="App:Shutdown", message="Initiating shutdown sequence...", level="INFO")
+        
         try:
             from bot.engine.worker import get_manager
             mgr = get_manager()
             
-            # 1. Stop worker manager polling immediately to prevent new jobs
-            log.dual_log(tag="App:Shutdown", message="Phase 1: Stopping worker manager polling loop", level="INFO")
-            mgr.stop()
+            if mgr:
+                log.dual_log(tag="App:Shutdown", message="Phase 1: Stopping worker manager polling loop", level="INFO")
+                mgr.stop()
+                
+                log.dual_log(tag="App:Shutdown", message="Phase 2: Broadcasting cancellation to active workers", level="INFO")
+                for flag in list(mgr.cancellation_flags.values()):
+                    flag.set()
+                
+                drain_start = time.time()
+                drain_timeout = 60.0
+                
+                log.dual_log(tag="App:Shutdown", message=f"Phase 3: Draining active jobs for up to {drain_timeout}s", level="INFO")
+                while mgr._active_jobs and (time.time() - drain_start < drain_timeout):
+                    remaining = len(mgr._active_jobs)
+                    log.dual_log(tag="App:Shutdown", message=f"Draining {remaining} active job(s), elapsed: {time.time() - drain_start:.1f}s")
+                    await asyncio.sleep(2)
+                
+                if mgr._active_jobs:
+                    log.dual_log(tag="App:Shutdown", message=f"Drain timeout exceeded, {len(mgr._active_jobs)} job(s) remaining", level="WARNING")
+                else:
+                    log.dual_log(tag="App:Shutdown", message="All active jobs drained successfully", level="INFO")
             
-            # 2. Broadcast Cancellation to EXISTING workers
-            # Use list() to create a snapshot and avoid RuntimeError if threads remove themselves during iteration
-            log.dual_log(tag="App:Shutdown", message="Phase 2: Broadcasting cancellation to active workers", level="INFO")
-            for flag in list(mgr.cancellation_flags.values()):
-                flag.set()
-            
-            # 3. Drain (60s limit) - wait for active jobs to complete
-            import asyncio
-            import time
-            drain_start = time.time()
-            drain_timeout = 60.0
-            
-            log.dual_log(tag="App:Shutdown", message=f"Phase 3: Draining active jobs for up to {drain_timeout}s", level="INFO")
-            while mgr._active_jobs and (time.time() - drain_start < drain_timeout):
-                remaining = len(mgr._active_jobs)
-                log.dual_log(tag="App:Shutdown", message=f"Draining {remaining} active job(s), elapsed: {time.time() - drain_start:.1f}s")
-                await asyncio.sleep(2)
-            
-            if mgr._active_jobs:
-                log.dual_log(tag="App:Shutdown", message=f"Drain timeout exceeded, {len(mgr._active_jobs)} job(s) remaining", level="WARNING")
-            else:
-                log.dual_log(tag="App:Shutdown", message="All active jobs drained successfully", level="INFO")
-            
-            # 4. Release browser resources
             log.dual_log(tag="App:Shutdown", message="Releasing browser resources", level="INFO")
             from utils.browser_daemon import daemon_manager
             daemon_manager.shutdown_driver()
             daemon_manager.surgical_kill()
 
-            # 5. Wait for database writes and shutdown writer
             from database.writer import wait_for_writes, shutdown_writer
             await wait_for_writes()
             shutdown_writer()
@@ -91,6 +92,9 @@ async def lifespan(app: FastAPI):
             log.dual_log(tag="App:Shutdown", message="Clean shutdown complete", level="INFO")
         except Exception as e:
             log.dual_log(tag="App:Shutdown", message=f"Shutdown error: {e}", level="ERROR")
+
+        if startup_failed:
+            os._exit(1)
 
 
 # Create FastAPI app with lifespan

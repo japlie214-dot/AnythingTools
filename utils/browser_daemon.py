@@ -91,8 +91,8 @@ class ChromeDaemonManager:
                     killed = True
                     log.dual_log(tag="Browser:Kill", message=f"Killed Chrome PID {current_pid} for profile {target_dir}")
             except (psutil.AccessDenied, psutil.PermissionError) as e:
-                log.dual_log(tag="Browser:Kill", message=f"Permission denied killing Chrome PID {current_pid}: {e}", level="CRITICAL")
-                sys.exit(1)
+                log.dual_log(tag="Browser:Kill", message=f"FATAL: Permission denied killing Chrome PID {current_pid}: {e}", level="CRITICAL")
+                raise RuntimeError(f"Permission denied killing Chrome PID: {e}")
             except psutil.NoSuchProcess:
                 continue
             except Exception as e:
@@ -112,12 +112,13 @@ class ChromeDaemonManager:
         self.surgical_kill()
         
         # Initialize driver with Botasaurus parameters
-        # Note: Using 'profile' parameter instead of arguments for Botasaurus compatibility
+        # FIX: Replace 'profile' parameter with explicit --user-data-dir argument
+        profile_path = os.path.abspath(config.CHROME_USER_DATA_DIR).replace("\\", "/")
         self._driver = Driver(
             headless=False,
-            user_agent="REAL",
+            user_agent="real",  # FIX: Normalize to lowercase as documented
             window_size=(1920, 1080),
-            profile=os.path.abspath(config.CHROME_USER_DATA_DIR),
+            arguments=[f"--user-data-dir={profile_path}"],
         )
         
         # Audit and log the spawned Chrome PID
@@ -135,6 +136,11 @@ class ChromeDaemonManager:
         self._id_tracking.clear()
         # Status remains INITIALIZING until deep_warmup completes successfully
         
+        # PHASE 1 FIX: Add mandatory 5-second stabilization delay
+        if self._driver:
+            log.dual_log(tag="Browser:Daemon", message="Waiting 3s for Chrome CDP to settle...")
+            self._driver.sleep(5)
+            
         return self._driver
     
     def get_or_create_driver(self) -> Driver:
@@ -162,29 +168,38 @@ class ChromeDaemonManager:
                 self._status = BrowserStatus.CRITICAL_FAILURE
                 log.dual_log(tag="Browser:Daemon", message="Driver shut down.")
     
-    async def deep_warmup(self) -> bool:
+    def deep_warmup(self) -> bool:
         """
         Full stack verification: Navigation -> SoM -> Vision.
         Returns True if successful, False otherwise.
         """
         try:
             from utils.browser_utils import safe_google_get
-            from utils.som_utils import inject_som
+            from utils.som_utils import reinject_all
             from utils.vision_utils import capture_and_optimize
             
             driver = self.get_or_create_driver()
             
-            # Phase 1: Navigation Test
+            # Phase 1: Navigation Test - RETARGETED to Space Jam
             log.dual_log(tag="Startup:Warmup", message="Phase 1: Navigation Test")
-            safe_google_get(driver, "https://example.com")
-            driver.sleep(2)
-            if "Example Domain" not in (driver.page_html or ""):
-                raise RuntimeError("Navigation failed: Content mismatch")
+            safe_google_get(driver, "https://www.spacejam.com/1996/")
+            driver.short_random_sleep()
+
+            # Verify presence of the expected marker string (case-insensitive)
+            try:
+                page_html = (driver.page_html or "").lower()
+                expected = "SPACE JAM, characters, names, and all related".lower()
+                if expected not in page_html:
+                    raise RuntimeError("Navigation failed: Content mismatch - expected marker not found")
+            except Exception as e:
+                # Surface as warmup failure
+                raise RuntimeError(f"Navigation verification failed: {e}")
             
             # Phase 2: SoM Test
             log.dual_log(tag="Startup:Warmup", message="Phase 2: SoM Injection Test")
-            last_id = inject_som(driver)
-            if last_id <= 1:
+            reinject_all(driver, self._id_tracking)
+            main_range = self._id_tracking.get('main')
+            if not main_range or main_range[1] <= 1:
                 raise RuntimeError("SoM Injection failed: No markers added")
             
             # Phase 3: Vision Test

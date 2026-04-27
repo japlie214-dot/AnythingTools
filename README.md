@@ -56,7 +56,7 @@ AnythingTools is a FastAPI-based deterministic tool hosting service that provide
   - `server.py`: Dynamic artifacts directory mounting from config
   - `database.py`: Pragmas, writer initialization, lifecycle runner, vec0 validation
   - `registry.py`: Whitelisted tool discovery (scraper, draft_editor, publisher, batch_reader)
-  - `browser.py`: Deep warmup with 60s timeout, failure → `sys.exit(1)`
+  - `browser.py`: Deep warmup with 90s timeout, failure → `sys.exit(1)`
   - `telegram.py`: Async orphan handshake for Telegram bot token
 
 **4. Worker Manager (`bot/engine/worker.py`)**
@@ -183,7 +183,7 @@ Tier 3 (Concurrent):
 │   └── *.py                 # reader, job_queue, blackboard, formula_cache
 ├── deprecated/              # Legacy code (~70% volume, never loaded)
 │   ├── bot/                 # Old agent/weaver/modes
-│   └── tools/               # Old research, finance, polymarket, etc.
+│   └── tools/               # Old research, finance, polymarket, quiz.
 ├── tools/                   # Tool implementations
 │   ├── scraper/             # Extraction + curation + persistence
 │   │   ├── prompts.py       # Canonical prompts (post-PLAN-02)
@@ -212,7 +212,7 @@ Tier 3 (Concurrent):
 │   │   ├── server.py        # Artifacts mounting
 │   │   ├── database.py      # Pragmas, writer, lifecycle, vec0
 │   │   ├── registry.py      # Tool registry loading
-│   │   ├── browser.py       # Warmup (60s timeout + deep verification)
+│   │   ├── browser.py       # Warmup (90s timeout + deep verification)
 │   │   ├── telegram.py      # Async handshake
 │   │   └── __init__.py      # Pipeline assembly
 │   ├── browser_daemon.py    # Browser driver management (ChromeDaemonManager)
@@ -284,8 +284,8 @@ Tier 3 (Concurrent):
 - **CRITICAL_FAILURE**: Warmup failed or shutdown initiated
 
 **9. Deep Warmup Verification**
-- **Phase 1 (Navigation)**: Navigate to example.com, verify content
-- **Phase 2 (SoM)**: Inject data-ai-id markers, verify count > 1
+- **Phase 1 (Navigation)**: Navigate to Space Jam 1996, verify marker string "SPACE JAM, characters, names, and all related" exists (case-insensitive)
+- **Phase 2 (SoM)**: Inject data-ai-id markers with vertical displacement logic, verify count > 1
 - **Phase 3 (Vision)**: Capture screenshot, slice if needed, verify valid slices
 - **Failure Policy**: Any failure → CRITICAL log → `sys.exit(1)` → application shutdown
 
@@ -421,54 +421,99 @@ from tools.scraper.prompts import SCRAPER_SYS_PROMPT, CURATION_SYS_PROMPT
 def _init_driver(self) -> Driver:
     self._status = BrowserStatus.INITIALIZING
     self.surgical_kill()  # Kill existing Chrome for this profile
+    
+    profile_path = os.path.abspath(config.CHROME_USER_DATA_DIR).replace("\\", "/")
     self._driver = Driver(
         headless=False,
-        user_agent="REAL",
+        user_agent="real",  # Normalized to lowercase
         window_size=(1920, 1080),
-        profile=os.path.abspath(config.CHROME_USER_DATA_DIR),
+        arguments=[f"--user-data-dir={profile_path}"],  # Explicit param
     )
     # Log PID
-    self._pid = self._driver.browser.process.pid
+    if hasattr(self._driver, 'browser') and hasattr(self._driver.browser, 'process'):
+        self._pid = self._driver.browser.process.pid
+        log.dual_log(tag="Browser:Daemon", message=f"Chrome spawned with PID {self._pid}")
+    
+    # 3-second stabilization delay
+    log.dual_log(tag="Browser:Daemon", message="Waiting 3s for Chrome CDP to settle...")
+    self._driver.sleep(3)
+    
     # Status remains INITIALIZING until deep_warmup() succeeds
 ```
 
 *Surgical Kill:*
 ```python
 def surgical_kill(self) -> None:
+    if psutil is None:
+        return
+    
     target_dir = os.path.abspath(config.CHROME_USER_DATA_DIR).lower()
+    killed = False
+    
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         current_pid = proc.pid
         try:
             info = proc.info
+            if not info:
+                continue
             cmdline = " ".join(info.get('cmdline') or []).lower()
             proc_name = (info.get('name') or "").lower()
+            
             if "chrome" in proc_name and target_dir in cmdline:
                 proc.kill()
+                killed = True
+                log.dual_log(tag="Browser:Kill", message=f"Killed Chrome PID {current_pid} for profile {target_dir}")
         except (psutil.AccessDenied, psutil.PermissionError) as e:
-            sys.exit(1)  # Fail immediately on permission errors
+            log.dual_log(tag="Browser:Kill", message=f"FATAL: Permission denied killing Chrome PID {current_pid}: {e}", level="CRITICAL")
+            raise RuntimeError(f"Permission denied killing Chrome PID: {e}")
+        except psutil.NoSuchProcess:
+            continue
+        except Exception as e:
+            log.dual_log(tag="Browser:Kill", message=f"Error killing process: {e}", level="WARNING")
+    
+    if killed:
+        log.dual_log(tag="Browser:Kill", message=f"Surgically killed Chrome processes for {target_dir}")
 ```
 
 *Deep Warmup:*
 ```python
-async def deep_warmup(self) -> bool:
+def deep_warmup(self) -> bool:
     try:
+        from utils.browser_utils import safe_google_get
+        from utils.som_utils import reinject_all
+        from utils.vision_utils import capture_and_optimize
+        
         driver = self.get_or_create_driver()
-        # Phase 1: Navigation
-        safe_google_get(driver, "https://example.com")
-        driver.sleep(2)
-        if "Example Domain" not in (driver.page_html or ""):
-            raise RuntimeError("Navigation failed")
-        # Phase 2: SoM Injection
-        last_id = inject_som(driver)
-        if last_id <= 1:
-            raise RuntimeError("SoM failed")
-        # Phase 3: Vision
+        
+        # Phase 1: Navigation Test - Space Jam 1996
+        log.dual_log(tag="Startup:Warmup", message="Phase 1: Navigation Test")
+        safe_google_get(driver, "https://www.spacejam.com/1996/")
+        driver.short_random_sleep()
+        
+        # Verify presence of the expected marker string (case-insensitive)
+        page_html = (driver.page_html or "").lower()
+        expected = "SPACE JAM, characters, names, and all related".lower()
+        if expected not in page_html:
+            raise RuntimeError("Navigation failed: Content mismatch - expected marker not found")
+        
+        # Phase 2: SoM Test
+        log.dual_log(tag="Startup:Warmup", message="Phase 2: SoM Injection Test")
+        reinject_all(driver, self._id_tracking)
+        main_range = self._id_tracking.get('main')
+        if not main_range or main_range[1] <= 1:
+            raise RuntimeError("SoM injection failed: No markers added")
+        
+        # Phase 3: Vision Test
+        log.dual_log(tag="Startup:Warmup", message="Phase 3: Vision Subsystem Test")
         slices = capture_and_optimize(driver, 0)
         if not slices or not any(s.get("b64") for s in slices if s.get("status") == "OK"):
-            raise RuntimeError("Vision failed")
+            raise RuntimeError("Vision test failed: No valid slices produced")
+        
+        log.dual_log(tag="Startup:Warmup", message="Deep Warmup Successful")
         self._status = BrowserStatus.READY
         return True
     except Exception as e:
+        log.dual_log(tag="Startup:Warmup", message=f"CRITICAL: Warmup Failed: {e}", level="CRITICAL")
         self._status = BrowserStatus.CRITICAL_FAILURE
         return False
 ```
@@ -486,46 +531,74 @@ if tool_name in ["scraper", "browser_task"]:
 
 **Two-Phase Shutdown** (`app.py`):
 ```python
-# Phase 1: Stop polling, broadcast cancellation
-mgr.stop()
-for flag in list(mgr.cancellation_flags.values()):
-    flag.set()
-
-# Phase 2: Drain (60s)
-drain_start = time.time()
-while mgr._active_jobs and (time.time() - drain_start < 60.0):
-    await asyncio.sleep(2)
-
-# Release resources
-daemon_manager.shutdown_driver()
-daemon_manager.surgical_kill()
-await wait_for_writes()
-shutdown_writer()
+finally:
+    log.dual_log(tag="App:Shutdown", message="Initiating shutdown sequence...", level="INFO")
+    
+    try:
+        from bot.engine.worker import get_manager
+        mgr = get_manager()
+        
+        # Phase 1: Stop polling, broadcast cancellation
+        log.dual_log(tag="App:Shutdown", message="Phase 1: Stopping worker manager polling loop", level="INFO")
+        mgr.stop()
+        
+        log.dual_log(tag="App:Shutdown", message="Phase 2: Broadcasting cancellation to active workers", level="INFO")
+        for flag in list(mgr.cancellation_flags.values()):  # Snapshot to prevent RuntimeError
+            flag.set()
+        
+        # Phase 2: Drain (60s)
+        drain_start = time.time()
+        drain_timeout = 60.0
+        log.dual_log(tag="App:Shutdown", message=f"Phase 3: Draining active jobs for up to {drain_timeout}s", level="INFO")
+        while mgr._active_jobs and (time.time() - drain_start < drain_timeout):
+            remaining = len(mgr._active_jobs)
+            log.dual_log(tag="App:Shutdown", message=f"Draining {remaining} active job(s), elapsed: {time.time() - drain_start:.1f}s")
+            await asyncio.sleep(2)
+        
+        if mgr._active_jobs:
+            log.dual_log(tag="App:Shutdown", message=f"Drain timeout exceeded, {len(mgr._active_jobs)} job(s) remaining", level="WARNING")
+        else:
+            log.dual_log(tag="App:Shutdown", message="All active jobs drained successfully", level="INFO")
+        
+        # Release resources
+        log.dual_log(tag="App:Shutdown", message="Releasing browser resources", level="INFO")
+        from utils.browser_daemon import daemon_manager
+        daemon_manager.shutdown_driver()
+        daemon_manager.surgical_kill()
+        
+        from database.writer import wait_for_writes, shutdown_writer
+        await wait_for_writes()
+        shutdown_writer()
+        
+        log.dual_log(tag="App:Shutdown", message="Clean shutdown complete", level="INFO")
+    except Exception as e:
+        log.dual_log(tag="App:Shutdown", message=f"Shutdown error: {e}", level="ERROR")
+    
+    if startup_failed:
+        os._exit(1)
 ```
 
-### 5.6 Warmup Sequence with Failure Policy
-
-**Warmup Sequence** (`utils/startup/browser.py`):
+**Warmup Sequence with Failure Policy** (`utils/startup/browser.py`):
 ```python
 async def warmup_browser() -> None:
+    """CRITICAL: Deep warmup orchestration. Fatal on failure."""
     def _do_warmup():
         browser_lock.acquire()
         try:
-            return asyncio.run(daemon_manager.deep_warmup())
+            return daemon_manager.deep_warmup()
         finally:
             browser_lock.safe_release()
 
     try:
-        success = await asyncio.wait_for(asyncio.to_thread(_do_warmup), timeout=60.0)
+        # 90-second timeout for slow cold-starts and stabilization delay
+        success = await asyncio.wait_for(asyncio.to_thread(_do_warmup), timeout=90.0)
         if not success:
-            log.dual_log(tag="Startup:Browser", message="Deep Warmup failed. Shutting down.", level="CRITICAL")
-            sys.exit(1)
+            raise RuntimeError("Browser failed internal health checks.")
     except asyncio.TimeoutError:
-        log.dual_log(tag="Startup:Browser", message="Warmup timed out. Shutting down.", level="CRITICAL")
-        sys.exit(1)
+        raise RuntimeError("Browser warmup timed out after 90 seconds.")
     except Exception as e:
         log.dual_log(tag="Startup:Browser", message=f"Warmup crashed: {e}", level="CRITICAL")
-        sys.exit(1)
+        raise RuntimeError(f"Browser Warmup Failed: {e}")
 ```
 
 ## 6. Public Interfaces

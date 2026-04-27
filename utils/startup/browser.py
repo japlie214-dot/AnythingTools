@@ -10,28 +10,21 @@ log = get_dual_logger(__name__)
 
 
 async def warmup_browser() -> None:
-    """
-    Deep warmup orchestration with failure policy.
-    On failure: logs warning and triggers sys.exit(1).
-    """
+    """CRITICAL: Deep warmup orchestration. Fatal on failure."""
     def _do_warmup():
         browser_lock.acquire()
         try:
-            # Run deep warmup via daemon manager (async)
-            import asyncio
-            return asyncio.run(daemon_manager.deep_warmup())
+            return daemon_manager.deep_warmup()
         finally:
             browser_lock.safe_release()
 
     try:
-        # Increased timeout to 60s to accommodate deep stack verification
+        # Expand timeout to 60 seconds to accommodate stabilization delay and slow cold-starts
         success = await asyncio.wait_for(asyncio.to_thread(_do_warmup), timeout=60.0)
         if not success:
-            log.dual_log(tag="Startup:Browser", message="Deep Warmup failed. Shutting down.", level="CRITICAL")
-            sys.exit(1)
+            raise RuntimeError("Browser failed internal health checks.")
     except asyncio.TimeoutError:
-        log.dual_log(tag="Startup:Browser", message="Deep Warmup timed out after 60 seconds. Shutting down.", level="CRITICAL")
-        sys.exit(1)
+        raise RuntimeError("Browser warmup timed out after 90 seconds.")
     except Exception as e:
-        log.dual_log(tag="Startup:Browser", message=f"Warmup process crashed: {e}", level="CRITICAL")
-        sys.exit(1)
+        log.dual_log(tag="Startup:Browser", message=f"Warmup crashed: {e}", level="CRITICAL")
+        raise RuntimeError(f"Browser Warmup Failed: {e}")

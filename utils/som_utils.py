@@ -23,16 +23,46 @@ log = get_dual_logger(__name__)
 
 
 def inject_som(driver: Driver, start_id: int = 1) -> int:
-    """Inject data-ai-id attributes and return the last ID used."""
+    """Inject data-ai-id attributes with visual badges and return the last ID used."""
     try:
         last_id = driver.run_js(
             """(function(startId){
                 var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null, false);
                 var id = startId;
+                var existingRects = [];
                 while (walker.nextNode()) {
                     var el = walker.currentNode;
-                    if (el.offsetParent !== null) {
-                        el.setAttribute('data-ai-id', String(id++));
+                    var rect = el.getBoundingClientRect();
+                    if (el.offsetParent !== null && rect.width > 0 && rect.height > 0) {
+                        var currentId = String(id++);
+                        el.setAttribute('data-ai-id', currentId);
+                        
+                        var badge = document.createElement('div');
+                        badge.setAttribute('data-ai-badge', 'true');
+                        badge.textContent = currentId;
+                        badge.style.position = 'absolute';
+                        badge.style.backgroundColor = 'red';
+                        badge.style.color = 'white';
+                        badge.style.fontSize = '12px';
+                        badge.style.padding = '2px 4px';
+                        badge.style.zIndex = '2147483647';
+                        badge.style.pointerEvents = 'none';
+                        
+                        var top = rect.top + window.scrollY;
+                        var left = rect.left + window.scrollX;
+                        
+                        // Vertical displacement logic to prevent overlap
+                        for (var i = 0; i < existingRects.length; i++) {
+                            var eRect = existingRects[i];
+                            if (Math.abs(eRect.top - top) < 15 && Math.abs(eRect.left - left) < 15) {
+                                top += 15;
+                            }
+                        }
+                        existingRects.push({top: top, left: left});
+                        
+                        badge.style.top = top + 'px';
+                        badge.style.left = left + 'px';
+                        document.body.appendChild(badge);
                     }
                 }
                 return id;
@@ -57,14 +87,22 @@ def wait_for_dom_stability(driver: Driver, timeout: int = 10):
 
 
 def extract_surgical_html(driver: Driver) -> str:
-    """Returns readable HTML while preserving data-ai-id attributes."""
+    """Returns readable HTML while preserving data-ai-id attributes, applying configured character budget."""
     from utils.text_processing import clean_html_for_agent
-    return clean_html_for_agent(driver.page_html or "", extra_attrs={"data-ai-id"})
+    import config
+    budget = getattr(config, "BROWSER_SOM_HTML_CHAR_BUDGET", 20000)
+    raw_html = driver.page_html or ""
+    return clean_html_for_agent(raw_html, max_chars=budget, extra_attrs={"data-ai-id"})
 
 
-def reinject_all(driver: Driver, id_tracking: dict):
-    """Utility expected by agentic loops to refresh markers."""
-    inject_som(driver)
+def reinject_all(driver: Driver, id_tracking: dict) -> None:
+    """Full rebuild: wait for DOM stability, inject main document, and track ID ranges."""
+    wait_for_dom_stability(driver)
+    remove_overlays(driver)
+    
+    start_id = 1
+    last_id = inject_som(driver, start_id)
+    id_tracking['main'] = (start_id, last_id - 1)
 
 
 def inject_ai_ids(driver: Driver) -> None:

@@ -20,6 +20,9 @@ TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
 # --- Browser / Chrome Data Dir ---
 CHROME_USER_DATA_DIR: str = os.getenv("CHROME_USER_DATA_DIR", "chrome_profile")
 
+# --- Browser SoM Configuration ---
+BROWSER_SOM_HTML_CHAR_BUDGET: int = int(os.getenv("BROWSER_SOM_HTML_CHAR_BUDGET", "20000"))
+
 # --- Telemetry / Logging ---
 TELEMETRY_DRY_RUN: bool = os.getenv("TELEMETRY_DRY_RUN", "false").lower() in ("true", "1", "yes")
 

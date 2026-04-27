@@ -7,6 +7,7 @@ from .database import init_database_layer, run_db_migrations, validate_vec0
 from .registry import load_tool_registry
 from .browser import warmup_browser
 from .telegram import start_telegram_handshake
+from .recovery import run_startup_recovery
 
 async def run_startup(app_instance=None) -> StartupContext:
     ctx = StartupContext()
@@ -24,6 +25,7 @@ async def run_startup(app_instance=None) -> StartupContext:
     # Tier 2: Dependent Database logic (Sequential)
     orchestrator.add_sequential("run_db_migrations", run_db_migrations)
     orchestrator.add_sequential("validate_vec0", validate_vec0)
+    orchestrator.add_sequential("startup_recovery", run_startup_recovery)
 
     # Tier 3: Application logic (Concurrent)
     orchestrator.add_concurrent_tier([
