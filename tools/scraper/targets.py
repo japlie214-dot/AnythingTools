@@ -38,3 +38,4 @@ ARTICLE_BODY_SELECTORS = [
 ]
 
 VALID_TARGET_NAMES = {t["name"] for t in TARGETS}
+TARGET_SITE_MAP = {t["name"]: t for t in TARGETS}

@@ -1,24 +1,25 @@
-# AnythingTools - Deterministic Tool Hosting Service
+# AnythingTools - Modular Tool Hosting service with Advanced Startup Architecture
 
 ## 1. Project Overview
 
-AnythingTools is a deterministic tool-hosting service exposing web scraping, publishing, batch reading, and backup tools via FastAPI. It enforces thread-based tool execution, single-writer database architecture (SQLite WAL), and structured markdown callbacks.
+AnythingTools is a FastAPI-based deterministic tool hosting service that provides web scraping, publishing, batch reading, and backup capabilities via a REST API. The system executes tools in isolated threads with a single-writer database architecture (SQLite WAL mode) and structured callback delivery.
 
 ### Operational Capabilities
-- **Web Scraper**: Strict DOM validation, video/audio rejection, ULID-based identification, automatic delta backup post-persistence
-- **Publisher**: Telegram delivery with state management and crash recovery
-- **Batch Reader**: Semantic search over scraped content (vector + full-text)
-- **Backup System**: OOM-safe Parquet export/import for 5 master tables with intelligent restoration, streaming chunks, and atomic writes
+
+- **Web Scraper**: DOM-validated extraction, ULID-based identification, automatic delta backup post-persistence, configurable target site registry
+- **Publisher**: Telegram message delivery with state management and crash recovery
+- **Batch Reader**: Hybrid semantic search combining vector embeddings (FTS5) and full-text search
+- **Backup System**: Streaming Parquet export/import with OOM-safe chunking (500 rows/batch), watermark-based delta, FTS5 post-restore rebuild
 
 ### Explicit Non-Capabilities
-- **No continuous backup**: Batch-only execution (triggered or manual)
-- **No selective restore**: All-or-nothing restoration for master tables
-- **No telemetry**: Local SQLite only
-- **No real-time streaming**: Polling-based worker architecture (1s interval)
-- **No automatic migration**: Manual schema reconciliation only
-- **No concurrent writers**: Single background writer thread
+
+- **No continuous/real-time backup**: Batch-only execution, manual or triggered
+- **No selective restore**: All-or-nothing restoration for master tables only
+- **No telemetry**: Local SQLite only, no external metrics collection
+- **No concurrent writers**: Single background writer thread (max 1000 queued tasks)
+- **No automatic schema migration**: Manual reconciliation via reconciler
 - **No backup verification**: No checksums or corruption detection
-- **No direct FTS backup**: FTS tables excluded from restores, rebuilt post-restore
+- **No FTS backup**: FTS tables excluded from restores, rebuilt synchronously
 
 ---
 
@@ -27,60 +28,89 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 ### Core Components
 
 **1. API Layer (`app.py`, `api/`)**
-- FastAPI with lifespan hook for startup/shutdown tasks
-- Mounted `/artifacts` static file server
-- Background task execution for export/restore operations
-- **Endpoints**: 
-  - `/api/tools/{tool}` - Tool job enqueueing
-  - `/api/jobs/{id}` - Job status retrieval with logs
-  - `/api/backup/export` - Manual backup trigger (queued, returns job_id)
-  - `/api/backup/restore` - Manual restore trigger (queued, requires browser_lock)
-  - `/api/backup/status` - Backup directory status
-  - `/api/metrics` - System metrics (write queue, active jobs)
+- FastAPI lifespan manager for startup/shutdown orchestration
+- Static file server mounted at `/artifacts` and `/api/artifacts`
+- Background job execution for export/restore operations
+- **Key Endpoints**:
+  - `POST /api/tools/{tool}` - Enqueue tool execution
+  - `GET /api/jobs/{id}` - Job status with logs
+  - `POST /api/backup/export` - Manual backup trigger
+  - `POST /api/backup/restore` - Manual restore (requires browser_lock)
+  - `GET /api/backup/status` - Backup directory status
+  - `GET /api/metrics` - System metrics (queue, active jobs)
 
-**2. Worker Manager (`bot/engine/worker.py`)**
-- `UnifiedWorkerManager`: Polls database every 1s for `QUEUED` jobs
-- Thread-isolated tool execution
-- Callback delivery with exponential backoff (3 attempts)
+**2. Startup Orchestration (`utils/startup/`)**
+- **New modular architecture** (post-refactor):
+  - `core.py`: StartupOrchestrator with concurrent tiering support
+  - `cleanup.py`: Zombie Chrome process and temp file cleanup
+  - `server.py`: Dynamic artifacts directory mounting from config
+  - `database.py`: Pragmas, DB writer initialization, lifecycle runner, vec0 validation
+  - `registry.py`: Tool registry loading with validation
+  - `browser.py`: Browser warmup (5s wait → example.com navigation → verification)
+  - `telegram.py`: Async orphan handshake for Telegram bot token
+  - `__init__.py`: Pipeline assembly with three-tier execution
+
+**3. Worker Manager (`bot/engine/worker.py`)**
+- `UnifiedWorkerManager`: Polls database every 1s for `QUEUED`, `INTERRUPTED`, `PENDING_CALLBACK` jobs
+- Thread-isolated tool execution with cancellation flags
+- Callback delivery with exponential backoff (3 attempts max)
 - **Job lifecycle**: `QUEUED` → `RUNNING` → `COMPLETED|FAILED|PARTIAL|PENDING_CALLBACK|INTERRUPTED`
-- **Recovery**: Handles `INTERRUPTED` jobs on restart
+- **Recovery**: Automatically requeues interrupted jobs on restart
 
-**3. Database Layer (`database/`)**
-- **Single-writer background thread** (`writer.py`) with write queue (max 1000)
+**4. Database Layer (`database/`)**
+- **Single-writer background thread** (`writer.py`) with bounded queue (max 1000)
 - **WAL mode** for concurrent readers
 - **Schema v9** with `updated_at` tracking for delta backups
-- **Current tables**: 
-  - Master: `scraped_articles`, `scraped_articles_vec`, `long_term_memories`, `long_term_memories_vec`
-  - Non-master: `jobs`, `job_items`, `job_logs`, `broadcast_batches`
+- **Tables**:
+  - *Master*: `scraped_articles`, `scraped_articles_vec`, `long_term_memories`, `long_term_memories_vec`
+  - *Non-master*: `jobs`, `job_items`, `job_logs`, `broadcast_batches`
 - **Schema Reconciliation** (`reconciler.py`): Detects drift, performs pre-drop snapshots, cascades FK recreations
-- **FTS5 Handling**: Excluded from standard reconciliation, handled separately
+- **FTS5 Handling**: Excluded from standard reconciliation, created via dedicated existence-based checks
 
-**4. Tool Implementations (`tools/`)**
-- **Scraper**: Full pipeline (extraction → curation → persistence → backup) with job_items tracking
-  - **Prompt Module**: Uses `tools/scraper/prompts.py` (canonical after PLAN-02 migration)
-- **Publisher**: Telegram delivery, state management via `job_items`
+**5. Tool Layer (`tools/`)**
+- **Scraper**: Full pipeline (extraction → curation → persistence → auto-backup) with job_items tracking
+- **Publisher**: Telegram delivery with state management via job_items
 - **Batch Reader**: Hybrid vector + FTS5 search
 - **Backup**: Multi-table Parquet export/import with streaming
+- **Registry** (`registry.py`): Whitelisted core tools only: `scraper`, `draft_editor`, `publisher`, `batch_reader`
 
-**5. Backup System (`tools/backup/`)**
-- **Config** (`config.py`): OOM-safe batch size clamping (max 10000)
-- **Schema** (`schema.py`): PyArrow schemas with binary embeddings, embedding validation
-- **Exporter** (`exporter.py`): Chunked SQL reads (500 rows/batch), parameterized queries, virtual table aware
-- **Storage** (`storage.py`): Atomic Parquet writes, embedding validation, ISO-8601 watermarks
-- **Restore** (`restore.py`): Single-writer queue routing (batch 500), adaptive column mapping, synchronous FTS rebuild
-- **Runner** (`runner.py`): Orchestrates backup/restore with job tracking, read-only connections
-- **Models** (`models.py`): Pydantic v1/v2 compatibility for serialization
+**6. Backup System (`tools/backup/`)**
+- **Config**: OOM-safe batch size ceiling (10,000 rows)
+- **Schema**: PyArrow schemas with binary embeddings (variable-length, was fixed)
+- **Exporter** (`exporter.py`): Chunked 500-row SQL reads, parameterized queries, FTS exclusion
+- **Storage** (`storage.py`): Atomic writes, embedding validation, ISO-8601 watermarks
+- **Restore** (`restore.py`): Single-writer queue routing, adaptive column mapping, synchronous FTS rebuild
+- **Runner** (`runner.py`): Read-only connection, ISO-8601 timestamps
 
 ### Execution Model
+
 - **API**: Event-driven (FastAPI)
 - **Worker**: Polling-based (1s interval)
 - **Tools**: Thread-isolated execution
 - **Database**: Single-writer, multi-reader (WAL)
 - **Backup**: Streaming chunked execution (prevent OOM)
 
-### Data Flow (Backup/Restore)
+### Data Flow
 
-**Backup Export (Full/Delta)**:
+**Startup Pipeline (Three-Tier):**
+```
+Tier 1 (Concurrent):
+├─ mount_artifacts → config.ARTIFACTS_DIR
+├─ cleanup_zombie_chrome → psutil.scan + kill
+├─ cleanup_temp_files → remove *.tmp.parquet
+├─ init_database_layer → pragmas + start_writer()
+└─ start_telegram_handshake → async task launch
+
+Tier 2 (Sequential):
+├─ run_db_migrations → lifecycle.reconcile()
+└─ validate_vec0 → verify extension / fallback
+
+Tier 3 (Concurrent):
+├─ load_tool_registry → whitelist + validation
+└─ warmup_browser → wait 5s → navigate to example.com → verify text
+```
+
+**Backup Export (Full/Delta):**
 ```
 [Reader Thread] → export_table_chunks(conn, table, mode, last_ts)
     ↓
@@ -93,7 +123,7 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 [Watermark Update] → table_watermarks: {table: ISO-8601}
 ```
 
-**Restore with FTS Rebuild**:
+**Restore with FTS Rebuild:**
 ```
 [Read Connection] → restore_master_tables_direct(conn)
     ↓
@@ -114,67 +144,87 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 
 ## 3. Repository Structure
 
-### Top-Level Directories
 ```
 ./
-├── api/                    # FastAPI routes + schemas (updated: table_watermarks)
-├── bot/                    # Worker engine  
-├── clients/                # External services (LLM, Snowflake)
-├── database/               # SQLite layer
-│   ├── schemas/            # Canonical DDL (single source of truth)
-│   │   ├── __init__.py     # MASTER_TABLES: list[str], ALL_FTS_TABLES
-│   │   ├── vector.py       # FTS5 triggers + FTS_TABLES dict (extracted)
-│   │   └── *.py            # jobs, finance, pdf, token
-│   ├── reconciler.py       # Schema drift detection + repair (FTS-aware)
-│   ├── schema_introspector.py  # PRAGMA parsing + DDL comparison
-│   ├── lifecycle.py        # Uses reconciler
-│   ├── writer.py           # Background single-writer thread + enqueue_transaction
-│   ├── connection.py       # DB connection manager (optional vec0, query_only)
-│   └── health.py           # Table validation
-├── deprecated/             # Legacy code (~70% volume, never loaded)
-├── tools/                  # Tool implementations
-│   ├── scraper/            # Extraction, curation, persistence + auto-backup
-│   │   ├── prompts.py      # Canonical prompt constants (PLAN-02)
-│   │   ├── Skill.py        # Tool descriptor
-│   │   └── *.py            # browser, curation, extraction, etc.
-│   ├── publisher/          # Telegram delivery
-│   ├── batch_reader/       # Semantic search
-│   ├── backup/             # Hardened backup system
-│   │   ├── config.py       # Batch size ceiling, rule comments
-│   │   ├── models.py       # Watermark/Result with table_watermarks + model_dump_compat()
-│   │   ├── schema.py       # PyArrow schemas (binary embeddings, validation helper)
-│   │   ├── exporter.py     # Parameterized queries, FTS exclusion
-│   │   ├── storage.py      # Atomic writes + embedding validation
-│   │   ├── restore.py      # enqueue_transaction + sync FTS rebuild
-│   │   └── runner.py       # Read-only connection, ISO-8601 timestamps
-│   ├── draft_editor/       # (Singular tool)
-│   └── *                   # Other tools (base.py, registry.py)
-├── utils/                  # Infrastructure
-│   ├── browser_daemon.py   # Browser driver management
-│   ├── browser_lock.py     # Lock for restore operations
-│   └── logger/             # Dual logging system
-├── tests/                  # Unit tests
-│   ├── test_backup.py      # Schema, validation, Pydantic compat tests
-│   └── test_browser_e2e.py # Browser automation tests
-├── app.py                  # FastAPI entrypoint with health tracking
-├── config.py               # API key and global config
-└── requirements.txt        # Dependencies
+├── api/                      # FastAPI routes + schemas
+│   ├── routes.py            # All endpoints with job/backup logic
+│   ├── schemas.py           # Pydantic models (watermark support)
+│   ├── telegram_client.py   # Bot API + orphan handshake
+│   └── telegram_notifier.py # Message delivery
+├── bot/                     # Worker engine
+│   ├── engine/
+│   │   ├── worker.py        # UnifiedWorkerManager (threads)
+│   │   └── tool_runner.py   # Job execution helpers
+│   └── core/
+│       └── constants.py     # Job status enums
+├── clients/                 # External services
+│   ├── snowflake_client.py  # Snowflake connector
+│   └── llm/
+│       ├── factory.py       # LLM provider selection
+│       └── payloads.py      # Request builders
+├── database/                # SQLite layer
+│   ├── schemas/             # Canonical DDL
+│   │   ├── __init__.py      # MASTER_TABLES, ALL_FTS_TABLES
+│   │   ├── vector.py        # FTS5 triggers + vec0 tables
+│   │   └── *.py             # jobs, finance, pdf, token
+│   ├── reconciler.py        # Schema drift detection + repair
+│   ├── schema_introspector.py # PRAGMA parsing + DDL comparison
+│   ├── lifecycle.py         # Reconciler wrapper + recovery
+│   ├── writer.py            # Background single-writer thread
+│   ├── connection.py        # DB manager (optional vec0, query_only)
+│   ├── health.py            # Table validation
+│   └── *.py                 # reader, job_queue, blackboard, formula_cache
+├── deprecated/              # Legacy code (~70% volume, never loaded)
+│   ├── bot/                 # Old agent/weaver/modes
+│   └── tools/               # Old research, finance, polymarket, etc.
+├── tools/                   # Tool implementations
+│   ├── scraper/             # Extraction + curation + persistence
+│   │   ├── prompts.py       # Canonical prompts (post-PLAN-02)
+│   │   ├── Skill.py         # Tool descriptor
+│   │   ├── tool.py          # Main tool
+│   │   ├── browser.py       # DOM helpers
+│   │   ├── curation.py      # Article selection
+│   │   └── extraction.py    # Content extraction
+│   ├── publisher/           # Telegram delivery
+│   ├── batch_reader/        # Hybrid search
+│   ├── backup/              # Hardened backup system
+│   │   ├── config.py        # Batch ceiling (10k), OOM rules
+│   │   ├── models.py        # Watermark/Result (Pydantic compat)
+│   │   ├── schema.py        # PyArrow schemas, validation helpers
+│   │   ├── exporter.py      # Parameterized queries, FTS exclusion
+│   │   ├── storage.py       # Atomic writes + embedding validation
+│   │   ├── restore.py       # enqueue_transaction + sync FTS
+│   │   └── runner.py        # Read-only connection
+│   ├── draft_editor/        # Content editing tool
+│   ├── base.py              # BaseTool
+│   └── registry.py          # Whitelisted tool discovery
+├── utils/                   # Infrastructure
+│   ├── startup/             # Modular startup system (NEW)
+│   │   ├── core.py          # StartupOrchestrator (tiers)
+│   │   ├── cleanup.py       # Zombie chrome + temp files
+│   │   ├── server.py        # Artifacts mounting
+│   │   ├── database.py      # Pragmas, writer, lifecycle, vec0
+│   │   ├── registry.py      # Tool registry loading
+│   │   ├── browser.py       # Warmup (5s wait + timeout)
+│   │   ├── telegram.py      # Async handshake
+│   │   └── __init__.py      # Pipeline assembly
+│   ├── browser_daemon.py    # Browser driver management
+│   ├── browser_lock.py      # Lock for restore operations
+│   ├── logger/              # Dual logging system
+│   └── *.py                 # security, helpers, etc.
+├── tests/                   # Unit tests
+│   ├── test_backup.py       # Schema, validation, Pydantic compat
+│   └── test_browser_e2e.py  # Browser automation
+├── app.py                   # FastAPI entrypoint (refactored)
+├── config.py                # API key and global configuration
+└── requirements.txt         # Dependencies
 ```
 
 ### Non-Obvious Structures
-- **`deprecated/`** - 70% repository volume, imports disabled, never executed
-- **`tests/`** - Unit tests for backup system and browser E2E
-- **No automatic migration**: Manual schema changes only via reconciler
-- **`tools/scraper/prompts.py`** - Canonical prompt module after PLAN-02 fix (replaced `prompt.py`)
-
-### Critical Architecture Files
-- `app.py` - Lifespan startup/shutdown with StartupHealth tracking
-- `bot/engine/worker.py` - Job execution lifecycle
-- `database/writer.py` - Single-writer thread + `enqueue_transaction`
-- `database/connection.py` - WAL + optional vec0 + `query_only` mode
-- `database/schemas/__init__.py` - MASTER_TABLES definition (ordered list, no FTS)
-- `tools/backup/runner.py` - Read-only exports, restore routing
-- `tools/scraper/prompts.py` - Canonical prompt definitions (POST-PLAN-02)
+- **`deprecated/`** - 70% repository volume, imports disabled, never executed. Contains legacy tools (finance, research, polymarket, quiz) and old bot architecture.
+- **`tests/`** - Unit tests for backup system and browser E2E only
+- **No automatic migration**: Manual schema changes via reconciler only
+- **`tools/scraper/prompts.py`** - Canonical prompt module after PLAN-02 (replaced `prompt.py`)
 
 ---
 
@@ -183,40 +233,39 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 ### Key Abstractions
 
 **1. Master Tables (Protected)**
-- `scraped_articles` - Content storage with `vec_rowid` reference
-- `scraped_articles_vec` - Vector embeddings (vec0 virtual table, binary column)
+- `scraped_articles` - Content with `vec_rowid` reference
+- `scraped_articles_vec` - Vector embeddings (vec0 virtual table)
 - `long_term_memories` - Persistent agent memory
 - `long_term_memories_vec` - Memory embeddings
 - **Excluded**: `scraped_articles_fts` (derived, rebuilt post-restore)
 
 **2. Single-Writer Queue**
 - `enqueue_write(sql, params)` - Single statement
-- `enqueue_transaction(statements)` - Batched transaction (restore uses batch_size=500)
+- `enqueue_transaction(statements)` - Batched transaction (restore: batch_size=500)
 - `wait_for_writes(timeout)` - Synchronous barrier
 
 **3. Watermark-Based Delta**
 - **Table-watermarks**: Per-table ISO-8601 `last_export_ts` in `watermark.json`
 - **Delta selection**: `WHERE updated_at > ?` (parameterized)
-- **Exclusive writes**: Only append, never modify existing Parquet files
+- **Exclusive writes**: Never modify existing Parquet files
 - **ISO-8601 only**: All delta comparisons use `.isoformat()`
 
 **4. ULID Identification**
-- Job IDs, Article IDs, Batch IDs
-- 8-byte truncation for SQLite integer compatibility
+- Job IDs, Article IDs, Batch IDs (8-byte truncation for SQLite integer)
 - **Critical**: `id TEXT PRIMARY KEY` in scraped_articles
 
 **5. UPSERT Semantics**
-- **Old**: `INSERT OR REPLACE` → destroys `id`, rotates `vec_rowid` → vector bloat
+- **Old (broken)**: `INSERT OR REPLACE` → destroys `id`, rotates `vec_rowid`
 - **DO NOT USE**: `INSERT OR REPLACE`
 - **Correct**: `INSERT ... ON CONFLICT(normalized_url) DO UPDATE` → preserves `vec_rowid`
 
 **6. FTS5 External Content**
-- **Excluded from backup**: `scraped_articles_fts` not in `MASTER_TABLES`
+- **Excluded from backup**: Not in `MASTER_TABLES`
 - **Rebuilt post-restore**: `INSERT INTO scraped_articles_fts(scraped_articles_fts) VALUES('rebuild')`
 - **Synchronous**: Blocks via `wait_for_writes(timeout=300.0)`
 
 **7. FTS5 Categorization (PLAN-02 Fix)**
-- **`ALL_FTS_TABLES`**: New dict in `schemas/__init__.py`
+- **`ALL_FTS_TABLES`**: Dict in `schemas/__init__.py`
 - **Reconciler exclusion**: FTS tables skipped from standard drift detection
 - **Separate handling**: Created via dedicated loop with simple existence check
 
@@ -224,9 +273,8 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 
 **Current Master Table Definition** (`database/schemas/__init__.py`):
 ```python
-# RULE: MASTER_TABLES must be an ordered list (parents before children) for FK-safe restores.
+# RULE: MASTER_TABLES must be ordered list (parents before children) for FK-safe restores.
 # RULE: Derived/External FTS tables (e.g., scraped_articles_fts) must NEVER be included here.
-# They cannot be restored directly and must be rebuilt post-restoration.
 MASTER_TABLES: list[str] = [
     "scraped_articles",
     "scraped_articles_vec",
@@ -239,46 +287,22 @@ ALL_FTS_TABLES: Dict[str, str] = {
 }
 ```
 
-**Embedding Schema** (`tools/backup/schema.py`):
+**Virtual Table Reconciliation** (`database/schema_introspector.py`):
 ```python
-VECTOR_BYTE_LENGTH = 4096  # 1024 float32s
-FLOAT32_COUNT = 1024
-
-SCRAPED_ARTICLES_VEC_SCHEMA = pa.schema([
-    pa.field("rowid", pa.int64(), nullable=False),
-    pa.field("embedding", pa.binary(), nullable=False),  # FIXED: variable-length
-])
-```
-
-**Validation Helper** (`tools/backup/schema.py`):
-```python
-def validate_embedding_bytes(embedding_bytes: bytes, expected_length: int = VECTOR_BYTE_LENGTH) -> None:
-    """Validate that embedding bytes match the expected fixed size."""
-    if embedding_bytes is None:
-        raise ValueError("Embedding bytes cannot be None")
-    actual = len(embedding_bytes)
-    if actual != expected_length:
-        raise ValueError(f"Embedding size mismatch: expected {expected_length}, got {actual}")
+# For virtual tables (FTS5 / vec0), use existence-based reconciliation
+if is_virtual:
+    return table_exists(conn, table_name)
 ```
 
 **Prompt Module Migration** (`tools/scraper/prompts.py`):
 ```python
-# tools/scraper/prompts.py
 """
 Prompts for the Scraper tool (AnythingTools adaptation).
 All prompts MUST require the LLM to return strict JSON.
 """
-
 SCRAPER_SYS_PROMPT = (
     "You are the Scraper sub-agent running in the 'scraper' agent_domain. "
-    "All outputs MUST be valid JSON. When asked to curate, return an object like:\n"
-    "{\"top_10\": [\"ulid1\", \"ulid2\", ...]}\n"
-    "Do not include narrative text outside of the JSON object."
-)
-
-CURATION_SYS_PROMPT = (
-    "Given an array of candidate articles (as JSON), select up to 10 most "
-    "impactful articles and return ONLY: {\"top_10\": [<ulid strings>]}."
+    "All outputs MUST be valid JSON. ...\n"
 )
 ```
 
@@ -297,12 +321,8 @@ export_table_chunks(conn, table_name, config, mode="full", last_ts=""):
     
     params = ()
     if mode == "delta" and last_ts:
-        # Parameterized WHERE clause (safe, table_name validated against MASTER_TABLES)
-        cursor = conn.execute(f"PRAGMA table_info({table_name})")
-        cols = [r[1] for r in cursor.fetchall()]
-        if "updated_at" in cols:
-            query += " WHERE updated_at > ?"
-            params = (last_ts,)
+        query += " WHERE updated_at > ?"
+        params = (last_ts,)
     
     chunk_iter = pd.read_sql_query(query, conn, chunksize=config.batch_size, params=params)
 ```
@@ -317,8 +337,7 @@ batch_size = min(getattr(global_config, "BACKUP_BATCH_SIZE", 500), 10000)
 
 **DataFrame Validation** (`tools/backup/storage.py`):
 ```python
-def _validate_embedding_column(df: pd.DataFrame, table_name: str) -> None:
-    """Validate embedding byte lengths for vector tables before Parquet write."""
+def _validate_embedding_column(df: pd.DataFrame, table_name: str):
     if "embedding" not in df.columns:
         return
     embeddings = df["embedding"].dropna()
@@ -327,30 +346,20 @@ def _validate_embedding_column(df: pd.DataFrame, table_name: str) -> None:
             validate_embedding_bytes(emb)  # Raises ValueError on mismatch
 ```
 
-**Atomic Write + Batch Iterator** (`tools/backup/storage.py`):
+**Atomic Write** (`tools/backup/storage.py`):
 ```python
-def write_table_batch(table_name: str, chunks_iter, config: BackupConfig) -> int:
-    schema = TABLE_SCHEMAS[table_name]
-    dest = config.table_dir(table_name) / f"{table_name}_{ts}.parquet"
-    temp_path = dest.with_suffix(".tmp.parquet")
-    
-    writer = pq.ParquetWriter(str(temp_path), schema, compression=config.compression)
-    for df, count in chunks_iter:
-        if table_name.endswith("_vec"):
-            _validate_embedding_column(df, table_name)
-        table = pa.Table.from_pandas(df, schema=schema)
-        writer.write_table(table)
-    writer.close()
-    temp_path.replace(dest)  # Atomic rename
+dest = config.table_dir(table_name) / f"{table_name}_{ts}.parquet"
+temp_path = dest.with_suffix(".tmp.parquet")
+writer = pq.ParquetWriter(str(temp_path), schema, compression=config.compression)
+# Write batches...
+writer.close()
+temp_path.replace(dest)  # Atomic rename
 ```
 
 ### 5.3 Single-Writer Restore & FTS Rebuild
 
 **Restore with Transaction Batching** (`tools/backup/restore.py`):
 ```python
-from database.writer import enqueue_transaction, wait_for_writes
-import asyncio
-
 for batch in parquet_file.iter_batches(batch_size=500):
     pylist = batch.to_pylist()
     statements = []
@@ -362,23 +371,14 @@ for batch in parquet_file.iter_batches(batch_size=500):
     count += len(statements)
 
 # Synchronously wait for background writer
-try:
-    loop = asyncio.get_running_loop()
-    asyncio.run_coroutine_threadsafe(wait_for_writes(timeout=120.0), loop).result()
-except RuntimeError:
-    asyncio.run(wait_for_writes(timeout=120.0))
+asyncio.run(wait_for_writes(timeout=120.0))
 ```
 
 **FTS Rebuild Synchronous** (`tools/backup/restore.py`):
 ```python
 if restored_counts.get("scraped_articles", 0) > 0:
     enqueue_write("INSERT INTO scraped_articles_fts(scraped_articles_fts) VALUES('rebuild')")
-    # Blocks until rebuild completes
-    try:
-        loop = asyncio.get_running_loop()
-        asyncio.run_coroutine_threadsafe(wait_for_writes(timeout=300.0), loop).result()
-    except RuntimeError:
-        asyncio.run(wait_for_writes(timeout=300.0))
+    asyncio.run(wait_for_writes(timeout=300.0))  # Blocks until complete
 ```
 
 ### 5.4 Read-Only Runner Connection
@@ -386,7 +386,6 @@ if restored_counts.get("scraped_articles", 0) > 0:
 **Export Only Reads** (`tools/backup/runner.py`):
 ```python
 def run(mode: str = "delta", ...):
-    # Exports only require read access. Do not close the thread-local read connection.
     conn = DatabaseManager.get_read_connection()
     try:
         result = export_all_tables(conn, config, mode=mode)
@@ -394,36 +393,46 @@ def run(mode: str = "delta", ...):
         pass  # Keep thread-local connection alive
 ```
 
-**Restore Reads Only** (`tools/backup/runner.py`):
-```python
-def restore(manual_job_id: Optional[str] = None):
-    # Restore only requires read access to schema info;
-    # writes are routed via enqueue_transaction.
-    conn = DatabaseManager.get_read_connection()
-    result = restore_master_tables_direct(conn)
-```
-
-### 5.5 Scraper Pipeline & Prompt Evolution
+### 5.5 Scraper Pipeline
 
 **Tool Execution** (`tools/scraper/tool.py`):
 ```python
 from tools.scraper.prompts import SCRAPER_SYS_PROMPT, CURATION_SYS_PROMPT
-
 # Uses canonical constants from prompts.py (post-PLAN-02)
-scraper_prompt = SCRAPER_SYS_PROMPT
-curation_prompt = CURATION_SYS_PROMPT
 ```
 
-**Prompt Migration Evidence**:
-- **Before**: `tools/scraper/prompt.py` (original) → aliases in `prompts.py`
-- **After** (PLAN-02): `tools/scraper/prompts.py` (canonical, deleted `prompt.py`)
-- **Old references removed**: `tools/scraper/Skill.py` line 28 updated `prompt.py` → `prompts.py`
+### 5.6 Browser Warmup (With Timeout)
+
+**Warmup Sequence** (`utils/startup/browser.py`):
+```python
+def _do_warmup():
+    browser_lock.acquire()
+    try:
+        driver = get_or_create_driver()
+        driver.short_random_sleep(5.0)  # Wait 5s before navigation
+        driver.get("https://example.com")
+        html = driver.page_html or ""
+        if "Example Domain" not in html:
+            raise RuntimeError("Verification failed")
+    finally:
+        browser_lock.safe_release()
+
+result = await asyncio.wait_for(asyncio.to_thread(_do_warmup), timeout=35.0)
+```
 
 ---
 
 ## 6. Public Interfaces
 
 ### API Endpoints
+
+**Tool Enqueueing**:
+```bash
+curl -X POST http://localhost:8000/api/tools/scraper \
+  -H "X-API-Key: dev_default_key" \
+  -d '{"args": {"url": "https://example.com"}}'
+# Returns: {"status": "QUEUED", "job_id": "01H7Y..."}
+```
 
 **Backup Export**:
 ```bash
@@ -439,14 +448,7 @@ curl -X POST http://localhost:8000/api/backup/restore \
 # Returns: {"status": "RESTORE_QUEUED", "job_id": "01H7Z..."}
 ```
 
-**Status**:
-```bash
-curl http://localhost:8000/api/backup/status \
-  -H "X-API-Key: dev_default_key"
-# Returns: {enabled, backup_dir, watermark, file_counts, total_size_bytes}
-```
-
-**Job Tracking**:
+**Job Status**:
 ```bash
 curl http://localhost:8000/api/jobs/{job_id} \
   -H "X-API-Key: dev_default_key"
@@ -457,34 +459,29 @@ curl http://localhost:8000/api/jobs/{job_id} \
 
 **Manual Full Backup**:
 ```python
-from tools.backup.storage import export_all_tables
 from database.connection import DatabaseManager
+from tools.backup.storage import export_all_tables
 
 conn = DatabaseManager.get_read_connection()
 export_all_tables(conn, mode="full")
-conn.close()  # Thread-local; safe to close
+conn.close()
 ```
 
 **Manual Restore**:
 ```python
+from database.connection import DatabaseManager
 from tools.backup.restore import restore_master_tables_direct
+
 conn = DatabaseManager.get_read_connection()
 restore_master_tables_direct(conn)
 conn.close()
-```
-
-**Scraper (Auto-Backup)**:
-```python
-from tools.scraper.tool import ScraperTool
-# Auto-runs delta backup after persistence
-tool = ScraperTool()
 ```
 
 ---
 
 ## 7. State, Persistence, and Data
 
-### Database Schema (v9, `updated_at` required)
+### Database Schema (v9)
 
 **Master Tables**:
 ```sql
@@ -508,10 +505,9 @@ CREATE TABLE scraped_articles (
 ```
 backups/
   scraped_articles/
-    scraped_articles_20260426_055301234567.parquet  (newest only in full mode)
+    scraped_articles_20260426_055301234567.parquet
   scraped_articles_vec/
     scraped_articles_vec_20260426_055301234567.parquet
-  ...
   watermark.json
 ```
 
@@ -520,36 +516,33 @@ backups/
 {
   "table_watermarks": {
     "scraped_articles": "2026-04-26T11:05:22.600Z",
-    "scraped_articles_vec": "2026-04-26T11:05:22.600Z",
-    ...
+    "scraped_articles_vec": "2026-04-26T11:05:22.600Z"
   }
 }
 ```
-
-### PyArrow Schemas
-
-- **Vector tables**: `pa.binary()` (FIXED: variable-length, was `fixed_size_binary`)
-- **Validation**: `validate_embedding_bytes` raises on mismatch
-- **FTS schema**: Excluded from `TABLE_SCHEMAS`
 
 ---
 
 ## 8. Dependencies & Integration
 
-### Runtime Dependencies (from `requirements.txt`)
+### Runtime Dependencies
 - `pyarrow>=15.0.0` - Parquet I/O (mandatory)
 - `pandas>=2.0.0` - Chunked DataFrames
 - `sqlite-vec>=0.1.0` - Vector extension (optional)
 - `fastapi`, `uvicorn` - API
 - `botasaurus` - Browser automation
+- `python-telegram-bot` - Telegram delivery
+- `psutil==5.9.5` - Process cleanup
 
 ### Environment Variables
 ```bash
+API_KEY="dev_default_key"
 BACKUP_ENABLED=true
-BACKUP_ONEDRIVE_DIR=""
 BACKUP_BATCH_SIZE=500      # Enforced ceiling 10000 in code
 BACKUP_COMPRESSION="zstd"
-API_KEY="dev_default_key"
+ANYTHINGLLM_ARTIFACTS_DIR="/path/to/artifacts"
+CHROME_USER_DATA_DIR="chrome_profile"
+TELEGRAM_BOT_TOKEN="token"
 ```
 
 ### Integration Points
@@ -675,7 +668,6 @@ print('Actions:', [a for a in report.actions if a.action != 'unchanged'])
 - Continuous backup / real-time sync
 - Partial restore / incremental restore
 - Cloud sync (OneDrive optional)
-- Backup verification with checksums
 - Multi-dataset (single DB)
 
 ---
@@ -700,7 +692,7 @@ print('Actions:', [a for a in report.actions if a.action != 'unchanged'])
 - **Fix Applied**: `enqueue_transaction`, `wait_for_writes`
 
 **4. `tools/backup/storage.py`**
-- **Risk**: Iterator contract (`(DataFrame, count)`)
+- **Risk**: Iterator contract `(DataFrame, count)`
 - **Risk**: Atomic rename (`.tmp` → final)
 - **Fix Applied**: Embedding validation, ISO-8601 watermarks
 
@@ -708,13 +700,13 @@ print('Actions:', [a for a in report.actions if a.action != 'unchanged'])
 - **Risk**: MASTER_TABLES must be ordered list, no FTS
 - **Fix Applied**: Explicit rules, list type, `ALL_FTS_TABLES`
 
-**6. `api/schemas.py`**
+**6. `database/schema_introspector.py`**
+- **Risk**: Virtual table DDL comparison
+- **Fix Applied**: Existence-based reconciliation for FTS5/vec0
+
+**7. `api/schemas.py`**
 - **Risk**: Watermark schema compatibility
 - **Fix Applied**: `table_watermarks` field
-
-**7. `tools/backup/models.py`** (unchanged from README)
-- **Risk**: Pydantic v1/v2 serialization
-- **State**: `model_dump_compat()` present
 
 **8. `tools/scraper/prompts.py`**
 - **Risk**: Prompt constant naming, formatting errors
@@ -722,16 +714,16 @@ print('Actions:', [a for a in report.actions if a.action != 'unchanged'])
 
 ### Tight Coupling
 - **Schema v9**: `updated_at` required for delta
-- **PyArrow 15+**: `binary(4096)` for embeddings (FIXED: now variable length)
+- **PyArrow 15+**: Binary embeddings (variable length)
 - **Batch size**: 500 enforced (10000 ceiling)
 - **Browser lock**: Restore requires exclusive access
 - **Prompt module**: Scraper relies on `prompts.py` constants
 
 ### Easy Extension
-- Add tables: Update `MASTER_TABLES`, `TABLE_SCHEMAS`
-- Change compression: `BACKUP_COMPRESSION`
-- Tune memory: Decrease batch size
-- Add OneDrive: Set `BACKUP_ONEDRIVE_DIR`
+- **Add tables**: Update `MASTER_TABLES`, `TABLE_SCHEMAS`
+- **Change compression**: `BACKUP_COMPRESSION`
+- **Tune memory**: Decrease batch size
+- **Add OneDrive**: Set `BACKUP_ONEDRIVE_DIR`
 
 ### Hardest Refactors
 - Remove pyarrow: Rewrite all backup I/O

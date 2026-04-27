@@ -74,14 +74,9 @@ def schema_matches(
     if not table_exists(conn, table_name):
         return False
 
-    # For virtual tables (FTS5 / vec0), compare sqlite_master.sql directly.
+    # For virtual tables (FTS5 / vec0), use existence-based reconciliation
     if is_virtual:
-        actual_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
-            (table_name,),
-        ).fetchone()
-        actual_sql = actual_row[0] if actual_row and actual_row[0] else ""
-        return _normalize_ddl(actual_sql) == _normalize_ddl(desired_ddl)
+        return table_exists(conn, table_name)
 
     # For regular tables, compare effective column list via PRAGMA table_info.
     actual_cols = _get_columns(conn, table_name)
