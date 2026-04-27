@@ -1,36 +1,37 @@
 # utils/startup/browser.py
 
 import asyncio
+import sys
 from utils.logger.core import get_dual_logger
-from utils.browser_daemon import get_or_create_driver
 from utils.browser_lock import browser_lock
+from utils.browser_daemon import daemon_manager
 
 log = get_dual_logger(__name__)
 
+
 async def warmup_browser() -> None:
+    """
+    Deep warmup orchestration with failure policy.
+    On failure: logs warning and triggers sys.exit(1).
+    """
     def _do_warmup():
         browser_lock.acquire()
         try:
-            driver = get_or_create_driver()
-            log.dual_log(tag="Startup:Browser", message="Warmup: waiting 5 seconds before navigation...", level="INFO")
-            driver.short_random_sleep(5.0)  # Wait 5 seconds before navigation
-            
-            log.dual_log(tag="Startup:Browser", message="Navigating to example.com for warmup...", level="INFO")
-            driver.get("https://example.com")
-            driver.short_random_sleep()
-
-            html = driver.page_html or ""
-            if "Example Domain" not in html:
-                raise RuntimeError("Browser warmup verification failed: 'Example Domain' not found in page HTML")
-
-            log.dual_log(tag="Startup:Browser", message="Browser warmup verified successfully", level="INFO")
-            return True
+            # Run deep warmup via daemon manager (async)
+            import asyncio
+            return asyncio.run(daemon_manager.deep_warmup())
         finally:
             browser_lock.safe_release()
 
     try:
-        result = await asyncio.wait_for(asyncio.to_thread(_do_warmup), timeout=35.0)  # Increased timeout to 35s
-        if not result:
-            raise RuntimeError("Browser warmup returned negative result")
+        # Increased timeout to 60s to accommodate deep stack verification
+        success = await asyncio.wait_for(asyncio.to_thread(_do_warmup), timeout=60.0)
+        if not success:
+            log.dual_log(tag="Startup:Browser", message="Deep Warmup failed. Shutting down.", level="CRITICAL")
+            sys.exit(1)
     except asyncio.TimeoutError:
-        raise RuntimeError("Browser warmup timed out after 35 seconds")
+        log.dual_log(tag="Startup:Browser", message="Deep Warmup timed out after 60 seconds. Shutting down.", level="CRITICAL")
+        sys.exit(1)
+    except Exception as e:
+        log.dual_log(tag="Startup:Browser", message=f"Warmup process crashed: {e}", level="CRITICAL")
+        sys.exit(1)

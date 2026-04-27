@@ -1,17 +1,17 @@
-# AnythingTools - Modular Tool Hosting service with Advanced Startup Architecture
+# AnythingTools - Deterministic Tool Hosting with Browser Lifecycle Management
 
 ## 1. Project Overview
 
 AnythingTools is a FastAPI-based deterministic tool hosting service that provides web scraping, publishing, batch reading, and backup capabilities via a REST API. The system executes tools in isolated threads with a single-writer database architecture (SQLite WAL mode) and structured callback delivery.
 
-### Operational Capabilities
+**Primary Operational Capabilities:**
 
-- **Web Scraper**: DOM-validated extraction, ULID-based identification, automatic delta backup post-persistence, configurable target site registry
-- **Publisher**: Telegram message delivery with state management and crash recovery
-- **Batch Reader**: Hybrid semantic search combining vector embeddings (FTS5) and full-text search
-- **Backup System**: Streaming Parquet export/import with OOM-safe chunking (500 rows/batch), watermark-based delta, FTS5 post-restore rebuild
+- **Web Scraper**: DOM-validated extraction, ULID-based identification, automatic delta backup post-persistence, configurable target site registry via `tools/scraper/` (extraction.py, curation.py, persistence.py)
+- **Publisher**: Telegram message delivery with state management and crash recovery via `tools/publisher/`
+- **Batch Reader**: Hybrid semantic search combining vector embeddings (FTS5) and full-text search via `tools/batch_reader/`
+- **Backup System**: Streaming Parquet export/import with OOM-safe chunking (500 rows/batch), watermark-based delta, FTS5 post-restore rebuild via `tools/backup/`
 
-### Explicit Non-Capabilities
+**Explicit Non-Capabilities:**
 
 - **No continuous/real-time backup**: Batch-only execution, manual or triggered
 - **No selective restore**: All-or-nothing restoration for master tables only
@@ -20,8 +20,6 @@ AnythingTools is a FastAPI-based deterministic tool hosting service that provide
 - **No automatic schema migration**: Manual reconciliation via reconciler
 - **No backup verification**: No checksums or corruption detection
 - **No FTS backup**: FTS tables excluded from restores, rebuilt synchronously
-
----
 
 ## 2. High-Level Architecture
 
@@ -32,32 +30,43 @@ AnythingTools is a FastAPI-based deterministic tool hosting service that provide
 - Static file server mounted at `/artifacts` and `/api/artifacts`
 - Background job execution for export/restore operations
 - **Key Endpoints**:
-  - `POST /api/tools/{tool}` - Enqueue tool execution
+  - `POST /api/tools/{tool}` - Enqueue tool execution (with circuit breaker for browser tools)
   - `GET /api/jobs/{id}` - Job status with logs
   - `POST /api/backup/export` - Manual backup trigger
   - `POST /api/backup/restore` - Manual restore (requires browser_lock)
   - `GET /api/backup/status` - Backup directory status
   - `GET /api/metrics` - System metrics (queue, active jobs)
 
-**2. Startup Orchestration (`utils/startup/`)**
-- **New modular architecture** (post-refactor):
-  - `core.py`: StartupOrchestrator with concurrent tiering support
+**2. Browser Lifecycle Management (`utils/browser_daemon.py`)**
+- **ChromeDaemonManager**: Centralized singleton managing all browser operations
+- **Health State Machine**: `INITIALIZING` → `READY` → `DEGRADED` → `CRITICAL_FAILURE`
+- **Surgical Process Management**: Kills only Chrome processes matching `CHROME_USER_DATA_DIR` via `psutil`
+- **PID Auditing**: Logs spawned Chrome PID on every initialization
+- **Deep Warmup**: 3-phase verification (Navigation → SoM → Vision) before marking `READY`
+- **Legacy Accessors**: Backward-compatible functions (`get_or_create_driver()`, etc.)
+
+**3. Startup Orchestration (`utils/startup/`)**
+- **Three-Tier Pipeline** (`__init__.py`):
+  - **Tier 1 (Concurrent)**: Artifacts mounting, zombie cleanup, temp cleanup, DB writer init, Telegram handshake
+  - **Tier 2 (Sequential)**: DB migrations (reconciliation), vec0 validation
+  - **Tier 3 (Concurrent)**: Tool registry load, browser warmup
+- **Core Components**:
+  - `core.py`: `StartupOrchestrator` with tiering support, failure propagation
   - `cleanup.py`: Zombie Chrome process and temp file cleanup
   - `server.py`: Dynamic artifacts directory mounting from config
-  - `database.py`: Pragmas, DB writer initialization, lifecycle runner, vec0 validation
-  - `registry.py`: Tool registry loading with validation
-  - `browser.py`: Browser warmup (5s wait → example.com navigation → verification)
+  - `database.py`: Pragmas, writer initialization, lifecycle runner, vec0 validation
+  - `registry.py`: Whitelisted tool discovery (scraper, draft_editor, publisher, batch_reader)
+  - `browser.py`: Deep warmup with 60s timeout, failure → `sys.exit(1)`
   - `telegram.py`: Async orphan handshake for Telegram bot token
-  - `__init__.py`: Pipeline assembly with three-tier execution
 
-**3. Worker Manager (`bot/engine/worker.py`)**
+**4. Worker Manager (`bot/engine/worker.py`)**
 - `UnifiedWorkerManager`: Polls database every 1s for `QUEUED`, `INTERRUPTED`, `PENDING_CALLBACK` jobs
 - Thread-isolated tool execution with cancellation flags
 - Callback delivery with exponential backoff (3 attempts max)
 - **Job lifecycle**: `QUEUED` → `RUNNING` → `COMPLETED|FAILED|PARTIAL|PENDING_CALLBACK|INTERRUPTED`
 - **Recovery**: Automatically requeues interrupted jobs on restart
 
-**4. Database Layer (`database/`)**
+**5. Database Layer (`database/`)**
 - **Single-writer background thread** (`writer.py`) with bounded queue (max 1000)
 - **WAL mode** for concurrent readers
 - **Schema v9** with `updated_at` tracking for delta backups
@@ -67,20 +76,20 @@ AnythingTools is a FastAPI-based deterministic tool hosting service that provide
 - **Schema Reconciliation** (`reconciler.py`): Detects drift, performs pre-drop snapshots, cascades FK recreations
 - **FTS5 Handling**: Excluded from standard reconciliation, created via dedicated existence-based checks
 
-**5. Tool Layer (`tools/`)**
+**6. Tool Layer (`tools/`)**
 - **Scraper**: Full pipeline (extraction → curation → persistence → auto-backup) with job_items tracking
 - **Publisher**: Telegram delivery with state management via job_items
 - **Batch Reader**: Hybrid vector + FTS5 search
 - **Backup**: Multi-table Parquet export/import with streaming
 - **Registry** (`registry.py`): Whitelisted core tools only: `scraper`, `draft_editor`, `publisher`, `batch_reader`
 
-**6. Backup System (`tools/backup/`)**
+**7. Backup System (`tools/backup/`)**
 - **Config**: OOM-safe batch size ceiling (10,000 rows)
 - **Schema**: PyArrow schemas with binary embeddings (variable-length, was fixed)
 - **Exporter** (`exporter.py`): Chunked 500-row SQL reads, parameterized queries, FTS exclusion
 - **Storage** (`storage.py`): Atomic writes, embedding validation, ISO-8601 watermarks
 - **Restore** (`restore.py`): Single-writer queue routing, adaptive column mapping, synchronous FTS rebuild
-- **Runner** (`runner.py`): Read-only connection, ISO-8601 timestamps
+- **Runner** (`runner.py`): Read-only connection, ISO-8601 timestamps, browser_lock acquisition
 
 ### Execution Model
 
@@ -107,7 +116,7 @@ Tier 2 (Sequential):
 
 Tier 3 (Concurrent):
 ├─ load_tool_registry → whitelist + validation
-└─ warmup_browser → wait 5s → navigate to example.com → verify text
+└─ warmup_browser → deep verification → sys.exit(1) on failure
 ```
 
 **Backup Export (Full/Delta):**
@@ -140,20 +149,18 @@ Tier 3 (Concurrent):
 [Wait] → wait_for_writes(300s timeout for rebuild)
 ```
 
----
-
 ## 3. Repository Structure
 
 ```
 ./
 ├── api/                      # FastAPI routes + schemas
-│   ├── routes.py            # All endpoints with job/backup logic
+│   ├── routes.py            # All endpoints with job/backup logic (circuit breaker at line 57-64)
 │   ├── schemas.py           # Pydantic models (watermark support)
 │   ├── telegram_client.py   # Bot API + orphan handshake
 │   └── telegram_notifier.py # Message delivery
 ├── bot/                     # Worker engine
 │   ├── engine/
-│   │   ├── worker.py        # UnifiedWorkerManager (threads)
+│   │   ├── worker.py        # UnifiedWorkerManager (threads, handles INTERRUPTED jobs)
 │   │   └── tool_runner.py   # Job execution helpers
 │   └── core/
 │       └── constants.py     # Job status enums
@@ -164,13 +171,13 @@ Tier 3 (Concurrent):
 │       └── payloads.py      # Request builders
 ├── database/                # SQLite layer
 │   ├── schemas/             # Canonical DDL
-│   │   ├── __init__.py      # MASTER_TABLES, ALL_FTS_TABLES
+│   │   ├── __init__.py      # MASTER_TABLES, ALL_FTS_TABLES (rules enforced)
 │   │   ├── vector.py        # FTS5 triggers + vec0 tables
 │   │   └── *.py             # jobs, finance, pdf, token
 │   ├── reconciler.py        # Schema drift detection + repair
 │   ├── schema_introspector.py # PRAGMA parsing + DDL comparison
 │   ├── lifecycle.py         # Reconciler wrapper + recovery
-│   ├── writer.py            # Background single-writer thread
+│   ├── writer.py            # Background single-writer thread (queue max 1000)
 │   ├── connection.py        # DB manager (optional vec0, query_only)
 │   ├── health.py            # Table validation
 │   └── *.py                 # reader, job_queue, blackboard, formula_cache
@@ -199,23 +206,25 @@ Tier 3 (Concurrent):
 │   ├── base.py              # BaseTool
 │   └── registry.py          # Whitelisted tool discovery
 ├── utils/                   # Infrastructure
-│   ├── startup/             # Modular startup system (NEW)
+│   ├── startup/             # Modular startup system
 │   │   ├── core.py          # StartupOrchestrator (tiers)
 │   │   ├── cleanup.py       # Zombie chrome + temp files
 │   │   ├── server.py        # Artifacts mounting
 │   │   ├── database.py      # Pragmas, writer, lifecycle, vec0
 │   │   ├── registry.py      # Tool registry loading
-│   │   ├── browser.py       # Warmup (5s wait + timeout)
+│   │   ├── browser.py       # Warmup (60s timeout + deep verification)
 │   │   ├── telegram.py      # Async handshake
 │   │   └── __init__.py      # Pipeline assembly
-│   ├── browser_daemon.py    # Browser driver management
+│   ├── browser_daemon.py    # Browser driver management (ChromeDaemonManager)
 │   ├── browser_lock.py      # Lock for restore operations
 │   ├── logger/              # Dual logging system
+│   ├── som_utils.py         # SoM injection, overlay removal, single-tab enforcement
+│   ├── vision_utils.py      # Screenshot capture, slicing, optimization
 │   └── *.py                 # security, helpers, etc.
 ├── tests/                   # Unit tests
 │   ├── test_backup.py       # Schema, validation, Pydantic compat
 │   └── test_browser_e2e.py  # Browser automation
-├── app.py                   # FastAPI entrypoint (refactored)
+├── app.py                   # FastAPI entrypoint (refactored with 2-phase shutdown)
 ├── config.py                # API key and global configuration
 └── requirements.txt         # Dependencies
 ```
@@ -225,8 +234,7 @@ Tier 3 (Concurrent):
 - **`tests/`** - Unit tests for backup system and browser E2E only
 - **No automatic migration**: Manual schema changes via reconciler only
 - **`tools/scraper/prompts.py`** - Canonical prompt module after PLAN-02 (replaced `prompt.py`)
-
----
+- **`utils/browser_daemon.py`** - New singleton manager replacing module-level globals (as of this update)
 
 ## 4. Core Concepts & Domain Model
 
@@ -269,6 +277,23 @@ Tier 3 (Concurrent):
 - **Reconciler exclusion**: FTS tables skipped from standard drift detection
 - **Separate handling**: Created via dedicated loop with simple existence check
 
+**8. ChromeDaemonManager Health States**
+- **INITIALIZING**: Browser process starting, warmup not yet run
+- **READY**: Deep warmup passed (Navigation, SoM, Vision tests successful)
+- **DEGRADED**: Not currently used but reserved for future states
+- **CRITICAL_FAILURE**: Warmup failed or shutdown initiated
+
+**9. Deep Warmup Verification**
+- **Phase 1 (Navigation)**: Navigate to example.com, verify content
+- **Phase 2 (SoM)**: Inject data-ai-id markers, verify count > 1
+- **Phase 3 (Vision)**: Capture screenshot, slice if needed, verify valid slices
+- **Failure Policy**: Any failure → CRITICAL log → `sys.exit(1)` → application shutdown
+
+**10. Two-Phase Shutdown (app.py)**
+- **Phase 1**: Stop worker manager polling, broadcast cancellation to existing workers
+- **Phase 2**: 60-second drain timer, release browser resources, shutdown DB writer
+- **Thread-Safety**: Uses `list()` snapshot for cancellation flags to prevent RuntimeError
+
 ### Schema Evolution Evidence
 
 **Current Master Table Definition** (`database/schemas/__init__.py`):
@@ -305,8 +330,6 @@ SCRAPER_SYS_PROMPT = (
     "All outputs MUST be valid JSON. ...\n"
 )
 ```
-
----
 
 ## 5. Detailed Behavior
 
@@ -381,19 +404,7 @@ if restored_counts.get("scraped_articles", 0) > 0:
     asyncio.run(wait_for_writes(timeout=300.0))  # Blocks until complete
 ```
 
-### 5.4 Read-Only Runner Connection
-
-**Export Only Reads** (`tools/backup/runner.py`):
-```python
-def run(mode: str = "delta", ...):
-    conn = DatabaseManager.get_read_connection()
-    try:
-        result = export_all_tables(conn, config, mode=mode)
-    finally:
-        pass  # Keep thread-local connection alive
-```
-
-### 5.5 Scraper Pipeline
+### 5.4 Scraper Pipeline
 
 **Tool Execution** (`tools/scraper/tool.py`):
 ```python
@@ -401,26 +412,121 @@ from tools.scraper.prompts import SCRAPER_SYS_PROMPT, CURATION_SYS_PROMPT
 # Uses canonical constants from prompts.py (post-PLAN-02)
 ```
 
-### 5.6 Browser Warmup (With Timeout)
+### 5.5 Browser Environment Management
+
+**ChromeDaemonManager Operations** (`utils/browser_daemon.py`):
+
+*Initialization:*
+```python
+def _init_driver(self) -> Driver:
+    self._status = BrowserStatus.INITIALIZING
+    self.surgical_kill()  # Kill existing Chrome for this profile
+    self._driver = Driver(
+        headless=False,
+        user_agent="REAL",
+        window_size=(1920, 1080),
+        profile=os.path.abspath(config.CHROME_USER_DATA_DIR),
+    )
+    # Log PID
+    self._pid = self._driver.browser.process.pid
+    # Status remains INITIALIZING until deep_warmup() succeeds
+```
+
+*Surgical Kill:*
+```python
+def surgical_kill(self) -> None:
+    target_dir = os.path.abspath(config.CHROME_USER_DATA_DIR).lower()
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        current_pid = proc.pid
+        try:
+            info = proc.info
+            cmdline = " ".join(info.get('cmdline') or []).lower()
+            proc_name = (info.get('name') or "").lower()
+            if "chrome" in proc_name and target_dir in cmdline:
+                proc.kill()
+        except (psutil.AccessDenied, psutil.PermissionError) as e:
+            sys.exit(1)  # Fail immediately on permission errors
+```
+
+*Deep Warmup:*
+```python
+async def deep_warmup(self) -> bool:
+    try:
+        driver = self.get_or_create_driver()
+        # Phase 1: Navigation
+        safe_google_get(driver, "https://example.com")
+        driver.sleep(2)
+        if "Example Domain" not in (driver.page_html or ""):
+            raise RuntimeError("Navigation failed")
+        # Phase 2: SoM Injection
+        last_id = inject_som(driver)
+        if last_id <= 1:
+            raise RuntimeError("SoM failed")
+        # Phase 3: Vision
+        slices = capture_and_optimize(driver, 0)
+        if not slices or not any(s.get("b64") for s in slices if s.get("status") == "OK"):
+            raise RuntimeError("Vision failed")
+        self._status = BrowserStatus.READY
+        return True
+    except Exception as e:
+        self._status = BrowserStatus.CRITICAL_FAILURE
+        return False
+```
+
+**API Circuit Breaker** (`api/routes.py`):
+```python
+if tool_name in ["scraper", "browser_task"]:
+    from utils.browser_daemon import daemon_manager, BrowserStatus
+    if daemon_manager.status != BrowserStatus.READY:
+        raise HTTPException(
+            status_code=503, 
+            detail=f"Browser environment is currently {daemon_manager.status.value}. Tool unavailable."
+        )
+```
+
+**Two-Phase Shutdown** (`app.py`):
+```python
+# Phase 1: Stop polling, broadcast cancellation
+mgr.stop()
+for flag in list(mgr.cancellation_flags.values()):
+    flag.set()
+
+# Phase 2: Drain (60s)
+drain_start = time.time()
+while mgr._active_jobs and (time.time() - drain_start < 60.0):
+    await asyncio.sleep(2)
+
+# Release resources
+daemon_manager.shutdown_driver()
+daemon_manager.surgical_kill()
+await wait_for_writes()
+shutdown_writer()
+```
+
+### 5.6 Warmup Sequence with Failure Policy
 
 **Warmup Sequence** (`utils/startup/browser.py`):
 ```python
-def _do_warmup():
-    browser_lock.acquire()
+async def warmup_browser() -> None:
+    def _do_warmup():
+        browser_lock.acquire()
+        try:
+            return asyncio.run(daemon_manager.deep_warmup())
+        finally:
+            browser_lock.safe_release()
+
     try:
-        driver = get_or_create_driver()
-        driver.short_random_sleep(5.0)  # Wait 5s before navigation
-        driver.get("https://example.com")
-        html = driver.page_html or ""
-        if "Example Domain" not in html:
-            raise RuntimeError("Verification failed")
-    finally:
-        browser_lock.safe_release()
-
-result = await asyncio.wait_for(asyncio.to_thread(_do_warmup), timeout=35.0)
+        success = await asyncio.wait_for(asyncio.to_thread(_do_warmup), timeout=60.0)
+        if not success:
+            log.dual_log(tag="Startup:Browser", message="Deep Warmup failed. Shutting down.", level="CRITICAL")
+            sys.exit(1)
+    except asyncio.TimeoutError:
+        log.dual_log(tag="Startup:Browser", message="Warmup timed out. Shutting down.", level="CRITICAL")
+        sys.exit(1)
+    except Exception as e:
+        log.dual_log(tag="Startup:Browser", message=f"Warmup crashed: {e}", level="CRITICAL")
+        sys.exit(1)
 ```
-
----
 
 ## 6. Public Interfaces
 
@@ -477,8 +583,6 @@ restore_master_tables_direct(conn)
 conn.close()
 ```
 
----
-
 ## 7. State, Persistence, and Data
 
 ### Database Schema (v9)
@@ -521,8 +625,6 @@ backups/
 }
 ```
 
----
-
 ## 8. Dependencies & Integration
 
 ### Runtime Dependencies
@@ -536,7 +638,7 @@ backups/
 
 ### Environment Variables
 ```bash
-API_KEY="dev_default_key"
+API_KEY="dev_default_key_change_me_in_production"
 BACKUP_ENABLED=true
 BACKUP_BATCH_SIZE=500      # Enforced ceiling 10000 in code
 BACKUP_COMPRESSION="zstd"
@@ -558,8 +660,6 @@ TELEGRAM_BOT_TOKEN="token"
 - `VECTOR_BYTE_LENGTH` ↔ 1024 float32s (fixed)
 - `batch_size=500` ↔ OOM safety
 - `prompts.py` constants ↔ Scraper tool execution
-
----
 
 ## 9. Setup, Build, and Execution
 
@@ -603,8 +703,6 @@ conn.close()
 "
 ```
 
----
-
 ## 10. Testing & Validation
 
 ### Unit Tests (`tests/`)
@@ -633,15 +731,13 @@ print('Actions:', [a for a in report.actions if a.action != 'unchanged'])
 - **No delta diff test**: Parquet vs DB
 - **No pyarrow version check**: Runtime
 
----
-
 ## 11. Known Limitations & Non-Goals
 
 ### Critical Constraints
 1. **Single-Writer**: Restore blocks on active scraper via `browser_lock`
 2. **All-or-Nothing**: No selective table restore
 3. **Parquet Immutability**: Files never modified, only deleted
-4. **No Verification**: No checksums
+4. **No verification**: No checksums
 5. **Batch Size Ceiling**: 10,000 rows max (OOM prevention)
 
 ### Runtime Limits
@@ -669,8 +765,6 @@ print('Actions:', [a for a in report.actions if a.action != 'unchanged'])
 - Partial restore / incremental restore
 - Cloud sync (OneDrive optional)
 - Multi-dataset (single DB)
-
----
 
 ## 12. Change Sensitivity
 
@@ -711,6 +805,21 @@ print('Actions:', [a for a in report.actions if a.action != 'unchanged'])
 **8. `tools/scraper/prompts.py`**
 - **Risk**: Prompt constant naming, formatting errors
 - **Fix Applied (PLAN-02)**: Canonical module, fixed typos, deleted legacy `prompt.py`
+
+**9. `utils/browser_daemon.py` (NEW)**
+- **Risk**: State machine correctness, surgical kill accuracy, warmup failure propagation
+- **Fix Applied**: 
+  - Singleton manager with health states
+  - PID-aware process filtering
+  - Deep warmup with sys.exit(1) on failure
+  - Thread-safe legacy accessors
+
+**10. `app.py` (MODIFIED)**
+- **Risk**: Shutdown race conditions, missing browser cleanup
+- **Fix Applied**: 
+  - Two-phase shutdown (polling stop → cancellation → drain → cleanup)
+  - Thread-safe iteration with `list()`
+  - Surgical kill integration
 
 ### Tight Coupling
 - **Schema v9**: `updated_at` required for delta

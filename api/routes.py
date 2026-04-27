@@ -54,6 +54,15 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
     if not meta:
         raise HTTPException(status_code=404, detail="Tool not found")
 
+    # Circuit breaker for browser-bound tools
+    if tool_name in ["scraper", "browser_task"]:
+        from utils.browser_daemon import daemon_manager, BrowserStatus
+        if daemon_manager.status != BrowserStatus.READY:
+            raise HTTPException(
+                status_code=503, 
+                detail=f"Browser environment is currently {daemon_manager.status.value}. Tool unavailable."
+            )
+
     # Input validation using optional INPUT_MODEL exported by the tool module
     InputModel = None
     try:
@@ -280,7 +289,6 @@ async def delete_job(job_id: str, request: Request):
     else:
         # Job not actively running yet; we marked it in DB and manager will honor it.
         return {"job_id": job_id, "status": "CANCELLING"}
-
 
 
 @router.get("/metrics")
