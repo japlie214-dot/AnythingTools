@@ -15,6 +15,10 @@ MASTER_TABLES: list[str] = [
     "long_term_memories_vec",
 ]
 
+ALL_FTS_TABLES: Dict[str, str] = {
+    **vector.FTS_TABLES,
+}
+
 ALL_TABLES: Dict[str, str] = {
     **jobs.TABLES, **finance.TABLES, **vector.TABLES, **pdf.TABLES, **token.TABLES
 }
@@ -32,6 +36,8 @@ def get_init_script() -> str:
     parts = []
     for name, ddl in ALL_TABLES.items():
         parts.append(ddl)
+    for name, ddl in ALL_FTS_TABLES.items():
+        parts.append(ddl)
     for name, ddl in ALL_VEC_TABLES.items():
         if SQLITE_VEC_AVAILABLE:
             parts.append(ddl)
@@ -48,6 +54,8 @@ def get_repair_script(table_name: str) -> Optional[str]:
     """Return repair DDL for a single table or trigger with vec0 fallback."""
     if table_name in ALL_TABLES:
         return ALL_TABLES[table_name]
+    if table_name in ALL_FTS_TABLES:
+        return ALL_FTS_TABLES[table_name]
     if table_name in ALL_VEC_TABLES:
         if SQLITE_VEC_AVAILABLE:
             return ALL_VEC_TABLES[table_name]

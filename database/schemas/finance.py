@@ -1,4 +1,4 @@
-# file: database/schemas/finance.py
+# database/schemas/finance.py
 
 TABLES = {
     "financial_metrics": """CREATE TABLE financial_metrics (
@@ -9,7 +9,7 @@ TABLES = {
             metric_unit TEXT,
             as_of TEXT NOT NULL,
             metadata_json TEXT NOT NULL DEFAULT '{}'
-        )
+        );
 """,
     "market_data_snapshots": """CREATE TABLE market_data_snapshots (
             id TEXT PRIMARY KEY,
@@ -18,8 +18,8 @@ TABLES = {
             snapshot_at TEXT NOT NULL,
             payload_json TEXT NOT NULL,
             UNIQUE(symbol, source, snapshot_at)
-        )
-CREATE INDEX idx_market_data_snapshots_symbol_snapshot_at ON market_data_snapshots(symbol, snapshot_at)
+        );
+CREATE INDEX idx_market_data_snapshots_symbol_snapshot_at ON market_data_snapshots(symbol, snapshot_at);
 """,
     "financial_formulas": """CREATE TABLE financial_formulas (
             ticker TEXT NOT NULL,
@@ -30,8 +30,8 @@ CREATE INDEX idx_market_data_snapshots_symbol_snapshot_at ON market_data_snapsho
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (ticker, statement_type)
-        )
-CREATE INDEX idx_formulas_ticker_stmt ON financial_formulas(ticker, statement_type, validated_at DESC)
+        );
+CREATE INDEX idx_formulas_ticker_stmt ON financial_formulas(ticker, statement_type, validated_at DESC);
 """,
     "calculated_metrics": """CREATE TABLE calculated_metrics (
             ticker TEXT NOT NULL,
@@ -40,7 +40,7 @@ CREATE INDEX idx_formulas_ticker_stmt ON financial_formulas(ticker, statement_ty
             std_dev_3y REAL,
             pe_ratio REAL,
             PRIMARY KEY (ticker, date)
-        )
+        );
 """,
     "raw_fundamentals": """CREATE TABLE raw_fundamentals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,10 +54,10 @@ CREATE INDEX idx_formulas_ticker_stmt ON financial_formulas(ticker, statement_ty
             source TEXT DEFAULT 'SEC_EDGAR',
             extracted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(ticker, statement_type, period_end_date, concept)
-        )
-CREATE INDEX idx_raw_fundamentals_ticker_period ON raw_fundamentals(ticker, period_end_date)
-CREATE INDEX idx_raw_fundamentals_concept ON raw_fundamentals(concept)
-CREATE INDEX idx_fundamentals_ticker_date ON raw_fundamentals(ticker, statement_type, period_end_date DESC)
+        );
+CREATE INDEX idx_raw_fundamentals_ticker_period ON raw_fundamentals(ticker, period_end_date);
+CREATE INDEX idx_raw_fundamentals_concept ON raw_fundamentals(concept);
+CREATE INDEX idx_fundamentals_ticker_date ON raw_fundamentals(ticker, statement_type, period_end_date DESC);
 """,
     "stock_prices": """CREATE TABLE stock_prices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,8 +69,8 @@ CREATE INDEX idx_fundamentals_ticker_date ON raw_fundamentals(ticker, statement_
             close REAL,
             volume INTEGER,
             UNIQUE(ticker, date)
-        )
-CREATE INDEX idx_prices_ticker_date ON stock_prices(ticker, date DESC)
+        );
+CREATE INDEX idx_prices_ticker_date ON stock_prices(ticker, date DESC);
 """,
 }
 

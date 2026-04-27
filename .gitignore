@@ -110,4 +110,5 @@ pip-wheel-metadata/
 # Keep local environment files out
 local_settings.py
 
+backups
 # End of .gitignore

@@ -20,7 +20,7 @@ SCRAPED_ARTICLES_SCHEMA = pa.schema([
 
 SCRAPED_ARTICLES_VEC_SCHEMA = pa.schema([
     pa.field("rowid", pa.int64(), nullable=False),
-    pa.field("embedding", pa.binary(VECTOR_BYTE_LENGTH), nullable=False),
+    pa.field("embedding", pa.binary(), nullable=False),
 ])
 
 # FTS schema intentionally omitted: derived/external FTS tables must not be backed up or restored directly.
@@ -40,7 +40,7 @@ LONG_TERM_MEMORIES_SCHEMA = pa.schema([
 
 LONG_TERM_MEMORIES_VEC_SCHEMA = pa.schema([
     pa.field("rowid", pa.int64(), nullable=False),
-    pa.field("embedding", pa.binary(VECTOR_BYTE_LENGTH), nullable=False),
+    pa.field("embedding", pa.binary(), nullable=False),
 ])
 
 TABLE_SCHEMAS = {

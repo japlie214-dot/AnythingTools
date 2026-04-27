@@ -1,4 +1,4 @@
-# file: database/schemas/pdf.py
+# database/schemas/pdf.py
 
 TABLES = {
     "pdf_parsed_pages": """CREATE TABLE pdf_parsed_pages (
@@ -9,8 +9,8 @@ TABLES = {
             content TEXT,
             embedding_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(embedding_status IN ('PENDING','EMBEDDED','SKIPPED')),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-CREATE INDEX idx_pdf_pages_file_page ON pdf_parsed_pages(pdf_name, page_number)
+        );
+CREATE INDEX idx_pdf_pages_file_page ON pdf_parsed_pages(pdf_name, page_number);
 """,
 }
 

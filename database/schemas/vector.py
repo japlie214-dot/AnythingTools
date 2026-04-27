@@ -13,14 +13,10 @@ TABLES = {
             embedding_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(embedding_status IN ('PENDING','EMBEDDED','SKIPPED')),
             scraped_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-CREATE INDEX idx_scraped_articles_norm_url ON scraped_articles(normalized_url)
-CREATE INDEX idx_scraped_articles_status ON scraped_articles(embedding_status)
-CREATE INDEX idx_scraped_articles_vec_rowid ON scraped_articles(vec_rowid)
-""",
-    "scraped_articles_fts": """CREATE VIRTUAL TABLE IF NOT EXISTS scraped_articles_fts USING fts5(
-            title, conclusion, summary, content='scraped_articles', content_rowid='vec_rowid'
         );
+CREATE INDEX idx_scraped_articles_norm_url ON scraped_articles(normalized_url);
+CREATE INDEX idx_scraped_articles_status ON scraped_articles(embedding_status);
+CREATE INDEX idx_scraped_articles_vec_rowid ON scraped_articles(vec_rowid);
 """,
     "long_term_memories": """CREATE TABLE long_term_memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,10 +28,16 @@ CREATE INDEX idx_scraped_articles_vec_rowid ON scraped_articles(vec_rowid)
             type TEXT NOT NULL DEFAULT 'Knowledge',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-CREATE INDEX idx_memories_agent_domain ON long_term_memories(agent_domain, type, created_at DESC)
-CREATE INDEX idx_memories_session_type ON long_term_memories(session_id, type, created_at DESC)
+        );
+CREATE INDEX idx_memories_agent_domain ON long_term_memories(agent_domain, type, created_at DESC);
+CREATE INDEX idx_memories_session_type ON long_term_memories(session_id, type, created_at DESC);
 """,
+}
+
+FTS_TABLES = {
+    "scraped_articles_fts": """CREATE VIRTUAL TABLE IF NOT EXISTS scraped_articles_fts USING fts5(
+            title, conclusion, summary, content='scraped_articles', content_rowid='vec_rowid'
+        );""",
 }
 
 VEC_TABLES = {

@@ -1,11 +1,11 @@
-# file: database/reconciler.py
+# database/reconciler.py
 
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 from database.schema_introspector import schema_matches, table_exists, trigger_exists, _get_columns, _columns_from_ddl_in_memory
-from database.schemas import ALL_TABLES, ALL_VEC_TABLES, ALL_TRIGGERS, MASTER_TABLES
+from database.schemas import ALL_TABLES, ALL_VEC_TABLES, ALL_FTS_TABLES, ALL_TRIGGERS, MASTER_TABLES
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
@@ -40,6 +40,8 @@ class SchemaReconciler:
 
             # 1. Regular tables
             for name, ddl in ALL_TABLES.items():
+                if name in ALL_FTS_TABLES:
+                    continue
                 is_master = name in MASTER_TABLES
                 if not table_exists(self.conn, name):
                     self.conn.executescript(ddl)
@@ -82,6 +84,13 @@ class SchemaReconciler:
                     
                     direct_drift.add(name)
                     report.add(ReconciliationAction(name, "recreated", is_master, reason="Schema drift detected"))
+
+            # 1.5 FTS Tables (Derived Virtual Tables)
+            for name, ddl in ALL_FTS_TABLES.items():
+                if not table_exists(self.conn, name):
+                    log.dual_log(tag="DB:Reconciler", level="INFO", message=f"Creating missing FTS table: {name}")
+                    self.conn.executescript(ddl)
+                    report.add(ReconciliationAction(name, "created", is_master=False))
 
             # 2. Virtual tables (vec0, FTS5)
             for name, ddl in ALL_VEC_TABLES.items():

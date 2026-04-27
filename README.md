@@ -53,9 +53,11 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
   - Master: `scraped_articles`, `scraped_articles_vec`, `long_term_memories`, `long_term_memories_vec`
   - Non-master: `jobs`, `job_items`, `job_logs`, `broadcast_batches`
 - **Schema Reconciliation** (`reconciler.py`): Detects drift, performs pre-drop snapshots, cascades FK recreations
+- **FTS5 Handling**: Excluded from standard reconciliation, handled separately
 
 **4. Tool Implementations (`tools/`)**
 - **Scraper**: Full pipeline (extraction → curation → persistence → backup) with job_items tracking
+  - **Prompt Module**: Uses `tools/scraper/prompts.py` (canonical after PLAN-02 migration)
 - **Publisher**: Telegram delivery, state management via `job_items`
 - **Batch Reader**: Hybrid vector + FTS5 search
 - **Backup**: Multi-table Parquet export/import with streaming
@@ -120,22 +122,24 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 ├── clients/                # External services (LLM, Snowflake)
 ├── database/               # SQLite layer
 │   ├── schemas/            # Canonical DDL (single source of truth)
-│   │   ├── __init__.py     # MASTER_TABLES: list[str] (no FTS)
-│   │   ├── vector.py       # 5 master table DDL + FTS5 triggers
+│   │   ├── __init__.py     # MASTER_TABLES: list[str], ALL_FTS_TABLES
+│   │   ├── vector.py       # FTS5 triggers + FTS_TABLES dict (extracted)
 │   │   └── *.py            # jobs, finance, pdf, token
-│   ├── reconciler.py       # Schema drift detection + repair
+│   ├── reconciler.py       # Schema drift detection + repair (FTS-aware)
 │   ├── schema_introspector.py  # PRAGMA parsing + DDL comparison
-│   ├── lifecycle.py        # Uses reconciler, removes versioning
+│   ├── lifecycle.py        # Uses reconciler
 │   ├── writer.py           # Background single-writer thread + enqueue_transaction
 │   ├── connection.py       # DB connection manager (optional vec0, query_only)
 │   └── health.py           # Table validation
 ├── deprecated/             # Legacy code (~70% volume, never loaded)
 ├── tools/                  # Tool implementations
 │   ├── scraper/            # Extraction, curation, persistence + auto-backup
+│   │   ├── prompts.py      # Canonical prompt constants (PLAN-02)
+│   │   ├── Skill.py        # Tool descriptor
+│   │   └── *.py            # browser, curation, extraction, etc.
 │   ├── publisher/          # Telegram delivery
 │   ├── batch_reader/       # Semantic search
-│   ├── backup/             # Hardened backup system (Phase 3)
-│   │   ├── __init__.py
+│   ├── backup/             # Hardened backup system
 │   │   ├── config.py       # Batch size ceiling, rule comments
 │   │   ├── models.py       # Watermark/Result with table_watermarks + model_dump_compat()
 │   │   ├── schema.py       # PyArrow schemas (binary embeddings, validation helper)
@@ -143,24 +147,34 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 │   │   ├── storage.py      # Atomic writes + embedding validation
 │   │   ├── restore.py      # enqueue_transaction + sync FTS rebuild
 │   │   └── runner.py       # Read-only connection, ISO-8601 timestamps
-└── utils/                  # Infrastructure
-└── tests/                  # Unit tests (newly added)
-    ├── test_backup.py      # Schema, validation, Pydantic compat tests
-    └── test_migration_pipeline.py  # Placeholder replaced
+│   ├── draft_editor/       # (Singular tool)
+│   └── *                   # Other tools (base.py, registry.py)
+├── utils/                  # Infrastructure
+│   ├── browser_daemon.py   # Browser driver management
+│   ├── browser_lock.py     # Lock for restore operations
+│   └── logger/             # Dual logging system
+├── tests/                  # Unit tests
+│   ├── test_backup.py      # Schema, validation, Pydantic compat tests
+│   └── test_browser_e2e.py # Browser automation tests
+├── app.py                  # FastAPI entrypoint with health tracking
+├── config.py               # API key and global config
+└── requirements.txt        # Dependencies
 ```
 
+### Non-Obvious Structures
+- **`deprecated/`** - 70% repository volume, imports disabled, never executed
+- **`tests/`** - Unit tests for backup system and browser E2E
+- **No automatic migration**: Manual schema changes only via reconciler
+- **`tools/scraper/prompts.py`** - Canonical prompt module after PLAN-02 fix (replaced `prompt.py`)
+
 ### Critical Architecture Files
-- `app.py` - Lifespan startup/shutdown
+- `app.py` - Lifespan startup/shutdown with StartupHealth tracking
 - `bot/engine/worker.py` - Job execution lifecycle
 - `database/writer.py` - Single-writer thread + `enqueue_transaction`
 - `database/connection.py` - WAL + optional vec0 + `query_only` mode
 - `database/schemas/__init__.py` - MASTER_TABLES definition (ordered list, no FTS)
 - `tools/backup/runner.py` - Read-only exports, restore routing
-
-### Non-Obvious Structures
-- **`deprecated/`** - 70% repository volume, imports disabled, never executed
-- **`tests/`** - Post-Phase 3: `test_backup.py` added, migration placeholder replaced
-- **No automatic migration**: Manual schema changes only via reconciler
+- `tools/scraper/prompts.py` - Canonical prompt definitions (POST-PLAN-02)
 
 ---
 
@@ -201,6 +215,11 @@ AnythingTools is a deterministic tool-hosting service exposing web scraping, pub
 - **Rebuilt post-restore**: `INSERT INTO scraped_articles_fts(scraped_articles_fts) VALUES('rebuild')`
 - **Synchronous**: Blocks via `wait_for_writes(timeout=300.0)`
 
+**7. FTS5 Categorization (PLAN-02 Fix)**
+- **`ALL_FTS_TABLES`**: New dict in `schemas/__init__.py`
+- **Reconciler exclusion**: FTS tables skipped from standard drift detection
+- **Separate handling**: Created via dedicated loop with simple existence check
+
 ### Schema Evolution Evidence
 
 **Current Master Table Definition** (`database/schemas/__init__.py`):
@@ -214,6 +233,10 @@ MASTER_TABLES: list[str] = [
     "long_term_memories",
     "long_term_memories_vec",
 ]
+
+ALL_FTS_TABLES: Dict[str, str] = {
+    **vector.FTS_TABLES,
+}
 ```
 
 **Embedding Schema** (`tools/backup/schema.py`):
@@ -223,7 +246,7 @@ FLOAT32_COUNT = 1024
 
 SCRAPED_ARTICLES_VEC_SCHEMA = pa.schema([
     pa.field("rowid", pa.int64(), nullable=False),
-    pa.field("embedding", pa.binary(VECTOR_BYTE_LENGTH), nullable=False),  # FIXED: was fixed_size_binary
+    pa.field("embedding", pa.binary(), nullable=False),  # FIXED: variable-length
 ])
 ```
 
@@ -236,6 +259,27 @@ def validate_embedding_bytes(embedding_bytes: bytes, expected_length: int = VECT
     actual = len(embedding_bytes)
     if actual != expected_length:
         raise ValueError(f"Embedding size mismatch: expected {expected_length}, got {actual}")
+```
+
+**Prompt Module Migration** (`tools/scraper/prompts.py`):
+```python
+# tools/scraper/prompts.py
+"""
+Prompts for the Scraper tool (AnythingTools adaptation).
+All prompts MUST require the LLM to return strict JSON.
+"""
+
+SCRAPER_SYS_PROMPT = (
+    "You are the Scraper sub-agent running in the 'scraper' agent_domain. "
+    "All outputs MUST be valid JSON. When asked to curate, return an object like:\n"
+    "{\"top_10\": [\"ulid1\", \"ulid2\", ...]}\n"
+    "Do not include narrative text outside of the JSON object."
+)
+
+CURATION_SYS_PROMPT = (
+    "Given an array of candidate articles (as JSON), select up to 10 most "
+    "impactful articles and return ONLY: {\"top_10\": [<ulid strings>]}."
+)
 ```
 
 ---
@@ -359,11 +403,27 @@ def restore(manual_job_id: Optional[str] = None):
     result = restore_master_tables_direct(conn)
 ```
 
+### 5.5 Scraper Pipeline & Prompt Evolution
+
+**Tool Execution** (`tools/scraper/tool.py`):
+```python
+from tools.scraper.prompts import SCRAPER_SYS_PROMPT, CURATION_SYS_PROMPT
+
+# Uses canonical constants from prompts.py (post-PLAN-02)
+scraper_prompt = SCRAPER_SYS_PROMPT
+curation_prompt = CURATION_SYS_PROMPT
+```
+
+**Prompt Migration Evidence**:
+- **Before**: `tools/scraper/prompt.py` (original) → aliases in `prompts.py`
+- **After** (PLAN-02): `tools/scraper/prompts.py` (canonical, deleted `prompt.py`)
+- **Old references removed**: `tools/scraper/Skill.py` line 28 updated `prompt.py` → `prompts.py`
+
 ---
 
 ## 6. Public Interfaces
 
-### API Endpoints (Working After Phase 3)
+### API Endpoints
 
 **Backup Export**:
 ```bash
@@ -416,8 +476,8 @@ conn.close()
 **Scraper (Auto-Backup)**:
 ```python
 from tools.scraper.tool import ScraperTool
-tool = ScraperTool()
 # Auto-runs delta backup after persistence
+tool = ScraperTool()
 ```
 
 ---
@@ -468,7 +528,7 @@ backups/
 
 ### PyArrow Schemas
 
-- **Vector tables**: `pa.binary(4096)` (FIXED: was `fixed_size_binary`)
+- **Vector tables**: `pa.binary()` (FIXED: variable-length, was `fixed_size_binary`)
 - **Validation**: `validate_embedding_bytes` raises on mismatch
 - **FTS schema**: Excluded from `TABLE_SCHEMAS`
 
@@ -497,12 +557,14 @@ API_KEY="dev_default_key"
 - **Reconciler → Backup**: Pre-drop snapshot trigger
 - **Restore → FTS**: Synchronous rebuild after data
 - **Writer Queue**: All writes to single thread (`writer.py`)
+- **Prompts → Scraper**: Uses canonical module post-PLAN-02
 
 ### Tight Coupling
 - `MASTER_TABLES` ordered list ↔ FK constraints
 - `updated_at` column ↔ Delta backup logic
 - `VECTOR_BYTE_LENGTH` ↔ 1024 float32s (fixed)
 - `batch_size=500` ↔ OOM safety
+- `prompts.py` constants ↔ Scraper tool execution
 
 ---
 
@@ -552,11 +614,9 @@ conn.close()
 
 ## 10. Testing & Validation
 
-### New Unit Tests (`tests/test_backup.py`)
-- **Schema validity**: Binary embedding fields
-- **Embedding validation**: Correct sizes, error on mismatch
-- **Pydantic compat**: `model_dump_compat()` results
-- **Pandas round-trip**: Arrow → Parquet → Python types
+### Unit Tests (`tests/`)
+- **test_backup.py**: Schema validity, embedding validation, Pydantic compat, Pandas round-trip
+- **test_browser_e2e.py**: Browser automation end-to-end tests
 
 ### Manual Verification
 ```bash
@@ -632,7 +692,7 @@ print('Actions:', [a for a in report.actions if a.action != 'unchanged'])
 **2. `database/reconciler.py`**
 - **Risk**: Pre-drop snapshot must use `export_table_chunks`
 - **Risk**: FK cascade traversal
-- **Fix Applied**: Correct export call
+- **Fix Applied**: Correct export call, FTS table exclusion
 
 **3. `tools/backup/restore.py`**
 - **Risk**: Byte guard for `pd.isna()`
@@ -646,21 +706,26 @@ print('Actions:', [a for a in report.actions if a.action != 'unchanged'])
 
 **5. `database/schemas/__init__.py`**
 - **Risk**: MASTER_TABLES must be ordered list, no FTS
-- **Fix Applied**: Explicit rules, list type
+- **Fix Applied**: Explicit rules, list type, `ALL_FTS_TABLES`
 
 **6. `api/schemas.py`**
 - **Risk**: Watermark schema compatibility
 - **Fix Applied**: `table_watermarks` field
 
-**7. `tools/backup/models.py`**
+**7. `tools/backup/models.py`** (unchanged from README)
 - **Risk**: Pydantic v1/v2 serialization
-- **Fix Applied**: `model_dump_compat()`
+- **State**: `model_dump_compat()` present
+
+**8. `tools/scraper/prompts.py`**
+- **Risk**: Prompt constant naming, formatting errors
+- **Fix Applied (PLAN-02)**: Canonical module, fixed typos, deleted legacy `prompt.py`
 
 ### Tight Coupling
 - **Schema v9**: `updated_at` required for delta
-- **PyArrow 15+**: `binary(4096)` for embeddings
+- **PyArrow 15+**: `binary(4096)` for embeddings (FIXED: now variable length)
 - **Batch size**: 500 enforced (10000 ceiling)
 - **Browser lock**: Restore requires exclusive access
+- **Prompt module**: Scraper relies on `prompts.py` constants
 
 ### Easy Extension
 - Add tables: Update `MASTER_TABLES`, `TABLE_SCHEMAS`
@@ -673,3 +738,4 @@ print('Actions:', [a for a in report.actions if a.action != 'unchanged'])
 - Async backup: `aiofiles` + async DB
 - Schema v10: Update DDL + migration
 - API update: Wire new endpoints
+- Prompt migration: Rename module, update imports

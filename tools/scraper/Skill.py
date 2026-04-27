@@ -25,5 +25,5 @@ Artifacts
 
 Notes
 - The tool is cooperative-cancelable: it accepts a `cancellation_flag` and will stop when it is set.
-- Prompts used by sub-agents require strict JSON-only responses (see `prompt.py`).
+- Prompts used by sub-agents require strict JSON-only responses (see `prompts.py`).
 """

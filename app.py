@@ -14,6 +14,8 @@ from fastapi.security.api_key import APIKeyHeader
 from fastapi import Security, HTTPException
 from contextlib import asynccontextmanager
 import logging
+from dataclasses import dataclass, field
+from typing import List
 import os
 import asyncio
 from pathlib import Path
@@ -57,6 +59,23 @@ from tools.registry import REGISTRY
 # MIGRATIONS_DIR is now managed by database.migrations; removed from app.py
 
 log = get_dual_logger(__name__)
+
+
+@dataclass
+class StartupHealth:
+    ok: bool = True
+    failures: List[str] = field(default_factory=list)
+
+    def require(self, step_name: str, exc: Exception) -> None:
+        self.ok = False
+        self.failures.append(step_name)
+        log.dual_log(
+            tag="Sys:Startup",
+            message=f"Critical startup step failed: {step_name}: {exc}",
+            level="CRITICAL",
+            exc_info=exc,
+        )
+        raise RuntimeError(f"Startup step '{step_name}' failed: {exc}") from exc
 
 
 async def validate_vec0_extension() -> None:
@@ -113,6 +132,8 @@ async def lifespan(app: FastAPI):
     Shutdown:
         1) Drain and shutdown DB writer
     """
+    health = StartupHealth()
+
     # === Step 1: Mount artifacts/ static directory
     artifacts_dir = Path("artifacts")
     artifacts_dir.mkdir(exist_ok=True)
@@ -121,14 +142,13 @@ async def lifespan(app: FastAPI):
     app.mount("/artifacts", StaticFiles(directory=str(artifacts_dir)), name="artifacts_public")
 
     # === Step 1.2: Performance tune SQLite pragmas
-    # Set aggressive pragmas on the default connection factory
     pragmas = [
         "PRAGMA journal_mode=WAL;",
         "PRAGMA synchronous=NORMAL;",
-        "PRAGMA cache_size=-64000;",  # 64MB cache
+        "PRAGMA cache_size=-64000;",
         "PRAGMA temp_store=MEMORY;",
         "PRAGMA foreign_keys=ON;",
-        "PRAGMA mmap_size=268435456;",  # 256MB mmap
+        "PRAGMA mmap_size=268435456;",
     ]
     try:
         conn = DatabaseManager.get_read_connection()
@@ -141,14 +161,14 @@ async def lifespan(app: FastAPI):
     except Exception:
         log.dual_log(tag="DB:Init", message="Failed to tune SQLite pragmas", level="WARNING")
 
-    # === Step 1.3: Start DB writer thread (writes go through queues)
+    # === Step 1.3: Start DB writer thread
     try:
         start_writer()
         log.dual_log(tag="DB:Writer", message="Writer thread started", level="INFO")
     except Exception as e:
-        log.dual_log(tag="DB:Writer", message=f"Failed to start writer thread: {e}", level="ERROR")
+        health.require("db_writer", e)
 
-    # === Step 1.4: Zombie-chrome cleanup (best-effort)
+    # === Step 1.4: Zombie-chrome cleanup
     zombie_count = 0
     try:
         if psutil:
@@ -156,34 +176,27 @@ async def lifespan(app: FastAPI):
                 try:
                     name = p.info["name"] or ""
                     cmdline = " ".join(p.info["cmdline"] or [])
-                    # Target only zombie chrome processes: chrome that is definitely not headful
                     if "chrome" in name.lower() or "chromium" in name.lower():
-                        # Detect detached or zombie chrome processes
                         if p.status() == "zombie" or "--headless" in cmdline:
                             zombie_count += 1
                             p.kill()
-                        # Also kill processes with no visible display if on Linux
                         elif os.name != "nt" and "DISPLAY" not in os.environ and "--headless" not in cmdline:
                             zombie_count += 1
                             p.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
                 except Exception:
-                    logging.exception("Error scanning for zombie-chrome")
+                    pass
             if zombie_count > 0:
                 log.dual_log(tag="Browser:Cleanup", message=f"Cleaned up {zombie_count} zombie chrome processes", level="INFO")
-        else:
-            log.dual_log(tag="Browser:Cleanup", message="psutil not available, skipping zombie-chrome cleanup", level="DEBUG")
     except Exception:
-        logging.exception("Zombie-chrome cleanup failed; continuing startup")
+        pass
 
-    # 1.5) Ensure chrome_download/ exists for browser tools
     try:
         os.makedirs("chrome_download", exist_ok=True)
     except Exception:
         pass
 
-    # 1.6) Cleanup orphaned Parquet temp files
     try:
         from tools.backup.config import BackupConfig
         bak_cfg = BackupConfig.from_global_config()
@@ -196,34 +209,52 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.dual_log(tag="Sys:Startup", message=f"Failed cleaning backup temp files: {e}", level="WARNING")
 
-    # === Step 2: Perform authoritative schema initialization and migration execution FIRST
-    try:
-        from database.lifecycle import run_database_lifecycle
-        await run_database_lifecycle()
-    except Exception as e:
-        log.dual_log(
-            tag="DB:Lifecycle",
-            message=f"Database lifecycle raised non-fatal error: {e}",
-            level="WARNING",
-            exc_info=e,
-        )
+    # === Step 2: Database lifecycle (CRITICAL) ===
+    from database.lifecycle import run_database_lifecycle
+    await run_database_lifecycle()
 
-    # === Step 3: Load tools registry (optional pre-cache)
+    # === Step 3: Tool registry (CRITICAL) ===
     try:
         REGISTRY.load_all()
-        log.dual_log(tag="Tools:Registry", message=f"Registry loaded: {len(REGISTRY._tools)} tools", level="INFO")
+        loaded = len(REGISTRY._tools)
+        if loaded == 0:
+            raise RuntimeError("Registry loaded 0 tools.")
+        log.dual_log(tag="Tools:Registry", message=f"Registry loaded: {loaded} tools", level="INFO")
     except Exception as e:
-        log.dual_log(tag="Tools:Registry", message=f"Failed loading registry: {e}", level="WARNING")
+        health.require("tool_registry", e)
 
-    # === Step 4: Validate vec0 extension (best-effort warnings only)
-    await validate_vec0_extension()
+    # === Step 4: Browser driver warmup (CRITICAL) ===
+    try:
+        from utils.browser_daemon import get_or_create_driver
+        from utils.browser_lock import browser_lock
+        
+        def _warmup_browser():
+            browser_lock.acquire()
+            try:
+                driver = get_or_create_driver()
+                driver.run_js("return 1;")
+            finally:
+                browser_lock.safe_release()
+                
+        await asyncio.wait_for(asyncio.to_thread(_warmup_browser), timeout=30.0)
+        log.dual_log(tag="Browser:Warmup", message="Driver responsive", level="INFO")
+    except Exception as e:
+        health.require("browser_warmup", e)
 
-    # === Step 5: Signal ready
+    # === Step 5: Validate vec0 extension ===
+    try:
+        await validate_vec0_extension()
+    except Exception as e:
+        log.dual_log(tag="Sys:Vec0", message=f"Vec0 validation skipped: {e}", level="WARNING")
+
+    if not health.ok:
+        raise RuntimeError(f"Startup incomplete: {health.failures}")
+
     log.dual_log(tag="Sys:Startup", message="Lifespan startup completed", level="INFO")
 
     yield
 
-    # === Shutdown: Drain and shutdown DB writer
+    # === Shutdown ===
     try:
         await wait_for_writes()
         shutdown_writer()
