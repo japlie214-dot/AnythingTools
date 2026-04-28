@@ -31,11 +31,9 @@ class SumAnalLogger:
         self._logger = logging.getLogger(f"sumanal.{name}")
         self._logger.setLevel(logging.DEBUG)
         self._logger.propagate = False
-        console_h, file_h = _get_master_handlers()
+        console_h = _get_master_handlers()[0]
         if console_h not in self._logger.handlers:
             self._logger.addHandler(console_h)
-        if file_h not in self._logger.handlers:
-            self._logger.addHandler(file_h)
 
     def dual_log(
         self,
@@ -54,6 +52,13 @@ class SumAnalLogger:
 
         # 1. Console + master file via composed logger.
         self._logger.log(level_int, message, extra=extra, exc_info=exc_info)
+        
+        if level_int >= logging.ERROR:
+            try:
+                from utils.error_export import export_error_context
+                export_error_context(tag, message, _current_job_id.get())
+            except Exception:
+                pass
 
         # ── Logger Agent buffer capture ──────────────────────────────────────
         _buf = _tool_log_buffer.get()
@@ -117,7 +122,7 @@ class SumAnalLogger:
             from database.writer import enqueue_write
 
             enqueue_write(
-                "INSERT INTO job_logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (log_id, job_id, tag, level.upper(), status_state, message, payload_str, ts),
             )
 
@@ -180,7 +185,7 @@ def flush_tool_buffer_to_job_logs(job_id: str, buf: list[dict] | None) -> None:
                         payload_json = None
 
             enqueue_write(
-                "INSERT INTO job_logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (row_id, job_id, tag, level, status_state, message, payload_json, timestamp),
             )
         except Exception as e:
@@ -224,49 +229,15 @@ def get_sql_logger(statement_type: str) -> SumAnalLogger:
 
 
 def global_log_purge() -> None:
-    """Archive existing logs, close all handlers, and prepare a fresh logging state."""
-    import shutil
-    import sys
-
+    """Archiving removed. Only ensure log directory exists and console handler is configured."""
     with _cache_lock:
-        for handler in _handler_cache.values():
-            try:
-                handler.close()
-            except Exception:
-                pass
-        _handler_cache.clear()
-        _logger_cache.clear()
-
-        for name in list(logging.root.manager.loggerDict):
-            if name.startswith("sumanal."):
-                lg = logging.root.manager.loggerDict[name]
-                if isinstance(lg, logging.Logger):
-                    for h in lg.handlers[:]:
-                        lg.removeHandler(h)
-
-        if _LOG_DIR.exists():
-            log_files = [f for f in _LOG_DIR.iterdir() if f.is_file()]
-            if log_files:
-                ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
-                archive_dir = _LOG_DIR / "archive" / ts
-                try:
-                    archive_dir.mkdir(parents=True, exist_ok=True)
-                    for f in log_files:
-                        try:
-                            shutil.move(str(f), str(archive_dir / f.name))
-                        except Exception as e:
-                            sys.stderr.write(f"Warning: could not archive {f.name}: {e}\n")
-                except Exception as e:
-                    sys.stderr.write(f"Warning: archive directory creation failed: {e}\n")
-
         _LOG_DIR.mkdir(parents=True, exist_ok=True)
-        console_h, file_h = _get_master_handlers()
+        console_h = _get_master_handlers()[0]
         for name in list(logging.root.manager.loggerDict):
             if name.startswith("sumanal."):
                 lg = logging.root.manager.loggerDict[name]
                 if isinstance(lg, logging.Logger):
                     lg.addHandler(console_h)
-                    lg.addHandler(file_h)
 
 
 def flush_all_log_handlers() -> None:

@@ -93,7 +93,7 @@ def _fetch_recent_errors(job_id: str, limit: int = 10) -> str:
         from database.connection import DatabaseManager
         conn = DatabaseManager.get_read_connection()
         rows = conn.execute(
-            "SELECT timestamp, tag, level, message FROM job_logs "
+            "SELECT timestamp, tag, level, message FROM logs "
             "WHERE job_id = ? AND level IN ('ERROR', 'WARNING', 'CRITICAL') "
             "ORDER BY timestamp DESC LIMIT ?",
             (job_id, limit)

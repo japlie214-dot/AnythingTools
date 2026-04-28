@@ -120,6 +120,8 @@ class Top10Curator:
         """
         Execute validated curation with 3-retry loop and quality scoring.
         """
+        from utils.logger.structured import granular_log
+        
         log_ctx = {"batch_id": batch_id} if batch_id else {}
         if not candidates:
             return [], 0
@@ -144,7 +146,8 @@ class Top10Curator:
             return [], 0
 
         # Phase 1: Smart packing
-        packed_candidates, target_count = self._pack_context(valid_candidates)
+        with granular_log("Scraper:Curation:Pack", valid_count=len(valid_candidates)):
+            packed_candidates, target_count = self._pack_context(valid_candidates)
         if target_count == 0:
             return [], 0
 
@@ -155,66 +158,67 @@ class Top10Curator:
         best_score = -1.0
 
         # Phase 2: Validated curation with 3 retries
-        for attempt in range(1, self.MAX_RETRIES + 1):
-            prompt = f"Return a JSON object with key 'top_{target_count}' containing an array of EXACTLY {target_count} unique ULIDs.\n"
-            if previous_errors:
-                prompt += f"\nWARNINGS from past attempts:\n"
-                for err in previous_errors:
-                    prompt += f"- {err}\n"
-                prompt += "\nDo NOT repeat these mistakes.\n"
-            
-            prompt += f"\nCandidates:\n{json.dumps(packed_candidates, ensure_ascii=False)}"
+        with granular_log("Scraper:Curation:LLM", target_count=target_count):
+            for attempt in range(1, self.MAX_RETRIES + 1):
+                prompt = f"Return a JSON object with key 'top_{target_count}' containing an array of EXACTLY {target_count} unique ULIDs.\n"
+                if previous_errors:
+                    prompt += f"\nWARNINGS from past attempts:\n"
+                    for err in previous_errors:
+                        prompt += f"- {err}\n"
+                    prompt += "\nDo NOT repeat these mistakes.\n"
+                
+                prompt += f"\nCandidates:\n{json.dumps(packed_candidates, ensure_ascii=False)}"
 
-            try:
-                log.dual_log(
-                    tag="LLM:Azure:Request",
-                    message="Sending request to Azure OpenAI (Curation)",
-                    payload={**log_ctx, "attempt": attempt}
-                )
-                resp = sync_llm_chat(
-                    [{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"}
-                )
-                log.dual_log(
-                    tag="LLM:Azure:Response",
-                    message="Received response from Azure OpenAI.",
-                    payload={**log_ctx, "attempt": attempt}
-                )
-                
-                parsed = json.loads(resp.content or "{}")
-                key = f"top_{target_count}"
-                top_ulids = parsed.get(key) or parsed.get("top_10") or []
-                
-                seen = set()
-                valid_ulids = []
-                for u in top_ulids:
-                    if u in candidate_ulids and u not in seen:
-                        seen.add(u)
-                        valid_ulids.append(u)
-                        
-                curated = [ulid_to_item[u] for u in valid_ulids]
-                quality = self._score_curation_quality(curated, packed_candidates, target_count)
-                
-                log.dual_log(
-                    tag="Scraper:Curation:Score",
-                    message=f"Quality score for attempt {attempt}: {quality['composite']}",
-                    payload={**log_ctx, "attempt": attempt, "quality": quality}
-                )
-                
-                if quality["composite"] > best_score:
-                    best_score = quality["composite"]
-                    best_result = (curated, target_count)
+                try:
+                    log.dual_log(
+                        tag="LLM:Azure:Request",
+                        message="Sending request to Azure OpenAI (Curation)",
+                        payload={**log_ctx, "attempt": attempt}
+                    )
+                    resp = sync_llm_chat(
+                        [{"role": "user", "content": prompt}],
+                        response_format={"type": "json_object"}
+                    )
+                    log.dual_log(
+                        tag="LLM:Azure:Response",
+                        message="Received response from Azure OpenAI.",
+                        payload={**log_ctx, "attempt": attempt}
+                    )
                     
-                if len(valid_ulids) == target_count:
-                    log.dual_log(tag="Scraper:Curation:Selected", message=f"Selected attempt {attempt} as final result.", payload={**log_ctx, "attempt": attempt})
-                    return curated, target_count
-                else:
-                    err_msg = f"Expected {target_count} valid unique items, got {len(valid_ulids)}."
-                    previous_errors.append(err_msg)
-                    log.dual_log(tag="Scraper:Curation:Partial", message=err_msg, level="WARNING", payload={"attempt": attempt})
+                    parsed = json.loads(resp.content or "{}")
+                    key = f"top_{target_count}"
+                    top_ulids = parsed.get(key) or parsed.get("top_10") or []
+                    
+                    seen = set()
+                    valid_ulids = []
+                    for u in top_ulids:
+                        if u in candidate_ulids and u not in seen:
+                            seen.add(u)
+                            valid_ulids.append(u)
+                            
+                    curated = [ulid_to_item[u] for u in valid_ulids]
+                    quality = self._score_curation_quality(curated, packed_candidates, target_count)
+                    
+                    log.dual_log(
+                        tag="Scraper:Curation:Score",
+                        message=f"Quality score for attempt {attempt}: {quality['composite']}",
+                        payload={**log_ctx, "attempt": attempt, "quality": quality}
+                    )
+                    
+                    if quality["composite"] > best_score:
+                        best_score = quality["composite"]
+                        best_result = (curated, target_count)
+                        
+                    if len(valid_ulids) == target_count:
+                        log.dual_log(tag="Scraper:Curation:Selected", message=f"Selected attempt {attempt} as final result.", payload={**log_ctx, "attempt": attempt})
+                        return curated, target_count
+                    else:
+                        err_msg = f"Expected {target_count} valid unique items, got {len(valid_ulids)}."
+                        previous_errors.append(err_msg)
+                        log.dual_log(tag="Scraper:Curation:Partial", message=err_msg, level="WARNING", payload={"attempt": attempt})
 
-            except Exception as e:
-                previous_errors.append(f"Parse error: {e}")
+                except Exception as e:
+                    previous_errors.append(f"Parse error: {e}")
 
         # Fallback: Retry exhaustion
         log.dual_log(

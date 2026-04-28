@@ -231,12 +231,12 @@ async def get_job_status(job_id: str, request: Request):
 
     status_val = row["status"]
 
-    # Load job logs from persistent store (job_logs)
+    # Load job logs from persistent store (logs)
     job_logs = []
     try:
         conn = DatabaseManager.get_read_connection()
         rows = conn.execute(
-            "SELECT timestamp, level, tag, status_state, message FROM job_logs WHERE job_id = ? ORDER BY timestamp",
+            "SELECT timestamp, level, tag, status_state, message FROM logs WHERE job_id = ? ORDER BY timestamp",
             (job_id,),
         ).fetchall()
         for r in rows:
@@ -244,11 +244,11 @@ async def get_job_status(job_id: str, request: Request):
     except Exception:
         pass
 
-    # Attempt to read latest payload row from job_logs (payload_json) for final_payload
+    # Attempt to read latest payload row from logs (payload_json) for final_payload
     final_payload = None
     try:
         conn = DatabaseManager.get_read_connection()
-        p = conn.execute("SELECT payload_json FROM job_logs WHERE job_id = ? AND payload_json IS NOT NULL ORDER BY timestamp DESC LIMIT 1", (job_id,)).fetchone()
+        p = conn.execute("SELECT payload_json FROM logs WHERE job_id = ? AND payload_json IS NOT NULL ORDER BY timestamp DESC LIMIT 1", (job_id,)).fetchone()
         if p and p["payload_json"]:
             try:
                 final_payload = json.loads(p["payload_json"])
@@ -284,7 +284,7 @@ async def delete_job(job_id: str, request: Request):
     try:
         enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("CANCELLING", ts, job_id))
         enqueue_write(
-            "INSERT INTO job_logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (ULID.generate(), job_id, "system", "INFO", "CANCELLING", "Cancellation requested via API", None, ts),
         )
     except Exception:

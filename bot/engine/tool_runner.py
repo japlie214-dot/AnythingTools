@@ -33,11 +33,11 @@ async def run_tool_safely(tool: BaseTool, args: Dict[str, Any], telemetry: Any, 
                 from utils.id_generator import ULID
                 from datetime import datetime, timezone
                 enqueue_write(
-                    "INSERT INTO job_logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (ULID.generate(), job_id, "ToolRunner:Error", "ERROR", error_msg, json.dumps({"traceback": raw_tb}), datetime.now(timezone.utc).isoformat())
                 )
             except Exception as log_err:
-                log.dual_log(tag="ToolRunner", message=f"Failed to log error to job_logs: {log_err}", level="WARNING")
+                log.dual_log(tag="ToolRunner", message=f"Failed to log error to logs: {log_err}", level="WARNING")
         
         log.dual_log(tag="ToolRunner", message=f"Tool execution failed: {exc}", level="ERROR", payload={"job_id": job_id, "tool": tool.name})
         return ToolResult(output=error_msg, success=False)

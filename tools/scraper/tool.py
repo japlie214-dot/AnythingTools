@@ -30,17 +30,17 @@ class ScraperTool(BaseTool):
     description = "Scrape and curate top articles from a target site. Returns a curated top 10 list enriched with insights."
     input_model = None  # Dynamic validation in execute()
 
-    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, job_id: str | None = None, session_id: str | None = None, cancellation_flag: threading.Event | None = None, dry_run: bool | None = None, **kwargs) -> str:
         """Execute the full scraper pipeline including extraction, curation, artifacts, and backup."""
         import threading
-        cancellation_flag = kwargs.get("cancellation_flag") or threading.Event()
-        return await self._run_internal(args, telemetry, cancellation_flag, **kwargs)
+        cancellation_flag = cancellation_flag or threading.Event()
+        return await self._run_internal(args, telemetry, job_id, session_id, cancellation_flag, dry_run, **kwargs)
 
-    async def _run_internal(self, args: dict[str, Any], telemetry: Any, cancellation_flag: threading.Event, **kwargs) -> str:
+    async def _run_internal(self, args: dict[str, Any], telemetry: Any, job_id: str | None, session_id: str | None, cancellation_flag: threading.Event, dry_run: bool | None, **kwargs) -> str:
         """Internal implementation with full pipeline."""
+        from utils.logger.structured import granular_log
         
-        job_id = kwargs.get("job_id")
-        session_id = str(kwargs.get("session_id") or kwargs.get("chat_id", "0"))
+        session_id = str(session_id or kwargs.get("chat_id", "0"))
         target_site = args.get("target_site")
         
         batch_id = ULID.generate()
@@ -73,14 +73,15 @@ class ScraperTool(BaseTool):
             }
             try:
                 enqueue_write(
-                    "INSERT INTO job_logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (ULID.generate(), job_id, "Scraper:Validation:Failed", "WARNING", "FAILED", summary, json.dumps(payload, ensure_ascii=False), datetime.now(timezone.utc).isoformat())
                 )
             except Exception:
                 pass
             return json.dumps(payload, ensure_ascii=False)
 
-        dry_run = kwargs.get("dry_run", config.TELEMETRY_DRY_RUN)
+        if dry_run is None:
+            dry_run = config.TELEMETRY_DRY_RUN
         if dry_run:
             return _fail_internal("[DRY RUN] Scraper tool execution skipped.", "Disable dry run to execute.")
 
@@ -126,7 +127,8 @@ class ScraperTool(BaseTool):
             from utils.browser_daemon import get_or_create_driver
             _scrape_driver = get_or_create_driver()
             
-            results = await asyncio.to_thread(
+            with granular_log("Scraper:Botasaurus", target_site=target_site, job_id=job_id):
+                results = await asyncio.to_thread(
                 _run_botasaurus_scraper,
                 _scrape_driver,
                 {
@@ -154,7 +156,7 @@ class ScraperTool(BaseTool):
                 _record_artifact(raw_filepath, "json", f"Raw scraper output for {target_site}")
                 if job_id:
                     enqueue_write(
-                        "INSERT INTO job_logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (ULID.generate(), job_id, "Scraper:Extraction:Complete", "INFO", "COMPLETED", f"Extracted {len(results)} items", json.dumps({"count": len(results), "batch_id": batch_id}), datetime.now(timezone.utc).isoformat())
                     )
             except Exception as e:
@@ -183,7 +185,8 @@ class ScraperTool(BaseTool):
                 if job_id: add_job_item(job_id, slim_meta, json.dumps({"target_site": target_site}))
                 from tools.scraper.extraction import ArticleSlimmer
                 slimmer = ArticleSlimmer()
-                slim_list = slimmer.slim(results, batch_id=batch_id)
+                with granular_log("Scraper:Slim", results_count=len(results)):
+                    slim_list = slimmer.slim(results, batch_id=batch_id)
                 if job_id: update_item_status(job_id, slim_meta, "COMPLETED", json.dumps({"slim_count": len(slim_list), "batch_id": batch_id}))
             else:
                 out = _get_step_output("slim")

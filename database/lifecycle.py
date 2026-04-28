@@ -87,6 +87,11 @@ async def _reconcile_with_restoration() -> None:
     
     conn = DatabaseManager.create_write_connection()
     try:
+        # Force fresh logs table on startup
+        conn.execute("DROP TABLE IF EXISTS logs")
+        conn.commit()
+        log.dual_log(tag="DB:Lifecycle", level="INFO", message="Dropped logs table for fresh startup.")
+
         # Run reconciliation
         reconciler = SchemaReconciler(conn)
         report = reconciler.reconcile()

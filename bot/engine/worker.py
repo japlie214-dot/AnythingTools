@@ -130,7 +130,7 @@ def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: l
                 resp.raise_for_status()
 
             enqueue_write(
-                "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
                 (ULID.generate(), job_id, "Worker:Callback:Success", "INFO", f"Callback delivered (attempt {attempt})", now_iso())
             )
             return True
@@ -139,17 +139,18 @@ def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: l
             status_code = e.response.status_code
             if 400 <= status_code < 500:
                 enqueue_write(
-                    "INSERT INTO job_logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (ULID.generate(), job_id, "Worker:Callback:ClientError", "ERROR", f"HTTP {status_code} (no retry)", json.dumps({"status_code": status_code}), now_iso())
                 )
                 return False
+            # Non-4xx HTTP errors are considered transient/server and may be retried
             enqueue_write(
-                "INSERT INTO job_logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (ULID.generate(), job_id, "Worker:Callback:ServerError", "WARNING", f"HTTP {status_code} (retry)", json.dumps({"status_code": status_code}), now_iso())
             )
         except Exception as e:
             enqueue_write(
-                "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
                 (ULID.generate(), job_id, "Worker:Callback:Transient", "WARNING", f"Transient error: {str(e)[:200]}", now_iso())
             )
 
@@ -157,7 +158,7 @@ def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: l
             time.sleep(base_delay * (2 ** (attempt - 1)))
 
     enqueue_write(
-        "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
         (ULID.generate(), job_id, "Worker:Callback:MaxRetries", "ERROR", f"Callback failed after {max_retries} attempts", now_iso())
     )
     return False
@@ -288,7 +289,7 @@ class UnifiedWorkerManager:
                         (new_retry_count, now_iso(), job_id)
                     )
                     enqueue_write(
-                        "INSERT INTO job_logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
                         (ULID.generate(), job_id, "Worker:Callback:Abandoned", "ERROR", "Max callback retries exceeded, marked as PARTIAL", now_iso())
                     )
                 else:
