@@ -1,4 +1,4 @@
-# tools/backup/exporter.py
+# database/backup/exporter.py
 import sqlite3
 import struct
 from typing import Iterator, Tuple, Optional, Dict, Any, List

@@ -109,7 +109,7 @@ async def _reconcile_with_restoration() -> None:
             log.dual_log(tag="DB:Lifecycle", level="WARNING", 
                        message=f"Master tables need restoration: {report.master_tables_recreated}")
             
-            from tools.backup.restore import restore_master_tables_direct
+            from database.backup.restore import restore_master_tables_direct
             restore_result = restore_master_tables_direct(conn, report.master_tables_recreated)
             
             if restore_result.success:
@@ -126,7 +126,7 @@ async def _reconcile_with_restoration() -> None:
                 
                 # 7. Post-restore cleanup: Run full backup to replace Pre-Drop Snapshots
                 log.dual_log(tag="DB:Lifecycle", level="INFO", message="Running full backup for cleanup")
-                from tools.backup.storage import export_all_tables
+                from database.backup.storage import export_all_tables
                 export_result = export_all_tables(conn, mode="full")
                 
                 if export_result.success:

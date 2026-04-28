@@ -118,9 +118,9 @@ class SchemaReconciler:
                 if is_master:
                     # Pre-Drop Snapshot - FIXED: Use streaming export
                     try:
-                        from tools.backup.exporter import export_table_chunks
-                        from tools.backup.config import BackupConfig
-                        from tools.backup.storage import write_table_batch
+                        from database.backup.exporter import export_table_chunks
+                        from database.backup.config import BackupConfig
+                        from database.backup.storage import write_table_batch
                         config = BackupConfig.from_global_config()
                         chunks = export_table_chunks(self.conn, name, config, mode="full")
                         written = write_table_batch(name, chunks, config)

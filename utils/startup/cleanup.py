@@ -2,7 +2,7 @@
 
 import os
 from utils.logger.core import get_dual_logger
-from tools.backup.config import BackupConfig
+from database.backup.config import BackupConfig
 
 log = get_dual_logger(__name__)
 

@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tools.backup.schema import (
+from database.backup.schema import (
     TABLE_SCHEMAS,
     VECTOR_BYTE_LENGTH,
     FLOAT32_COUNT,
@@ -69,7 +69,7 @@ class TestSchemaPandasRoundtrip:
 
 class TestWatermarkCompatibility:
     def test_model_dump_compat(self):
-        from tools.backup.models import Watermark
+        from database.backup.models import Watermark
         wm = Watermark(last_article_id="test123", total_articles_exported=42)
         d = wm.model_dump_compat()
         assert d["last_article_id"] == "test123"

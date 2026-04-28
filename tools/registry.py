@@ -34,41 +34,114 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: Dict[str, Dict[str, Any]] = {}
+        self._discovery_results: Dict[str, Dict[str, Any]] = {}
+        self._previous_discovery_results: Dict[str, Dict[str, Any]] = {}
+
+    def diagnostic_list(self) -> Dict[str, Dict[str, Any]]:
+        return self._discovery_results.copy()
 
     def load_all(self) -> None:
-        """Import only the whitelisted core tools.
-
-        This method is resilient: failures to import a particular tool module
-        are logged and do not abort discovery of other modules.
+        """Import explicitly whitelisted core tools with state diffing.
+        
+        State diffing prevents log spam on repeated requests by only logging
+        tool states that have changed since the last invocation.
         """
-        self._tools.clear()
+        self._previous_discovery_results = self._discovery_results.copy()
+        
+        # Use temporary dicts to prevent transient 404s/503s during concurrent API requests
+        temp_tools = {}
+        temp_discovery = {}
+        
         package_dir = Path(__file__).parent
 
-        # Load only explicitly whitelisted core tools
+        # Load explicitly whitelisted core tools (No backup)
         core_tools = ["scraper", "draft_editor", "publisher", "batch_reader"]
         
         for tool_dir in core_tools:
-            child = package_dir / tool_dir
-            if not child.exists():
-                continue
-                
-            module_name = f"tools.{child.name}"
+            self._discover_tool(package_dir, tool_dir, temp_tools, temp_discovery)
+
+        # Atomic swap avoids race conditions without locking overhead
+        self._tools = temp_tools
+        self._discovery_results = temp_discovery
+
+        self._log_state_changes()
+
+    def _discover_tool(self, package_dir: Path, tool_dir: str, temp_tools: dict, temp_discovery: dict) -> None:
+        child = package_dir / tool_dir
+        module_name = f"tools.{child.name}"
+        
+        if not child.exists():
+            temp_discovery[tool_dir] = {
+                "status": "MISSING",
+                "module": module_name,
+                "error": f"Directory not found: {child}"
+            }
+            return
+
+        found_any = False
+            
+        try:
+            module = importlib.import_module(module_name)
+            if self._register_module_tools(module, temp_tools, temp_discovery, primary_tool=tool_dir, module_name=module_name):
+                found_any = True
+        except Exception as e:
+            temp_discovery[tool_dir] = {
+                "status": "FAILED",
+                "module": module_name,
+                "error": str(e),
+                "exception_type": type(e).__name__
+            }
+
+        # Attempt to import conventional submodules
+        for sub in ("tool", "Skill"):
+            sub_module_name = f"tools.{child.name}.{sub}"
             try:
-                module = importlib.import_module(module_name)
-                self._register_module_tools(module)
-            except Exception as e:
-                log.dual_log(tag="Registry:Load", message=f"Failed to import tool package {module_name}: {e}", level="WARNING", payload={"module": module_name})
-
-            # Attempt to import conventional submodules inside the package
-            for sub in ("tool", "Skill"):
-                try:
-                    submod = importlib.import_module(f"tools.{child.name}.{sub}")
-                    self._register_module_tools(submod)
-                except Exception:
+                submod = importlib.import_module(sub_module_name)
+                if self._register_module_tools(submod, temp_tools, temp_discovery, primary_tool=tool_dir, module_name=sub_module_name):
+                    found_any = True
+            except ModuleNotFoundError as e:
+                # If the specific submodule (e.g. "Skill.py") just doesn't exist, ignore it.
+                if getattr(e, "name", None) == sub_module_name:
                     pass
+                else:
+                    temp_discovery[tool_dir] = {
+                        "status": "FAILED",
+                        "module": sub_module_name,
+                        "error": str(e),
+                        "exception_type": type(e).__name__
+                    }
+            except Exception as e:
+                # Catch actual syntax/runtime errors and record them for 503 HTTP responses
+                temp_discovery[tool_dir] = {
+                    "status": "FAILED",
+                    "module": sub_module_name,
+                    "error": str(e),
+                    "exception_type": type(e).__name__
+                }
+                
+        if not found_any and tool_dir not in temp_discovery:
+            temp_discovery[tool_dir] = {
+                "status": "REJECTED",
+                "module": module_name,
+                "error": "No valid BaseTool subclasses found in module"
+            }
+
+    def _log_state_changes(self) -> None:
+        for tool_name, current in self._discovery_results.items():
+            prev = self._previous_discovery_results.get(tool_name)
+            # Only log if state changed
+            if prev != current:
+                status = current.get("status")
+                if status == "LOADED":
+                    log.dual_log(tag="Registry:Register", message=f"Registered tool: {tool_name}", level="INFO", payload=current)
+                elif status in ("FAILED", "REJECTED", "MISSING"):
+                    log.dual_log(tag="Registry:Discover", message=f"Tool discovery failed for {tool_name}: {current.get('error')}", level="ERROR", payload={"tool": tool_name, "status": status})
 
 
-    def _register_module_tools(self, module):
+    def _register_module_tools(self, module, temp_tools: dict, temp_discovery: dict, primary_tool: str = None, module_name: str = None) -> bool:
+        if module_name is None:
+            module_name = module.__name__
+
         # Attempt to capture INPUT_MODEL.schema() if provided by the module.
         input_schema: Optional[Dict[str, Any]] = None
         try:
@@ -77,7 +150,7 @@ class ToolRegistry:
                 try:
                     input_schema = InputModel.schema()
                 except Exception as e:
-                    log.dual_log(tag="Registry:Schema", message=f"Failed to serialize INPUT_MODEL for {module.__name__}: {e}", level="WARNING", payload={"module": module.__name__})
+                    log.dual_log(tag="Registry:Schema", message=f"Failed to serialize INPUT_MODEL for {module_name}: {e}", level="WARNING", payload={"module": module_name})
         except Exception:
             input_schema = None
 
@@ -90,6 +163,7 @@ class ToolRegistry:
         except Exception:
             pass
 
+        found_any = False
         # Register concrete BaseTool subclasses defined in the module.
         for _, obj in inspect.getmembers(module, inspect.isclass):
             # Only interested in concrete subclasses defined in this module.
@@ -113,38 +187,43 @@ class ToolRegistry:
                     inst = obj()  # many tools have parameterless constructors
                     tool_name = getattr(inst, "name", None)
                 except Exception as e:
-                    log.dual_log(tag="Registry:Register", message=f"Skipping tool class because name not found and instantiation failed: {obj}: {e}", level="WARNING", payload={"class": f"{obj}"})
+                    temp_discovery[primary_tool or "unknown"] = {
+                        "status": "REJECTED",
+                        "module": module_name,
+                        "error": f"Skipping tool class {obj} - instantiation failed: {e}"
+                    }
                     continue
 
             # Validate tool name against Azure OpenAI naming constraints
             if not tool_name or not re.match(r'^[a-zA-Z0-9_-]+$', tool_name):
-                raise ValueError(f"Invalid tool name '{tool_name}'. Tool names must match ^[a-zA-Z0-9_-]+$")
+                temp_discovery[tool_name or primary_tool or "unknown"] = {
+                    "status": "REJECTED",
+                    "module": module_name,
+                    "error": f"Invalid tool name '{tool_name}'. Must match ^[a-zA-Z0-9_-]+$"
+                }
+                continue
 
-            self._tools[tool_name] = {
+            temp_tools[tool_name] = {
                 "cls": obj,
                 "input_schema": input_schema,
                 "module": module.__name__,
                 "description": description,
             }
+            temp_discovery[tool_name] = {
+                "status": "LOADED",
+                "module": module_name,
+                "error": None
+            }
+            found_any = True
+
             log.dual_log(tag="Registry:Register", message=f"Registered tool: {tool_name}", level="DEBUG", payload={"module": module.__name__, "class": obj.__name__})
+
+        return found_any
 
     def get_tool_class(self, name: str) -> Optional[Type[BaseTool]]:
         meta = self._tools.get(name)
         return meta.get("cls") if meta else None
 
-    def get_actions(self, scope: str) -> list[Dict[str, Any]]:
-        """Return tools filtered by namespace (e.g. scope='browser' matches tools.actions.browser.*)."""
-        entries = []
-        for name, meta in self._tools.items():
-            mod = meta.get("module", "")
-            if mod.startswith(f"tools.actions.{scope}") or mod.startswith(f"tools.{scope}"):
-                input_schema = meta.get("input_schema") or {"type": "object", "properties": {}, "required": []}
-                entries.append({
-                    "name": name,
-                    "description": meta.get("description", ""),
-                    "input_schema": input_schema
-                })
-        return entries
 
     def create_tool_instance(self, name: str, **kwargs) -> Optional[BaseTool]:
         """Instantiate a fresh tool for a job.

@@ -20,8 +20,8 @@ from utils.security import scan_args_for_urls
 from pydantic import ValidationError
 
 # Backup imports
-from tools.backup.config import BackupConfig
-from tools.backup.runner import BackupRunner
+from database.backup.config import BackupConfig
+from database.backup.runner import BackupRunner
 from utils.browser_lock import browser_lock
 
 log = get_dual_logger(__name__)
@@ -52,6 +52,13 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
     REGISTRY.load_all()
     meta = REGISTRY._tools.get(tool_name)
     if not meta:
+        diagnostics = REGISTRY.diagnostic_list()
+        diag_info = diagnostics.get(tool_name)
+        
+        if diag_info and diag_info.get("status") in ("FAILED", "REJECTED"):
+            reason = diag_info.get("error", "Unknown error")
+            raise HTTPException(status_code=503, detail=f"Tool failed to load: {reason}")
+        
         raise HTTPException(status_code=404, detail="Tool not found")
 
     # Circuit breaker for browser-bound tools

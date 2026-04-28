@@ -30,8 +30,10 @@ class ScraperTool(BaseTool):
     description = "Scrape and curate top articles from a target site. Returns a curated top 10 list enriched with insights."
     input_model = None  # Dynamic validation in execute()
 
-    async def execute(self, args: dict[str, Any], telemetry: Any, cancellation_flag: threading.Event, **kwargs) -> str:
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         """Execute the full scraper pipeline including extraction, curation, artifacts, and backup."""
+        import threading
+        cancellation_flag = kwargs.get("cancellation_flag") or threading.Event()
         return await self._run_internal(args, telemetry, cancellation_flag, **kwargs)
 
     async def _run_internal(self, args: dict[str, Any], telemetry: Any, cancellation_flag: threading.Event, **kwargs) -> str:
@@ -235,7 +237,7 @@ class ScraperTool(BaseTool):
             if not _check_step("backup"):
                 await telemetry(self.status("Syncing backup to Parquet...", "RUNNING"))
                 if job_id: add_job_item(job_id, bak_meta, "{}")
-                from tools.backup.runner import BackupRunner
+                from database.backup.runner import BackupRunner
                 bak_res = BackupRunner.run(mode="delta", trigger_type="auto")
                 if not bak_res.success and bak_res.error != "Disabled":
                     if job_id: update_item_status(job_id, bak_meta, "FAILED", json.dumps({"error": bak_res.error}))

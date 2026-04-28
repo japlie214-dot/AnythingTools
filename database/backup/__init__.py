@@ -1,4 +1,4 @@
-"""tools/backup/__init__.py
+"""database/backup/__init__.py
 Parquet Backup & Restore module for scraped articles.
 
 Provides watermark-based delta export, immutable Parquet file storage,
