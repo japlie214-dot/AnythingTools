@@ -23,17 +23,15 @@ log = get_dual_logger(__name__)
 
 
 def inject_som(driver: Driver, start_id: int = 1) -> int:
-    """Inject data-ai-id attributes with visual badges and return the last ID used."""
+    """Inject data-ai-id attributes and return the last ID used."""
+    from utils.observation_adapter import BotasaurusObservationAdapter
     try:
-        from utils.som_injector import SoMInjector, InjectionMode, SoMCriticalTimeoutError
-        injector = SoMInjector(driver, timeout=60.0)
-        try:
-            return injector.inject(start_id=start_id, mode=InjectionMode.FULL)
-        except SoMCriticalTimeoutError:
-            raise  # Let the orchestrator or daemon catch this to perform surgical kill
-        except Exception as e:
-            log.dual_log(tag="SoM:Inject", message=f"Full injection failed: {e}. Retrying in marker-only mode.", level="WARNING")
-            return injector.inject(start_id=start_id, mode=InjectionMode.MARKER_ONLY)
+        adapter = BotasaurusObservationAdapter(driver)
+        adapter.post_extract()  # Clean any existing markers first
+        res = adapter.pre_extract(lenient=True)
+        # Return count (not ID) for backward compatibility
+        # The adapter returns flat "bid_N" format, so we return 1 + count
+        return res.get("marked_count", 0) + 1
     except Exception as e:
         log.dual_log(tag="SoM:Inject", message=f"SoM injection failed entirely: {e}", level="ERROR")
         return start_id
@@ -75,7 +73,7 @@ def extract_surgical_html(driver: Driver) -> str:
     import config
     budget = getattr(config, "BROWSER_SOM_HTML_CHAR_BUDGET", 20000)
     raw_html = driver.page_html or ""
-    return clean_html_for_agent(raw_html, max_chars=budget, extra_attrs={"data-ai-id"})
+    return clean_html_for_agent(raw_html, max_chars=budget, extra_attrs={"data-ai-id", "browsergym_set_of_marks", "browsergym_visibility_ratio"})
 
 
 def reinject_all(driver: Driver, id_tracking: dict) -> None:
@@ -83,9 +81,10 @@ def reinject_all(driver: Driver, id_tracking: dict) -> None:
     wait_for_dom_stability(driver)
     remove_overlays(driver)
     
-    start_id = 1
-    last_id = inject_som(driver, start_id)
-    id_tracking['main'] = (start_id, last_id - 1)
+    last_id = inject_som(driver)
+    # Bid namespace is 0-indexed: bid_0 to bid_{marked_count-1}
+    # inject_som returns count + 1, so we calculate: (0, last_id - 2)
+    id_tracking['main'] = (0, last_id - 2) if last_id > 1 else (0, 0)
 
 
 def inject_ai_ids(driver: Driver) -> None:
@@ -94,12 +93,13 @@ def inject_ai_ids(driver: Driver) -> None:
 
 
 def remove_overlays(driver: Driver) -> None:
-    """Remove common overlay and badge elements via allowed run_js."""
+    """Remove common overlay elements via allowed run_js."""
     try:
+        from utils.observation_adapter import BotasaurusObservationAdapter
+        BotasaurusObservationAdapter(driver).post_extract()
         driver.run_js(
             """(function(){
                 var selectors = [
-                    '[data-ai-badge]',
                     '.cookie-banner',
                     '.overlay',
                     '.modal-backdrop',
@@ -208,7 +208,7 @@ def setup_dom_stability_observer(driver: Driver) -> None:
                 var target = document.body || document.documentElement;
                 window.__dom_observer = new MutationObserver(function(mutations){
                     // Re-run removal of known overlay classes if they appear
-                    var overlays = document.querySelectorAll('[data-ai-badge], .overlay, .modal-backdrop');
+                    var overlays = document.querySelectorAll('.overlay, .modal-backdrop');
                     overlays.forEach(function(el){ el.remove(); });
                 });
                 if (target) window.__dom_observer.observe(target, { childList: true, subtree: true });

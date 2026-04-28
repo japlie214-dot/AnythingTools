@@ -22,6 +22,8 @@ CHROME_USER_DATA_DIR: str = os.getenv("CHROME_USER_DATA_DIR", "chrome_profile")
 
 # --- Browser SoM Configuration ---
 BROWSER_SOM_HTML_CHAR_BUDGET: int = int(os.getenv("BROWSER_SOM_HTML_CHAR_BUDGET", "20000"))
+BROWSER_SOM_TAGS_TO_MARK: str = os.getenv("BROWSER_SOM_TAGS_TO_MARK", "standard_html")
+BROWSER_SOM_SCALE_FACTOR: float = float(os.getenv("BROWSER_SOM_SCALE_FACTOR", "1.0"))
 
 # --- Telemetry / Logging ---
 TELEMETRY_DRY_RUN: bool = os.getenv("TELEMETRY_DRY_RUN", "false").lower() in ("true", "1", "yes")

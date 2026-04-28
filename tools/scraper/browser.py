@@ -85,7 +85,7 @@ def extract_hybrid_html(driver: Driver) -> tuple[str, int]:
             tag.decompose()
             
         # 2. Minimize attributes globally to prevent descendants from leaking noise
-        allowed_attrs = {"href", "data-ai-id"}
+        allowed_attrs = {"href", "data-ai-id", "browsergym_set_of_marks", "browsergym_visibility_ratio"}
         for tag in soup.find_all(True):
             tag.attrs = {k: v for k, v in tag.attrs.items() if k in allowed_attrs}
             

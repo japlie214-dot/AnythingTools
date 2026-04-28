@@ -7,15 +7,8 @@ _log = get_dual_logger(__name__)
 
 
 def safe_google_get(driver: Driver, url: str, *, bypass_cloudflare: bool = True) -> None:
-    """Stealth-aware wrapper around driver.google_get().
-
-    Attempts the call with bypass_cloudflare=True (Botasaurus ≥ street-smarts
-    builds). On TypeError caused specifically by the unrecognised kwarg —
-    indicating an older Botasaurus build — logs a WARNING and retries with the
-    bare signature so the run continues in degraded mode rather than crashing.
-    Any other TypeError (e.g. url is None, driver is uninitialised) is re-raised
-    immediately to avoid masking real bugs.
-    """
+    """Stealth-aware wrapper around driver.google_get()."""
+    _log.dual_log(tag="Browser:Navigate", message=f"Navigating to: {url}", payload={"url": url})
     try:
         driver.google_get(url, bypass_cloudflare=bypass_cloudflare)
         # Enforce single-tab defensively after navigation.
@@ -56,7 +49,7 @@ def extract_hybrid_html(html_content: str, limit: int = 400000) -> str:
 
     captured_chunks = []
     for element in soup.find_all(True):
-        is_interactive = element.has_attr("data-ai-id")
+        is_interactive = element.has_attr("data-ai-id") or element.has_attr("browsergym_set_of_marks")
         text = element.get_text(separator=" ", strip=True)
         if not is_interactive and len(text) <= 40:
             continue
@@ -67,7 +60,7 @@ def extract_hybrid_html(html_content: str, limit: int = 400000) -> str:
                 continue
 
         # Strip attributes to minimize token usage
-        allowed_attrs = {"href", "data-ai-id"}
+        allowed_attrs = {"href", "data-ai-id", "browsergym_set_of_marks", "browsergym_visibility_ratio"}
         attrs = dict(element.attrs)
         element.attrs = {k: v for k, v in attrs.items() if k in allowed_attrs}
 

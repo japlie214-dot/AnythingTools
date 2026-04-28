@@ -39,22 +39,22 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
         try:
             wait_for_dom_stability(driver)
             try:
-                from utils.som_injector import SoMCriticalTimeoutError
+                from utils.observation_adapter import MarkingError
                 last_id = inject_som(driver, start_id=1)
-            except SoMCriticalTimeoutError:
+            except MarkingError:
                 from utils.browser_daemon import daemon_manager
                 daemon_manager.surgical_kill()
-                raise RuntimeError("JS injection hung. Browser killed.")
+                raise RuntimeError("SoM Injection hung. Browser killed.")
             
             if last_id > 1:
-                target_id = random.randint(1, last_id - 1)
+                target_id = random.randint(0, last_id - 2)
                 log.dual_log(
                     tag="Scraper:Engagement",
-                    message=f"Engagement scroll to data-ai-id {target_id}",
+                    message=f"Engagement scroll to data-ai-id bid_{target_id}",
                     level="INFO",
-                    payload={"ai_id": target_id},
+                    payload={"ai_id": f"bid_{target_id}"},
                 )
-                element = driver.select(f'[data-ai-id="{target_id}"]')
+                element = driver.select(f'[data-ai-id="bid_{target_id}"]')
                 if element:
                     element.scroll_into_view()
         except Exception as e:
@@ -139,8 +139,14 @@ def process_article(
                 wait_for_dom_stability(driver)
                 last_id = inject_som(driver, start_id=1)
                 if last_id > 1:
-                    target_id = random.randint(1, last_id - 1)
-                    element = driver.select(f'[data-ai-id="{target_id}"]')
+                    target_id = random.randint(0, last_id - 2)
+                    log.dual_log(
+                        tag="Scraper:Engagement",
+                        message=f"Engagement scroll to data-ai-id bid_{target_id}",
+                        level="INFO",
+                        payload={"ai_id": f"bid_{target_id}"},
+                    )
+                    element = driver.select(f'[data-ai-id="bid_{target_id}"]')
                     if element:
                         element.scroll_into_view()
             except Exception as e:

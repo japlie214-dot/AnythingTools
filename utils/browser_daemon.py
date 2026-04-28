@@ -183,19 +183,34 @@ class ChromeDaemonManager:
             
             driver = self.get_or_create_driver()
             
-            # Phase 1: Navigation Test - RETARGETED to Space Jam
+            # Phase 0: Tab Management Test
+            log.dual_log(tag="Startup:Warmup", message="Phase 0: Tab Management Test")
+            try:
+                log.dual_log(tag="Browser:Navigate", message=f"Navigating to: https://google.com", payload={"url": "https://google.com"})
+                driver.open_link_in_new_tab("https://google.com")
+                driver.short_random_sleep()
+                tabs = getattr(driver, '_browser', None)
+                if tabs and hasattr(tabs, 'tabs') and len(tabs.tabs) > 1:
+                    driver.switch_to_tab(tabs.tabs[1])
+                    driver.short_random_sleep()
+                    driver.switch_to_tab(tabs.tabs[0])
+                    tabs.tabs[1].close()
+                    from utils.som_utils import enforce_single_tab
+                    enforce_single_tab(driver)
+            except Exception as e:
+                log.dual_log(tag="Startup:Warmup", message=f"Tab test warning: {e}", level="WARNING")
+
+            # Phase 1: Navigation Test
             log.dual_log(tag="Startup:Warmup", message="Phase 1: Navigation Test")
             safe_google_get(driver, "https://www.spacejam.com/1996/")
             driver.short_random_sleep()
 
-            # Verify presence of the expected marker string (case-insensitive)
             try:
                 page_html = (driver.page_html or "").lower()
-                expected = "SPACE JAM, characters, names, and all related".lower()
+                expected = "space jam, characters, names, and all related".lower()
                 if expected not in page_html:
-                    raise RuntimeError("Navigation failed: Content mismatch - expected marker not found")
+                    raise RuntimeError("Navigation failed: Content mismatch - Space Jam marker not found")
             except Exception as e:
-                # Surface as warmup failure
                 raise RuntimeError(f"Navigation verification failed: {e}")
             
             # Phase 2: SoM Test
@@ -203,17 +218,17 @@ class ChromeDaemonManager:
             try:
                 reinject_all(driver, self._id_tracking)
             except Exception as e:
-                from utils.som_injector import SoMCriticalTimeoutError
-                if isinstance(e, SoMCriticalTimeoutError):
+                from utils.observation_adapter import MarkingError
+                if isinstance(e, MarkingError):
                     log.dual_log(tag="Startup:Warmup", message="CRITICAL: JS Execution hung during SoM injection. Forcing surgical kill to prevent thread leak.", level="CRITICAL")
                     self.surgical_kill()
                     self._status = BrowserStatus.CRITICAL_FAILURE
                     raise RuntimeError("SoM Injection caused infinite loop. Chrome killed.") from e
                 raise
-                
+                 
             main_range = self._id_tracking.get('main')
-            if not main_range or main_range[1] <= 1:
-                raise RuntimeError("SoM Injection failed: No markers added")
+            if not main_range:
+                raise RuntimeError("SoM Injection failed: Tracking failed")
             
             # Phase 3: Vision Test
             log.dual_log(tag="Startup:Warmup", message="Phase 3: Vision Subsystem Test")

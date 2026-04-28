@@ -1,1174 +1,715 @@
-# AnythingTools - Deterministic Tool Hosting with Browser Lifecycle Management
+# AnythingTools - Browser Automation and Observability System
 
 ## 1. Project Overview
 
-AnythingTools is a FastAPI-based deterministic tool hosting service that provides web scraping, publishing, batch reading, and backup capabilities via a REST API. The system executes tools in isolated threads with a single-writer database architecture (SQLite WAL mode) and structured callback delivery.
+**Operational Purpose:** AnythingTools is a production-grade browser automation system that integrates with Botasaurus to provide Set-of-Marks (SoM) observation extraction for AI agents. It operates as a FastAPI service that orchestrates browser tasks, extracts structured DOM observations, and maintains browser state across tool executions.
 
-**Primary Operational Capabilities:**
+**Problems Solved:**
+- **DOM Observation for LLMs**: Attaches persistent, non-colliding identifiers (`bid_N`) to interactive elements without modifying DOM structure permanently
+- **Browser State Management**: Maintains single-tab policy and surgical process control with zombie Chrome cleanup
+- **Heuristic-Based Element Detection**: Identifies clickable/interactive elements using geometry, computed styles, and event handlers without O(N) reflow thrashing
+- **Tool Execution Orchestration**: Provides guaranteed cleanup (`finally` block) for temporary DOM modifications across tool runs
 
-- **Web Scraper**: DOM-validated extraction using Set-of-Marks (SoM) instrumentation, ULID-based identification, automatic delta backup post-persistence, configurable target site registry via `tools/scraper/`
-- **Publisher**: Telegram message delivery with state management and crash recovery via `tools/publisher/`
-- **Batch Reader**: Hybrid semantic search combining vector embeddings (FTS5) and full-text search via `tools/batch_reader/`
-- **Backup System**: Streaming Parquet export/import with OOM-safe chunking (500 rows/batch), watermark-based delta, FTS5 post-restore rebuild via `tools/backup/`
-
-**Explicit Non-Capabilities:**
-
-- **No continuous/real-time backup**: Batch-only execution, manual or triggered
-- **No selective restore**: All-or-nothing restoration for master tables only
-- **No telemetry**: Local SQLite only, no external metrics collection
-- **No concurrent writers**: Single background writer thread (max 1000 queued tasks)
-- **No automatic schema migration**: Manual reconciliation via reconciler
-- **No backup verification**: No checksums or corruption detection
-- **No FTS backup**: FTS tables excluded from restores, rebuilt synchronously
-- **No proactive Telegram**: Passive-only output sink (no handshakes or startup messages)
+**Explicit Non-Goals:**
+- **No Async JavaScript Execution**: All JS runs via blocking `run_js()` calls; no Promise-based or event-driven script execution
+- **No Dynamic Configuration Reload**: Config values are loaded once at startup (from environment variables)
+- **No Headless/Stealth Mode**: Browser runs in visible mode; stealth/anti-detection features are not implemented
+- **No Multi-User Support**: Designed for single-user local deployment; no session isolation or authentication beyond basic API key
 
 ## 2. High-Level Architecture
 
-### Core Components
+### System Components
 
-**1. API Layer (`app.py`, `api/`)**
-- FastAPI lifespan manager for startup/shutdown orchestration
-- Static file server mounted at `/artifacts` and `/api/artifacts`
-- Background job execution for export/restore operations
-- **Key Endpoints**:
-  - `POST /api/tools/{tool}` - Enqueue tool execution (with circuit breaker for browser tools)
-  - `GET /api/jobs/{id}` - Job status with logs
-  - `POST /api/backup/export` - Manual backup trigger
-  - `POST /api/backup/restore` - Manual restore (requires browser_lock)
-  - `GET /api/backup/status` - Backup directory status
-  - `GET /api/metrics` - System metrics (queue, active jobs)
-
-**2. Browser Lifecycle Management (`utils/browser_daemon.py`)**
-- **ChromeDaemonManager**: Centralized singleton managing all browser operations with Botasaurus 4.x
-- **Health State Machine**: `INITIALIZING` → `READY` → `DEGRADED` → `CRITICAL_FAILURE`
-- **Surgical Process Management**: Kills only Chrome processes matching `CHROME_USER_DATA_DIR` via `psutil`
-- **PID Auditing**: Logs spawned Chrome PID on every initialization using `._browser._process_pid`
-- **Deep Warmup**: 3-phase verification (Navigation → SoM → Vision) before marking `READY`
-  - Phase 1: Navigate to `https://www.spacejam.com/1996/` with marker verification
-  - Phase 2: SoM injection test with timeout handling
-  - Phase 3: Vision subsystem screenshot capture
-- **Legacy Accessors**: Backward-compatible functions (`get_or_create_driver()`, etc.)
-
-**3. SoM Architecture (NEW - PLAN-01)**
-- **SoM Injector** (`utils/som_injector.py`): Chunked injection engine with bounded execution
-  - `WatchdogTimer`: Cooperative threading timeout for `run_js()` calls
-  - `SoMCriticalTimeoutError`: Signals thread-blocking JavaScript hangs
-  - `BadgePositionCalculator`: Python-based O(n²) spatial overlap resolution
-  - **Three-phase injection**:
-    1. Scan via JS with `getComputedStyle()` opacity/visibility verification
-    2. Calculate positions in Python (avoiding DOM reflows)
-    3. Batched mutation via JS with Indexed ID tracking
-- **Orchestrator Core** (`bot/orchestrator_core/`):
-  - `OrchestratorRouter`: State machine coordinating context building, budget enforcement, tool execution
-  - `SoMContextBuilder`: Tracks bounded context, marker ranges, element hints
-  - `BudgetEnforcer`: FIFO eviction for LLM context window management
-- **Integration**: `run_tool_with_orchestrator()` in `bot/engine/tool_runner.py`
-- **Cleanup**: `clear_job_tracking()` prevents memory leaks across job sessions
-
-**4. Startup Orchestration (`utils/startup/`)**
-- **Three-Tier Pipeline** (`__init__.py`):
-  - **Tier 1 (Concurrent)**: Artifacts mounting, zombie cleanup, temp cleanup, DB writer init
-  - **Tier 2 (Sequential)**: DB migrations (reconciliation), vec0 validation
-  - **Tier 3 (Concurrent)**: Tool registry load, browser warmup
-- **Core Components**:
-  - `core.py`: `StartupOrchestrator` with tiering support, failure propagation
-  - `cleanup.py`: Zombie Chrome process and temp file cleanup
-  - `server.py`: Dynamic artifacts directory mounting from config
-  - `database.py`: Pragmas, writer initialization, lifecycle runner, vec0 validation
-  - `registry.py`: Whitelisted tool discovery (`scraper`, `draft_editor`, `publisher`, `batch_reader`)
-  - `browser.py`: Deep warmup with 90s timeout, failure → `sys.exit(1)`
-  - `telegram.py`: **REMOVED** (as of PLAN-01) - No proactive handshake
-
-**5. Worker Manager (`bot/engine/worker.py`)**
-- `UnifiedWorkerManager`: Polls database every 1s for `QUEUED`, `INTERRUPTED`, `PENDING_CALLBACK` jobs
-- Thread-isolated tool execution with cancellation flags
-- Callback delivery with exponential backoff (3 attempts max)
-- **Job lifecycle**: `QUEUED` → `RUNNING` → `COMPLETED|FAILED|PARTIAL|PENDING_CALLBACK|INTERRUPTED`
-- **Recovery**: Automatically requeues interrupted jobs on restart
-
-**6. Database Layer (`database/`)**
-- **Single-writer background thread** (`writer.py`) with bounded queue (max 1000)
-- **WAL mode** for concurrent readers
-- **Schema v9** with `updated_at` tracking for delta backups
-- **Tables**:
-  - *Master*: `scraped_articles`, `scraped_articles_vec`, `long_term_memories`, `long_term_memories_vec`
-  - *Non-master*: `jobs`, `job_items`, `job_logs`, `broadcast_batches`
-- **Schema Reconciliation** (`reconciler.py`): Detects drift, performs pre-drop snapshots, cascades FK recreations
-- **FTS5 Handling**: Excluded from standard reconciliation, created via dedicated existence-based checks
-
-**7. Tool Layer (`tools/`)**
-- **Scraper**: Full pipeline (extraction → curation → persistence → auto-backup) with SoM integration
-- **Publisher**: Telegram delivery with state management via job_items (passive sink only)
-- **Batch Reader**: Hybrid vector + FTS5 search
-- **Backup**: Multi-table Parquet export/import with streaming
-- **Registry** (`registry.py`): Whitelisted core tools only with MCP-style schema
-
-**8. Backup System (`tools/backup/`)**
-- **Config**: OOM-safe batch size ceiling (10,000 rows)
-- **Schema**: PyArrow schemas with binary embeddings (variable-length, was fixed)
-- **Exporter** (`exporter.py`): Chunked 500-row SQL reads, parameterized queries, FTS exclusion
-- **Storage** (`storage.py`): Atomic writes, embedding validation, ISO-8601 watermarks
-- **Restore** (`restore.py`): Single-writer queue routing, adaptive column mapping, synchronous FTS rebuild
-- **Runner** (`runner.py`): Read-only connection, ISO-8601 timestamps, browser_lock acquisition
-
-### Execution Model
-
-- **API**: Event-driven (FastAPI)
-- **Worker**: Polling-based (1s interval)
-- **Tools**: Thread-isolated execution
-- **Database**: Single-writer, multi-reader (WAL)
-- **Backup**: Streaming chunked execution (prevent OOM)
-- **SoM Orchestration**: State machine with budget enforcement
-
-### Data Flow
-
-**Tool Execution with Orchestration:**
 ```
-[API Request] → POST /api/tools/{tool}
-    ↓
-[Job Queue] → QUEUED status
-    ↓
-[Worker Poll] → UnifiedWorkerManager dequeues
-    ↓
-[run_tool_with_orchestrator()]
-    ├─ Context Building: SoMContextBuilder.initialize()
-    ├─ If browser tool:
-    │   ├─ Get driver: daemon_manager.get_or_create_driver()
-    │   ├─ Wait DOM stability: wait_for_dom_stability()
-    │   ├─ SoM Injection: inject_som() → WatchdogTimer → SoMInjector
-    │   │   ├─ Scan with getComputedStyle() verification
-    │   │   ├─ Python position calculation
-    │   │   └─ Batched JS mutation
-    │   ├─ Store markers: context_builder.inject_som_markers()
-    │   └─ Exception handling: SoMCriticalTimeoutError → surgical_kill()
-    └─ Execute: tool_executor() with context + hints
-        ↓
-[Tool Logic] → Pass through orchestrator
-    ↓
-[Cleanup] → browser_daemon.clear_job_tracking() (finally block)
-    ↓
-[Database] → Enqueue writes via single-writer
-    ↓
-[Callback] → Deliver result with exponential backoff
+┌─────────────────────────────────────────────────────────────────┐
+│                        FastAPI Entry Point (app.py)              │
+│  - Lifespan: Startup/Shutdown hooks                              │
+│  - API Key Authentication                                        │
+│  - Mounts /api routes with auth                                  │
+└─────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Bot Orchestrator (router.py)                  │
+│  - SoMContextBuilder initialization                              │
+│  - Injects SoM markers before tool execution                     │
+│  - Guaranteed post_extract() cleanup in finally block            │
+│  - Surgical kill on MarkingError                                 │
+└─────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Browser Daemon Manager (browser_daemon.py)          │
+│  - Chrome process lifecycle management                           │
+│  - Tab Management Test (google.com open/close)                   │
+│  - Space Jam 1996 warmup validation                              │
+│  - Surgical kill via psutil for zombie cleanup                   │
+└─────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Botasaurus Driver (External Dependency)             │
+│  - Chrome browser automation via CDP                             │
+│  - Synchronous run_js() execution                                │
+└─────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              JavaScript Assets (frame_mark_elements.js)          │
+│  - 0-indexed bid counter: bid_0, bid_1, ...                      │
+│  - Heuristic SoM detection (clickable, pointer, geometry)        │
+│  - Shadow DOM traversal support                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Startup Pipeline (Three-Tier):**
-```
-Tier 1 (Concurrent):
-├─ mount_artifacts → config.ARTIFACTS_DIR
-├─ cleanup_zombie_chrome → psutil.scan + kill
-├─ cleanup_temp_files → remove *.tmp.parquet
-├─ init_database_layer → pragmas + start_writer()
-└─ [REMOVED] start_telegram_handshake
+### Data Flow: Tool Execution with SoM
 
-Tier 2 (Sequential):
-├─ run_db_migrations → lifecycle.reconcile()
-└─ validate_vec0 → verify extension / fallback
-
-Tier 3 (Concurrent):
-├─ load_tool_registry → whitelist + validation
-└─ warmup_browser → deep verification (Space Jam → SoM → Vision)
-    ├─ Phase 1: Navigate + verify "SPACE JAM" marker
-    ├─ Phase 2: SoM injection test
-    ├─ Phase 3: Vision screenshot capture
-    └─ Failure: CRITICAL log + sys.exit(1)
 ```
+1. Tool Request Received (e.g., scraper with URL)
+   │
+2. Orchestrator creates SoMContextBuilder
+   │
+3. Browser Daemon ensures driver is alive
+   │
+4. wait_for_dom_stability(driver)  // Wait for DOM to stabilize
+   │
+5. inject_som(driver) → BotasaurusObservationAdapter.pre_extract()
+   │   ├─ Runs frame_mark_elements.js (blocking)
+   │   ├─ Returns: {marked_count: N, som_count: M, last_bid: "bid_(N-1)"}
+   │   └─ Tracks range: (0, N-2) in id_tracking['main']
+   │
+6. Tool execution (with context: som_context, element_hints)
+   │   ├─ Tool can reference bid_0, bid_1, etc.
+   │   └─ Scraper engagement: random.randint(0, N-2) → scroll into view
+   │
+7. Finally block executes (guaranteed):
+   │   ├─ BotasaurusObservationAdapter.post_extract()
+   │   │   └─ Runs frame_unmark_elements.js (removes data-ai-id, visibility, set_of_marks)
+   │   └─ daemon_manager.clear_job_tracking()  // Cleans id_tracking dict
+   │
+8. Response returned
+```
+
+### Control Flow & Lifecycle
+
+**Runtime Model:** Event-driven via HTTP requests; each request spawns isolated execution context with browser lifecycle management.
+
+**Execution Model:** Synchronous within tool execution (no async/await in core observation logic). Browser daemon maintains single long-lived Chrome process with surgical restart capabilities.
+
+**State Transitions:**
+- `INITIALIZING` → `READY` (after warmup)
+- `READY` → `DEGRADED` (after failures)
+- `READY` → `CRITICAL_FAILURE` (on MarkingError) → `surgical_kill()` → `INITIALIZING`
 
 ## 3. Repository Structure
 
 ```
-./
-├── api/                      # FastAPI routes + schemas
-│   ├── routes.py            # All endpoints with job/backup logic
-│   ├── schemas.py           # Pydantic models
-│   ├── telegram_client.py   # Bot API (passive only, NO handshake method)
-│   └── telegram_notifier.py # Message delivery (passive sink)
-├── bot/                     # Worker engine
-│   ├── engine/
-│   │   ├── worker.py        # UnifiedWorkerManager (threads, INTERRUPTED)
-│   │   └── tool_runner.py   # Job execution + run_tool_with_orchestrator()
+AnythingTools/
+│
+├── app.py                              # FastAPI entrypoint with lifespan hooks
+├── config.py                           # Environment-based configuration
+├── README.md                           # This file
+├── requirements.txt                    # Python dependencies
+│
+├── api/                                # HTTP endpoints and auth
+│   ├── routes.py                      # Main router (auth-protected)
+│   ├── schemas.py                     # Pydantic models
+│   ├── telegram_client.py             # Telegram API wrapper
+│   └── telegram_notifier.py           # Message publishing
+│
+├── bot/                                # Core orchestration logic
 │   ├── core/
-│   │   └── constants.py     # Job status enums
-│   └── orchestrator_core/   # NEW: SoM-aware orchestration
-│       ├── router.py        # OrchestratorRouter (state machine)
-│       ├── context.py       # SoMContextBuilder (tracking)
-│       ├── eviction.py      # BudgetEnforcer (FIFO)
-│       └── __init__.py      # Package exports
-├── clients/                 # External services
-│   ├── snowflake_client.py  # Snowflake connector
-│   └── llm/
-│       ├── factory.py       # LLM provider selection
-│       └── payloads.py      # Request builders
-├── database/                # SQLite layer
-│   ├── schemas/             # Canonical DDL
-│   │   ├── __init__.py      # MASTER_TABLES, ALL_FTS_TABLES
-│   │   ├── vector.py        # FTS5 triggers + vec0 tables
-│   │   └── *.py             # jobs, finance, pdf, token
-│   ├── reconciler.py        # Schema drift detection + repair
-│   ├── schema_introspector.py # PRAGMA parsing + DDL comparison
-│   ├── lifecycle.py         # Reconciler wrapper + recovery
-│   ├── writer.py            # Background single-writer thread
-│   ├── connection.py        # DB manager
-│   ├── health.py            # Table validation
-│   └── *.py                 # reader, job_queue, blackboard, formula_cache
-├── deprecated/              # Legacy code (70% volume, never loaded)
-│   ├── bot/                 # Old agent/weaver/modes
-│   └── tools/               # Old research, finance, polymarket, quiz
-├── tools/                   # Tool implementations
-│   ├── scraper/             # Extraction + curation + persistence
-│   │   ├── prompts.py       # Canonical prompts (post-PLAN-02)
-│   │   ├── Skill.py         # Tool descriptor
-│   │   ├── tool.py          # Main tool
-│   │   ├── browser.py       # DOM helpers
-│   │   ├── curation.py      # Article selection
-│   │   └── extraction.py    # Content extraction (SoM integration)
-│   ├── publisher/           # Telegram delivery (passive only)
-│   ├── batch_reader/        # Hybrid search
-│   ├── backup/              # Hardened backup system
-│   │   ├── config.py        # Batch ceiling (10k), OOM rules
-│   │   ├── models.py        # Watermark/Result (Pydantic compat)
-│   │   ├── schema.py        # PyArrow schemas
-│   │   ├── exporter.py      # Parameterized queries, FTS exclusion
-│   │   ├── storage.py       # Atomic writes + embedding validation
-│   │   ├── restore.py       # enqueue_transaction + sync FTS
-│   │   └── runner.py        # Read-only connection
-│   ├── draft_editor/        # Content editing tool
-│   ├── base.py              # BaseTool
-│   └── registry.py          # Whitelisted tool discovery + MCP schema
-├── utils/                   # Infrastructure
-│   ├── startup/             # Modular startup system
-│   │   ├── core.py          # StartupOrchestrator (tiers)
-│   │   ├── cleanup.py       # Zombie chrome + temp files
-│   │   ├── server.py        # Artifacts mounting
-│   │   ├── database.py      # Pragmas, writer, lifecycle, vec0
-│   │   ├── registry.py      # Tool registry loading
-│   │   ├── browser.py       # Warmup (90s timeout + deep verification)
-│   │   └── __init__.py      # Pipeline assembly (NO telegram import)
-│   ├── browser_daemon.py    # Browser driver management (Botasaurus 4.x)
-│   ├── browser_lock.py      # Lock for restore operations
-│   ├── logger/              # Dual logging system
-│   ├── som_utils.py         # SoM injection (delegates to SoMInjector)
-│   ├── som_injector.py      # NEW: Chunked injection with watchdog
-│   ├── vision_utils.py      # Screenshot capture, slicing
-│   └── *.py                 # security, helpers, etc.
-├── tests/                   # Unit tests
-│   ├── test_backup.py       # Schema, validation, Pydantic compat
-│   └── test_browser_e2e.py  # Browser automation
-├── app.py                   # FastAPI entrypoint
-├── config.py                # API key and global configuration
-└── requirements.txt         # Dependencies
+│   │   └── constants.py               # App constants
+│   ├── engine/
+│   │   ├── worker.py                  # Job worker manager
+│   │   └── tool_runner.py             # Tool execution runner
+│   └── orchestrator_core/
+│       ├── router.py                  # SoM-aware tool router (CRITICAL)
+│       ├── context.py                 # SoMContextBuilder
+│       └── eviction.py                # Budget enforcement
+│
+├── tools/                              # Tool implementations
+│   ├── base.py                        # Base tool classes
+│   ├── registry.py                    # Tool registry (dynamic loading)
+│   ├── batch_reader/                  # Batch reading tool
+│   ├── draft_editor/                  # Draft editing tool
+│   ├── publisher/                     # Publishing tool
+│   └── scraper/                       # Web scraper (SoM-enabled)
+│       ├── extraction.py              # URL extraction with random scroll
+│       ├── browser.py                 # Hybrid HTML extraction
+│       ├── paywall.py                 # Paywall detection
+│       ├── task.py                    # Scraping task orchestration
+│       └── tool.py                    # CLI interface
+│
+├── utils/                              # Core utilities
+│   ├── javascript/                    # JS assets for Dom injection
+│   │   ├── frame_mark_elements.js     # SoM injection (0-indexed)
+│   │   └── frame_unmark_elements.js   # Cleanup script
+│   │
+│   ├── logger/                        # Dual logger (console + structured)
+│   │   ├── core.py
+│   │   ├── formatters.py
+│   │   └── handlers.py
+│   │
+│   ├── startup/                       # Lifespan initialization
+│   │   ├── browser.py                 # Browser warmup (Space Jam)
+│   │   ├── database.py                # DB migrations
+│   │   └── core.py                    # Coordinated startup
+│   │
+│   ├── observation_adapter.py         # SoM adapter (synchronous, MarkingError)
+│   ├── browser_daemon.py              # Chrome lifecycle manager
+│   ├── browser_utils.py               # safe_google_get with logging
+│   ├── action_mapper.py               # bid → CSS selector (str|int support)
+│   ├── som_utils.py                   # inject_som, reinject_all, etc.
+│   ├── browser_lock.py                # File-based Chrome mutex
+│   ├── text_processing.py             # HTML cleaning for LLMs
+│   ├── vision_utils.py                # Screenshot capture
+│   └── ...
+│
+├── database/                           # Persistence layer
+│   ├── schemas/                       # Peewee ORM models
+│   ├── connection.py                  # DB connection management
+│   ├── writer.py                      # Async write buffer
+│   ├── job_queue.py                   # Job queue with status tracking
+│   └── ...
+│
+├── clients/                            # External service clients
+│   ├── llm/                           # LLM client factory (Azure/Chutes)
+│   │   ├── factory.py
+│   │   └── providers/
+│   └── snowflake_client.py            # Snowflake integration
+│
+├── deprecated/                         # Legacy code (evidences of evolution)
+│   ├── bot/core/                      # Old agent/modes implementations
+│   ├── tools/                         # Deprecated tools (finance, search, etc.)
+│   └── ...                            # See "Changes" section
+│
+└── tests/                              # Test files
+    ├── test_backup.py
+    └── test_browser_e2e.py            # End-to-end browser tests
 ```
 
-### Non-Obvious Structures
-- **`deprecated/`** - 70% repository volume, imports disabled, never executed
-- **`tests/`** - Unit tests for backup system and browser E2E only
-- **No automatic migration**: Manual schema changes via reconciler only
-- **`utils/som_injector.py`** - NEW: Replaces monolithic JS injection with chunked architecture
-- **`bot/orchestrator_core/`** - NEW: State machine orchestration for SoM-aware execution
-- **`api/telegram_client.py`** - REMOVED: `run_orphan_handshake()` method (passive-only)
-- **`utils/startup/telegram.py`** - DELETED: No longer imported or executed
+**Notable Structural Choices:**
+- **`deprecated/` directory**: Contains evidence of prior architecture (monolithic agent, finance tools). Actively unused but retained for historical analysis.
+- **`javascript/` subdirectory**: JS assets colocated with Python code for clarity; loaded via `pkgutil.get_data()` or file fallback.
+- **`orchestrator_core/`**: Decoupled from main bot logic to isolate SoM concerns; router.py enforces cleanup.
 
 ## 4. Core Concepts & Domain Model
 
 ### Key Abstractions
 
-**1. Master Tables (Protected)**
-- `scraped_articles` - Content with `vec_rowid` reference
-- `scraped_articles_vec` - Vector embeddings (vec0 virtual table)
-- `long_term_memories` - Persistent agent memory
-- `long_term_memories_vec` - Memory embeddings
-- **Excluded**: `scraped_articles_fts` (derived, rebuilt post-restore)
+**1. Set-of-Marks (SoM)**
+- **Definition**: Temporary attributes (`data-ai-id`, `browsergym_set_of_marks`, `browsergym_visibility_ratio`) attached to DOM elements to provide AI agents with clickable identifiers.
+- **Invariant**: Attributes must be removed after tool execution (observed via `post_extract()` in `finally` block).
+- **Namespace**: Flat 0-indexed `bid_N` format (`bid_0`, `bid_1`, ... `bid_(n-1)`). No hierarchical IDs.
 
-**2. Single-Writer Queue**
-- `enqueue_write(sql, params)` - Single statement
-- `enqueue_transaction(statements)` - Batched transaction (restore: batch_size=500)
-- `wait_for_writes(timeout)` - Synchronous barrier
+**2. Bidirectional Mapping (Action Mapper)**
+- **Input Types**: String (`"bid_0"`) or Integer (`0`)
+- **Output**: CSS Selector `[data-ai-id="bid_0"]`
+- **Purpose**: Decouples LLM (which thinks in numeric IDs) from implementation (which uses string selectors).
 
-**3. Watermark-Based Delta**
-- **Table-watermarks**: Per-table ISO-8601 `last_export_ts` in `watermark.json`
-- **Delta selection**: `WHERE updated_at > ?` (parameterized)
-- **Exclusive writes**: Never modify existing Parquet files
-- **ISO-8601 only**: All delta comparisons use `.isoformat()`
+**3. MarkingError**
+- **Type**: Custom exception class in `observation_adapter.py`
+- **Usage**: Raised when `pre_extract()` fails and `lenient=False`
+- **Handler**: Router catches and triggers `daemon_manager.surgical_kill()`
 
-**4. ULID Identification**
-- Job IDs, Article IDs, Batch IDs (8-byte truncation for SQLite integer)
-- **Critical**: `id TEXT PRIMARY KEY` in scraped_articles
+**4. SoMContextBuilder**
+- **Location**: `bot/orchestrator_core/context.py`
+- **Function**: Wraps `inject_som()` result into tool execution context
+- **Delivers**: `som_context` dict and `element_hints` to tools
 
-**5. UPSERT Semantics**
-- **Old (broken)**: `INSERT OR REPLACE` → destroys `id`, rotates `vec_rowid`
-- **DO NOT USE**: `INSERT OR REPLACE`
-- **Correct**: `INSERT ... ON CONFLICT(normalized_url) DO UPDATE` → preserves `vec_rowid`
+### Implicit Rules & Assumptions
 
-**6. FTS5 External Content**
-- **Excluded from backup**: Not in `MASTER_TABLES`
-- **Rebuilt post-restore**: `INSERT INTO scraped_articles_fts(scraped_articles_fts) VALUES('rebuild')`
-- **Synchronous**: Blocks via `wait_for_writes(timeout=300.0)`
+**Domain Rules:**
+1. **Bid uniqueness**: JavaScript guarantees no duplicate `bid_N` via `allBids` Set
+2. **Zero-trust cleanup**: `post_extract()` runs even if tool crashes (finally block)
+3. **Single-tab invariant**: `enforce_single_tab()` strips `target="_blank"` and overrides `window.open`
+4. **Geometry-first detection**: SoM uses `getBoundingClientRect()` + computed styles; **explicitly avoids** `document.elementFromPoint()` (causes reflow)
+5. **Blocking execution**: All JS runs synchronously; no async/await in observation layer
 
-**7. FTS5 Categorization (PLAN-02 Fix)**
-- **`ALL_FTS_TABLES`**: Dict in `schemas/__init__.py`
-- **Reconciler exclusion**: FTS tables skipped from standard drift detection
-- **Separate handling**: Created via dedicated loop with simple existence check
+**Technical Constraints:**
+- **Chrome only**: Botasaurus dependency; no Firefox/WebKit support
+- **Windows path assumption**: `CHROME_USER_DATA_DIR` uses Windows-style paths
+- **Synchronous**: No concurrent browser operations; one tool at a time
+- **Process-level isolation**: Zombie Chrome cleanup via `psutil.process_iter()` (not OS-agnostic)
 
-**8. ChromeDaemonManager Health States (Updated for SoM)**
-- **INITIALIZING**: Browser process starting, warmup not yet run
-- **READY**: Deep warmup passed (Navigation, SoM, Vision tests successful)
-- **DEGRADED**: Reserved for future states
-- **CRITICAL_FAILURE**: Warmup failed, SoM hung, or shutdown initiated → surgical kill
+### Terminology
 
-**9. Deep Warmup Verification (Space Jam Required)**
-- **Phase 1 (Navigation)**: Navigate to `https://www.spacejam.com/1996/`, verify marker string "SPACE JAM, characters, names, and all related" exists (case-insensitive)
-- **Phase 2 (SoM)**: Inject data-ai-id markers, verify count > 1, **handles timeouts with surgical kill**
-- **Phase 3 (Vision)**: Capture screenshot, slice if needed, verify valid slices
-- **Failure Policy**: Any failure → CRITICAL log → `sys.exit(1)` or `surgical_kill()` → application shutdown
-
-**10. Two-Phase Shutdown (app.py)**
-- **Phase 1**: Stop worker manager polling, broadcast cancellation to existing workers
-- **Phase 2**: 60-second drain timer, release browser resources, shutdown DB writer
-- **Thread-Safety**: Uses `list()` snapshot for cancellation flags to prevent RuntimeError
-
-**11. Set-of-Marks (SoM) Context (NEW - PLAN-01)**
-- **Data-ai-id attributes**: Sequential injection on visible elements
-- **Badge positions**: Calculated in Python to avoid DOM reflows
-- **Marker ranges**: Stored in job context for LLM hints
-- **Element hints**: Extracted and passed to tools
-- **Visibility checks**: `window.getComputedStyle(el)` for `opacity !== '0'` and `visibility !== 'hidden'`
-
-**12. Budget Enforcement (NEW - PLAN-01)**
-- **LLM Context Limit**: Configurable (default 800,000 chars)
-- **FIFO Eviction**: Oldest context removed when budget exceeded
-- **Single-item truncation**: If one item exceeds budget, truncate to 1000 chars
-- **Applied at**: Orchestration layer before LLM calls
-
-**13. Watchdog Timeout (NEW - PLAN-01)**
-- **Cooperative Timer**: Threading event set by timer thread
-- **Applied to**: All `run_js()` calls in SoM injection
-- **Timeout**: Configurable (default 60.0 seconds)
-- **Action on Timeout**: `SoMCriticalTimeoutError` → `surgical_kill()` → `CRITICAL_FAILURE`
-- **Prevents**: Python thread leaks from infinite JavaScript execution
-
-**14. Passive Telegram Sink (PLAN-01 Cleanup)**
-- **No handshake**: `run_orphan_handshake()` method removed
-- **No startup messages**: `start_telegram_handshake()` task deleted
-- **No proactive sending**: All Telegram messages are user/job-initiated
-- **Enforcement**: Documented in `utils/telegram/__init__.py` architectural rule
-
-### Schema Evolution Evidence
-
-**Current Master Table Definition** (`database/schemas/__init__.py`):
-```python
-# RULE: MASTER_TABLES must be ordered list (parents before children) for FK-safe restores.
-# RULE: Derived/External FTS tables (e.g., scraped_articles_fts) must NEVER be included here.
-MASTER_TABLES: list[str] = [
-    "scraped_articles",
-    "scraped_articles_vec",
-    "long_term_memories",
-    "long_term_memories_vec",
-]
-
-ALL_FTS_TABLES: Dict[str, str] = {
-    **vector.FTS_TABLES,
-}
-```
-
-**Virtual Table Reconciliation** (`database/schema_introspector.py`):
-```python
-# For virtual tables (FTS5 / vec0), use existence-based reconciliation
-if is_virtual:
-    return table_exists(conn, table_name)
-```
-
-**Prompt Module Migration** (`tools/scraper/prompts.py`):
-```python
-"""
-Prompts for the Scraper tool (AnythingTools adaptation).
-All prompts MUST require the LLM to return strict JSON.
-"""
-SCRAPER_SYS_PROMPT = (
-    "You are the Scraper sub-agent running in the 'scraper' agent_domain. "
-    "All outputs MUST be valid JSON. ...\n"
-)
-```
-
-**SoM Injection Architecture** (`utils/som_injector.py`):
-```python
-class SoMInjector:
-    # Three-phase injection with watchdog
-    _SCAN_JS = "..."  # With getComputedStyle() verification
-    _MARK_IDS_JS_TEMPLATE = "..."  # Batched ID assignment
-    _MARK_BADGES_JS_TEMPLATE = "..."  # Batched badge creation
-    
-    def inject(self, start_id, mode):
-        with WatchdogTimer(self._timeout) as wd:
-            total_tagged = self._driver.run_js(self._TAG_SCAN_INDICES_JS)
-            if wd.timed_out:
-                raise SoMCriticalTimeoutError(...)
-        # ... calculate positions in Python, batch mutations
-```
-
-**Orchestrator Router** (`bot/orchestrator_core/router.py`):
-```python
-class OrchestratorRouter:
-    def __init__(self, job_id: str, budget: int | None = None):
-    
-    async def run(self, tool_name, tool_args, tool_executor, browser_daemon, **kwargs):
-        try:
-            # Context building
-            context_builder = SoMContextBuilder(self._job_id)
-            context_builder.initialize(tool_name, tool_args)
-            
-            # SoM injection if browser tool
-            if browser_daemon:
-                last_id = inject_som(driver, start_id=1)
-                context_builder.inject_som_markers((1, last_id - 1))
-            
-            # Tool execution with context
-            result = await tool_executor(tool_name, tool_args, **kwargs)
-            
-        except SoMCriticalTimeoutError:
-            browser_daemon.surgical_kill()
-            raise RuntimeError("SoM Injection hung. Browser killed.")
-            
-        finally:
-            if browser_daemon:
-                browser_daemon.clear_job_tracking()  # Memory leak prevention
-```
+| Term | Definition | Evidence |
+|------|------------|----------|
+| **Bid** | String ID like `bid_0` injected by JS | `frame_mark_elements.js:85` |
+| **SoM** | Set-of-Marks: elements with `browsergym_set_of_marks="1"` | `frame_mark_elements.js:92-125` |
+| **Surgical Kill** | Process-level Chrome termination via psutil | `browser_daemon.py:66-101` |
+| **Watchdog** | Threading.Timer for timeout (documentation only; run_js is blocking) | `observation_adapter.py:40-61` |
+| **Hybrid HTML** | Greedy leaf-node extraction preserving SoM attrs | `browser_utils.py:46-79` |
 
 ## 5. Detailed Behavior
 
-### 5.1 SoM Injection with Watchdog & Chunking
+### Normal Execution: Scraping a URL
 
-**Flow** (`utils/som_injector.py`, `utils/som_utils.py`):
-```python
-# 1. Tag Scan Indices (with watchdog)
-total_tagged = driver.run_js(SoMInjector._TAG_SCAN_INDICES_JS)
-# → 60s timeout enforced → raises SoMCriticalTimeoutError if hung
+```
+Request: POST /api/tools/scraper
+Body: { "url": "https://example.com/article" }
 
-# 2. Scan Visible Elements (with visibility checks)
-raw = driver.run_js(SoMInjector._SCAN_JS)
-# → Uses window.getComputedStyle(el)
-# → Skips opacity=0, visibility=hidden elements
-
-# 3. Python Position Calculation
-elements = [ElementInfo(...)]
-badge_positions = BadgePositionCalculator.compute_positions(elements)
-# → O(n²) overlap displacement: +15px if within threshold
-
-# 4. Batched ID Assignment
-for batch in elements:
-    mark_data = [{"scanIdx": ..., "aiId": current_id}]
-    driver.run_js(SoMInjector._MARK_IDS_JS_TEMPLATE)
-    current_id += len(batch)
-
-# 5. Batched Badge Injection (if FULL mode)
-for batch in elements:
-    badge_data = [{"aiId": ..., "top": ..., "left": ...}]
-    driver.run_js(SoMInjector._MARK_BADGES_JS_TEMPLATE)
-
-# 6. Cleanup
-driver.run_js("removeAttribute('data-ai-scan-idx')")
+Flow:
+1. app.py::lifespan() ensures browser_daemon is READY
+2. bot/orchestrator_core/router.py::run()
+   ├─ context_builder.initialize("scraper", {url})
+   ├─ driver = daemon_manager.get_or_create_driver()
+   ├─ wait_for_dom_stability(driver)  // Polls DOM element count
+   ├─ inject_som(driver)
+   │   └─ BotasaurusObservationAdapter.pre_extract()
+   │       ├─ run_js(frame_mark_elements.js, {"bid_attr": "data-ai-id"})
+   │       └─ Returns: {marked_count: 42, som_count: 3, last_bid: "bid_41"}
+   ├─ context_builder.inject_som_markers((0, 39))
+   └─ tool_executor(scraper, args, som_context=..., element_hints=...)
+       └─ tools/scraper/task.py::process_article()
+           ├─ safe_google_get(driver, url)  // Logs: Browser:Navigate url
+           ├─ extract_hybrid_html(driver)  // Preserves data-ai-id
+           ├─ Scroll engagement: random.randint(0, 39) → scrollIntoView
+           └─ LLM extraction with SoM context
+   └─ FINALLY: post_extract() + clear_job_tracking()
+Response: { "status": "SUCCESS", "data": { ... } }
 ```
 
-**Graceful Degradation** (`utils/som_utils.py`):
-```python
-def inject_som(driver, start_id):
-    try:
-        return injector.inject(start_id, mode=FULL)
-    except SoMCriticalTimeoutError:
-        raise  # Propagated to orchestrator for surgical kill
-    except Exception as e:
-        log.warning(f"Full failed, retrying marker-only: {e}")
-        return injector.inject(start_id, mode=MARKER_ONLY)
-```
+### Edge Cases & Error Handling
 
-### 5.2 Domain-Specific Execution
+**Case 1: MarkingError during warmup**
+- **Detection**: `reinject_all()` raises `MarkingError`
+- **Action**: 
+  ```python
+  # browser_daemon.py:222-226
+  if isinstance(e, MarkingError):
+      log.dual_log(..., level="CRITICAL")
+      self.surgical_kill()
+      self._status = BrowserStatus.CRITICAL_FAILURE
+      raise RuntimeError("SoM Injection caused infinite loop. Chrome killed.")
+  ```
 
-**ChromeDaemonManager Lifecycle** (`utils/browser_daemon.py`):
-```python
-# Initialization
-driver = Driver(
-    headless=False,
-    user_agent="real",
-    window_size=(1920, 1080),
-    arguments=[f"--user-data-dir={profile_path}"]
-)
+**Case 2: Tab opens during execution**
+- **Detection**: Single-tab policy violation
+- **Action**: `enforce_single_tab()` patches `window.open` and strips `target="_blank"` immediately after navigation
 
-# PID Capture (Botasaurus 4.x)
-if hasattr(driver, '_browser') and hasattr(driver._browser, '_process_pid'):
-    self._pid = driver._browser._process_pid  # NEW attribute path
+**Case 3: Chrome hang on run_js**
+- **Limitation**: Watchdog exists but cannot interrupt blocking call; relies on Botasaurus driver timeout or external surgical kill
+- **Evidence**: Comments in `observation_adapter.py:97-98` acknowledge blocking nature
 
-# Deep Warmup with SoM + Timeout
-def deep_warmup(self):
-    # Phase 1: Navigation to Space Jam
-    safe_google_get(driver, "https://www.spacejam.com/1996/")
-    
-    # Phase 2: SoM Test with Exception Handling
-    try:
-        reinject_all(driver, self._id_tracking)
-    except SoMCriticalTimeoutError:
-        log.critical("JS hung during SoM injection")
-        self.surgical_kill()
-        self._status = CRITICAL_FAILURE
-        raise RuntimeError("Chrome killed due to infinite loop")
-    
-    # Phase 3: Vision
-    capture_and_optimize(driver, 0)
-```
+**Case 4: Post-extract cleanup failure**
+- **Handling**: Silent failure, warning logged only
+  ```python
+  # observation_adapter.py:131-133
+  except Exception:
+      pass  // Never raises
+  ```
 
-**Orchestration Flow** (`bot/engine/tool_runner.py`):
-```python
-async def run_tool_with_orchestrator(tool_name, args, telemetry, job_id, **kwargs):
-    # 1. Resolve browser daemon if tool needs it
-    browser_daemon = None
-    if tool_name in ["scraper", "browser_task"]:
-        if daemon_manager.status.value == "READY":
-            browser_daemon = daemon_manager
-    
-    # 2. Create router
-    router = OrchestratorRouter(job_id)
-    
-    # 3. Execute with full orchestration
-    return await router.run(
-        tool_name=tool_name,
-        tool_args=args,
-        tool_executor=execute_tool,  # Wraps run_tool_safely
-        browser_daemon=browser_daemon,
-        **kwargs
-    )
-```
+**Case 5: Video detection false positives**
+- **Mitigation**: Checks actual platform strings in iframe src
+  ```python
+  # extraction.py:184
+  video_platforms = ["youtube.com/embed", "youtu.be", "vimeo.com", "dailymotion.com"]
+  ```
 
-**Tool Execution with Context** (`tools/scraper/extraction.py`):
-```python
-# Engagement scroll with error handling
-try:
-    wait_for_dom_stability(driver)
-    try:
-        last_id = inject_som(driver, start_id=1)
-    except SoMCriticalTimeoutError:
-        daemon_manager.surgical_kill()
-        raise RuntimeError("JS injection hung. Browser killed.")
-    
-    if last_id > 1:
-        target_id = random.randint(1, last_id - 1)
-        element = driver.select(f'[data-ai-id="{target_id}"]')
-        if element:
-            element.scroll_into_view()
-except Exception as e:
-    log.debug(f"Engagement failed: {e}")
-```
+### Configuration Paths
 
-### 5.3 Error Handling & State Transitions
+**Primary**: Environment variables via `.env` loaded in `config.py`
 
-**On SoM Timeout**:
-1. `WatchdogTimer` expires → `_timed_out.set()`
-2. `run_js()` completes or continues but flag is set
-3. `SoMCriticalTimeoutError` raised
-4. Orchestrator catches → calls `browser_daemon.surgical_kill()`
-5. Sets `browser_daemon._status = CRITICAL_FAILURE`
-6. Application either aborts or reinitializes
+**Critical SoM Configs** (used in adapter/JS):
+- `BROWSER_SOM_TAGS_TO_MARK` → JS `TAGS_TO_MARK` (default: "standard_html")
+- `BROWSER_SOM_SCALE_FACTOR` → Adapter scales bbox coordinates (default: 1.0)
+- `BROWSER_SOM_HTML_CHAR_BUDGET` → Limits extracted HTML size (default: 20000)
 
-**On Telegram Cleanup (PLAN-01)**:
-1. `run_orphan_handshake()` method deleted from `api/telegram_client.py`
-2. `utils/startup/telegram.py` file deleted
-3. `utils/startup/__init__.py` removes import and Tier 1 task
-4. `utils/telegram/__init__.py` adds architectural rule comment
-5. No proactive messages ever sent
-
-**On Memory Leak Prevention**:
-1. `OrchestratorRouter.run()` has `finally` block
-2. `browser_daemon.clear_job_tracking()` called regardless of success
-3. `_id_tracking.clear()` under lock
-4. Prevents accumulation across job executions
+**Other Key Configs**:
+- `CHROME_USER_DATA_DIR` → Chrome profile location
+- `API_KEY` → FastAPI authentication
+- `ANYTHINGLLM_*` → External LLM integration
 
 ## 6. Public Interfaces
 
-### API Endpoints
+### HTTP API
 
-**Tool Execution** (`POST /api/tools/{tool}`):
-```bash
-curl -X POST http://localhost:8000/api/tools/scraper \
-  -H "Content-Type: application/json" \
-  -d '{
-    "targets": [{"url": "https://example.com", "selectors": ["article"]}],
-    "job_metadata": {"user_id": "123"}
-  }'
-```
-Response:
-```json
-{
-  "status": "QUEUED",
-  "job_id": "01H7Y...",
-  "message": "Job enqueued successfully"
-}
-```
-- Circuit breaker active for browser tools if daemon not READY
+**Authenticated Endpoints (`/api` prefix)**
+- **Tool Execution**: `POST /api/tools/{tool_name}`
+  - **Auth**: `X-API-Key` header required
+  - **Body**: Tool-specific args
+  - **Response**: Tool result + SoM context (if browser used)
 
-**Job Status** (`GET /api/jobs/{id}`):
-```bash
-curl http://localhost:8000/api/jobs/01H7Y...
-```
-Response:
-```json
-{
-  "status": "COMPLETED",
-  "logs": [...],
-  "final_payload": {"articles_scraped": 5}
-}
-```
+**Public Endpoints**
+- **Manifest**: `GET /api/manifest` (no auth)
+  - Returns registry of all available tools
 
-**Backup Export** (`POST /api/backup/export`):
-```bash
-curl -X POST http://localhost:8000/api/backup/export \
-  -H "Content-Type: application/json" \
-  -d '{"mode": "delta"}'
-```
-Response:
-```json
-{"status": "EXPORT_QUEUED", "job_id": "01H7Y..."}
-```
+### Python Callables (Internal)
 
-**Backup Restore** (`POST /api/backup/restore`):
-```bash
-curl -X POST http://localhost:8000/api/backup/restore \
-  -H "Content-Type: application/json" \
-  -d '{"watermark": "2024-01-01T00:00:00"}'
-```
-Response:
-```json
-{"status": "RESTORE_QUEUED", "job_id": "01H7Z..."}
-```
+**Primary Orchestration:**
+- `bot/orchestrator_core/router.py::OrchestratorRouter.run()`
+  - **Parameters**: `tool_name`, `tool_args`, `tool_executor`, `browser_daemon`
+  - **Returns**: `ToolResult`
+  - **Side Effects**: Injects/removes SoM attributes, manages browser lifecycle
 
-**System Metrics** (`GET /api/metrics`):
-```bash
-curl http://localhost:8000/api/metrics
-```
-Response:
-```json
-{
-  "queue_length": 3,
-  "active_jobs": 2,
-  "browser_status": "READY",
-  "chrome_pid": 12345
-}
-```
+**Browser Control:**
+- `utils/browser_daemon.py::daemon_manager.get_or_create_driver()`
+  - **Returns**: Botasaurus `Driver` instance
+  - **Lifecycle**: Long-lived, auto-reinitialized if dead
 
-### Python/CLI
+**SoM Injection:**
+- `utils/som_utils.py::inject_som(driver, start_id=1) → int`
+  - **Returns**: `marked_count + 1` (last ID + 1)
+  - **Behavior**: Delegates to `BotasaurusObservationAdapter`
 
-**Manual Tool Trigger**:
-```python
-from tools.registry import REGISTRY
-from bot.engine.tool_runner import run_tool_with_orchestrator
+**Action Resolution:**
+- `utils/action_mapper.py::click(driver, bid: str | int)`
+- `utils/action_mapper.py::fill(driver, bid: str | int, value: str)`
+- `utils/action_mapper.py::hover(driver, bid: str | int)`
 
-# Registry provides whitelist + schema
-REGISTRY.load_all()
-REGISTRY.schema_list()  # MCP-style for LLM discovery
-REGISTRY.get_som_tools()  # ["scraper", "browser_task"]
+### Tool Entry Points
 
-# Execute via orchestrator (integrates SoM)
-async def run_example():
-    result = await run_tool_with_orchestrator(
-        tool_name="scraper",
-        args={"targets": [...]},
-        telemetry=None,  # Reserved
-        job_id="manual_001",
-        browser_daemon=daemon_manager
-    )
-```
+**Scraper:**
+- `tools/scraper/tool.py` (CLI via `python -m tools.scraper.tool`)
+- `tools/scraper/task.py::process_article()` (programmatic)
 
-**System Operations**:
-```python
-from utils.browser_daemon import daemon_manager
+**Batch Reader:**
+- `tools/batch_reader/tool.py`
 
-# Status check
-print(daemon_manager.status.value)  # "READY", "CRITICAL_FAILURE", etc.
+**Publisher:**
+- `tools/publisher/tool.py`
 
-# Surgical kill on demand
-daemon_manager.surgical_kill()
+### Expected Inputs/Outputs
 
-# Track cleanup
-daemon_manager.clear_job_tracking()
-```
-
-**Backup Operations**:
-```python
-from tools.backup.runner import run_backup_export
-
-# From API or CLI
-run_backup_export(mode="delta")
-```
+| Interface | Input Type | Output Type | Constraints |
+|-----------|------------|-------------|-------------|
+| `inject_som()` | `Driver` | `int` | Must be called after `wait_for_dom_stability()` |
+| `post_extract()` | `Driver` | `None` | Run in `finally`; never raises |
+| `action_mapper.click()` | `Driver`, `str\|int` | `None` | Element must exist; raises `ValueError` if not |
+| `safe_google_get()` | `Driver`, `URL` | `None` | Logs URL explicitly via `Browser:Navigate` |
 
 ## 7. State, Persistence, and Data
 
-### Database Schema (v9)
+### In-Memory State
 
-**Master Tables** (protected, restored):
-```sql
-CREATE TABLE scraped_articles (
-    id TEXT PRIMARY KEY,  -- ULID
-    normalized_url TEXT UNIQUE,
-    vec_rowid INTEGER,    -- Reference to vectors
-    updated_at TEXT,      -- ISO-8601
-    -- ... content fields
-);
+**Browser Daemon:**
+- `_driver`: Long-running Botasaurus Driver instance
+- `_id_tracking`: Dict mapping `'main'` → `(start, end)` tuple of bid range
+- `_action_log`: `deque(maxlen=50)` of recent operations
+- `_status`: `BrowserStatus` enum
 
-CREATE TABLE scraped_articles_vec (
-    rowid INTEGER PRIMARY KEY,
-    embedding BLOB,       -- vec0 binary
-    source_id TEXT,       -- FK to scraped_articles.id
-    updated_at TEXT
-);
+**Orchestrator (per-request):**
+- `SoMContextBuilder`: Temporary context built for single tool execution
+- **Cleared in finally**: `daemon_manager.clear_job_tracking()`
 
-CREATE TABLE long_term_memories (...);
-CREATE TABLE long_term_memories_vec (...);
+### Persistent State
+
+**Database (SQLite/Peewee):**
+- **Schemas**:
+  - `Job` (jobs.py): Tracks scraper tasks, status, metadata
+  - `TokenUsage` (token.py): LLM token counts
+  - `FinanceData` (finance.py): Financial metrics (legacy)
+  - `PDFMetadata` (pdf.py): PDF processing state
+  - `VectorEmbedding` (vector.py): Semantic search embeddings
+
+**Files:**
+- **Chrome Profile**: `CHROME_USER_DATA_DIR` (user-managed)
+- **Artifacts**: `data/temp/` (screenshots, logs)
+- **Backups**: Parquet files in `BACKUP_ONEDRIVE_DIR` (if enabled)
+
+### Data Lifecycle
+
+**Scraper Job:**
+```
+enqueue_job() → RUNNING (metadata cached) → SUCCESS/FAILED
+   ↓
+metadata persisted to DB after validation & summary
+   ↓
+on resume: check metadata → skip if validation_passed=True
 ```
 
-**Non-Master Tables** (not restored, rebuilt):
-```sql
-CREATE TABLE jobs (
-    id TEXT PRIMARY KEY,
-    tool_name TEXT,
-    status TEXT,          -- QUEUED, RUNNING, etc.
-    created_at TEXT,
-    updated_at TEXT
-);
-
-CREATE TABLE job_items (...);
-CREATE TABLE job_logs (...);
-CREATE TABLE broadcast_batches (...);
+**SoM Attributes:**
+```
+pre_extract() → Injected (visible during tool execution)
+   ↓
+finally block → post_extract() → Removed
+   ↓
+Effective lifecycle: Single request only
 ```
 
-**FTS5 Tables** (excluded, rebuilt post-restore):
-```sql
-CREATE VIRTUAL TABLE scraped_articles_fts USING fts5(
-    content,
-    content='scraped_articles'
-);
--- Rebuilt via: INSERT INTO scraped_articles_fts(scraped_articles_fts) VALUES('rebuild')
-```
+### Migration & Cleanup
 
-### Backup Data Format
+**Schema Migrations:**
+- **Location**: `database/schemas/` (versioned via Peewee schema introspection)
+- **Control**: `SUMANAL_ALLOW_SCHEMA_RESET=1` environment variable required for destructive resets
 
-**Parquet Files** (`artifacts/backup/YYYY-MM-DD/`):
-```
-backup_2024-01-01/
-├── watermark.json              # ISO-8601 per-table timestamps
-├── scraped_articles.parquet    # Binary columns for embeddings
-├── scraped_articles_vec.parquet
-├── long_term_memories.parquet
-└── long_term_memories_vec.parquet
-```
-
-**Watermark Format**:
-```json
-{
-  "scraped_articles": "2024-01-01T12:00:00",
-  "scraped_articles_vec": "2024-01-01T12:00:00"
-}
-```
-
-**Atomic Write Pattern**:
-```python
-# exporter.py
-write_table_batch(chunk_df, table_name):
-    temp_path = f"{table_name}.tmp.parquet"
-    final_path = f"{table_name}.parquet"
-    
-    # Validate embeddings if vector table
-    if table_name.endswith("_vec"):
-        validate_embeddings(chunk_df)
-    
-    # Write atomically
-    pq.write_table(chunk_df, temp_path)
-    os.replace(temp_path, final_path)
-```
+**Cleanup Behavior:**
+- **On Shutdown**: `app.py` drains jobs → kills browser → closes DB writer
+- **On Startup**: Removes orphan Chrome processes (surgical kill), runs DB migrations
+- **Manual**: `daemon_manager.surgical_kill()` forces Chrome termination
 
 ## 8. Dependencies & Integration
 
-### Runtime Dependencies
+### External Dependencies
 
-- **FastAPI**: Web framework
-- **SQLite3**: Primary database (WAL mode)
-- **PyArrow**: Parquet export/import (v15+)
-- **Botasaurus**: Browser automation (v4.x with `._browser._process_pid`)
-- **psutil**: Process management for surgical kills
-- **python-telegram-bot**: Telegram API (passive usage only)
-- **peewee**: ORM (legacy, some usage)
-- **aiofiles**: Async file I/O
+| Package | Usage | Reason |
+|---------|-------|--------|
+| **botasaurus** | Browser automation, CDP | Direct wrapper for Chrome DevTools Protocol |
+| **fastapi** | HTTP server, routing | Async request handling with lifespan hooks |
+| **peewee** | ORM for SQLite | Lightweight DB for job tracking |
+| **psutil** | Process management | Surgical Chrome kill (pid-based) |
+| **beautifulsoup4** | HTML parsing | Hybrid extraction, paywall detection |
+| **aiofiles** | Async file I/O | Non-blocking file operations |
+| **snowflake-connector** | Warehouse integration | Enterprise data persistence |
+| **openai** / **azure** | LLM clients | Tool result processing |
+| **pydantic** | Config/validation | Type-safe config loading |
 
-### Environment Variables
+### Environment/Assumptions
 
-```bash
-# API Configuration
-API_PORT=8000
-API_HOST=0.0.0.0
-ARTIFACTS_DIR=./artifacts
+**Platform**: Windows 10/11 (evidenced by `psutil`, `cmd.exe` commands in `.bat` scripts)
 
-# Database
-DATABASE_PATH=./data/anything.db
-DB_WRITER_QUEUE_MAX=1000
+**Chrome**: Must be installed with user data directory writable
 
-# Browser
-CHROME_USER_DATA_DIR=./chrome_profile
-CHROME_USER_AGENT=real
-CHROME_WINDOW_SIZE=1920,1080
-CHROME_WARMUP_TIMEOUT=90
+**Python**: 3.11+ (type hints, union syntax `str | int`)
 
-# Backup
-BACKUP_ENABLED=true
-BACKUP_BATCH_SIZE=500
-BACKUP_ONEDRIVE_DIR=
-BACKUP_COMPRESSION=zstd
+**Network**: Access to:
+- `spacejam.com/1996/` (warmup validation)
+- `google.com` (tab management test)
+- Target scraping URLs
 
-# Telegram (optional, passive only)
-TELEGRAM_BOT_TOKEN=
+### Coupling Points
 
-# SoM / Orchestration
-SOM_INJECTION_TIMEOUT=60.0
-LLM_CONTEXT_CHAR_LIMIT=800000
-```
+**Tight Coupling:**
+- `frame_mark_elements.js` ↔ `observation_adapter.py` (contract on return value shape)
+- `router.py` ↔ `browser_daemon.py` (exception handling `MarkingError` → surgical kill)
+- `action_mapper.py` ↔ Tool execution (expects `bid_N` format)
 
-### Integration Points
+**Looser Coupling:**
+- Tools ↔ LLM providers (configurable via factory)
+- Database ↔ Persistence (can be disabled if migrations fail gracefully)
 
-**External Services**:
-- **Telegram**: Passive delivery only via `api/telegram_client.py`
-- **Snowflake**: Optional (via `clients/snowflake_client.py`)
-- **OneDrive**: Optional backup destination
+### External Service Assumptions
 
-**Internal Bridges**:
-- **Registry → Orchestration**: `REGISTRY.get_som_tools()` provides browser-compatible tools
-- **Orchestrator → Tools**: `run_tool_with_orchestrator()` wraps tool execution
-- **Daemon → Browser**: `daemon_manager.get_or_create_driver()` provides shared driver
-- **Worker → Database**: Single-writer queue via `database.writer`
+**Azure OpenAI**:
+- Assumes `AZURE_DEPLOYMENT` exists; defaults to `gpt-5.4-mini`
 
-### Tight Coupling
+**Chutes**:
+- Fallback provider; requires `CHUTES_API_TOKEN`
 
-**Critical Coupling Points**:
-1. **SoM Injector + Botasaurus 4.x**: Specifically uses `._browser._process_pid`
-2. **Orchestrator + Browser Daemon**: Must share `clear_job_tracking()` lifecycle
-3. **Scraper + SoM**: `extraction.py` calls `inject_som()` expecting sequential IDs
-4. **Startup + Warmup**: Tier 3 fails entire app if browser warmup fails
-5. **Backup + Database**: Writer must be initialized before backup operations
-6. **FTS5 + Restore**: Explicit rebuild after master restore, 300s synchronous wait
+**Snowflake**:
+- Optional; requires private key file at `SNOWFLAKE_PRIVATE_KEY_PATH`
 
-**Why Coupled**:
-- Botasaurus 4.x changed internal attribute names
-- SoM architecture prevents thread leaks via surgical kill integration
-- Orchestrator manages shared state (ID tracking, context)
-- Warmup verifies system health before accepting jobs
-- FTS5 derives from masters, cannot be independently restored
+**Telegram**:
+- Optional push notifications; requires `TELEGRAM_BOT_TOKEN` + user handshake
 
 ## 9. Setup, Build, and Execution
 
-### Clean Setup
+### Prerequisites
 
-**1. Install dependencies**
 ```bash
-cd c:/New folder/AnythingTools
+# Windows only
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-**2. Verify pyarrow**
+### Environment Configuration
+
+Create `.env` file:
 ```bash
-python -c "import pyarrow; print(pyarrow.__version__)"
-# Must be >= 15.0.0
+# Required
+API_KEY=your-secret-key-here
+CHROME_USER_DATA_DIR=C:\path\to\chrome\profile
+
+# SoM Configuration (optional, defaults provided)
+BROWSER_SOM_TAGS_TO_MARK=standard_html
+BROWSER_SOM_SCALE_FACTOR=1.0
+BROWSER_SOM_HTML_CHAR_BUDGET=20000
+
+# LLM (choose one)
+AZURE_OPENAI_KEY=...
+AZURE_OPENAI_ENDPOINT=...
+AZURE_DEPLOYMENT=gpt-5.4-mini
+
+# OR
+CHUTES_API_TOKEN=...
+CHUTES_MODEL=meta-llama/Llama-3.3-70B-Instruct
+
+# Optional
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_USER_ID=...
+SNOWFLAKE_ACCOUNT=...
 ```
 
-**3. Environment**
+### Running the Application
+
+**Development (Hot Reload):**
 ```bash
-# Create .env file
-cp .env.example .env  # If exists, edit manually
-
-# Required:
-BACKUP_ENABLED=true
-BACKUP_BATCH_SIZE=500
-CHROME_USER_DATA_DIR=chrome_profile
-
-# Optional:
-TELEGRAM_BOT_TOKEN=your_token_here
+python -m uvicorn app:app --reload --port 8000
 ```
 
-**4. Start API**
+**Production:**
 ```bash
-python app.py
-# or
-uvicorn app:app --host 0.0.0.0 --port 8000
+# No reload for stability
+python -m uvicorn app:app --port 8000
 ```
 
-**5. Verify Warmup**
+**Docker** (not provided in repo; would need custom Dockerfile exposing port 8000 and mounting Chrome profile)
+
+### Tool Execution (Scraper Example)
+
+**CLI:**
 ```bash
-curl http://localhost:8000/api/metrics
-# Should show browser_status: "READY" and chrome_pid
+python -m tools.scraper.tool --url https://example.com --output result.json
 ```
 
-### Manual Operations
-
-**Trigger Backup Export**:
-```bash
-curl -X POST http://localhost:8000/api/backup/export \
-  -H "Content-Type: application/json" \
-  -d '{"mode": "full"}'
-```
-
-**Trigger Backup Restore**:
-```bash
-curl -X POST http://localhost:8000/api/backup/restore \
-  -H "Content-Type: application/json" \
-  -d '{"watermark": "2024-01-01T00:00:00"}'
-```
-
-**Check Job Logs**:
-```bash
-curl http://localhost:8000/api/jobs/{job_id}
-```
-
-**Surgical Kill (emergency)**:
+**Programmatic:**
 ```python
-from utils.browser_daemon import daemon_manager
-daemon_manager.surgical_kill()
+from bot.orchestrator_core.router import OrchestratorRouter
+from tools.scraper.task import process_article
+
+router = OrchestratorRouter(job_id="test-001")
+result = await router.run(
+    tool_name="scraper",
+    tool_args={"url": "https://example.com"},
+    tool_executor=process_article,
+    browser_daemon=daemon_manager
+)
 ```
+
+### Build Processes
+
+**None**: This is pure Python code; no compilation step. Dependencies are installed via pip.
+
+**Just-In-Time Building**: Tool registry loads classes dynamically via entry points or importlib.
 
 ## 10. Testing & Validation
 
-### Unit Tests (`tests/`)
+### Test Structure
+
+```
+tests/
+├── test_backup.py          # Parquet backup integration
+└── test_browser_e2e.py     # End-to-end browser tests
+```
+
+### Running Tests
+
 ```bash
-# Backup system
-pytest tests/test_backup.py
+# All tests
+python -m pytest tests/
 
-# Browser E2E
-pytest tests/test_browser_e2e.py
+# Browser only
+python -m pytest tests/test_browser_e2e.py
 ```
 
-**Coverage**:
-- Backup export/import with PyArrow schema validation
-- Browser warmup flow (requires Chrome)
-- SoM injection basic flow (mocked driver)
+### Test Coverage Gaps
 
-### Manual Verification
+**Observable Gaps** (based on file list):
+- **No unit tests** for `observation_adapter.py` (tested only via integration)
+- **No direct tests** for `frame_mark_elements.js` (requires browser runtime)
+- **No tests** for `action_mapper.py` (presumably manual validation)
+- **No tests** for `router.py` (orchestrator logic untested in isolation)
 
-**1. SoM Injection**:
-```python
-from utils.browser_daemon import daemon_manager
-from utils.som_utils import inject_som
+**Existing Coverage**:
+- `test_backup.py`: Tests database backup workflow
+- `test_browser_e2e.py`: Likely tests scraper with real browser (inferred from name)
 
-driver = daemon_manager.get_or_create_driver()
-driver.get("https://example.com")
-last_id = inject_som(driver, 1)
-print(f"Elements tagged: {last_id - 1}")
-# Verify badges visible on page
-```
+### Test Interpretation
 
-**2. Budget Enforcement**:
-```python
-from bot.orchestrator_core.eviction import BudgetEnforcer
-
-enforcer = BudgetEnforcer(budget=1000)
-items = [{"char_count": 500}, {"char_count": 600}]
-result = enforcer.enforce(items)
-print(len(result))  # Should be 1 (first item evicted)
-```
-
-**3. Surgical Kill**:
-```python
-from utils.browser_daemon import daemon_manager
-import psutil
-
-# Start browser
-driver = daemon_manager.get_or_create_driver()
-print(f"PID: {daemon_manager.pid}")
-
-# Kill and verify
-daemon_manager.surgical_kill()
-assert daemon_manager.pid is None
-# Verify no chrome processes matching profile
-```
-
-**4. Telegram Passive**:
-```python
-from api.telegram_client import TelegramBot
-
-# Should have NO run_orphan_handshake method
-assert not hasattr(TelegramBot, 'run_orphan_handshake')
-
-# Can send (if token + chat_id set)
-# Cannot handshake
-```
-
-**5. Startup Pipeline**:
-```bash
-python -c "from utils.startup import run_startup; import asyncio; asyncio.run(run_startup())"
-# Should complete all 3 tiers without telegram handshake
-```
-
-### Gaps (No Coverage)
-
-- **FTS5 rebuild performance**: No test for 300s synchronous wait
-- **Multi-user concurrent writes**: Single-writer designed for low concurrency
-- **Schema v10 upgrade**: No test for future migrations
-- **OneDrive integration**: Optional, not tested
-- **Snowflake client**: Optional, not tested
-- **LLM budget enforcement**: Orchestrator logic exists but no end-to-end test
-- **Watchdog timer edge cases**: Thread timing issues not covered
-- **Chrome 4.x compatibility**: Specific to Botasaurus 4.x, no version matrix
+**Success Criteria**: 
+- E2E tests pass → browser automation, SoM injection, extraction working end-to-end
+- Backup tests pass → DB state persistence validated
 
 ## 11. Known Limitations & Non-Goals
 
-### Critical Constraints
+### Hard-Coded Constraints
 
-- **No concurrent writers**: Single background thread, queue max 1000
-- **No selective restore**: All master tables or nothing
-- **No FTS backup**: Must rebuild post-restore (300s wait)
-- **No continuous backup**: Batch-only, manual or scheduled
-- **No telemetry**: Local SQLite only
-- **No automatic migration**: Manual reconciliation
-- **No backup verification**: No checksums
-- **No real-time browser**: Warmup-based, single shared driver
-- **No proactive Telegram**: Strict passive sink
-- **Timeout kills**: SoM hangs trigger surgical kill, not graceful retry
+1. **Blocking Execution**: 
+   - `run_js()` is synchronous; JS hangs block main thread
+   - **Mitigation**: Watchdog exists but cannot preempt; relies on external `surgical_kill()`
 
-### Runtime Limits
+2. **Single-Tab Policy**:
+   - Hard-coded in `enforce_single_tab()` 
+   - **Impact**: Cannot test multi-tab workflows; popups blocked at runtime
 
-- **Worker polling interval**: 1 second
-- **Callback retries**: 3 attempts with exponential backoff
-- **Warmup timeout**: 90 seconds → sys.exit(1)
-- **SoM injection timeout**: 60 seconds → surgical kill
-- **Restore wait per table**: 120 seconds
-- **FTS rebuild wait**: 300 seconds
-- **Writer queue max**: 1000 tasks
-- **Backup batch size**: 500 rows (10000 ceiling)
-- **Context budget**: 800,000 chars (default, configurable)
+3. **Windows-Centric**:
+   - Path separators, `psutil` assumptions
+   - **Impact**: Likely fails on Linux/macOS without modification
 
-### Architectural Trade-offs
+4. **No Headless Mode**:
+   - Chrome always launches visibly
+   - **Impact**: Not suitable for CI/CD or server environments without X11
 
-**Single Browser Instance**:
-- ✅ Simpler lifecycle management
-- ✅ Lower memory usage
-- ❌ Cannot parallelize browser tools
-- ❌ One hang affects all browser operations
+5. **Static Configuration**:
+   - Config loaded once at startup
+   - **Impact**: Requires restart to change SoM parameters or LLM providers
 
-**Polling Worker**:
-- ✅ Simple, reliable
-- ✅ No message broker needed
-- ❌ 1s latency minimum
-- ❌ No event-driven updates
+### Missing Features (Despite Proxies)
 
-**SQLite WAL**:
-- ✅ Concurrent readers
-- ✅ Zero-config
-- ❌ Single writer
-- ❌ No horizontal scaling
+- **Async JS Execution**: Not implemented despite `aiofiles` dependency
+- **Migrations UI**: No CLI or admin interface for schema resets
+- **Metrics/Telemetry**: `TELEMETRY_DRY_RUN` exists but no actual metrics collection
+- **Session Isolation**: Single user context; no multi-tenant support
 
-**PyArrow Parquet**:
-- ✅ Efficient binary storage
-- ✅ Columnar compression
-- ❌ Very large files can OOM
-- ❌ Requires chunked reads
+### Technical Debt (Visible in Code)
 
-### Explicit Non-Goals
+1. **Legacy Import in Scraper** (FIXED in PLAN-02):
+   - Evidence: Old reference to `utils.som_injector` now updated to `observation_adapter`
 
-- 🚫 **Real-time streaming**: No websockets, no live updates
-- 🚫 **Distributed workers**: Single process only
-- 🚫 **Cloud-native**: Designed for local/single-machine
-- 🚫 **Multi-tenant isolation**: Single user model
-- 🚫 **Selective backup**: Master tables only
-- 🚫 **Incremental restore**: All-or-nothing
-- 🚫 **Export verification**: No integrity checks
-- 🚫 **Continuous integration**: No CI/CD pipelines
-- 🚫 **Auto-scaling**: Fixed single-writer model
-- 🚫 **GraphQL API**: REST only
-- 🚫 **NoSQL backend**: SQLite only
-- 🚫 **Browser automation**: Automation via SoM only, no macro recording
-- 🚫 **Real-time collaboration**: Single-user focus
-- 🚫 **AI training**: Inference only, no model updates
-- 🚫 **Proactive notifications**: Telegram passive-only
+2. **Unused `deprecated/` Code**:
+   - Contains finance, polymarket, vector_memory tools
+   - **Impact**: Maintenance burden, potential confusion for new contributors
+
+3. **Comment-Only Watchdog**:
+   - `WatchdogTimer` is documented but functionally limited due to blocking `run_js()`
+   - **Risk**: False sense of security about timeout protection
+
+4. **Vague "Standard HTML"**:
+   - `TAGS_TO_MARK = "standard_html"` is a magic string with no specification
+   - **Impact**: Unclear what elements are marked without reading JS
 
 ## 12. Change Sensitivity
 
 ### Most Fragile Components
 
-**1. ChromeDaemonManager** (`utils/browser_daemon.py`)
-- **Sensitivity**: 🔴 HIGH
-- **Why**: Botasaurus 4.x attribute path (`._browser._process_pid`), surgical kill logic, warmup phases
-- **Risk**: Browser update breaks PID capture, warmup failure = app crash
-- **Change Impact**: 
-  - Botasaurus upgrade: Update PID attribute path
-  - Chrome update: May require warmup verification update
-  - SoM timeout change: Affects thread leak prevention
+**1. `bot/orchestrator_core/router.py`**
+- **Why**: Central orchestration; modifying `post_extract()` or exception handling breaks cleanup guarantees
+- **Risk**: Memory leaks, zombie Chrome processes if cleanup removed
+- **Safe Changes**: Adding logging, modifying context injection
 
-**2. SoM Injector & Watchdog** (`utils/som_injector.py`)
-- **Sensitivity**: 🔴 HIGH
-- **Why**: Timeout logic, JS execution paths, batch size tuning
-- **Risk**: Infinite loops in JS, incorrect badge IDs, thread leaks
-- **Change Impact**:
-  - `run_js()` signature: Breaks watchdog wrapper
-  - JS DOM traversal: Affects element counting
-  - Timeout value: Too short = false positives, too long = delayed failure
+**2. `utils/javascript/frame_mark_elements.js`**
+- **Why**: Contract with `observation_adapter.py` on return value; changes affect all downstream tools
+- **Risk**: SoM detection failures, LLM confusion over bid format
+- **Safe Changes**: Adding new detection heuristics (must preserve `bid_N` format)
 
-**3. Orchestrator Router** (`bot/orchestrator_core/router.py`)
-- **Sensitivity**: 🟡 MEDIUM-HIGH
-- **Why**: Glues daemon, context, tools, cleanup
-- **Risk**: Memory leaks if cleanup fails, context corruption
-- **Change Impact**:
-  - `finally` block removal = memory leak
-  - Context builder API change = tool breakage
-  - Budget enforcer bypass = LLM overflow
+**3. `utils/browser_daemon.py::reinject_all()`**
+- **Why**: Range calculation `(0, last_id - 2)` must match JS 0-indexing
+- **Risk**: Off-by-one errors → LLM references non-existent `bid_N`
+- **Safe Changes**: None; range logic is critical
 
-**4. Single-Writer Queue** (`database/writer.py`)
-- **Sensitivity**: 🔴 HIGH
-- **Why**: All writes flow through here, queue limit 1000
-- **Risk**: Queue overflow = write loss, slow I/O = backup failure
-- **Change Impact**:
-  - Queue size change: Affects OOM safety
-  - Writer thread crash: All writes blocked
-  - WAL mode disable: Concurrency break
+**4. `utils/som_utils.py::inject_som()`**
+- **Why**: Delegates to adapter; signature affects all callers
+- **Risk**: Breaks backward compatibility with legacy tools
+- **Safe Changes**: None
 
-**5. FTS5 Rebuild** (`database/lifecycle.py`)
-- **Sensitivity**: 🟡 MEDIUM
-- **Why**: 300s synchronous wait, blocks restore completion
-- **Risk**: Long tables hang restore, memory spike
-- **Change Impact**:
-  - Timeout reduction: May cause partial rebuild
-  - Async rebuild: Breaks synchronous assumption
+### Easiest to Extend
 
-### Tight Coupling
+**1. Tools (New Implementations)**
+- **Pattern**: Inherit from `tools.base.Tool`, register via `tools.registry`
+- **Mechanism**: Dynamic loading, no core changes needed
 
-**Coupling Matrix**:
-```
-Component A          → Component B                | Coupling | Reason
----------------------|----------------------------|----------|----------------------
-SoMInjector          → Botasaurus 4.x API         | HIGH     | PID path, run_js
-OrchestratorRouter   → ChromeDaemonManager        | HIGH     | surgical_kill, tracking
-Tool Runner          → Orchestration              | HIGH     | Context injection
-Scraper/Extraction   → SoM Utils                  | HIGH     | inject_som calls
-Startup/Tier 3       → Browser Warmup             | HIGH     | sys.exit on failure
-Worker/Manager       → Database Writer            | HIGH     | Job updates
-Backup/Restore       → Browser Lock               | MEDIUM   | Exclusive access
-Telegram/Client      → Config (passive only)      | LOW      | Token optional
-```
+**2. LLM Providers**
+- **Pattern**: Add new class to `clients/llm/providers/`, update factory
+- **Mechanism**: Config-driven selection
 
-**Mitigations**:
-- Registry abstraction for tools
-- Try/except around SoM injection
-- Watchdog timer for JS hangs
-- Finally block for cleanup
-- Retry logic for callbacks
+**3. Logging Formats**
+- **Pattern**: Modify `utils/logger/formatters.py`
+- **Mechanism**: Decoupled from business logic
 
-### Easy Extension
+### Hardest to Change
 
-**Easy Areas**:
-- **Add tables to backup**: Update `MASTER_TABLES`, `TABLE_SCHEMAS`
-- **Change backup compression**: `BACKUP_COMPRESSION` config
-- **Tune memory**: Decrease `BACKUP_BATCH_SIZE`
-- **Add OneDrive**: Set `BACKUP_ONEDRIVE_DIR`
-- **Add new tool**: Create `tools/{name}/` with `Skill.py`, add to registry whitelist
-- **Add LLM provider**: Update `clients/llm/factory.py`
-- **Change SoM timeout**: `SOM_INJECTION_TIMEOUT` env var
-- **Add budget rules**: Modify `BudgetEnforcer.enforce()`
+**1. SoM Namespace (bid_N to something else)**
+- **Impact**: Requires changes to JS, Python adapter, router, action_mapper, all tools
+- **Scope**: Cross-cutting; would break existing scraper logic
 
-**Hard Areas**:
-- **Remove pyarrow**: Rewrite all backup I/O
-- **Async backup**: `aiofiles` + async DB (writer is sync)
-- **Schema v10**: Update DDL + migration script
-- **API v2**: New endpoints, backward compatibility
-- **Prompt migration**: Update imports, validate LLM changes
-- **Multi-browser**: Rewrite singleton daemon manager
-- **Worker polling → event-driven**: New architecture entirely
-- **Proactive Telegram**: Would require architectural rule violation
+**2. Botasaurus Dependency**
+- **Impact**: All browser operations tied to Botasaurus API
+- **Replacement**: Would require rewriting `browser_daemon.py`, `observation_adapter.py`, `som_utils.py`
+
+**3. Synchronous Architecture**
+- **Impact**: Core assumption in `observation_adapter.py` and `router.py`
+- **Effort**: Would require async/await proliferation, rethinking watchdog timers

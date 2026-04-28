@@ -23,13 +23,13 @@ class OrchestratorRouter:
                 try:
                     driver = browser_daemon.get_or_create_driver()
                     from utils.som_utils import wait_for_dom_stability, inject_som
-                    from utils.som_injector import SoMCriticalTimeoutError
+                    from utils.observation_adapter import MarkingError
                     wait_for_dom_stability(driver)
                     try:
                         last_id = inject_som(driver, start_id=1)
                         if last_id > 1:
-                            context_builder.inject_som_markers((1, last_id - 1))
-                    except SoMCriticalTimeoutError:
+                            context_builder.inject_som_markers((0, last_id - 2))
+                    except MarkingError:
                         browser_daemon.surgical_kill()
                         raise RuntimeError("SoM Injection hung. Browser killed.")
                 except Exception as som_error:
@@ -48,5 +48,10 @@ class OrchestratorRouter:
             return ToolResult(output=f"Orchestrator error: {str(error)}", success=False)
         finally:
             if browser_daemon:
+                try:
+                    from utils.observation_adapter import BotasaurusObservationAdapter
+                    BotasaurusObservationAdapter(browser_daemon.get_or_create_driver()).post_extract()
+                except Exception:
+                    pass
                 browser_daemon.clear_job_tracking()
         
