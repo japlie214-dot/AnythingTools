@@ -1,3 +1,4 @@
+# api/telegram_client.py
 import asyncio
 import html
 from datetime import datetime
@@ -82,28 +83,3 @@ class TelegramBot:
         except TelegramError as e:
             log.dual_log(tag="TelegramBot", message=f"Failed to send poll: {e}", level="WARNING")
 
-    @classmethod
-    async def run_orphan_handshake(cls):
-        """Long-polling background task to capture the first message and bind chat_id."""
-        if not config.TELEGRAM_BOT_TOKEN:
-            return
-        bot = cls.get_bot()
-        offset = 0
-        log.dual_log(tag="TelegramBot:Handshake", message="Listening for orphan handshake (send any message to the bot)...")
-        while cls._chat_id is None:
-            try:
-                updates = await bot.get_updates(offset=offset, timeout=30)
-                for update in updates:
-                    offset = update.update_id + 1
-                    if update.effective_chat:
-                        cls.set_chat_id(update.effective_chat.id)
-                        await bot.send_message(
-                            chat_id=cls._chat_id,
-                            text="✅ Handshake Complete. Monitoring Job Stream."
-                        )
-                        return
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.dual_log(tag="TelegramBot:Handshake", message=f"Handshake poll error: {e}", level="WARNING")
-                await asyncio.sleep(5)

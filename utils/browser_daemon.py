@@ -123,7 +123,10 @@ class ChromeDaemonManager:
         
         # Audit and log the spawned Chrome PID
         try:
-            if hasattr(self._driver, 'browser') and hasattr(self._driver.browser, 'process'):
+            if hasattr(self._driver, '_browser') and hasattr(self._driver._browser, '_process_pid'):
+                self._pid = self._driver._browser._process_pid
+                log.dual_log(tag="Browser:Daemon", message=f"Chrome spawned with PID {self._pid}")
+            elif hasattr(self._driver, 'browser') and hasattr(self._driver.browser, 'process'):
                 self._pid = self._driver.browser.process.pid
                 log.dual_log(tag="Browser:Daemon", message=f"Chrome spawned with PID {self._pid}")
             else:
@@ -197,7 +200,17 @@ class ChromeDaemonManager:
             
             # Phase 2: SoM Test
             log.dual_log(tag="Startup:Warmup", message="Phase 2: SoM Injection Test")
-            reinject_all(driver, self._id_tracking)
+            try:
+                reinject_all(driver, self._id_tracking)
+            except Exception as e:
+                from utils.som_injector import SoMCriticalTimeoutError
+                if isinstance(e, SoMCriticalTimeoutError):
+                    log.dual_log(tag="Startup:Warmup", message="CRITICAL: JS Execution hung during SoM injection. Forcing surgical kill to prevent thread leak.", level="CRITICAL")
+                    self.surgical_kill()
+                    self._status = BrowserStatus.CRITICAL_FAILURE
+                    raise RuntimeError("SoM Injection caused infinite loop. Chrome killed.") from e
+                raise
+                
             main_range = self._id_tracking.get('main')
             if not main_range or main_range[1] <= 1:
                 raise RuntimeError("SoM Injection failed: No markers added")
@@ -220,6 +233,11 @@ class ChromeDaemonManager:
     def get_id_tracking(self) -> dict:
         """Return the shared SoM id-tracking dict by reference."""
         return self._id_tracking
+    
+    def clear_job_tracking(self) -> None:
+        """Clear id_tracking to prevent memory leak across job executions."""
+        with self._lock:
+            self._id_tracking.clear()
     
     def append_action_log(self, entry: dict) -> None:
         """Append a sanitised entry to the rolling log."""

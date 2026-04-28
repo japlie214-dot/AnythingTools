@@ -41,4 +41,44 @@ async def run_tool_safely(tool: BaseTool, args: Dict[str, Any], telemetry: Any, 
         
         log.dual_log(tag="ToolRunner", message=f"Tool execution failed: {exc}", level="ERROR", payload={"job_id": job_id, "tool": tool.name})
         return ToolResult(output=error_msg, success=False)
+
+
+async def run_tool_with_orchestrator(
+    tool_name: str,
+    args: Dict[str, Any],
+    telemetry: Any,
+    job_id: str,
+    **kwargs,
+) -> ToolResult:
+    """Execute a tool through the orchestrator for SoM-aware context."""
+    from bot.orchestrator_core.router import OrchestratorRouter
+    from utils.browser_daemon import daemon_manager
+
+    browser_daemon = None
+    if tool_name in kwargs.get("som_tools", ["scraper", "browser_task"]):
+        try:
+            if daemon_manager.status.value == "READY":
+                browser_daemon = daemon_manager
+        except Exception:
+            pass
+
+    router = OrchestratorRouter(job_id)
+
+    async def execute_tool(tn, ta, **kw):
+        from tools.registry import REGISTRY
+        tool_cls = REGISTRY.get_tool_class(tn)
+        if not tool_cls:
+            return ToolResult(output=f"Tool not found: {tn}", success=False)
+
+        tool_instance = REGISTRY.create_tool_instance(tn)
+        return await run_tool_safely(tool_instance, ta, telemetry, **kw)
+
+    return await router.run(
+        tool_name=tool_name,
+        tool_args=args,
+        tool_executor=execute_tool,
+        browser_daemon=browser_daemon,
+        job_id=job_id,
+        **kwargs,
+    )
         

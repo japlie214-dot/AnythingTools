@@ -165,24 +165,30 @@ class ToolRegistry:
                 return None
 
     def schema_list(self) -> list[Dict[str, Any]]:
-        """Return a minimal MCP-style manifest for all registered tools.
-
-        For tools that expose an INPUT_MODEL, the serialized Pydantic schema is
-        used as `input_schema`. Otherwise a permissive empty object schema is
-        returned to indicate free-form input.
-        """
+        """Return a minimal MCP-style manifest for all registered tools."""
         entries: list[Dict[str, Any]] = []
         for tool_name, meta in self._tools.items():
             input_schema = meta.get("input_schema")
             if not input_schema:
                 input_schema = {"type": "object", "properties": {}, "required": []}
-            description = meta.get("description") or f"Dynamically discovered tool {tool_name}"
+            description = meta.get("description")
+            if not description:
+                description = f"Dynamically discovered tool {tool_name}"
+            
+            som_instructions = ""
+            if tool_name in {"scraper", "browser_task"}:
+                som_instructions = " This tool uses SoM element targeting. Use data-ai-id attributes."
+
             entries.append({
                 "name": tool_name,
-                "description": description,
+                "description": description + som_instructions,
                 "input_schema": input_schema,
             })
         return entries
+
+    def get_som_tools(self) -> list[str]:
+        """Return list of tools that support SoM integration."""
+        return [name for name in self._tools.keys() if name in {"scraper", "browser_task"}]
 
 
     def get_responses_tools(self, tool_names: list[str]) -> list[Dict[str, Any]]:

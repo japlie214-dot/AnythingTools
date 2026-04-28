@@ -25,64 +25,47 @@ log = get_dual_logger(__name__)
 def inject_som(driver: Driver, start_id: int = 1) -> int:
     """Inject data-ai-id attributes with visual badges and return the last ID used."""
     try:
-        last_id = driver.run_js(
-            """(function(startId){
-                var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null, false);
-                var id = startId;
-                var existingRects = [];
-                while (walker.nextNode()) {
-                    var el = walker.currentNode;
-                    var rect = el.getBoundingClientRect();
-                    if (el.offsetParent !== null && rect.width > 0 && rect.height > 0) {
-                        var currentId = String(id++);
-                        el.setAttribute('data-ai-id', currentId);
-                        
-                        var badge = document.createElement('div');
-                        badge.setAttribute('data-ai-badge', 'true');
-                        badge.textContent = currentId;
-                        badge.style.position = 'absolute';
-                        badge.style.backgroundColor = 'red';
-                        badge.style.color = 'white';
-                        badge.style.fontSize = '12px';
-                        badge.style.padding = '2px 4px';
-                        badge.style.zIndex = '2147483647';
-                        badge.style.pointerEvents = 'none';
-                        
-                        var top = rect.top + window.scrollY;
-                        var left = rect.left + window.scrollX;
-                        
-                        // Vertical displacement logic to prevent overlap
-                        for (var i = 0; i < existingRects.length; i++) {
-                            var eRect = existingRects[i];
-                            if (Math.abs(eRect.top - top) < 15 && Math.abs(eRect.left - left) < 15) {
-                                top += 15;
-                            }
-                        }
-                        existingRects.push({top: top, left: left});
-                        
-                        badge.style.top = top + 'px';
-                        badge.style.left = left + 'px';
-                        document.body.appendChild(badge);
-                    }
-                }
-                return id;
-            })(%s);""" % start_id
-        )
-        return last_id or start_id
-    except Exception:
+        from utils.som_injector import SoMInjector, InjectionMode, SoMCriticalTimeoutError
+        injector = SoMInjector(driver, timeout=60.0)
+        try:
+            return injector.inject(start_id=start_id, mode=InjectionMode.FULL)
+        except SoMCriticalTimeoutError:
+            raise  # Let the orchestrator or daemon catch this to perform surgical kill
+        except Exception as e:
+            log.dual_log(tag="SoM:Inject", message=f"Full injection failed: {e}. Retrying in marker-only mode.", level="WARNING")
+            return injector.inject(start_id=start_id, mode=InjectionMode.MARKER_ONLY)
+    except Exception as e:
+        log.dual_log(tag="SoM:Inject", message=f"SoM injection failed entirely: {e}", level="ERROR")
         return start_id
 
 
 def wait_for_dom_stability(driver: Driver, timeout: int = 10):
-    """Wait for the number of elements to stop changing."""
+    """Wait for the DOM to stabilize using adaptive CDP checks."""
     import time
+    try:
+        if driver.run_js("return document.readyState") == "complete":
+            time.sleep(0.3)
+    except Exception:
+        pass
+        
     last_count = 0
     start_time = time.time()
+    stable_count = 0
+    
     while time.time() - start_time < timeout:
-        current_count = driver.run_js("return document.querySelectorAll('*').length")
+        try:
+            current_count = driver.run_js("return document.querySelectorAll('*').length")
+        except Exception:
+            time.sleep(0.5)
+            continue
+            
         if current_count == last_count and current_count > 0:
-            break
-        last_count = current_count
+            stable_count += 1
+            if stable_count >= 2:
+                break
+        else:
+            stable_count = 0
+            last_count = current_count
         time.sleep(0.5)
 
 

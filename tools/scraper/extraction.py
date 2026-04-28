@@ -38,7 +38,14 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
 
         try:
             wait_for_dom_stability(driver)
-            last_id = inject_som(driver, start_id=1)
+            try:
+                from utils.som_injector import SoMCriticalTimeoutError
+                last_id = inject_som(driver, start_id=1)
+            except SoMCriticalTimeoutError:
+                from utils.browser_daemon import daemon_manager
+                daemon_manager.surgical_kill()
+                raise RuntimeError("JS injection hung. Browser killed.")
+            
             if last_id > 1:
                 target_id = random.randint(1, last_id - 1)
                 log.dual_log(

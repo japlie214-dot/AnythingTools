@@ -6,7 +6,6 @@ from .server import get_mount_artifacts_step
 from .database import init_database_layer, run_db_migrations, validate_vec0
 from .registry import load_tool_registry
 from .browser import warmup_browser
-from .telegram import start_telegram_handshake
 from .recovery import run_startup_recovery
 
 async def run_startup(app_instance=None) -> StartupContext:
@@ -19,7 +18,6 @@ async def run_startup(app_instance=None) -> StartupContext:
         ("cleanup_zombie_chrome", cleanup_zombie_chrome),
         ("cleanup_temp_files", cleanup_temp_files),
         ("init_database_layer", init_database_layer),
-        ("start_telegram_handshake", start_telegram_handshake),
     ])
 
     # Tier 2: Dependent Database logic (Sequential)
