@@ -289,7 +289,6 @@ class FinancialReconciler:
                 message="Generated prompt.",
                 level="DEBUG",
                 payload=prompt,
-                destination=self.statement_type,
             )
             
             response = await llm.complete_chat(

@@ -56,8 +56,9 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
     except Exception as e:
         log.dual_log(
             tag="Scraper:Dedup",
-            message=f"Database check failed, proceeding with all links: {e}",
+            message="Database check failed, proceeding with all links",
             level="WARNING",
+            payload={"error": str(e)},
         )
         deduped_urls = links
 
@@ -82,8 +83,9 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
         except Exception as e:
             log.dual_log(
                 tag="Scraper:Partial",
-                message=f"PARTIAL resumption check failed: {e}",
+                message="PARTIAL resumption check failed",
                 level="WARNING",
+                payload={"error": str(e)},
             )
 
     # Phase 2: Pre-flight Job Item Generation (idempotent). Create job_items rows for every
@@ -234,8 +236,10 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                 except Exception as _ee:
                     log.dual_log(
                         tag="Scraper:ResumeEmbed",
-                        message=f"Re-embed failed for {_norm}: {_ee}",
-                        level="ERROR", exc_info=_ee,
+                        message="Re-embed failed",
+                        level="ERROR",
+                        exc_info=_ee,
+                        payload={"normalized_url": _norm, "error": str(_ee)},
                     )
                     _local_meta["retryable"] = True
                     if job_id:

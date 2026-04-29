@@ -58,7 +58,7 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
                 if element:
                     element.scroll_into_view()
         except Exception as e:
-            log.dual_log(tag="Scraper:Engagement", message=f"Engagement scroll failed: {e}", level="DEBUG")
+            log.dual_log(tag="Scraper:Engagement", message="Engagement scroll failed", level="DEBUG", payload={"error": str(e)})
 
         driver.long_random_sleep()
 
@@ -82,9 +82,10 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
     except Exception as exc:
         log.dual_log(
             tag="Scraper:Extract",
-            message=f"Link extraction failed for {target['name']}: {exc}",
+            message="Link extraction failed",
             level="ERROR",
             exc_info=exc,
+            payload={"target": target['name'], "error": str(exc)},
         )
         return []
 
@@ -150,7 +151,7 @@ def process_article(
                     if element:
                         element.scroll_into_view()
             except Exception as e:
-                log.dual_log(tag="Scraper:Engagement", message=f"Engagement scroll failed: {e}", level="DEBUG")
+                log.dual_log(tag="Scraper:Engagement", message="Engagement scroll failed", level="DEBUG", payload={"error": str(e)})
 
             driver.short_random_sleep()
 
@@ -189,7 +190,7 @@ def process_article(
                 if video_audio_tags or has_video_embed:
                     paragraph_text = " ".join(p.get_text(strip=True) for p in soup_pre.find_all("p"))
                     if len(paragraph_text) < 500:
-                        log.dual_log(tag="Scraper:Validation", message=f"Page rejected: video/audio primary content ({url}).", level="WARNING")
+                        log.dual_log(tag="Scraper:Validation", message="Page rejected: video/audio primary content", level="WARNING", payload={"url": url})
                         return {"status": "FAILED", "reason": "Page primary content is video/audio with insufficient article text."}
 
             # ── Paywall Detection ───────────────────────────────────────────
@@ -197,7 +198,7 @@ def process_article(
                 from tools.scraper.paywall import PaywallDetector
                 pw_result = PaywallDetector().detect(raw_html)
                 if pw_result.is_paywalled:
-                    log.dual_log(tag="Scraper:Paywall", message=f"Paywall detected on {url}. Attempt {val_attempt}/3.", level="WARNING")
+                    log.dual_log(tag="Scraper:Paywall", message="Paywall detected", level="WARNING", payload={"url": url, "attempt": val_attempt})
                     if val_attempt < 3:
                         continue
                     else:
@@ -231,13 +232,14 @@ def process_article(
                     reason = val_data.get("reason", "unknown")
                     log.dual_log(
                         tag="Scraper:Validation",
-                        message=f"Page invalid ({reason}). Attempt {val_attempt}/3.",
+                        message="Page invalid",
                         level="WARNING",
+                        payload={"reason": reason, "attempt": val_attempt, "url": url},
                     )
                     if cancellation_flag is not None and cancellation_flag.is_set():
                         return {"status": "CANCELED", "reason": "User requested stop via Human Help mode."}
                     if val_attempt < 3:
-                        log.dual_log(tag="Scraper:Paywall:Retry", message=f"Triggering auto-refresh for {url} (Attempt {val_attempt}).", level="INFO")
+                        log.dual_log(tag="Scraper:Paywall:Retry", message="Triggering auto-refresh", level="INFO", payload={"url": url, "attempt": val_attempt})
                         continue
                     return {
                         "status": "FAILED",
@@ -277,16 +279,18 @@ def process_article(
                     if is_context_length_error(format_exc):
                         log.dual_log(
                             tag="Scraper:Summarize:ContextLength",
-                            message=f"Context length exceeded during json_schema call: {format_exc}",
-                            level="WARNING"
+                            message="Context length exceeded during json_schema call",
+                            level="WARNING",
+                            payload={"error": str(format_exc)}
                         )
                         raise
                         
                     if isinstance(format_exc, BadRequestError):
                         log.dual_log(
                             tag="Scraper:Summarize:Fallback",
-                            message=f"json_schema format rejected, falling back to json_object: {format_exc}",
+                            message="json_schema format rejected; falling back to json_object",
                             level="WARNING",
+                            payload={"error": str(format_exc)}
                         )
                         sum_resp = sync_llm_chat(sum_msgs, response_format={"type": "json_object"})
                         used_format = "json_object"
@@ -311,8 +315,9 @@ def process_article(
                 if sum_data.get("error") == "INSUFFICIENT_CONTENT":
                     log.dual_log(
                         tag="Scraper:Summarize",
-                        message=f"Insufficient content. Attempt {sum_attempt}/3.",
+                        message="Insufficient content",
                         level="WARNING",
+                        payload={"attempt": sum_attempt, "url": url},
                     )
                 elif sum_data.get("title") and sum_data.get("conclusion"):
                     log.dual_log(
@@ -327,16 +332,16 @@ def process_article(
                 else:
                     log.dual_log(
                         tag="Scraper:Summarize",
-                        message=f"Missing mandatory fields in JSON. Attempt {sum_attempt}/3.",
+                        message="Missing mandatory fields in JSON",
                         level="WARNING",
-                        payload={"parsed": sum_data}
+                        payload={"parsed": sum_data, "attempt": sum_attempt, "url": url}
                     )
 
                 # Re-navigate on attempts 1 and 2; attempt 3 falls through to FAILED.
                 if sum_attempt < 3:
                     log.dual_log(
                         tag="Scraper:Navigate",
-                        message=f"Re-navigating for summarisation retry: {url}",
+                        message="Re-navigating for summarisation retry",
                         level="INFO",
                         payload={"url": url, "sum_attempt": sum_attempt},
                     )
@@ -365,9 +370,10 @@ def process_article(
         except Exception as exc:
             log.dual_log(
                 tag="Scraper:Process",
-                message=f"Error processing {url} on attempt {val_attempt}: {exc}",
+                message="Error processing article",
                 level="ERROR",
                 exc_info=exc,
+                payload={"url": url, "attempt": val_attempt, "error": str(exc)},
             )
 
     return {"status": "FAILED", "reason": "Validation failed after 3 attempts"}

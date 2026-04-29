@@ -33,7 +33,7 @@ class OrchestratorRouter:
                         browser_daemon.surgical_kill()
                         raise RuntimeError("SoM Injection hung. Browser killed.")
                 except Exception as som_error:
-                    log.dual_log(tag="Orchestrator:SoM:Error", message=f"SoM injection failed: {som_error}", level="WARNING")
+                    log.dual_log(tag="Orchestrator:SoM:Error", message=f"SoM injection failed", level="WARNING", payload={"error": str(som_error)})
 
             context = context_builder.get_context()
             if context:
@@ -44,7 +44,7 @@ class OrchestratorRouter:
             
             return result
         except Exception as error:
-            log.dual_log(tag="Orchestrator:Error", message=f"Orchestrator error: {error}", level="ERROR", exc_info=error)
+            log.dual_log(tag="Orchestrator:Error", message="Orchestrator error", level="ERROR", exc_info=error, payload={"error": str(error)})
             return ToolResult(output=f"Orchestrator error: {str(error)}", success=False)
         finally:
             if browser_daemon:

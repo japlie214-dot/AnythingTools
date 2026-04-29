@@ -2,10 +2,19 @@
 """Asynchronous log writer for logs.db with high-throughput optimizations."""
 import queue
 import threading
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
 from database.connection import LogsDatabaseManager
+from utils.id_generator import ULID
 
 # Bounded queue for log writes
-logs_write_queue = queue.Queue(maxsize=2000)
+logs_write_queue = queue.Queue(maxsize=5000)
+
+# Fallback lock for writing to persistent fallback log
+_fallback_lock = threading.Lock()
 
 # Shutdown event for graceful termination
 logs_shutdown_event = threading.Event()
@@ -25,6 +34,25 @@ def get_logs_write_generation():
     """Get the current write generation number."""
     with _logs_writer_lock:
         return _logs_write_generation
+
+
+def _write_fallback_log(sql, params):
+    """Last-resort persistent audit trail when queue overflows."""
+    try:
+        f_dir = Path("logs")
+        f_dir.mkdir(parents=True, exist_ok=True)
+        f_path = f_dir / "fallback.log"
+        entry = {
+            "fallback_ts": datetime.now(timezone.utc).isoformat(),
+            "event_id": ULID.generate(),
+            "sql": sql,
+            "params": params,
+        }
+        with _fallback_lock:
+            with open(f_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+    except Exception as e:
+        sys.stderr.write(f"[CRITICAL:LOG_FALLBACK_FAILED] {e}\n")
 
 
 def logs_writer_worker():
@@ -50,30 +78,40 @@ def logs_writer_worker():
                 with _logs_writer_lock:
                     _logs_write_generation += 1
             except Exception:
-                conn.rollback()
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             finally:
-                logs_write_queue.task_done()
+                try:
+                    logs_write_queue.task_done()
+                except Exception:
+                    pass
         except queue.Empty:
             # Check if shutdown was requested
             if logs_shutdown_event.is_set():
                 break
     
-    conn.close()
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 def logs_enqueue_write(sql, params=()):
-    """Enqueue a write operation to the logs database."""
+    """Enqueue a write operation to the logs database with overflow protection."""
     global _logs_writer_thread
-    
-    # Start writer thread if not running
     if _logs_writer_thread is None or not _logs_writer_thread.is_alive():
         start_logs_writer()
     
     try:
         logs_write_queue.put_nowait((sql, params))
     except queue.Full:
-        # Queue is full, drop the log (non-blocking behavior)
-        pass
+        try:
+            # 5s blocking grace before fallback
+            logs_write_queue.put((sql, params), timeout=5.0)
+        except queue.Full:
+            _write_fallback_log(sql, params)
 
 
 def start_logs_writer():

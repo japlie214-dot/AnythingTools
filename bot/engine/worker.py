@@ -129,37 +129,47 @@ def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: l
                 resp = client.post(url, json=callback_payload, headers=headers)
                 resp.raise_for_status()
 
-            enqueue_write(
-                "INSERT INTO logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-                (ULID.generate(), job_id, "Worker:Callback:Success", "INFO", f"Callback delivered (attempt {attempt})", now_iso())
+            from database.logs_writer import logs_enqueue_write
+            logs_enqueue_write(
+                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ULID.generate(), job_id, "Worker:Callback:Success", "INFO", None, "Callback delivered", json.dumps({"attempt": attempt}), ULID.generate(), None, now_iso())
             )
             return True
 
         except httpx.HTTPStatusError as e:
             status_code = e.response.status_code
             if 400 <= status_code < 500:
-                enqueue_write(
-                    "INSERT INTO logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (ULID.generate(), job_id, "Worker:Callback:ClientError", "ERROR", f"HTTP {status_code} (no retry)", json.dumps({"status_code": status_code}), now_iso())
+                from database.logs_writer import logs_enqueue_write
+                logs_enqueue_write(
+                    "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ULID.generate(), job_id, "Worker:Callback:ClientError", "ERROR", None, "HTTP client error (no retry)", json.dumps({"status_code": status_code}), ULID.generate(), None, now_iso())
                 )
                 return False
             # Non-4xx HTTP errors are considered transient/server and may be retried
-            enqueue_write(
-                "INSERT INTO logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (ULID.generate(), job_id, "Worker:Callback:ServerError", "WARNING", f"HTTP {status_code} (retry)", json.dumps({"status_code": status_code}), now_iso())
+            from database.logs_writer import logs_enqueue_write
+            logs_enqueue_write(
+                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ULID.generate(), job_id, "Worker:Callback:ServerError", "WARNING", None, "HTTP server error (retry)", json.dumps({"status_code": status_code}), ULID.generate(), None, now_iso())
             )
         except Exception as e:
-            enqueue_write(
-                "INSERT INTO logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-                (ULID.generate(), job_id, "Worker:Callback:Transient", "WARNING", f"Transient error: {str(e)[:200]}", now_iso())
+            from database.logs_writer import logs_enqueue_write
+            logs_enqueue_write(
+                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ULID.generate(), job_id, "Worker:Callback:Transient", "WARNING", None, "Transient error in callback", json.dumps({"error": str(e)}), ULID.generate(), None, now_iso())
             )
 
         if attempt < max_retries:
             time.sleep(base_delay * (2 ** (attempt - 1)))
 
-    enqueue_write(
-        "INSERT INTO logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-        (ULID.generate(), job_id, "Worker:Callback:MaxRetries", "ERROR", f"Callback failed after {max_retries} attempts", now_iso())
+    from database.logs_writer import logs_enqueue_write
+    logs_enqueue_write(
+        "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (ULID.generate(), job_id, "Worker:Callback:MaxRetries", "ERROR", None, "Max callback retries reached", json.dumps({"max_retries": max_retries}), ULID.generate(), None, now_iso())
     )
     return False
 
@@ -182,7 +192,7 @@ class UnifiedWorkerManager:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, name="unified-worker-manager", daemon=True)
         self._thread.start()
-        log.dual_log(tag="Worker:Manager:Start", message="Unified WorkerManager started.")
+        log.dual_log(tag="Worker:Manager:Start", message="Unified WorkerManager started.", payload={"status": "STARTED", "poll_interval": self.poll_interval})
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop_event.set()
@@ -208,7 +218,7 @@ class UnifiedWorkerManager:
                 ).fetchall()
                 
             except Exception as e:
-                log.dual_log(tag="Worker:Manager:Poll", message=f"DB poll failed: {e}", level="WARNING")
+                log.dual_log(tag="Worker:Manager:Poll", message="DB poll failed", level="WARNING", payload={"error": str(e)})
                 time.sleep(self.poll_interval)
                 continue
 
@@ -254,7 +264,7 @@ class UnifiedWorkerManager:
                         "The browser has been restarted at Google. Verify your location before "
                         "proceeding. Consult job_items to review completed steps."
                     )
-                    log.dual_log(tag="Worker:Job:Recovery", message=recovery_msg)
+                    log.dual_log(tag="Worker:Job:Recovery", message="Recovered interrupted job", payload={"job_id": job_id, "recovery_notice": recovery_msg})
 
                 # Prepare cancellation flag
                 flag = threading.Event()
@@ -288,9 +298,11 @@ class UnifiedWorkerManager:
                         "UPDATE jobs SET status = 'PARTIAL', retry_count = ?, updated_at = ? WHERE job_id = ?",
                         (new_retry_count, now_iso(), job_id)
                     )
-                    enqueue_write(
-                        "INSERT INTO logs (id, job_id, tag, level, message, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-                        (ULID.generate(), job_id, "Worker:Callback:Abandoned", "ERROR", "Max callback retries exceeded, marked as PARTIAL", now_iso())
+                    from database.logs_writer import logs_enqueue_write
+                    logs_enqueue_write(
+                        "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (ULID.generate(), job_id, "Worker:Callback:Abandoned", "ERROR", None, "Max callback retries exceeded, marked as PARTIAL", json.dumps({"retry_count": new_retry_count}), ULID.generate(), None, now_iso())
                     )
                 else:
                     enqueue_write(
@@ -381,16 +393,16 @@ class UnifiedWorkerManager:
             err_str = str(e)
             if err_str.startswith("PAUSED_FOR_HITL:"):
                 msg = err_str.split(":", 1)[1].strip() if ":" in err_str else err_str
-                log.dual_log(tag="Worker:Job:Paused", message=f"Job {job_id} paused for HITL: {msg}", level="WARNING")
+                log.dual_log(tag="Worker:Job:Paused", message="Job paused for HITL", level="WARNING", payload={"job_id": job_id, "reason": msg})
                 enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("PAUSED_FOR_HITL", now_iso(), job_id))
             else:
                 self._system_errors[job_id] += 1
                 if self._system_errors[job_id] >= 3:
-                    log.dual_log(tag="Worker:Job:Abandoned", message=f"Job {job_id} ABANDONED after 3 consecutive system errors: {e}", level="CRITICAL", notify_user=True)
+                    log.dual_log(tag="Worker:Job:Abandoned", message=f"Job {job_id} ABANDONED after 3 consecutive system errors", level="CRITICAL", payload={"job_id": job_id, "error": str(e)}, notify_user=True)
                     enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("ABANDONED", now_iso(), job_id))
                     del self._system_errors[job_id]
                 else:
-                    log.dual_log(tag="Worker:Job:Crashed", message=f"Job {job_id} crashed (Attempt {self._system_errors[job_id]}/3). Sleeping 10s: {e}", level="ERROR", exc_info=e)
+                    log.dual_log(tag="Worker:Job:Crashed", message=f"Job {job_id} crashed", level="ERROR", exc_info=e, payload={"job_id": job_id, "attempt": self._system_errors[job_id], "error": str(e)})
                     time.sleep(10)
                     enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("INTERRUPTED", now_iso(), job_id))
             

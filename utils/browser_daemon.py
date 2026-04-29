@@ -69,7 +69,7 @@ class ChromeDaemonManager:
         Fails app immediately on permission errors.
         """
         if psutil is None:
-            log.dual_log(tag="Browser:Kill", message="psutil not available, skipping surgical kill", level="WARNING")
+            log.dual_log(tag="Browser:Kill", message="psutil not available, skipping surgical kill", level="WARNING", payload={"action": "surgical_kill_skipped"})
             return
         
         target_dir = os.path.abspath(config.CHROME_USER_DATA_DIR).lower()
@@ -89,17 +89,17 @@ class ChromeDaemonManager:
                 if "chrome" in proc_name and target_dir in cmdline:
                     proc.kill()
                     killed = True
-                    log.dual_log(tag="Browser:Kill", message=f"Killed Chrome PID {current_pid} for profile {target_dir}")
+                    log.dual_log(tag="Browser:Kill", message=f"Killed Chrome PID {current_pid} for profile {target_dir}", payload={"pid": current_pid, "profile": target_dir})
             except (psutil.AccessDenied, psutil.PermissionError) as e:
-                log.dual_log(tag="Browser:Kill", message=f"FATAL: Permission denied killing Chrome PID {current_pid}: {e}", level="CRITICAL")
+                log.dual_log(tag="Browser:Kill", message=f"FATAL: Permission denied killing Chrome PID {current_pid}: {e}", level="CRITICAL", payload={"pid": current_pid, "error": str(e)})
                 raise RuntimeError(f"Permission denied killing Chrome PID: {e}")
             except psutil.NoSuchProcess:
                 continue
             except Exception as e:
-                log.dual_log(tag="Browser:Kill", message=f"Error killing process: {e}", level="WARNING")
+                log.dual_log(tag="Browser:Kill", message=f"Error killing process: {e}", level="WARNING", payload={"error": str(e)})
         
         if killed:
-            log.dual_log(tag="Browser:Kill", message=f"Surgically killed Chrome processes for {target_dir}")
+            log.dual_log(tag="Browser:Kill", message=f"Surgically killed Chrome processes for {target_dir}", payload={"profile": target_dir, "killed": True})
     
     def _init_driver(self) -> Driver:
         """
@@ -125,14 +125,14 @@ class ChromeDaemonManager:
         try:
             if hasattr(self._driver, '_browser') and hasattr(self._driver._browser, '_process_pid'):
                 self._pid = self._driver._browser._process_pid
-                log.dual_log(tag="Browser:Daemon", message=f"Chrome spawned with PID {self._pid}")
+                log.dual_log(tag="Browser:Daemon", message=f"Chrome spawned with PID {self._pid}", payload={"pid": self._pid})
             elif hasattr(self._driver, 'browser') and hasattr(self._driver.browser, 'process'):
                 self._pid = self._driver.browser.process.pid
-                log.dual_log(tag="Browser:Daemon", message=f"Chrome spawned with PID {self._pid}")
+                log.dual_log(tag="Browser:Daemon", message=f"Chrome spawned with PID {self._pid}", payload={"pid": self._pid})
             else:
-                log.dual_log(tag="Browser:Daemon", message="Chrome PID unavailable (driver structure unexpected)", level="WARNING")
+                log.dual_log(tag="Browser:Daemon", message="Chrome PID unavailable (driver structure unexpected)", level="WARNING", payload={"pid": None})
         except Exception as e:
-            log.dual_log(tag="Browser:Daemon", message=f"Failed to capture Chrome PID: {e}", level="WARNING")
+            log.dual_log(tag="Browser:Daemon", message=f"Failed to capture Chrome PID: {e}", level="WARNING", payload={"error": str(e)})
             self._pid = None
         
         # Clear SoM tracking for new session
@@ -141,7 +141,7 @@ class ChromeDaemonManager:
         
         # PHASE 1 FIX: Add mandatory 5-second stabilization delay
         if self._driver:
-            log.dual_log(tag="Browser:Daemon", message="Waiting 3s for Chrome CDP to settle...")
+            log.dual_log(tag="Browser:Daemon", message="Waiting 3s for Chrome CDP to settle...", payload={"delay_s": 3})
             self._driver.sleep(5)
             
         return self._driver
@@ -150,12 +150,12 @@ class ChromeDaemonManager:
         """Return the live Driver instance, re-initializing if session is dead."""
         with self._lock:
             if self._driver is None or not self.is_driver_alive():
-                log.dual_log(tag="Browser:Daemon", message="Initialising new Driver session.")
+                log.dual_log(tag="Browser:Daemon", message="Initialising new Driver session.", payload={"status": "INITIALIZING"})
                 if self._driver is not None:
                     try:
                         self._driver.close()
                     except Exception as e:
-                        log.dual_log(tag="Browser:Daemon", message=f"Error closing old driver: {e}", level="WARNING")
+                        log.dual_log(tag="Browser:Daemon", message=f"Error closing old driver: {e}", level="WARNING", payload={"error": str(e)})
                 self._init_driver()
             return self._driver
     
@@ -166,10 +166,10 @@ class ChromeDaemonManager:
                 try:
                     self._driver.close()
                 except Exception as e:
-                    log.dual_log(tag="Browser:Daemon", message=f"Error closing driver: {e}", level="WARNING")
+                    log.dual_log(tag="Browser:Daemon", message=f"Error closing driver: {e}", level="WARNING", payload={"error": str(e)})
                 self._driver = None
                 self._status = BrowserStatus.CRITICAL_FAILURE
-                log.dual_log(tag="Browser:Daemon", message="Driver shut down.")
+                log.dual_log(tag="Browser:Daemon", message="Driver shut down.", payload={"status": "CRITICAL_FAILURE"})
     
     def deep_warmup(self) -> bool:
         """
@@ -184,7 +184,7 @@ class ChromeDaemonManager:
             driver = self.get_or_create_driver()
             
             # Phase 0: Tab Management Test
-            log.dual_log(tag="Startup:Warmup", message="Phase 0: Tab Management Test")
+            log.dual_log(tag="Startup:Warmup", message="Phase 0: Tab Management Test", payload={"phase": "tab_management"})
             try:
                 log.dual_log(tag="Browser:Navigate", message=f"Navigating to: https://google.com", payload={"url": "https://google.com"})
                 driver.open_link_in_new_tab("https://google.com")
@@ -198,13 +198,13 @@ class ChromeDaemonManager:
                     from utils.som_utils import enforce_single_tab
                     enforce_single_tab(driver)
             except Exception as e:
-                log.dual_log(tag="Startup:Warmup", message=f"Tab test warning: {e}", level="WARNING")
-
+                log.dual_log(tag="Startup:Warmup", message=f"Tab test warning: {e}", level="WARNING", payload={"error": str(e)})
+            
             # Phase 1: Navigation Test
-            log.dual_log(tag="Startup:Warmup", message="Phase 1: Navigation Test")
+            log.dual_log(tag="Startup:Warmup", message="Phase 1: Navigation Test", payload={"phase": "navigation"})
             safe_google_get(driver, "https://www.spacejam.com/1996/")
             driver.short_random_sleep()
-
+            
             try:
                 page_html = (driver.page_html or "").lower()
                 expected = "space jam, characters, names, and all related".lower()
@@ -214,34 +214,34 @@ class ChromeDaemonManager:
                 raise RuntimeError(f"Navigation verification failed: {e}")
             
             # Phase 2: SoM Test
-            log.dual_log(tag="Startup:Warmup", message="Phase 2: SoM Injection Test")
+            log.dual_log(tag="Startup:Warmup", message="Phase 2: SoM Injection Test", payload=None)
             try:
                 reinject_all(driver, self._id_tracking)
             except Exception as e:
                 from utils.observation_adapter import MarkingError
                 if isinstance(e, MarkingError):
-                    log.dual_log(tag="Startup:Warmup", message="CRITICAL: JS Execution hung during SoM injection. Forcing surgical kill to prevent thread leak.", level="CRITICAL")
+                    log.dual_log(tag="Startup:Warmup", message="CRITICAL: JS Execution hung during SoM injection. Forcing surgical kill to prevent thread leak.", level="CRITICAL", payload={"action": "surgical_kill"})
                     self.surgical_kill()
                     self._status = BrowserStatus.CRITICAL_FAILURE
                     raise RuntimeError("SoM Injection caused infinite loop. Chrome killed.") from e
                 raise
-                 
+                
             main_range = self._id_tracking.get('main')
             if not main_range:
                 raise RuntimeError("SoM Injection failed: Tracking failed")
             
             # Phase 3: Vision Test
-            log.dual_log(tag="Startup:Warmup", message="Phase 3: Vision Subsystem Test")
+            log.dual_log(tag="Startup:Warmup", message="Phase 3: Vision Subsystem Test", payload=None)
             slices = capture_and_optimize(driver, 0)
             if not slices or not any(s.get("b64") for s in slices if s.get("status") == "OK"):
                 raise RuntimeError("Vision test failed: No valid slices produced")
             
-            log.dual_log(tag="Startup:Warmup", message="Deep Warmup Successful")
+            log.dual_log(tag="Startup:Warmup", message="Deep Warmup Successful", payload={"status": "SUCCESS"})
             # Set READY only after full verification
             self._status = BrowserStatus.READY
             return True
         except Exception as e:
-            log.dual_log(tag="Startup:Warmup", message=f"CRITICAL: Warmup Failed: {e}", level="CRITICAL")
+            log.dual_log(tag="Startup:Warmup", message=f"CRITICAL: Warmup Failed: {e}", level="CRITICAL", payload={"error": str(e)})
             self._status = BrowserStatus.CRITICAL_FAILURE
             return False
     

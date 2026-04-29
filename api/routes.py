@@ -41,7 +41,7 @@ def _ensure_writer_running() -> None:
     try:
         start_writer()
     except Exception:
-        log.dual_log(tag="API:Writer:Start", message="start_writer() failed (non-fatal)")
+        log.dual_log(tag="API:Writer:Start", message="start_writer() failed (non-fatal)", payload={"action": "writer_start_failed"})
 
 
 def get_session_id(request: Request) -> str:
@@ -139,7 +139,7 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
         "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (job_id, session_id, tool_name, json.dumps(args), "QUEUED", created, created),
     )
-    log.dual_log(tag="API:Job:Persist", message=f"Job {job_id} persisted", payload={"job_id": job_id})
+    log.dual_log(tag="API:Job:Persist", message=f"Job {job_id} persisted", payload={"job_id": job_id, "tool": tool_name, "session": session_id})
 
     # Ensure background writer is running
     _ensure_writer_running()
@@ -149,7 +149,7 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
         mgr = get_manager()
         mgr.start()
     except Exception as e:
-        log.dual_log(tag="API:Worker:Start", message=f"Failed to start worker manager: {e}", level="WARNING", exc_info=e)
+        log.dual_log(tag="API:Worker:Start", message=f"Failed to start worker manager: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
 
     return {"job_id": job_id, "status": "QUEUED"}
 
@@ -288,11 +288,14 @@ async def delete_job(job_id: str, request: Request):
         enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("CANCELLING", ts, job_id))
         # Write cancellation log to logs.db
         logs_enqueue_write(
-            "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (ULID.generate(), job_id, "system", "INFO", "CANCELLING", "Cancellation requested via API", None, ts),
+            "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ULID.generate(), job_id, "system", "INFO", "CANCELLING", "Cancellation requested via API", None, ULID.generate(), None, ts),
         )
     except Exception:
         pass
+
+    log.dual_log(tag="API:Job:Cancel", message=f"Cancel requested for job {job_id}", payload={"job_id": job_id, "had_flag": bool(flag)})
 
     if flag:
         flag.set()

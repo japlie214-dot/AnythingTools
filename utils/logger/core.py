@@ -3,17 +3,18 @@ import json
 import logging
 from typing import Any
 from datetime import datetime, timezone
+import warnings
+import traceback
 
 from utils.id_generator import ULID
 from utils.logger.formatters import _serialize_payload
 from utils.logger.handlers import (
     _cache_lock,
     _get_master_handlers,
-    _get_specialized_handler,
     _handler_cache,
     _normalize_exc_info,
 )
-from utils.logger.routing import LOG_MAP, _LOG_DIR
+from utils.logger.routing import _LOG_DIR
 from utils.logger.state import (
     _log_config,
     _tool_log_buffer,
@@ -24,7 +25,11 @@ _logger_cache: dict[str, "SumAnalLogger"] = {}
 
 
 class SumAnalLogger:
-    """Dual-stream logger: console + master file, optional specialized routing."""
+    """Dual-stream logger: console + master file.
+
+    The dual logger writes a brief, human-facing message to the console and
+    enqueues a complete structured JSON record into the ephemeral logs.db.
+    """
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -41,21 +46,30 @@ class SumAnalLogger:
         message: str,
         level: str = "INFO",
         payload: Any = None,
-        destination: str | None = None,
         exc_info: Exception | bool | tuple | None = None,
         status_state: str | None = None,
         notify_user: bool = False,
     ) -> None:
+        """Dual-stream logger: Console (Notification) + Database (Detail)."""
+        if payload is None:
+            warnings.warn(
+                f"[CONTRACT VIOLATION] tag={tag} has payload=None. Details must be logged to DB.",
+                UserWarning,
+                stacklevel=2,
+            )
+            payload = {"contract_violation": "No detail provided"}
+
         level_int = getattr(logging, level.upper(), logging.INFO)
         event_id = ULID.generate()
         extra = {"tag": tag, "payload": payload, "event_id": event_id}
 
         # 1. Console + master file via composed logger.
         self._logger.log(level_int, message, extra=extra, exc_info=exc_info)
-        
+
         if level_int >= logging.ERROR:
             try:
                 from utils.error_export import export_error_context
+
                 export_error_context(tag, message, _current_job_id.get())
             except Exception:
                 pass
@@ -63,79 +77,65 @@ class SumAnalLogger:
         # ── Logger Agent buffer capture ──────────────────────────────────────
         _buf = _tool_log_buffer.get()
         if _buf is not None:
-            _buf_payload = _serialize_payload(payload)
-            if _buf_payload is not None:
-                _buf_payload_str = json.dumps(_buf_payload, ensure_ascii=False, default=str)
-                _max_ctx = (
-                    getattr(_log_config, 'LOGGER_AGENT_MAX_CONTEXT', 100_000)
-                    if _log_config else 100_000
-                )
-                if len(_buf_payload_str) > _max_ctx:
-                    _marker = f"...[ENTRY TRUNCATED: original {len(_buf_payload_str)} chars]"
-                    _avail = _max_ctx - len(_marker)
-                    _buf_payload = (_buf_payload_str[:_avail] + _marker) if _avail > 0 else _marker
+            _ser = _serialize_payload(payload)
             _buf.append({
                 "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "level":     level.upper(),
-                "tag":       tag,
-                "message":   message,
-                "payload":   _buf_payload,
-                "status_state": status_state,  # carried for DB flush later
+                "level": level.upper(),
+                "tag": tag,
+                "message": message,
+                "payload": _ser,
+                "status_state": status_state,
+                "event_id": event_id,
             })
 
-        # 2. Specialized file via direct emit (no handler-list mutation).
-        if destination:
-            sp_handler = _get_specialized_handler(destination)
-            if sp_handler:
-                _exc = _normalize_exc_info(exc_info)
-                rec = logging.LogRecord(
-                    name=self._logger.name,
-                    level=level_int,
-                    pathname="",
-                    lineno=0,
-                    msg=message,
-                    args=(),
-                    exc_info=_exc,
-                )
-                rec.tag = tag
-                rec.payload = payload
-                rec.event_id = event_id
-                try:
-                    sp_handler.emit(rec)
-                except Exception:
-                    pass
-
-        # ── AnythingTools state sync & notifications ────────────────────────
-        # Immediate DB flush and job status + optional user notification.
+        # ── Structured Persistence (logs.db) ─────────────────────────────────
         job_id = _current_job_id.get()
-        if job_id:
-            payload_str = None
-            if payload is not None:
+        log_id = ULID.generate()
+        ts = datetime.now(timezone.utc).isoformat()
+
+        try:
+            payload_str = json.dumps(_serialize_payload(payload), ensure_ascii=False, default=str)
+        except Exception:
+            try:
+                payload_str = json.dumps(str(_serialize_payload(payload)), ensure_ascii=False)
+            except Exception:
+                payload_str = None
+
+        error_json = None
+        if exc_info:
+            _e = _normalize_exc_info(exc_info)
+            if _e and _e[0]:
                 try:
-                    payload_str = json.dumps(_serialize_payload(payload), ensure_ascii=False, default=str)
+                    error_json = json.dumps(
+                        {
+                            "type": _e[0].__name__,
+                            "message": str(_e[1]),
+                            "traceback": "".join(traceback.format_exception(*_e)),
+                        },
+                        ensure_ascii=False,
+                    )
                 except Exception:
-                    payload_str = None
+                    error_json = None
 
-            log_id = ULID.generate()
-            ts = datetime.now(timezone.utc).isoformat()
+        # Route logs to logs.db instead of main database
+        from database.logs_writer import logs_enqueue_write
 
-            # Route logs to logs.db instead of main database
-            from database.logs_writer import logs_enqueue_write
+        logs_enqueue_write(
+            "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (log_id, job_id, tag, level.upper(), status_state, message, payload_str, event_id, error_json, ts),
+        )
 
-            logs_enqueue_write(
-                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (log_id, job_id, tag, level.upper(), status_state, message, payload_str, ts),
+        if status_state:
+            from database.writer import enqueue_write
+
+            enqueue_write(
+                "UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?",
+                (status_state, ts, job_id),
             )
 
-            if status_state:
-                from database.writer import enqueue_write
-                enqueue_write(
-                    "UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?",
-                    (status_state, ts, job_id),
-                )
-
-            if notify_user:
-                pass # Telegram notifier removed for pure tool-hosting environment.
+        if notify_user:
+            pass  # Telegram notifier removed for pure tool-hosting environment.
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -179,8 +179,9 @@ def flush_tool_buffer_to_job_logs(job_id: str, buf: list[dict] | None) -> None:
                         payload_json = None
 
             logs_enqueue_write(
-                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (row_id, job_id, tag, level, status_state, message, payload_json, timestamp),
+                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row_id, job_id, tag, level, status_state, message, payload_json, entry.get("event_id"), None, timestamp),
             )
         except Exception as e:
             try:
@@ -195,31 +196,6 @@ def get_dual_logger(name: str) -> SumAnalLogger:
         if name not in _logger_cache:
             _logger_cache[name] = SumAnalLogger(name)
         return _logger_cache[name]
-
-
-def clear_sql_log(statement_type: str) -> None:
-    """Close cached handler, remove from cache, truncate the specialized file."""
-    if statement_type not in LOG_MAP:
-        return
-    filename = LOG_MAP[statement_type]
-    with _cache_lock:
-        if filename in _handler_cache:
-            handler = _handler_cache[filename]
-            handler.acquire()
-            try:
-                handler.close()
-            finally:
-                handler.release()
-            del _handler_cache[filename]
-        try:
-            open(_LOG_DIR / filename, "w").close()
-        except OSError:
-            pass
-
-
-def get_sql_logger(statement_type: str) -> SumAnalLogger:
-    """Convenience wrapper returning a SumAnalLogger named for *statement_type*."""
-    return get_dual_logger(f"sql.{statement_type.replace(' ', '_')}")
 
 
 def global_log_purge() -> None:

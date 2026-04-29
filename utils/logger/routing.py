@@ -1,13 +1,8 @@
 ﻿# utils/logger/routing.py
 from pathlib import Path
 
-# Shared by handlers.py (handler file creation) and core.py (clear_sql_log,
-# global_log_purge). Defined here — earlier in the DAG than both consumers —
-# to provide a single source of truth without cross-consumer coupling.
+# Shared by handlers.py and core.py. Keep _LOG_DIR, remove LOG_MAP which
+# implemented specialized file-routing. The dual-logger now writes only to
+# console + logs.db; any persistent file routing was removed by design.
 _LOG_DIR = Path("logs")
 
-LOG_MAP: dict[str, str] = {
-    "scraper": "scraper.log",
-    "draft_editor": "draft_editor.log",
-    "publisher": "publisher.log",
-}

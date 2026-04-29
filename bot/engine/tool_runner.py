@@ -29,12 +29,13 @@ async def run_tool_safely(tool: BaseTool, args: Dict[str, Any], telemetry: Any, 
         error_msg = f"Tool Execution Failure: {str(exc)}\n\nTraceback:\n{raw_tb}"
         if job_id:
             try:
-                from database.writer import enqueue_write
+                from database.logs_writer import logs_enqueue_write
                 from utils.id_generator import ULID
                 from datetime import datetime, timezone
-                enqueue_write(
-                    "INSERT INTO logs (id, job_id, tag, level, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (ULID.generate(), job_id, "ToolRunner:Error", "ERROR", error_msg, json.dumps({"traceback": raw_tb}), datetime.now(timezone.utc).isoformat())
+                logs_enqueue_write(
+                    "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ULID.generate(), job_id, "ToolRunner:Error", "ERROR", None, error_msg, json.dumps({"traceback": raw_tb}), ULID.generate(), None, datetime.now(timezone.utc).isoformat())
                 )
             except Exception as log_err:
                 log.dual_log(tag="ToolRunner", message=f"Failed to log error to logs: {log_err}", level="WARNING")

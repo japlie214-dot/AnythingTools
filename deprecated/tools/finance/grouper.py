@@ -125,10 +125,8 @@ async def run_grouping_loop(
     best_sql: Optional[str] = None
     current_args = {**prompt_args}
 
-    try:
-        clear_sql_log(statement_type)
-    except Exception:
-        pass
+    # Specialized file routing removed per new dual-logging contract.
+    # Any prior calls that passed 'destination' are now converted to plain dual_log
 
     for attempt in range(1, config.FINANCE_MAX_ATTEMPTS + 1):
         tag = f"Finance:Grouper:Attempt-{attempt}"
@@ -136,7 +134,6 @@ async def run_grouping_loop(
             tag=tag,
             message=f"[{statement_type}] Attempt {attempt}/{config.FINANCE_MAX_ATTEMPTS}",
             payload={"ticker": ticker},
-            destination=statement_type,
         )
 
         # Inject debugger suggestion from attempt 2 onwards
@@ -150,7 +147,6 @@ async def run_grouping_loop(
             message="LLM prompt generated.",
             level="DEBUG",
             payload=prompt,
-            destination=statement_type,
         )
         resp = await _llm.complete_chat(LLMRequest(
             messages=[{'role':'user','content':prompt}],
@@ -162,7 +158,6 @@ async def run_grouping_loop(
                 tag=tag,
                 message="LLM returned empty response.",
                 level="WARNING",
-                destination=statement_type,
             )
             current_args['errors'] = {'sql_errors': ['LLM returned empty response.']}
             await asyncio.sleep(3)
@@ -173,7 +168,6 @@ async def run_grouping_loop(
             message="LLM response received.",
             level="DEBUG",
             payload=resp.content,
-            destination=statement_type,
         )
 
         score, errors, sql = _score_sql(

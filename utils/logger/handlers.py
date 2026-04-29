@@ -6,7 +6,7 @@ import threading
 from typing import Any
 
 from utils.logger.formatters import ConsoleFormatter, FileFormatter, PayloadOrErrorFilter
-from utils.logger.routing import LOG_MAP, _LOG_DIR
+from utils.logger.routing import _LOG_DIR
 from utils.logger.state import _log_config
 
 # _handler_cache and _cache_lock are defined here and NOT in state.py because
@@ -33,10 +33,6 @@ def _get_master_handlers() -> tuple[logging.StreamHandler]:
         return (_handler_cache["master_console"],)
 
 
-def _get_specialized_handler(destination: str) -> None:
-    return None
-
-
 def _normalize_exc_info(exc_info: Any) -> tuple | None:
     """Normalize True / exception instance / tuple → (type, value, tb) or None."""
     if not exc_info:
@@ -46,3 +42,4 @@ def _normalize_exc_info(exc_info: Any) -> tuple | None:
     if isinstance(exc_info, tuple):
         return exc_info
     return sys.exc_info()
+
