@@ -21,8 +21,9 @@ except Exception:
     sqlite_vec = None  # type: ignore
     SQLITE_VEC_AVAILABLE = False
 
-# Path to the SQLite database file. Adjust as needed.
+# Path to the SQLite database files. Adjust as needed.
 DB_PATH = Path("data") / "sumanal.db"
+LOGS_DB_PATH = Path("data") / "logs.db"
 
 # Connection configuration constants
 READ_TIMEOUT_SECONDS = 30.0
@@ -103,6 +104,72 @@ class DatabaseManager:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        return conn
+
+    @classmethod
+    def close_read_connection(cls) -> None:
+        conn = getattr(cls._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            cls._local.conn = None
+
+
+class LogsDatabaseManager:
+    """Manager for the independent logs database with high-throughput pragmas."""
+    _local = threading.local()
+    _last_seen_generation = threading.local()
+
+    @classmethod
+    def get_read_connection(cls) -> sqlite3.Connection:
+        """Thread-local, query-only connection for read operations on logs.db."""
+        # Import writer generation at call-time to avoid circular import.
+        from database.logs_writer import get_logs_write_generation
+        
+        current_gen = get_logs_write_generation()
+
+        # Refresh connection if a newer write generation exists
+        if hasattr(cls._local, "conn") and cls._local.conn is not None:
+            last_seen = getattr(cls._last_seen_generation, "gen", -1)
+            if last_seen < current_gen:
+                try:
+                    cls._local.conn.close()
+                except Exception:
+                    pass
+                cls._local.conn = None
+
+        if not hasattr(cls._local, "conn") or cls._local.conn is None:
+            LOGS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(
+                str(LOGS_DB_PATH), timeout=READ_TIMEOUT_SECONDS, check_same_thread=True
+            )
+            conn.row_factory = sqlite3.Row
+            # High-throughput optimizations for logs
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = OFF")
+            conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+            conn.execute("PRAGMA query_only = ON")
+            cls._local.conn = conn
+
+        cls._last_seen_generation.gen = current_gen
+        return cls._local.conn
+
+    @classmethod
+    def get_connection(cls) -> sqlite3.Connection:
+        """Alias for read-only connections used throughout the codebase."""
+        return cls.get_read_connection()
+
+    @staticmethod
+    def create_write_connection() -> sqlite3.Connection:
+        """Dedicated connection for the logs writer thread."""
+        LOGS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(
+            str(LOGS_DB_PATH), timeout=READ_TIMEOUT_SECONDS, check_same_thread=True
+        )
+        conn.row_factory = sqlite3.Row
+        # High-throughput optimizations for logs
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = OFF")
         conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         return conn
 

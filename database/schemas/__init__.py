@@ -3,7 +3,7 @@
 import re
 from typing import Dict, Optional
 from database.connection import SQLITE_VEC_AVAILABLE
-from database.schemas import jobs, finance, vector, pdf, token
+from database.schemas import jobs, finance, vector, pdf, token, logs
 
 # RULE: MASTER_TABLES must be an ordered list (parents before children) for FK-safe restores.
 # RULE: Derived/External FTS tables (e.g., scraped_articles_fts) must NEVER be included here.
@@ -31,8 +31,13 @@ ALL_TRIGGERS: Dict[str, str] = {
     **vector.TRIGGERS
 }
 
+# Logs tables are separate
+LOGS_TABLES: Dict[str, str] = {
+    **logs.LOGS_TABLES
+}
+
 def get_init_script() -> str:
-    """Build the canonical init script from all domain modules."""
+    """Build the canonical init script for the main operational database."""
     parts = []
     for name, ddl in ALL_TABLES.items():
         parts.append(ddl)
@@ -50,7 +55,11 @@ def get_init_script() -> str:
         parts.append(ddl)
     return "\n".join(parts)
 
-def get_repair_script(table_name: str) -> Optional[str]:
+def get_logs_init_script() -> str:
+    """Build the canonical init script for the logs database."""
+    return "\n".join(LOGS_TABLES.values())
+
+def get_repair_script(table_name: str) -> str:
     """Return repair DDL for a single table or trigger with vec0 fallback."""
     if table_name in ALL_TABLES:
         return ALL_TABLES[table_name]
@@ -65,4 +74,5 @@ def get_repair_script(table_name: str) -> Optional[str]:
         )
     if table_name in ALL_TRIGGERS:
         return ALL_TRIGGERS[table_name]
-    return None
+    # LOGS_TABLES intentionally excluded - main DB writer never touches logs.db
+    return ""

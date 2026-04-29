@@ -33,19 +33,6 @@ CREATE INDEX idx_job_items_metadata ON job_items(
             json_extract(item_metadata, '$.ulid')
         );
 """,
-    "logs": """CREATE TABLE logs (
-            id TEXT PRIMARY KEY,
-            job_id TEXT,
-            tag TEXT,
-            level TEXT,
-            status_state TEXT,
-            message TEXT,
-            payload_json TEXT,
-            timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
-        );
-CREATE INDEX idx_logs_job_id ON logs(job_id, timestamp);
-""",
     "broadcast_batches": """CREATE TABLE broadcast_batches (
             batch_id TEXT PRIMARY KEY,
             target_site TEXT NOT NULL,

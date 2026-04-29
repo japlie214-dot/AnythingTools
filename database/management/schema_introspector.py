@@ -1,4 +1,4 @@
-# database/schema_introspector.py
+# database/management/schema_introspector.py
 
 import re
 import sqlite3
@@ -32,15 +32,6 @@ def trigger_exists(conn: sqlite3.Connection, trigger_name: str) -> bool:
         (trigger_name,),
     ).fetchone()
     return row is not None
-
-def _normalize_ddl(ddl: str) -> str:
-    """Remove IF NOT EXISTS, extra whitespace, and lower-case for comparison."""
-    ddl = re.sub(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS", "CREATE TABLE", ddl, flags=re.IGNORECASE)
-    ddl = re.sub(r"CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS", "CREATE INDEX", ddl, flags=re.IGNORECASE)
-    ddl = re.sub(r"CREATE\s+TRIGGER\s+IF\s+NOT\s+EXISTS", "CREATE TRIGGER", ddl, flags=re.IGNORECASE)
-    ddl = re.sub(r"CREATE\s+VIRTUAL\s+TABLE\s+IF\s+NOT\s+EXISTS", "CREATE VIRTUAL TABLE", ddl, flags=re.IGNORECASE)
-    ddl = " ".join(ddl.split())
-    return ddl.strip().lower()
 
 def _normalize_type_affinity(type_str: str) -> str:
     """Normalize SQLite dynamic types to standard affinities to prevent false drift."""

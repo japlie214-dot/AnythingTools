@@ -13,16 +13,19 @@ from tools.registry import REGISTRY
 from utils.logger.core import get_dual_logger
 from utils.id_generator import ULID
 from database.writer import start_writer, enqueue_write
-from database.connection import DatabaseManager
+from database.connection import DatabaseManager, LogsDatabaseManager
+from database.logs_writer import logs_enqueue_write
 from utils.artifact_manager import artifact_url_from_request
 from bot.engine.worker import get_manager
-from utils.security import scan_args_for_urls
 from pydantic import ValidationError
 
 # Backup imports
 from database.backup.config import BackupConfig
 from database.backup.runner import BackupRunner
 from utils.browser_lock import browser_lock
+
+# Security imports
+from utils.security import scan_args_for_urls
 
 log = get_dual_logger(__name__)
 router = APIRouter()
@@ -156,7 +159,7 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
 @router.post("/backup/export", response_model=ExportQueuedResponse)
 async def trigger_export(
     background_tasks: BackgroundTasks,
-    mode: str = Query("delta", description="Backup mode: 'full' or 'delta'")
+    mode: str = Query("full", description="Backup mode: 'full' or 'delta'")
 ):
     config = BackupConfig.from_global_config()
     if not config.enabled:
@@ -231,10 +234,10 @@ async def get_job_status(job_id: str, request: Request):
 
     status_val = row["status"]
 
-    # Load job logs from persistent store (logs)
+    # Load job logs from logs.db using LogsDatabaseManager
     job_logs = []
     try:
-        conn = DatabaseManager.get_read_connection()
+        conn = LogsDatabaseManager.get_read_connection()
         rows = conn.execute(
             "SELECT timestamp, level, tag, status_state, message FROM logs WHERE job_id = ? ORDER BY timestamp",
             (job_id,),
@@ -244,10 +247,10 @@ async def get_job_status(job_id: str, request: Request):
     except Exception:
         pass
 
-    # Attempt to read latest payload row from logs (payload_json) for final_payload
+    # Attempt to read latest payload row from logs.db (payload_json) for final_payload
     final_payload = None
     try:
-        conn = DatabaseManager.get_read_connection()
+        conn = LogsDatabaseManager.get_read_connection()
         p = conn.execute("SELECT payload_json FROM logs WHERE job_id = ? AND payload_json IS NOT NULL ORDER BY timestamp DESC LIMIT 1", (job_id,)).fetchone()
         if p and p["payload_json"]:
             try:
@@ -283,7 +286,8 @@ async def delete_job(job_id: str, request: Request):
     ts = now_iso()
     try:
         enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("CANCELLING", ts, job_id))
-        enqueue_write(
+        # Write cancellation log to logs.db
+        logs_enqueue_write(
             "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (ULID.generate(), job_id, "system", "INFO", "CANCELLING", "Cancellation requested via API", None, ts),
         )

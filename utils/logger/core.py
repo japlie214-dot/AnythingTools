@@ -119,14 +119,16 @@ class SumAnalLogger:
             log_id = ULID.generate()
             ts = datetime.now(timezone.utc).isoformat()
 
-            from database.writer import enqueue_write
+            # Route logs to logs.db instead of main database
+            from database.logs_writer import logs_enqueue_write
 
-            enqueue_write(
+            logs_enqueue_write(
                 "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (log_id, job_id, tag, level.upper(), status_state, message, payload_str, ts),
             )
 
             if status_state:
+                from database.writer import enqueue_write
                 enqueue_write(
                     "UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?",
                     (status_state, ts, job_id),
@@ -140,27 +142,19 @@ class SumAnalLogger:
 
 
 def flush_tool_buffer_to_job_logs(job_id: str, buf: list[dict] | None) -> None:
-    """Flush the in-memory tool log buffer into the persistent job_logs table.
+    """Flush the in-memory tool log buffer into the persistent logs.db.
 
     This function enqueues one INSERT per buffered entry using the single-writer
-    queue (enqueue_write) so all DB writes remain serialized and WAL-safe.
+    queue (logs_enqueue_write) so all DB writes remain serialized and WAL-safe.
 
     Entries that already had an immediate DB insert (marked by _persisted=True)
     are skipped to avoid duplicates.
     """
     if not job_id or not buf:
         return
-    try:
-        # local import to avoid circular import at module import time
-        from database.writer import enqueue_write
-    except Exception as e:
-        try:
-            get_dual_logger(__name__).dual_log(
-                tag="Logger:Flush", message=f"enqueue_write import failed: {e}", level="ERROR", exc_info=e
-            )
-        except Exception:
-            pass
-        return
+
+    # Import here to avoid circular import at module level
+    from database.logs_writer import logs_enqueue_write
 
     for entry in buf:
         # Skip entries that were already persisted immediately to job_logs.
@@ -184,7 +178,7 @@ def flush_tool_buffer_to_job_logs(job_id: str, buf: list[dict] | None) -> None:
                     except Exception:
                         payload_json = None
 
-            enqueue_write(
+            logs_enqueue_write(
                 "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (row_id, job_id, tag, level, status_state, message, payload_json, timestamp),
             )
