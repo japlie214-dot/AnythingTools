@@ -24,7 +24,8 @@ async def warmup_browser() -> None:
         if not success:
             raise RuntimeError("Browser failed internal health checks.")
     except asyncio.TimeoutError:
+        log.dual_log(tag="Startup:Browser", message="Browser warmup timed out.", level="ERROR", payload={"timeout_s": 60})
         raise RuntimeError("Browser warmup timed out after 90 seconds.")
     except Exception as e:
-        log.dual_log(tag="Startup:Browser", message=f"Warmup crashed: {e}", level="CRITICAL")
+        log.dual_log(tag="Startup:Browser", message=f"Warmup crashed: {e}", level="CRITICAL", payload={"error": str(e)})
         raise RuntimeError(f"Browser Warmup Failed: {e}")

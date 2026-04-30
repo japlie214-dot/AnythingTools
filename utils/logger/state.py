@@ -7,6 +7,9 @@ singletons used across the codebase.
 """
 
 import contextvars
+import threading
+
+_logger_ready = threading.Event()
 
 try:
     import config as _log_config  # read-only; may be None during early init

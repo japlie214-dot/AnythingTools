@@ -9,7 +9,51 @@ from clients.llm import get_llm_client, LLMRequest
 from clients.llm.utils import is_context_length_error
 from utils.logger import get_dual_logger
 from utils.logger.routing import DEBUGGER_FILE_MAP  # direct submodule import
-from tools.logger_agent.logger_prompts import trim_log_buffer
+
+import re
+
+_REDACT_KEYS = {
+    "password", "passwd", "token", "access_token", "api_key", "secret",
+    "private_key", "privateKey", "authorization", "auth", "key",
+}
+
+_RE_KEY_PATTERN = re.compile(
+    r'("(?P<k>{})"\s*:\s*)"([^\"]+)"'.format("|".join(re.escape(k) for k in _REDACT_KEYS)),
+    flags=re.IGNORECASE,
+)
+
+def _redact_payload(payload: dict) -> str:
+    try:
+        s = json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:
+        s = repr(payload)
+    if not s:
+        return ""
+    def repl(m: re.Match) -> str:
+        return f"{m.group(1)}\"<REDACTED>\""
+    try:
+        return _RE_KEY_PATTERN.sub(repl, s)
+    except Exception:
+        return s
+
+def trim_log_buffer(log_history: list[dict], max_chars: int) -> str:
+    if not log_history:
+        return ""
+    lines = []
+    for entry in log_history:
+        ts = entry.get("timestamp") or entry.get("time") or ""
+        lvl = entry.get("level") or entry.get("levelname") or ""
+        tag = entry.get("tag") or entry.get("logger") or entry.get("name") or ""
+        msg = entry.get("message") or entry.get("msg") or ""
+        payload = entry.get("payload") or entry.get("payload_json") or entry.get("extra") or {}
+        payload_s = _redact_payload(payload) if payload else ""
+        lines.append(f"{ts} {lvl} {tag}: {msg} | payload: {payload_s}" if payload_s else f"{ts} {lvl} {tag}: {msg}")
+    full = "\n".join(lines)
+    if len(full) <= max_chars:
+        return full
+    tail = full[-max_chars:]
+    nl = tail.find("\n")
+    return tail[nl+1:] if nl >= 0 else tail
 
 # All tags emitted here carry the "Debugger:" prefix — the Infinite Loop Guard
 # in dual_log() fires an unconditional early-return for any such tag.
@@ -65,6 +109,7 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
                         tag="Debugger:ContextAssembly",
                         message=f"Mapped file not found, skipping: {filepath}",
                         level="WARNING",
+                        payload={"file": str(filepath)},
                     )
                     continue
                 try:
@@ -75,6 +120,7 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
                         tag="Debugger:ContextAssembly",
                         message=f"Cannot read {filepath}: {read_err}",
                         level="WARNING",
+                        payload={"file": str(filepath), "error": str(read_err)},
                     )
                     continue
 
@@ -137,6 +183,7 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
                     message="Debugger Agent aborted after context-retry failure",
                     level="ERROR",
                     exc_info=exc,
+                    payload={"error": str(exc)},
                 )
                 return
 
@@ -155,6 +202,7 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
             tag="Debugger:Report",
             message=f"Debugger Agent report generated: {report_path}",
             level="INFO",
+            payload={"report_path": str(report_path)},
         )
 
     except Exception as agent_err:
@@ -165,4 +213,5 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
             message=f"Debugger Agent failed: {agent_err}",
             level="ERROR",
             exc_info=agent_err,
+            payload={"error": str(agent_err)},
         )

@@ -91,7 +91,7 @@ Below are the top-level directories and the primary files we used as evidence fo
   - Structured persistence of full details is written to the logs DB via [`database/logs_writer.py`](database/logs_writer.py:58).
   - The developer contract text is present in [`utils/logger/__init__.py`](utils/logger/__init__.py:4) with the explicit rule: "payload=None is a CONTRACT VIOLATION" (see [`utils/logger/__init__.py:12`](utils/logger/__init__.py:12)). The runtime enforces a warning when `payload` is omitted in [`utils/logger/core.py`](utils/logger/core.py:54).
 
-- Logs schema (concrete): `database/schemas/logs.py` defines the `logs` table with these columns (as present now): `id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp` (create DDL at [`database/schemas/logs.py:3`](database/schemas/logs.py:3)).
+- Logs schema (concrete): [`database/schemas/logs.py`](database/schemas/logs.py:3) defines the `logs` table with these columns (as present now): `id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp` (create DDL at [`database/schemas/logs.py:3`](database/schemas/logs.py:3)).
 
 - Single-writer invariant: All writes to main DB and logs DB are serialized through dedicated writer threads (`enqueue_write` in [`database/writer.py`](database/writer.py:141) and `logs_enqueue_write` in [`database/logs_writer.py`](database/logs_writer.py:101)). Reader connections refresh based on a write-generation counter implemented in [`database/writer.py`](database/writer.py:58) and [`database/logs_writer.py`](database/logs_writer.py:33) and observed by `DatabaseManager` and `LogsDatabaseManager` in [`database/connection.py`](database/connection.py:37, 127).
 
@@ -112,7 +112,7 @@ Below are the top-level directories and the primary files we used as evidence fo
   - Log write queue overflow: `logs_enqueue_write()` uses a bounded queue (`maxsize=5000`) and a 5-second blocking grace before falling back to a persistent `logs/fallback.log` (see [`database/logs_writer.py:14`](database/logs_writer.py:14) and fallback writer [`database/logs_writer.py:39`](database/logs_writer.py:39)).
   - Writer not running: `enqueue_write` attempts to `start_writer()` and logs (but will drop writes if it cannot start): see [`database/writer.py:150`](database/writer.py:150) and the subsequent `write_queue.put_nowait` handling at [`database/writer.py:167`](database/writer.py:167).
 
-- Configuration and runtime toggles: Config is read from [`config.py`](config.py:1) (module presence observed) and environment variables are honored — e.g., `SUMANAL_ALLOW_SCHEMA_RESET` referenced in `utils/startup/database.py` at [`utils/startup/database.py:81`](utils/startup/database.py:81).
+- Configuration and runtime toggles: Config is read from [`config.py`](config.py:1) (module presence observed) and environment variables are honored — e.g., `SUMANAL_ALLOW_SCHEMA_RESET` referenced in [`utils/startup/database.py`](utils/startup/database.py:81).
 
 
 6.  PUBLIC INTERFACES (precise endpoints & entry points)
@@ -141,7 +141,7 @@ Below are the top-level directories and the primary files we used as evidence fo
 - Data formats:
   - SQLite for structured data (main DB and logs DB). `logs.payload_json` stores JSON strings (`[`database/schemas/logs.py`](database/schemas/logs.py:3)).
   - Parquet used for backups/export (export logic present in [`database/backup/exporter.py`](database/backup/exporter.py:1); tests import `pyarrow`/`pandas` in [`tests/test_backup.py`](tests/test_backup.py:6)).
-  - Vector/BLOB formats for embeddings when `sqlite_vec` is not available: `database/connection.py` treats `sqlite_vec` as optional and degrades to BLOB storage (`[`database/connection.py:16`](database/connection.py:16)).
+  - Vector/BLOB formats for embeddings when `sqlite_vec` is not available: [`database/connection.py`](database/connection.py:16) treats `sqlite_vec` as optional and degrades to BLOB storage.
 
 - Reset/migration behavior (explicit):
   - On startup the lifecycle reconciler inspects schemas and may create or repair tables; destructive reset is controlled by `SUMANAL_ALLOW_SCHEMA_RESET` (`[`utils/startup/database.py`](utils/startup/database.py:81)).
@@ -155,29 +155,29 @@ Below are the top-level directories and the primary files we used as evidence fo
 - Integration points and external assumptions (code-level):
   - External LLM endpoints / clients are referenced by the client factory code in `clients/` and by callers that expect `get_llm_client(...)` (`[`bot/engine/tool_runner.py:15`](bot/engine/tool_runner.py:15)).
   - An external callback service (AnythingLLM) is exercised by `_do_callback_with_logging` in [`bot/engine/worker.py`](bot/engine/worker.py:37).
-  - Optional `sqlite_vec` extension: `database/connection.py` attempts to load `sqlite_vec` if available and the code contains fallbacks if it is absent (`[`database/connection.py:16`](database/connection.py:16)).
+  - Optional `sqlite_vec` extension: [`database/connection.py`](database/connection.py:16) attempts to load `sqlite_vec` if available and the code contains fallbacks if it is absent.
 
 
 9.  SETUP, BUILD, AND EXECUTION (explicit commands and preconditions)
 
 - Basic steps (reproducible from code evidence):
   1. Create a Python 3 environment and install packages referenced by imports (example modules observed: `fastapi`, `pydantic`, `httpx`, `pyarrow`, `pandas`, `psutil`, `botasaurus`/`selenium`). The repository contains `requirements.txt` at the root.
-  2. Ensure writable `data/` and `artifacts/` directories; `database/connection.py` creates parent directories where necessary (see `DB_PATH.parent.mkdir(...)` at [`database/connection.py:57`](database/connection.py:57)).
+  2. Ensure writable `data/` and `artifacts/` directories; [`database/connection.py`](database/connection.py:57) creates parent directories where necessary.
   3. Launch the application as the inline comment at the top of [`app.py`](app.py:8) suggests:
 
      ```bash
      python -m uvicorn app:app --reload --port 8000
      ```
 
-- Platform assumptions: Python 3.10+ (typing syntax used) and presence of Chrome/Chromium if browser-bound tools are executed — `utils/browser_daemon.py` expects `CHROME_USER_DATA_DIR` in config (`[`utils/browser_daemon.py:75`](utils/browser_daemon.py:75)).
+- Platform assumptions: Python 3.10+ (typing syntax used) and presence of Chrome/Chromium if browser-bound tools are executed — [`utils/browser_daemon.py`](utils/browser_daemon.py:75) expects `CHROME_USER_DATA_DIR` in config.
 
 
 10. TESTING & VALIDATION (what exists and gaps)
 
-- Tests present: `tests/test_backup.py` (evidence: [`tests/test_backup.py`](tests/test_backup.py:1)). The test file contains explicit assertions around `pyarrow` schemas and embedding validation (see tests importing `pyarrow` and `pandas` at [`tests/test_backup.py:6`](tests/test_backup.py:6)).
+- Tests present: [`tests/test_backup.py`](tests/test_backup.py:1) (evidence). The test file contains explicit assertions around `pyarrow` schemas and embedding validation (see tests importing `pyarrow` and `pandas` in [`tests/test_backup.py:6`](tests/test_backup.py:6)).
 
 - Test gaps visible from the repository:
-  - Core control paths lack test coverage visible in the repo: `bot/engine/worker.py` and `api/routes.py` (no corresponding test files referencing those modules are present in `tests/`).
+  - Core control paths lack test coverage visible in the repo: [`bot/engine/worker.py`](bot/engine/worker.py:177) and [`api/routes.py`](api/routes.py:1) (no corresponding test files referencing those modules are present in `tests/`).
   - The logging pipeline (`utils/logger/`) has no unit tests visible in `tests/`.
   - The browser lifecycle (`utils/browser_daemon.py`) does not have automated tests in `tests/`.
 
@@ -185,22 +185,22 @@ Below are the top-level directories and the primary files we used as evidence fo
 11. KNOWN LIMITATIONS & NON-GOALS (evidence-based)
 
 - Hard-coded or explicit constraints visible in code:
-  - `session_id` hardcoded to the string `"0"` as a fallback in multiple API code paths (`[`api/routes.py:53`](api/routes.py:53)).
+  - `session_id` hardcoded to the string "0" as a fallback in multiple API code paths ([`api/routes.py`](api/routes.py:53)).
   - Single API key approach enforced by `verify_api_key` in [`app.py`](app.py:26) — only a simple API key header is checked.
   - Single-writer SQLite architecture is used everywhere (see writer threads in [`database/writer.py`](database/writer.py:228) & [`database/logs_writer.py`](database/logs_writer.py:117)), limiting horizontal scale.
 
 - Specific implementation limitations observed in current files (concrete items needing attention):
-  - Residual legacy writes to the `logs` table using the main DB writer: example at [`tools/scraper/tool.py:75`](tools/scraper/tool.py:75) and additional occurrences at [`tools/scraper/tool.py:158`](tools/scraper/tool.py:158) where `enqueue_write(...)` is used to INSERT into `logs` using an older 8-column INSERT. This conflicts with the *current* `logs` schema (`[`database/schemas/logs.py`](database/schemas/logs.py:3)) and the intended `logs_enqueue_write(...)` producer (`[`database/logs_writer.py`](database/logs_writer.py:101)).
-  - `utils/logger/core.py` serializes payloads with a two-stage fallback that can produce a non-object JSON string for `payload_json` (see `payload_str` logic in [`utils/logger/core.py:96`](utils/logger/core.py:96)). The code attempts `json.dumps(_serialize_payload(payload))` and then `json.dumps(str(_serialize_payload(payload)))` as a fallback which results in a JSON string rather than a JSON object in the `payload_json` column. The code’s contract text in [`utils/logger/__init__.py`](utils/logger/__init__.py:12) requires structured JSON in payloads — this mismatch is visible in the implementation.
-  - Some places still log with `payload=None` which triggers the contract warning; examples in [`utils/browser_daemon.py`](utils/browser_daemon.py:217) (`payload=None` in `deep_warmup` logs) and other modules where `None` payloads remain present.
+  - Legacy log inserts in [`tools/scraper/tool.py`](tools/scraper/tool.py:75) use `enqueue_write(...)` to write directly to the `logs` table (examples at lines 75 and 158). These bypass the dedicated logs writer ([`database/logs_writer.py`](database/logs_writer.py:101)) and do not conform to the current `logs` schema defined in [`database/schemas/logs.py`](database/schemas/logs.py:3). Recommended action: migrate these inserts to `logs_enqueue_write(...)` and update INSERT statements to match the current column set (`id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp`).
+  - [`utils/logger/core.py`](utils/logger/core.py:102) falls back to serializing the payload as a JSON string when the primary structured serialization fails (see the payload serialization at [`utils/logger/core.py:102`](utils/logger/core.py:102)). This can store a JSON string in `payload_json` instead of a structured JSON object, violating the logger contract documented in [`utils/logger/__init__.py`](utils/logger/__init__.py:12). Recommended action: ensure `_serialize_payload` returns JSON-serializable objects and avoid string fallback; prefer explicit error handling and a safe fallback object.
+  - Several call sites still pass `payload=None` (e.g., [`utils/browser_daemon.py`](utils/browser_daemon.py:217)), which violates the logger contract requiring a non-empty dict. Recommended action: update call sites to provide an explicit payload object (`{}` or structured context) and audit the codebase for other occurrences. A helper script exists to help find violations: [`scripts/check_log_contract.py`](scripts/check_log_contract.py:1).
 
 
 12. CHANGE SENSITIVITY (what to watch when changing the code)
 
 - Most fragile areas (evidence and rationale):
-  1. Database lifecycle and schema reconciliation (`database/management/lifecycle.py`) — code executes DDL such as `DROP TABLE` and `CREATE TABLE` based on schema reconciliation. Mistakes here can destroy data (`[`database/management/lifecycle.py`](database/management/lifecycle.py:36)). Confidence: HIGH (explicit DDL operations present).
+  1. Database lifecycle and schema reconciliation (`database/management/lifecycle.py`) — code executes DDL such as `DROP TABLE` and `CREATE TABLE` based on schema reconciliation. Mistakes here can destroy data ([`database/management/lifecycle.py`](database/management/lifecycle.py:36)). Confidence: HIGH (explicit DDL operations present).
   2. Writer threading model (`database/writer.py` and `database/logs_writer.py`) — single-writer invariants and generation counters are used by `DatabaseManager`/`LogsDatabaseManager` to refresh read connections (`[`database/writer.py`](database/writer.py:66); [`database/connection.py`](database/connection.py:41,127)). Changes to this model require coordinated updates across readers and writers. Confidence: HIGH.
   3. Browser lifecycle/SoM instrumentation (`utils/browser_daemon.py` and `utils/som_utils`) — depends on fragile external browser process internals and JS injection. Confidence: HIGH.
 
 - Modules easiest to extend (evidence):
-  - Tool addition: adding a new tool module under `tools/` is straightforward; `tools/registry.py` performs discovery (`[`tools/registry.py`](tools/registry.py:1) present) and `api/routes.py` calls `REGISTRY.load_all()` at enqueue time (`[`api/routes.py:55`](api/routes.py:55)). Confidence: HIGH.
+  - Tool addition: adding a new tool module under `tools/` is straightforward; [`tools/registry.py`](tools/registry.py:1) performs discovery and [`api/routes.py`](api/routes.py:55) calls `REGISTRY.load_all()` at enqueue time. Confidence: HIGH.

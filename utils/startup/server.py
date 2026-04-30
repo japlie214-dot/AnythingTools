@@ -20,5 +20,5 @@ def get_mount_artifacts_step(app_instance):
             app_instance.mount("/api/artifacts", StaticFiles(directory=str(artifacts_dir)), name="artifacts")
             app_instance.mount("/artifacts", StaticFiles(directory=str(artifacts_dir)), name="artifacts_public")
 
-        log.dual_log(tag="Startup:Artifacts", message=f"Artifacts directory mounted at {artifacts_dir}", level="INFO")
+        log.dual_log(tag="Startup:Artifacts", message=f"Artifacts directory mounted at {artifacts_dir}", level="INFO", payload={"path": str(artifacts_dir)})
     return step

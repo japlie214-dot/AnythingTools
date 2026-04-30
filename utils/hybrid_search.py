@@ -90,7 +90,7 @@ async def execute_hybrid_search(
             vec_rows = conn.execute(vec_sql, [query_embedding, limit * 3] + valid_ulids).fetchall()
             vec_results = [dict(r) for r in vec_rows]
         except Exception as e:
-            log.dual_log(tag="Search:Hybrid:Vector", message=f"Vector search failed: {e}", level="WARNING", exc_info=e)
+            log.dual_log(tag="Search:Hybrid:Vector", message=f"Vector search failed: {e}", level="WARNING", exc_info=e, payload={"query": query, "error": str(e)})
 
     # 2. Keyword Search (FTS5)
     kw_results = []
@@ -110,7 +110,7 @@ async def execute_hybrid_search(
             kw_rows = conn.execute(kw_sql, [safe_query] + valid_ulids + [limit * 3]).fetchall()
             kw_results = [dict(r) for r in kw_rows]
         except Exception as e:
-            log.dual_log(tag="Search:Hybrid:Keyword", message=f"FTS5 keyword search failed: {e}", level="WARNING", exc_info=e)
+            log.dual_log(tag="Search:Hybrid:Keyword", message=f"FTS5 keyword search failed: {e}", level="WARNING", exc_info=e, payload={"safe_query": safe_query, "error": str(e)})
 
     # 3. Telemetry Logging
     log.dual_log(

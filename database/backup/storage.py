@@ -88,7 +88,7 @@ def write_table_batch(table_name: str, chunks_iter, config: BackupConfig) -> int
         if writer is not None:
             writer.close()
             temp_path.replace(dest)
-            log.dual_log(tag="Backup:Storage", level="INFO", message=f"Wrote {total_written} rows to {dest.name}")
+            log.dual_log(tag="Backup:Storage", level="INFO", message=f"Wrote {total_written} rows to {dest.name}", payload={"rows_written": total_written, "destination": dest.name})
         elif temp_path.exists():
             temp_path.unlink()
 
@@ -156,7 +156,7 @@ def export_all_tables(conn, config: Optional[BackupConfig] = None, mode: str = "
 
         return ExportResult(success=True, exported_counts=total_counts, duration_seconds=time.monotonic() - start)
     except Exception as e:
-        log.dual_log(tag="Backup:Export", message=f"Failed: {e}", level="ERROR", exc_info=e)
+        log.dual_log(tag="Backup:Export", message=f"Failed: {e}", level="ERROR", exc_info=e, payload={"error": str(e)})
         return ExportResult(success=False, error=str(e), duration_seconds=time.monotonic() - start)
 
 

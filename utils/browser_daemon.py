@@ -214,7 +214,7 @@ class ChromeDaemonManager:
                 raise RuntimeError(f"Navigation verification failed: {e}")
             
             # Phase 2: SoM Test
-            log.dual_log(tag="Startup:Warmup", message="Phase 2: SoM Injection Test", payload=None)
+            log.dual_log(tag="Startup:Warmup", message="Phase 2: SoM Injection Test", payload={"phase": "som_injection", "tracking_keys": list(self._id_tracking.keys())})
             try:
                 reinject_all(driver, self._id_tracking)
             except Exception as e:
@@ -231,7 +231,7 @@ class ChromeDaemonManager:
                 raise RuntimeError("SoM Injection failed: Tracking failed")
             
             # Phase 3: Vision Test
-            log.dual_log(tag="Startup:Warmup", message="Phase 3: Vision Subsystem Test", payload=None)
+            log.dual_log(tag="Startup:Warmup", message="Phase 3: Vision Subsystem Test", payload={"phase": "vision_subsystem", "driver_alive": self.is_driver_alive()})
             slices = capture_and_optimize(driver, 0)
             if not slices or not any(s.get("b64") for s in slices if s.get("status") == "OK"):
                 raise RuntimeError("Vision test failed: No valid slices produced")

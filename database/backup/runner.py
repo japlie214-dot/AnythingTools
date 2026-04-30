@@ -77,7 +77,7 @@ class BackupRunner:
         start = time.monotonic()
 
         # Block in background queue until scraper finishes
-        log.dual_log(tag="Backup:Restore", level="INFO", message="Waiting for browser_lock...")
+        log.dual_log(tag="Backup:Restore", level="INFO", message="Waiting for browser_lock...", payload={"action": "wait_lock"})
         browser_lock.acquire()
         try:
             # Restore only requires read access to schema info; writes are routed via enqueue_transaction.
@@ -93,7 +93,7 @@ class BackupRunner:
 
             return result
         except Exception as e:
-            log.dual_log(tag="Backup:Restore:Error", message=f"Restore failed: {e}", level="ERROR", exc_info=e)
+            log.dual_log(tag="Backup:Restore:Error", message=f"Restore failed: {e}", level="ERROR", exc_info=e, payload={"error": str(e)})
             if manual_job_id:
                 enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("FAILED", _utcnow(), manual_job_id))
             return RestoreResult(success=False, error=str(e), duration_seconds=time.monotonic() - start)

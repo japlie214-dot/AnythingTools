@@ -45,19 +45,15 @@ class SumAnalLogger:
         tag: str,
         message: str,
         level: str = "INFO",
-        payload: Any = None,
+        *,
+        payload: dict,
         exc_info: Exception | bool | tuple | None = None,
         status_state: str | None = None,
         notify_user: bool = False,
     ) -> None:
         """Dual-stream logger: Console (Notification) + Database (Detail)."""
-        if payload is None:
-            warnings.warn(
-                f"[CONTRACT VIOLATION] tag={tag} has payload=None. Details must be logged to DB.",
-                UserWarning,
-                stacklevel=2,
-            )
-            payload = {"contract_violation": "No detail provided"}
+        if not isinstance(payload, dict) or not payload:
+            raise TypeError(f"Hard Contract Violation: tag={tag} requires a non-empty dictionary payload.")
 
         level_int = getattr(logging, level.upper(), logging.INFO)
         event_id = ULID.generate()
@@ -66,11 +62,20 @@ class SumAnalLogger:
         # 1. Console + master file via composed logger.
         self._logger.log(level_int, message, extra=extra, exc_info=exc_info)
 
+        # Phase 1: If logger not ready, bypass DB writes and exit early.
+        from utils.logger.state import _logger_ready
+        if not _logger_ready.is_set():
+            return
+
         if level_int >= logging.ERROR:
             try:
-                from utils.error_export import export_error_context
-
-                export_error_context(tag, message, _current_job_id.get())
+                import threading
+                from utils.error_export import export_error_context_enhanced
+                threading.Thread(
+                    target=export_error_context_enhanced,
+                    args=(tag, message, _current_job_id.get(), event_id),
+                    daemon=True,
+                ).start()
             except Exception:
                 pass
 
@@ -185,7 +190,7 @@ def flush_tool_buffer_to_job_logs(job_id: str, buf: list[dict] | None) -> None:
             )
         except Exception as e:
             try:
-                get_dual_logger(__name__).dual_log(tag="Logger:Flush", message=f"Failed to enqueue job_log: {e}", level="ERROR", exc_info=e)
+                get_dual_logger(__name__).dual_log(tag="Logger:Flush", message=f"Failed to enqueue job_log: {e}", level="ERROR", exc_info=e, payload={"error": str(e)})
             except Exception:
                 pass
 

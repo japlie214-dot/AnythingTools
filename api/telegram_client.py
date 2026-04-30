@@ -31,7 +31,7 @@ class TelegramBot:
     @classmethod
     def set_chat_id(cls, chat_id: str):
         cls._chat_id = str(chat_id)
-        log.dual_log(tag="TelegramBot:Handshake", message=f"Bound to chat ID {chat_id}")
+        log.dual_log(tag="TelegramBot:Handshake", message=f"Bound to chat ID {chat_id}", payload={"chat_id": str(chat_id), "chat_id_last4": str(chat_id)[-4:]})
 
     @staticmethod
     async def send_chat_message(text: str, parse_mode: str = "HTML") -> bool:
@@ -54,11 +54,11 @@ class TelegramBot:
             )
             return True
         except RetryAfter as e:
-            log.dual_log(tag="TelegramBot", message=f"Rate limited. Sleeping {e.retry_after}s", level="WARNING")
+            log.dual_log(tag="TelegramBot", message=f"Rate limited. Sleeping {e.retry_after}s", level="WARNING", payload={"chat_id": chat_id, "retry_after": e.retry_after})
             await asyncio.sleep(e.retry_after)
             return await TelegramBot.send_chat_message(text, parse_mode)
         except TelegramError as e:
-            log.dual_log(tag="TelegramBot", message=f"Failed to send monitoring message: {e}", level="WARNING")
+            log.dual_log(tag="TelegramBot", message=f"Failed to send monitoring message: {e}", level="WARNING", payload={"chat_id": chat_id, "error": str(e)})
             return False
 
     @staticmethod
@@ -81,5 +81,5 @@ class TelegramBot:
             await asyncio.sleep(e.retry_after)
             await TelegramBot.send_poll(question, options, correct_option_id, explanation)
         except TelegramError as e:
-            log.dual_log(tag="TelegramBot", message=f"Failed to send poll: {e}", level="WARNING")
+            log.dual_log(tag="TelegramBot", message=f"Failed to send poll: {e}", level="WARNING", payload={"error": str(e)})
 

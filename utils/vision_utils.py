@@ -52,6 +52,7 @@ def _optimize_image_for_api(image_path: str, target_mb: int = 10) -> str | None:
             log.dual_log(
                 tag="Vision:Optimize",
                 message=f"Image optimized. Final size: {size / 1024 / 1024:.2f}MB",
+                payload={"final_size_bytes": size},
             )
             return base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception as e:
@@ -60,6 +61,7 @@ def _optimize_image_for_api(image_path: str, target_mb: int = 10) -> str | None:
             message="Image optimization failed.",
             level="ERROR",
             exc_info=e,
+            payload={"error": str(e)},
         )
         return None
 
@@ -95,6 +97,7 @@ def capture_and_optimize(driver: Driver, step_index: int) -> list[dict]:
             message=f"save_screenshot failed: {exc}",
             level="ERROR",
             exc_info=exc,
+            payload={"error": str(exc)},
         )
         return [{"b64": None, "path": None, "mime": None,
                  "status": "Screenshot Analysis Unavailable", "event_id": event_id}]

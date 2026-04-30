@@ -44,7 +44,7 @@ def execute_read_sql(sql: str, params: tuple = (), ensure_fresh: bool = False, a
                 from database.writer import wait_for_writes
                 asyncio.run(wait_for_writes())
             except Exception as e:
-                log.dual_log(tag="DB:Reader", message=f"ensure_fresh wait_for_writes failed: {e}", level="WARNING", exc_info=e)
+                log.dual_log(tag="DB:Reader", message=f"ensure_fresh wait_for_writes failed: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
 
     cur = _get_cursor()
     try:
@@ -52,7 +52,7 @@ def execute_read_sql(sql: str, params: tuple = (), ensure_fresh: bool = False, a
         rows = cur.fetchall()
         return [dict(r) for r in rows]
     except Exception as e:
-        log.dual_log(tag="DB:Reader", message=f"execute_read_sql failed: {e}", level="ERROR", exc_info=e)
+        log.dual_log(tag="DB:Reader", message=f"execute_read_sql failed: {e}", level="ERROR", exc_info=e, payload={"sql": sql, "params": params, "error": str(e)})
         raise ReaderError(str(e))
 def get_job_with_steps(job_id: str) -> Optional[Dict[str, Any]]:
     """Return job with parsed args and steps structure."""

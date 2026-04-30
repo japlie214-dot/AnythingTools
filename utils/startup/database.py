@@ -57,9 +57,16 @@ async def init_database_layer() -> None:
     
     # 3. Start writer threads
     start_writer()
-    from database.logs_writer import start_logs_writer
+    from database.logs_writer import start_logs_writer, verify_logs_readiness
     start_logs_writer()
     log.dual_log(tag="Startup:DB", message="All DB writer threads active", level="INFO", payload={"writers": ["main", "logs"]})
+    
+    # Verify logger readiness; abort if fails
+    if not verify_logs_readiness():
+        import os, signal, sys
+        sys.stderr.write("[FATAL] Logs database readiness check failed. Aborting startup.\n")
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
     
     # 4. Initialize log schema (if needed)
     try:

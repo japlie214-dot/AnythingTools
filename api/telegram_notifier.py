@@ -31,6 +31,6 @@ def notify_user_sync(text: str) -> None:
             asyncio.run(notify_user(text))
     except Exception:
         try:
-            log.dual_log(tag="API:Notifier", message=f"notify_user_sync fallback: {text}")
+            log.dual_log(tag="API:Notifier", message=f"notify_user_sync fallback: {text}", payload={"text_len": len(text) if text else 0, "text_preview": text[:200]})
         except Exception:
             pass

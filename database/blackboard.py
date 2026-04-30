@@ -60,7 +60,7 @@ class BlackboardService:
             "AND json_extract(item_metadata, '$.ulid') = ?",
             (json.dumps(output_data), datetime.now(timezone.utc).isoformat(), job_id, step_identifier),
         )
-        log.dual_log(tag="DB:WRITE:END", message=f"Step {step_identifier} persisted successfully")
+        log.dual_log(tag="DB:WRITE:END", message=f"Step {step_identifier} persisted successfully", payload={"step": step_identifier})
 
     @staticmethod
     def fail_step(job_id: str, step_identifier: str, error: str) -> None:

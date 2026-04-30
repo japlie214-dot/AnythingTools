@@ -41,14 +41,14 @@ def _build_insert_sql(table_name: str, desired_cols: List[Dict[str, Any]], file_
     pk_cols = [c["name"] for c in desired_cols if c["pk"]]
     missing_pk = [c for c in pk_cols if c not in file_cols]
     if missing_pk:
-        log.dual_log(tag="Backup:Restore", level="WARNING", message=f"Skipping {table_name}: missing PK columns {missing_pk}")
+        log.dual_log(tag="Backup:Restore", level="WARNING", message=f"Skipping {table_name}: missing PK columns {missing_pk}", payload={"table": table_name, "missing_pk": missing_pk})
         return None
 
     # Check required NOT NULL columns (not PK, no default)
     required = [c["name"] for c in desired_cols if c["notnull"] and not c["dflt_value"] and not c["pk"]]
     missing_required = [c for c in required if c not in file_cols]
     if missing_required:
-        log.dual_log(tag="Backup:Restore", level="WARNING", message=f"Skipping {table_name}: missing required NOT NULL columns {missing_required}")
+        log.dual_log(tag="Backup:Restore", level="WARNING", message=f"Skipping {table_name}: missing required NOT NULL columns {missing_required}", payload={"table": table_name, "missing_required": missing_required})
         return None
 
     # Build column list - only include columns that exist in backup
@@ -84,19 +84,19 @@ def restore_master_tables_direct(conn: sqlite3.Connection, table_names: Optional
 
         latest_file = _get_latest_parquet_file(config.table_dir(table_name), table_name)
         if not latest_file:
-            log.dual_log(tag="Backup:Restore", level="INFO", message=f"No backup data for {table_name}")
+            log.dual_log(tag="Backup:Restore", level="INFO", message=f"No backup data for {table_name}", payload={"table": table_name, "available": False})
             continue
 
         desired_cols = _get_columns(conn, table_name)
         if not desired_cols:
-            log.dual_log(tag="Backup:Restore", level="WARNING", message=f"Table {table_name} does not exist; cannot restore")
+            log.dual_log(tag="Backup:Restore", level="WARNING", message=f"Table {table_name} does not exist; cannot restore", payload={"table": table_name, "exists": False})
             continue
 
         try:
             parquet_file = pq.ParquetFile(latest_file)
             file_cols = parquet_file.schema.names
         except Exception as e:
-            log.dual_log(tag="Backup:Restore", level="ERROR", message=f"Failed to read Parquet file for {table_name}: {e}")
+            log.dual_log(tag="Backup:Restore", level="ERROR", message=f"Failed to read Parquet file for {table_name}: {e}", payload={"table": table_name, "file": str(latest_file) if latest_file else None, "error": str(e)})
             continue
 
         build_result = _build_insert_sql(table_name, desired_cols, file_cols)
@@ -132,15 +132,15 @@ def restore_master_tables_direct(conn: sqlite3.Connection, table_names: Optional
                 asyncio.run(wait_for_writes(timeout=120.0))
 
         except Exception as e:
-            log.dual_log(tag="Backup:Restore", level="ERROR", message=f"Transaction failed during restore of {table_name}: {e}")
+            log.dual_log(tag="Backup:Restore", level="ERROR", message=f"Transaction failed during restore of {table_name}: {e}", payload={"table": table_name, "error": str(e)})
             continue
 
         restored_counts[table_name] = count
-        log.dual_log(tag="Backup:Restore", level="INFO", message=f"Restored {count} rows into {table_name}")
+        log.dual_log(tag="Backup:Restore", level="INFO", message=f"Restored {count} rows into {table_name}", payload={"table": table_name, "rows_restored": count, "file": latest_file.name if latest_file else None})
 
     # Synchronous FTS rebuild at the tail-end
     if restored_counts.get("scraped_articles", 0) > 0:
-        log.dual_log(tag="Backup:Restore", level="INFO", message="Rebuilding FTS index synchronously...")
+        log.dual_log(tag="Backup:Restore", level="INFO", message="Rebuilding FTS index synchronously...", payload={"affected_table": "scraped_articles", "restored_rows": restored_counts.get("scraped_articles", 0)})
         from database.writer import enqueue_write, wait_for_writes
         import asyncio
         enqueue_write("INSERT INTO scraped_articles_fts(scraped_articles_fts) VALUES('rebuild')")
@@ -150,8 +150,8 @@ def restore_master_tables_direct(conn: sqlite3.Connection, table_names: Optional
                 asyncio.run_coroutine_threadsafe(wait_for_writes(timeout=300.0), loop).result()
             except RuntimeError:
                 asyncio.run(wait_for_writes(timeout=300.0))
-            log.dual_log(tag="Backup:Restore", level="INFO", message="FTS index rebuilt successfully.")
+            log.dual_log(tag="Backup:Restore", level="INFO", message="FTS index rebuilt successfully.", payload={"fts_rebuilt": True})
         except Exception as e:
-            log.dual_log(tag="Backup:Restore", level="ERROR", message=f"FTS rebuild failed: {e}")
+            log.dual_log(tag="Backup:Restore", level="ERROR", message=f"FTS rebuild failed: {e}", payload={"error": str(e)})
 
     return RestoreResult(success=True, restored_counts=restored_counts, duration_seconds=time.monotonic() - start)

@@ -46,42 +46,42 @@ async def lifespan(app: FastAPI):
     try:
         from utils.startup import run_startup
         await run_startup(app)
-        log.dual_log(tag="App:Lifespan", message="Startup completed successfully", level="INFO")
+        log.dual_log(tag="App:Lifespan", message="Startup completed successfully", level="INFO", payload={"status": "success"})
         yield
     except Exception as e:
-        log.dual_log(tag="App:Lifespan", message=f"Startup aborted: {e}", level="CRITICAL")
+        log.dual_log(tag="App:Lifespan", message=f"Startup aborted: {e}", level="CRITICAL", payload={"error": str(e), "startup_failed": True})
         startup_failed = True
     finally:
-        log.dual_log(tag="App:Shutdown", message="Initiating shutdown sequence...", level="INFO")
+        log.dual_log(tag="App:Shutdown", message="Initiating shutdown sequence...", level="INFO", payload={"phase": "init", "startup_failed": startup_failed})
         
         try:
             from bot.engine.worker import get_manager
             mgr = get_manager()
             
             if mgr:
-                log.dual_log(tag="App:Shutdown", message="Phase 1: Stopping worker manager polling loop", level="INFO")
+                log.dual_log(tag="App:Shutdown", message="Phase 1: Stopping worker manager polling loop", level="INFO", payload={"action": "stop_poll", "active_jobs": len(mgr._active_jobs)})
                 mgr.stop()
                 
-                log.dual_log(tag="App:Shutdown", message="Phase 2: Broadcasting cancellation to active workers", level="INFO")
+                log.dual_log(tag="App:Shutdown", message="Phase 2: Broadcasting cancellation to active workers", level="INFO", payload={"action": "broadcast_cancel", "cancellation_flags": len(mgr.cancellation_flags)})
                 for flag in list(mgr.cancellation_flags.values()):
                     flag.set()
                 
                 drain_start = time.time()
                 drain_timeout = 60.0
                 
-                log.dual_log(tag="App:Shutdown", message=f"Phase 3: Draining active jobs for up to {drain_timeout}s", level="INFO")
+                log.dual_log(tag="App:Shutdown", message="Draining active jobs", level="INFO", payload={"phase": 3, "drain_timeout_s": drain_timeout, "active_jobs": len(mgr._active_jobs)})
                 while mgr._active_jobs and (time.time() - drain_start < drain_timeout):
                     remaining = len(mgr._active_jobs)
-                    log.dual_log(tag="App:Shutdown", message=f"Draining {remaining} active job(s), elapsed: {time.time() - drain_start:.1f}s")
+                    log.dual_log(tag="App:Shutdown", message="Draining active jobs", payload={"remaining": remaining, "elapsed_s": round(time.time() - drain_start, 1)})
                     await asyncio.sleep(2)
                 
                 if mgr._active_jobs:
-                    log.dual_log(tag="App:Shutdown", message=f"Drain timeout exceeded, {len(mgr._active_jobs)} job(s) remaining", level="WARNING")
+                    log.dual_log(tag="App:Shutdown", message=f"Drain timeout exceeded, {len(mgr._active_jobs)} job(s) remaining", level="WARNING", payload={"remaining": len(mgr._active_jobs)})
                 else:
-                    log.dual_log(tag="App:Shutdown", message="All active jobs drained successfully", level="INFO")
+                    log.dual_log(tag="App:Shutdown", message="All active jobs drained successfully", level="INFO", payload={"drained": True, "elapsed_s": round(time.time() - drain_start, 1)})
             
-            log.dual_log(tag="App:Shutdown", message="Releasing browser resources", level="INFO")
             from utils.browser_daemon import daemon_manager
+            log.dual_log(tag="App:Shutdown", message="Releasing browser resources", level="INFO", payload={"daemon_pid": getattr(daemon_manager, "pid", None)})
             daemon_manager.shutdown_driver()
             daemon_manager.surgical_kill()
 
@@ -89,9 +89,9 @@ async def lifespan(app: FastAPI):
             await wait_for_writes()
             shutdown_writer()
             
-            log.dual_log(tag="App:Shutdown", message="Clean shutdown complete", level="INFO")
+            log.dual_log(tag="App:Shutdown", message="Clean shutdown complete", level="INFO", payload={"status": "clean", "startup_failed": startup_failed})
         except Exception as e:
-            log.dual_log(tag="App:Shutdown", message=f"Shutdown error: {e}", level="ERROR")
+            log.dual_log(tag="App:Shutdown", message=f"Shutdown error: {e}", level="ERROR", payload={"error": str(e)})
 
         if startup_failed:
             os._exit(1)

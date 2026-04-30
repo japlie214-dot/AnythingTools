@@ -38,7 +38,7 @@ async def run_tool_safely(tool: BaseTool, args: Dict[str, Any], telemetry: Any, 
                     (ULID.generate(), job_id, "ToolRunner:Error", "ERROR", None, error_msg, json.dumps({"traceback": raw_tb}), ULID.generate(), None, datetime.now(timezone.utc).isoformat())
                 )
             except Exception as log_err:
-                log.dual_log(tag="ToolRunner", message=f"Failed to log error to logs: {log_err}", level="WARNING")
+                log.dual_log(tag="ToolRunner", message=f"Failed to log error to logs: {log_err}", level="WARNING", payload={"error": str(log_err)})
         
         log.dual_log(tag="ToolRunner", message=f"Tool execution failed: {exc}", level="ERROR", payload={"job_id": job_id, "tool": tool.name})
         return ToolResult(output=error_msg, success=False)

@@ -53,6 +53,7 @@ class TelegramAPIClient:
             except TelegramError as e:
                 error_msg = str(e).lower()
                 is_perm = "chat not found" in error_msg or "blocked" in error_msg or "forbidden" in error_msg
+                log.dual_log(tag="Telegram:Send:Error", message=f"Telegram send error: {e}", level="WARNING", payload={"chat_id": chat_id, "error": str(e)})
                 return TelegramErrorInfo(success=False, is_permanent=is_perm, is_transient=not is_perm, description=str(e))
                 
         return TelegramErrorInfo(success=False, is_transient=True, description="Max retries exhausted")

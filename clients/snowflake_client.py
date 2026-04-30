@@ -74,6 +74,7 @@ class SnowflakeClient:
             log.dual_log(
                 tag="Snowflake",
                 message="Established new Snowflake connection via .p8 key-pair.",
+                payload={"account_last4": config.SNOWFLAKE_ACCOUNT[-4:] if config.SNOWFLAKE_ACCOUNT else None, "user": config.SNOWFLAKE_USER, "key_path": str(key_path)},
             )
 
     def embed(self, text: str, model: str = "voyage-multilingual-2") -> list[float]:

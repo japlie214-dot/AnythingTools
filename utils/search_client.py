@@ -37,7 +37,7 @@ class SearchClient:
                 return text_res + news_res
             except Exception as exc:
                 if attempt == SearchClient._DDGS_MAX_RETRIES:
-                    log.dual_log(tag="SearchClient", message=f"DDGS exhausted retries for '{query}'", level="ERROR", exc_info=True)
+                    log.dual_log(tag="SearchClient", message=f"DDGS exhausted retries for '{query}'", level="ERROR", exc_info=True, payload={"query": query})
                     break
                 time.sleep(SearchClient._DDGS_RETRY_DELAY_S)
         return []

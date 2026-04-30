@@ -43,6 +43,7 @@ def hitl_wait_for_operator(
             message="Operator typed 'Stop' — cancellation_flag set.",
             status_state="CANCELLED",
             notify_user=True,
+            payload={"action": "operator_stop"},
         )
         return False
 
@@ -71,6 +72,7 @@ async def hitl_wait_for_operator_async(
             message="Operator typed 'Stop' — cancellation_flag set.",
             status_state="CANCELLED",
             notify_user=True,
+            payload={"action": "operator_stop"},
         )
         return False
 

@@ -17,7 +17,7 @@ def safe_google_get(driver: Driver, url: str, *, bypass_cloudflare: bool = True)
             try:
                 enforce_single_tab(driver)
             except Exception as e:
-                _log.dual_log(tag="Browser:Utils", message=f"enforce_single_tab failed after google_get: {e}", level="WARNING", exc_info=e)
+                _log.dual_log(tag="Browser:Utils", message=f"enforce_single_tab failed after google_get: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
         except Exception:
             # Import may fail in constrained environments; ignore and continue.
             pass

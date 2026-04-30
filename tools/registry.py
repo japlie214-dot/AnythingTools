@@ -286,6 +286,7 @@ class ToolRegistry:
                     tag="Registry:Tools",
                     message=f"Allowed tool '{name}' not found in registry",
                     level="WARNING",
+                    payload={"tool": name, "status": "MISSING"},
                 )
                 continue
             tools.append({

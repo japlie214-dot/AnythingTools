@@ -48,7 +48,7 @@ def _attempt_table_repair(conn, table_name: str) -> bool:
     try:
         conn.executescript(script)
         conn.commit()
-        log.dual_log(tag="DB:Writer:Repair", message=f"Repaired table: {table_name}")
+        log.dual_log(tag="DB:Writer:Repair", message=f"Repaired table: {table_name}", payload={"table": table_name})
         return True
     except Exception:
         conn.rollback()
@@ -73,7 +73,7 @@ def db_writer_worker() -> None:
     """
     global _write_generation
     conn = DatabaseManager.create_write_connection()
-    log.dual_log(tag="DB:Writer:Start", message="DB writer thread started.")
+    log.dual_log(tag="DB:Writer:Start", message="DB writer thread started.", payload={"thread": "sqlite-writer", "queue_maxsize": write_queue.maxsize})
     while True:
         try:
             task = write_queue.get(timeout=1.0)
@@ -99,7 +99,7 @@ def db_writer_worker() -> None:
                             _write_generation += 1
                     except Exception as tx_err:
                         conn.rollback()
-                        log.dual_log(tag="DB:Writer:TxError", message=f"Transaction failed: {tx_err}", level="ERROR")
+                        log.dual_log(tag="DB:Writer:TxError", message=f"Transaction failed: {tx_err}", level="ERROR", payload={"error": str(tx_err), "transaction_type": "multi_statement"})
                 else:
                     for attempt in range(MAX_REPAIR_RETRIES + 1):
                         try:
@@ -135,7 +135,7 @@ def db_writer_worker() -> None:
             if shutdown_event.is_set() and write_queue.empty():
                 break
     conn.close()
-    log.dual_log(tag="DB:Writer:Stop", message="DB writer thread stopped.")
+    log.dual_log(tag="DB:Writer:Stop", message="DB writer thread stopped.", payload={"thread": "sqlite-writer", "stopped": True})
 
 
 def enqueue_write(sql: str, params: tuple = ()) -> None:
@@ -152,6 +152,7 @@ def enqueue_write(sql: str, params: tuple = ()) -> None:
             tag="DB:Writer",
             message="Writer thread not running; attempting restart.",
             level="WARNING",
+            payload={"thread_alive": False},
         )
         try:
             start_writer()
@@ -161,6 +162,7 @@ def enqueue_write(sql: str, params: tuple = ()) -> None:
                 message="Failed to start writer thread; write dropped.",
                 level="ERROR",
                 exc_info=e,
+                payload={"error": str(e)},
             )
             return
 
@@ -171,7 +173,7 @@ def enqueue_write(sql: str, params: tuple = ()) -> None:
             tag="DB:Writer",
             message="Write queue full; dropping non-critical write.",
             level="WARNING",
-            payload={"sql_preview": sql[:200]},
+            payload={"sql_preview": sql[:200], "qsize": write_queue.qsize()},
         )
 
 
@@ -188,6 +190,7 @@ def enqueue_execscript(script_text: str) -> None:
             tag="DB:Writer",
             message="Writer thread not running; attempting restart.",
             level="WARNING",
+            payload={"thread_alive": False},
         )
         try:
             start_writer()
@@ -207,7 +210,7 @@ def enqueue_execscript(script_text: str) -> None:
             tag="DB:Writer",
             message="Write queue full; dropping execscript.",
             level="WARNING",
-            payload={"script_head": script_text[:200]},
+            payload={"script_head": script_text[:200], "qsize": write_queue.qsize()},
         )
 
 
@@ -222,7 +225,7 @@ def enqueue_transaction(statements: list[tuple[str, tuple]]) -> None:
     try:
         write_queue.put_nowait((TRANSACTION_MARKER, statements))
     except queue.Full:
-        log.dual_log(tag="DB:Writer", message="Write queue full; dropping transaction.", level="WARNING")
+        log.dual_log(tag="DB:Writer", message="Write queue full; dropping transaction.", level="WARNING", payload={"qsize": write_queue.qsize(), "attempted_statements": len(statements)})
 
 
 def start_writer() -> threading.Thread:
@@ -249,7 +252,7 @@ async def wait_for_writes(timeout: float | None = None) -> bool:
         await asyncio.to_thread(write_queue.join)
         return True
     except Exception as e:
-        log.dual_log(tag="DB:Writer", message=f"wait_for_writes failed: {e}", level="WARNING", exc_info=e)
+        log.dual_log(tag="DB:Writer", message=f"wait_for_writes failed: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
         return False
 
 

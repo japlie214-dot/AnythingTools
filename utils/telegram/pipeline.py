@@ -61,7 +61,7 @@ class PublisherPipeline:
             valid_articles, skipped = validator.validate_batch(self.all_articles)
         except Exception as e:
             import traceback
-            log.dual_log(tag="Publisher:Pipeline:Crash", message=f"Validation phase crashed: {e}\n{traceback.format_exc()}", level="ERROR", exc_info=e)
+            log.dual_log(tag="Publisher:Pipeline:Crash", message=f"Validation phase crashed: {e}\n{traceback.format_exc()}", level="ERROR", exc_info=e, payload={"batch_id": self.batch_id, "job_id": self.job_id, "error": str(e)})
             raise RuntimeError(f"Publisher validation crashed: {e}") from e
         
         translator = BatchTranslator(self.job_id)
