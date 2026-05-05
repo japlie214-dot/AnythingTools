@@ -80,3 +80,80 @@ def export_error_context_enhanced(error_tag: str, error_message: str, job_id: st
         return filepath
     except Exception:
         return None
+
+
+def export_job_logs_to_file(job_id: str, final_status: str) -> Path | None:
+    """Export all logs for a specific job to a .txt file."""
+    import re
+    import sqlite3
+    from database.connection import LogsDatabaseManager
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        safe_status = re.sub(r'[<>:\"/\\|?*]', '_', final_status)[:20]
+        safe_job = re.sub(r'[<>:\"/\\|?*]', '_', job_id)[:30]
+        filename = f"job_{safe_job}_{safe_status}_{timestamp}.txt"
+        filepath = _LOG_DIR / filename
+        
+        db_entries = []
+        try:
+            conn = LogsDatabaseManager.get_read_connection()
+            rows = conn.execute(
+                "SELECT timestamp, level, tag, status_state, message, payload_json, error_json "
+                "FROM logs WHERE job_id = ? ORDER BY timestamp ASC",
+                (job_id,)
+            ).fetchall()
+            for r in rows:
+                entry = dict(r)
+                if entry.get("payload_json"):
+                    try:
+                        entry["payload"] = json.loads(entry["payload_json"])
+                    except Exception:
+                        entry["payload"] = entry["payload_json"]
+                if entry.get("error_json"):
+                    try:
+                        entry["error"] = json.loads(entry["error_json"])
+                    except Exception:
+                        entry["error"] = entry["error_json"]
+                db_entries.append(entry)
+        except Exception:
+            pass
+        
+        if not db_entries:
+            return None
+        
+        lines = [
+            "=" * 80,
+            f"JOB LOG EXPORT - {timestamp}",
+            "=" * 80,
+            f"Job ID: {job_id}",
+            f"Final Status: {final_status}",
+            f"Total Log Entries: {len(db_entries)}",
+            "-" * 80,
+            "LOG ENTRIES (chronological):",
+            "-" * 80,
+        ]
+        
+        for entry in db_entries:
+            ts = entry.get("timestamp", "")
+            lvl = entry.get("level", "")
+            tag = entry.get("tag", "")
+            state = entry.get("status_state") or ""
+            msg = entry.get("message", "")
+            payload = entry.get("payload")
+            error = entry.get("error")
+            
+            state_str = f" [{state}]" if state else ""
+            lines.append(f"[{ts}] [{lvl}] [{tag}]{state_str} {msg}")
+            if payload:
+                payload_str = json.dumps(payload, default=str, ensure_ascii=False) if not isinstance(payload, str) else payload
+                lines.append(f"  Payload: {payload_str}")
+            if error:
+                err_str = json.dumps(error, default=str, ensure_ascii=False) if not isinstance(error, str) else error
+                lines.append(f"  Error: {err_str}")
+        
+        lines.append("=" * 80)
+        filepath.write_text("\n".join(lines), encoding="utf-8")
+        return filepath
+    except Exception:
+        return None

@@ -18,10 +18,7 @@ async def cleanup_zombie_chrome() -> None:
             name = p.info["name"] or ""
             cmdline = " ".join(p.info["cmdline"] or [])
             if "chrome" in name.lower() or "chromium" in name.lower():
-                if p.status() == "zombie" or "--headless" in cmdline:
-                    zombie_count += 1
-                    p.kill()
-                elif os.name != "nt" and "DISPLAY" not in os.environ and "--headless" not in cmdline:
+                if p.status() == "zombie":
                     zombie_count += 1
                     p.kill()
         if zombie_count > 0:

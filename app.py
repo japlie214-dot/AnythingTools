@@ -128,8 +128,8 @@ public_router_no_auth = APIRouter()
 @public_router_no_auth.get("/manifest")
 async def public_manifest():
     from tools.registry import REGISTRY
-    REGISTRY.load_all()
     return {"tools": REGISTRY.schema_list()}
+
 
 app.include_router(public_router_no_auth, prefix="/api")
 

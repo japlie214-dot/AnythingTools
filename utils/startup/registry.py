@@ -6,7 +6,8 @@ from utils.logger.core import get_dual_logger
 log = get_dual_logger(__name__)
 
 async def load_tool_registry() -> None:
-    REGISTRY.load_all()
+    # Load the tool registry once at startup
+    REGISTRY.load_all(force=False)
     loaded_tools = list(REGISTRY._tools.keys())
     diagnostics = REGISTRY.diagnostic_list()
     

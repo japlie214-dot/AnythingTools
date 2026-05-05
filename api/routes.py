@@ -51,8 +51,6 @@ def get_session_id(request: Request) -> str:
 @router.post("/tools/{tool_name}", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
 async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
     session_id = "0"  # Hardcoded fallback for legacy DB constraints
-    # Refresh registry so code changes are visible
-    REGISTRY.load_all()
     meta = REGISTRY._tools.get(tool_name)
     if not meta:
         diagnostics = REGISTRY.diagnostic_list()
@@ -216,8 +214,8 @@ async def trigger_restore(background_tasks: BackgroundTasks):
 
 @router.get("/manifest")
 async def manifest():
-    REGISTRY.load_all()
     return {"tools": REGISTRY.schema_list()}
+
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)

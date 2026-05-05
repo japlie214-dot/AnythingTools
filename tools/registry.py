@@ -34,18 +34,22 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: Dict[str, Dict[str, Any]] = {}
+        self._loaded: bool = False
         self._discovery_results: Dict[str, Dict[str, Any]] = {}
         self._previous_discovery_results: Dict[str, Dict[str, Any]] = {}
 
     def diagnostic_list(self) -> Dict[str, Dict[str, Any]]:
         return self._discovery_results.copy()
 
-    def load_all(self) -> None:
+    def load_all(self, *, force: bool = False) -> None:
         """Import explicitly whitelisted core tools with state diffing.
         
         State diffing prevents log spam on repeated requests by only logging
         tool states that have changed since the last invocation.
         """
+        if self._loaded and not force:
+            return
+
         self._previous_discovery_results = self._discovery_results.copy()
         
         # Use temporary dicts to prevent transient 404s/503s during concurrent API requests
@@ -65,6 +69,8 @@ class ToolRegistry:
         self._discovery_results = temp_discovery
 
         self._log_state_changes()
+        
+        self._loaded = True
 
     def _discover_tool(self, package_dir: Path, tool_dir: str, temp_tools: dict, temp_discovery: dict) -> None:
         child = package_dir / tool_dir

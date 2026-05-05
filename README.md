@@ -1,180 +1,214 @@
-# AnythingTools — Codebase Reference (Exact, Current State)
+Project: AnythingTools
+=====================
 
-This README describes the repository as it exists right now. Every statement below is grounded on files present under the repository root and in-code comments; references to source files are provided for verification. Where the code is ambiguous or shows multiple possible interpretations, that ambiguity is explicitly stated.
+This repository is a self-contained tool-hosting and job-execution service that runs "tools" (pluggable worker-executable modules) and exposes them via an HTTP API. The codebase contains an HTTP server, a job queue persisted in SQLite, two background writer threads (one for application writes and a separate high-throughput writer for structured logs), a worker manager that claims and executes queued jobs, and a browser daemon used by browser-capable tools (notably the `scraper`).
 
-- Quick pointer to verify the application entrypoint: [`app.py`](app.py:1)
-- Configuration and environment-driven flags: [`config.py`](config.py:1)
+This README documents the repository as it exists now (no speculation). Every referenced file is shown as an exact code reference so the reader can inspect the implementation directly.
 
----
+Important top-level files you should inspect first:
+- [`app.py`](app.py:1)
+- [`config.py`](config.py:1)
+- [`api/routes.py`](api/routes.py:1)
+- [`bot/engine/worker.py`](bot/engine/worker.py:1)
+- [`tools/registry.py`](tools/registry.py:1)
+- [`tools/scraper/tool.py`](tools/scraper/tool.py:1)
+- [`tools/scraper/task.py`](tools/scraper/task.py:1)
+- [`database/writer.py`](database/writer.py:1)
+- [`database/logs_writer.py`](database/logs_writer.py:1)
+- [`database/connection.py`](database/connection.py:1)
+- [`utils/browser_daemon.py`](utils/browser_daemon.py:1)
+- [`utils/browser_lock.py`](utils/browser_lock.py:1)
+- [`utils/error_export.py`](utils/error_export.py:1)
+- [`tools/base.py`](tools/base.py:1)
 
 1. Project Overview
+-------------------
+Concrete, operational description (evidence-based):
+- The repository implements an HTTP API (FastAPI application started from [`app.py`](app.py:1) and [`api/routes.py`](api/routes.py:1)) that accepts job requests for named tools and persists those requests into an on-disk SQLite job table. See the SQL used in [`api/routes.py`](api/routes.py:1) when enqueuing jobs.
+- A background writer thread serializes all database writes to the primary SQLite database (`data/sumanal.db`) using a bounded queue. The writer is implemented in [`database/writer.py`](database/writer.py:1) using a `write_queue` and the `db_writer_worker` loop.
+- A separate logs subsystem writes structured log entries to a dedicated `logs.db` via a distinct, high-throughput writer implemented in [`database/logs_writer.py`](database/logs_writer.py:1) (the `logs_write_queue` and `logs_writer_worker`). The application pushes structured log entries into that queue through the dual logger in [`utils/logger/core.py`](utils/logger/core.py:1).
+- A worker manager (`UnifiedWorkerManager`) polls the `jobs` table and executes tool instances in isolated threads. Execution and lifecycle transitions (QUEUED → RUNNING → COMPLETED/PENDING_CALLBACK/FAILED/INTERRUPTED/ABANDONED) are visible in [`bot/engine/worker.py`](bot/engine/worker.py:1).
+- Browser-capable tools (e.g. the scraper) interact with a long-lived Chrome driver managed by a singleton manager in [`utils/browser_daemon.py`](utils/browser_daemon.py:1). Mutual exclusion across browser tasks is enforced by a synchronous `BrowserLockProxy` in [`utils/browser_lock.py`](utils/browser_lock.py:1) which wraps a `threading.Lock`.
 
-- What the system does (concrete, observable behavior):
-  - Hosts an HTTP API implemented with FastAPI: see [`app.py`](app.py:1). The application defines a lifespan (startup/shutdown) hook that runs an asynchronous startup routine and performs an orderly shutdown sequence that attempts to stop a worker manager, cancel worker flags, drain active jobs, and shut down database writer threads (see the lifespan implementation at [`app.py`](app.py:43)).
-  - Contains a modular set of "tools" (see the `tools/` package) that implement domain logic. The shipped tool with the largest surface area is the `scraper` tool, implemented under [`tools/scraper/`](tools/scraper/tool.py:1), which implements an end-to-end scraping pipeline: extraction, curation, artifact writing, and backup coordination.
-  - Provides background persistence and single-writer semantics for database writes via a background writer thread implemented in [`database/writer.py`](database/writer.py:1). There is an additional specialized writer for logs in [`database/logs_writer.py`](database/logs_writer.py:1).
-  - Exposes Telegram integration code under [`utils/telegram/`](utils/telegram/telegram_client.py:1) that uses `python-telegram-bot` exceptions (e.g., `RetryAfter`) and a rate limiter in [`utils/telegram/rate_limiter.py`](utils/telegram/rate_limiter.py:1).
+What the system actually solves (behavioral):
+- It accepts requests to run specific tool implementations (for example, the `scraper` tool), persists a durable job record, and ensures a background manager will claim and run the work. See the full enqueue flow in [`api/routes.py`](api/routes.py:1) and the worker claim/execute flow in [`bot/engine/worker.py`](bot/engine/worker.py:1).
 
-- What problem it actually solves (observed):
-  - The code orchestrates automation jobs (scraping/publishing) started via HTTP calls (API routes are located under `api/`), executes them asynchronously via a worker manager, persists results to local SQLite-backed tables, and provides artifact files under the `artifacts/` directory when produced by tools like the `scraper` (artifact writing helper in [`tools/scraper/tool.py`](tools/scraper/tool.py:311)).
-
-- What it explicitly does NOT do (observed omissions / absence):
-  - There is no frontend/UI code in the repository (no `frontend/` dir). The public surface is an HTTP API as in [`app.py`](app.py:100).
-  - There is no evidence of a distributed queueing system (no Celery, RabbitMQ client code). Background work is implemented with in-process threads and async tasks using the worker manager and the single-writer queue in [`database/writer.py`](database/writer.py:1).
-
----
+What the system explicitly does NOT do (evidence):
+- It does not perform runtime hot-reload of the tool registry. The current `ToolRegistry` uses a `_loaded` flag and `load_all(force=False)` semantics; the registry is loaded at startup via [`utils/startup/registry.py`](utils/startup/registry.py:1). See [`tools/registry.py`](tools/registry.py:1) for the `_loaded` short-circuit.
+- It is not a clustered, distributed job queue. The worker manager polls a local SQLite `jobs` table and uses local thread-based execution (no distributed coordination). See [`bot/engine/worker.py`](bot/engine/worker.py:1) and [`database/connection.py`](database/connection.py:1).
+- It does not persist arbitrary tool artifacts into external blob storage by default. Artifacts are written to an `artifacts/` directory via [`tools/scraper/tool.py`](tools/scraper/tool.py:1) (or the artifact manager). There are helpers to form artifact URLs, but there is no built-in S3/Cloud provider integration in the codebase (search for any cloud-specific storage code and you will find none).
 
 2. High-Level Architecture
+--------------------------
+Major components and responsibilities (explicit file-based evidence):
+- HTTP API server — [`app.py`](app.py:1) sets up the FastAPI app and the application lifespan. Router definitions and public endpoints are implemented in [`api/routes.py`](api/routes.py:1).
+- Tool Registry — [`tools/registry.py`](tools/registry.py:1) discovers and registers concrete `BaseTool` subclasses from the local `tools/` package. The registry exposes schema lists (`schema_list`) and a manifest helper for external callers.
+- Worker Manager — [`bot/engine/worker.py`](bot/engine/worker.py:1) polls the `jobs` table and spawns threads to execute tools. It manages lifecycle transitions and callback logic.
+- Tool execution wrapper — [`bot/engine/tool_runner.py`](bot/engine/tool_runner.py:1) provides centralized error handling when invoking a `BaseTool` implementation.
+- Tool implementations — The `tools/` package contains tool modules. The `scraper` tool ([`tools/scraper/tool.py`](tools/scraper/tool.py:1) + [`tools/scraper/task.py`](tools/scraper/task.py:1) and extraction helpers in [`tools/scraper/extraction.py`](tools/scraper/extraction.py:1)) is the most complete example: an entry-point wrapper (`ScraperTool`) and a browser-driven task implementation (`_run_botasaurus_scraper` in `task.py`).
+- Database writers — Two specialized writer threads serialize writes: the application writer in [`database/writer.py`](database/writer.py:1) (for `sumanal.db`) and the logs writer in [`database/logs_writer.py`](database/logs_writer.py:1) (for `logs.db`).
+- Browser daemon — [`utils/browser_daemon.py`](utils/browser_daemon.py:1) manages Chrome sessions, warmup, and surgical process termination. Consumer tools call `get_or_create_driver()` to obtain a `Driver` instance.
+- Logging and log exports — The structured logger in [`utils/logger/core.py`](utils/logger/core.py:1) writes JSON payloads to the logs queue; fatal job failures are exported to text files by functions in [`utils/error_export.py`](utils/error_export.py:1).
 
-- Major components and responsibilities (file references):
-  - HTTP API and application lifecycle: [`app.py`](app.py:1) and routes under `api/` (e.g., [`api/routes.py`](api/routes.py:1)).
-  - Startup orchestration and process-level initialization: [`utils/startup/`](utils/startup/__init__.py:1) and notably [`utils/startup/database.py`](utils/startup/database.py:1) (database writer startup, logs schema initialization, etc.).
-  - Logging subsystem (console + structured persistence): [`utils/logger/`](utils/logger/__init__.py:1) with core semantics in [`utils/logger/core.py`](utils/logger/core.py:1) and formatting/handlers in the same package.
-  - Persistence and single-writer queue: [`database/writer.py`](database/writer.py:1) (main writer), [`database/logs_writer.py`](database/logs_writer.py:1) (logs persistence), and schema definitions under [`database/schemas/`](database/schemas/__init__.py:1).
-  - Tools/Plugin registry: [`tools/registry.py`](tools/registry.py:1) and per-tool modules (example: [`tools/scraper/`](tools/scraper/tool.py:1)).
-  - Worker orchestration (in-process): [`bot/engine/worker.py`](bot/engine/worker.py:1) and supporting orchestrator code under `bot/orchestrator_core/`.
-  - External clients and integrations: `clients/` for LLM providers and Snowflake (e.g., [`clients/llm/providers/azure.py`](clients/llm/providers/azure.py:1), [`clients/snowflake_client.py`](clients/snowflake_client.py:1)).
+Data flow (end-to-end, step-by-step) — follow these specific code points to trace the flow:
+1. Client POST -> enqueue API: Client posts to `POST /api/tools/{tool_name}` handled by [`api/routes.py`](api/routes.py:1). The endpoint validates input (optional `INPUT_MODEL`) and writes a job row using `enqueue_write(...)` (see the SQL string in that file).
+2. DB write serialization: `enqueue_write` enqueues the SQL tuple to the bounded `write_queue` used by the writer thread in [`database/writer.py`](database/writer.py:1). The writer thread executes statements sequentially and increments a generation token (see `_write_generation`). Readers use `get_write_generation()` to determine when to refresh read connections (see [`database/connection.py`](database/connection.py:1)).
+3. Worker polling and claim: The `UnifiedWorkerManager` (constructed as a module-level singleton in [`bot/engine/worker.py`](bot/engine/worker.py:1)) periodically polls the `jobs` table (SQL shown in `_run_loop`) to find `QUEUED`/`INTERRUPTED`/ready `PENDING_CALLBACK` jobs and spawns threads via `spawn_thread_with_context` to execute them in `_run_job`.
+4. Tool instantiation and execution: The worker uses the `REGISTRY` (`tools/registry.py`), creates a tool instance (`create_tool_instance`) and calls `run_tool_safely` which calls `tool.execute` → `BaseTool.execute` → `tool.run`. See `bot/engine/tool_runner.py` and `tools/base.py`.
+5. Browser-bound tools: `ScraperTool` obtains a `Driver` from the browser daemon (`utils/browser_daemon.py`) and acquires `browser_lock` (see [`utils/browser_lock.py`](utils/browser_lock.py:1)) so only one browser task runs at a time.
+6. Tool output and callback: After tool completes, the worker normalizes the result, writes `result_json` to the jobs table, and calls `_do_callback_with_logging` to post structured callbacks to the external `AnythingLLM` endpoint (`config.ANYTHINGLLM_BASE_URL`) if configured. The callback sends a markdown message and never includes raw Base64 attachments (this is enforced in `_do_callback_with_logging` in [`bot/engine/worker.py`](bot/engine/worker.py:1)).
+7. Finalization and log export: For terminal failure states, the worker waits for the `logs_write_queue` to drain (up to a 60s timeout) and then calls `export_job_logs_to_file(job_id, final_status)` located in [`utils/error_export.py`](utils/error_export.py:1) to persist a job-level text log export.
 
-- Data flow (step-by-step, concrete):
-  1. An API request hits the FastAPI server (`app.py`), and route handlers (under `api/`) may create or enqueue a job. The app enforces an API key dependency (`app.py` lines 23–36 referencing [`config.py`](config.py:1)).
-  2. Jobs are recorded in SQLite-backed persistence (schemas in [`database/schemas/`](database/schemas/__init__.py:1)). Job items and statuses are managed via the job queue helpers under [`database/job_queue.py`](database/job_queue.py:1).
-  3. A worker manager (see [`bot/engine/worker.py`](bot/engine/worker.py:1)) polls or consumes the job queue, instantiates a tool via the `tools/` registry (`tools/registry.py`), and invokes the assigned tool's execution method (example: `ScraperTool._run_internal` in [`tools/scraper/tool.py`](tools/scraper/tool.py:33)).
-  4. Tools perform I/O (browsers, LLM calls); when writes to durable stores are needed, they call helper APIs that enqueue writes to the single-writer queue implemented in [`database/writer.py`](database/writer.py:1). Logs are dispatched through the structured logger (see [`utils/logger/core.py`](utils/logger/core.py:1)).
-  5. Long-running or error states are persisted in the job/job_items tables and (for backups) written to Parquet using backup helpers under `database/backup/` (see [`database/backup/runner.py`](database/backup/runner.py:1)).
-
-- Control flow / runtime model:
-  - The system is a hybrid: an HTTP server (async via FastAPI) that spawns/uses synchronous background threads (writer thread) and asynchronous worker tasks/threads for job execution — see `asynccontextmanager` usage in [`app.py`](app.py:43) and the background writer thread in [`database/writer.py`](database/writer.py:66).
-  - The logger implements a dual-stream model: console/master file vs. logs DB; structured entries are enqueued to a dedicated logs-writer queue (`utils/logger/core.py` and `database/logs_writer.py`).
-
----
+Execution model & lifecycle: The system is event-driven around the `jobs` table but implemented as a local poller (threaded), not a push/subscribe distributed queue. Lifespan and graceful shutdown are orchestrated in [`app.py`](app.py:1) (see the lifespan context where startup tasks run and where the shutdown sequence stops the worker manager, signals cancellations, drains jobs (60s max), shuts down the browser daemon, then waits for the writers to finish).
 
 3. Repository Structure (top-level walkthrough)
+---------------------------------------------
+Top-level layout (all paths are repository-relative):
 
-All top-level folders and critical files (present now):
+- [`app.py`](app.py:1) — FastAPI application entrypoint and lifecycle (startup/shutdown) orchestration.
+- [`config.py`](config.py:1) — Environment-backed configuration defaults. This module is imported widely; settings such as `ANYTHINGLLM_BASE_URL`, `TELEMETRY_DRY_RUN`, and `CHROME_USER_DATA_DIR` are defined here.
+- [`api/`](api:1) — HTTP route definitions and API-related helpers.
+  - [`api/routes.py`](api/routes.py:1) — The primary HTTP endpoints for job submission, backups, manifest, job status, and metrics.
+  - [`api/schemas.py`](api/schemas.py:1) — Pydantic request/response models referenced by the routes.
+- [`bot/`](bot:1) — Worker and orchestrator orchestration code.
+  - [`bot/engine/worker.py`](bot/engine/worker.py:1) — Unified worker manager and execution loop.
+  - [`bot/engine/tool_runner.py`](bot/engine/tool_runner.py:1) — Safe execution wrapper for tools.
+  - [`bot/orchestrator_core/`](bot/orchestrator_core:1) — SoM-aware orchestrator router used by orchestrated tool execution.
+- [`database/`](database:1) — DB connection and writer infrastructure and schemas.
+  - [`database/connection.py`](database/connection.py:1) — Encapsulates read/write SQLite connection creation and read-connection refresh via generation tokens. Uses `sumanal.db` and `logs.db` files.
+  - [`database/writer.py`](database/writer.py:1) — Main `write_queue` and writer thread (`db_writer_worker`) which executes SQL tasks deterministically.
+  - [`database/logs_writer.py`](database/logs_writer.py:1) — Specialized log writer for `logs.db` with its own `logs_write_queue` and stricter overflow handling.
+  - [`database/schemas/`](database/schemas:1) — SQL schema definitions and repair scripts used by the writer when `no such table` errors occur.
+- [`tools/`](tools:1) — Tool plugins (each tool is expected to provide a `BaseTool` subclass and potentially a `Skill` module for metadata).
+  - [`tools/registry.py`](tools/registry.py:1) — Lightweight discovery of whitelisted core tools and a manifest interface.
+  - Tool modules: `tools/scraper/`, `tools/draft_editor/`, `tools/publisher/`, `tools/batch_reader/` — `scraper` is the most complete and is implemented across `task.py`, `tool.py`, `extraction.py`, `persistence.py`, and related prompt files.
+- [`utils/`](utils:1) — Miscellaneous helpers: logging, browser management, text processing, artifact management, and startup hooks.
+  - [`utils/browser_daemon.py`](utils/browser_daemon.py:1) — Browser session lifecycle manager.
+  - [`utils/browser_lock.py`](utils/browser_lock.py:1) — Synchronous cross-thread lock for browser-bound tools.
+  - [`utils/error_export.py`](utils/error_export.py:1) — Utilities to export logs to text files (job-level and error-level exports).
+  - [`utils/logger/core.py`](utils/logger/core.py:1) — Structured dual logger that writes both to console and to the logs writer queue.
+  - [`utils/startup/`](utils/startup:1) — Startup orchestration; `run_startup` composes steps such as DB init, migrations, tool registry load, and browser warmup.
+- [`deprecated/`](deprecated:1) — Deprecated, legacy modules kept alongside the main code (evidence of prior architecture evolution). These files are not referenced by the main execution paths.
+- [`tests/`](tests:1) — A small test surface. Not comprehensive; see `tests/test_backup.py` and `tests/test_browser_e2e.py`.
 
-- `app.py` — FastAPI app entrypoint and lifespan hooks. See [`app.py`](app.py:1).
-- `config.py` — Environment-driven configuration and feature toggles (API key, telemetry flags, external service keys). See [`config.py`](config.py:1).
-- `api/` — HTTP route implementations and API wiring. Notably [`api/routes.py`](api/routes.py:1) mounts the main router used by the application.
-- `bot/` — Worker and orchestrator layer (manager, worker thread logic) used at runtime by the app. Example: [`bot/engine/worker.py`](bot/engine/worker.py:1).
-- `clients/` — External service clients (LLM, Snowflake, etc.). Example providers in [`clients/llm/providers/`](clients/llm/providers/azure.py:1) and a Snowflake client in [`clients/snowflake_client.py`](clients/snowflake_client.py:1).
-- `database/` — Persistence layer, single-writer queue, read/write helpers, backup/restore. Key files: [`database/writer.py`](database/writer.py:1), [`database/logs_writer.py`](database/logs_writer.py:1), schema scripts in `database/schemas/` (see [`database/schemas/logs.py`](database/schemas/logs.py:1)).
-- `tools/` — A registry and collection of tool modules; tools are functionally *plugins* that implement domain tasks. The `scraper` tool is at [`tools/scraper/tool.py`](tools/scraper/tool.py:1) with browser helpers at [`tools/scraper/browser.py`](tools/scraper/browser.py:1) and persistence internals at [`tools/scraper/persistence.py`](tools/scraper/persistence.py:1).
-- `utils/` — Reusable utilities (logging, browser helpers, HITL helpers, startup orchestration). Examples: [`utils/logger/`](utils/logger/__init__.py:1), [`utils/startup/database.py`](utils/startup/database.py:1), [`utils/hitl.py`](utils/hitl.py:1), and browser helpers under [`utils/browser_daemon.py`](utils/browser_daemon.py:1).
-- `tests/` — Automated tests present (at least `tests/test_backup.py` and `tests/test_browser_e2e.py`). These indicate unit/integration test artifacts exist but do not guarantee complete coverage.
-- `database/backup/` — Parquet export/import code and runner utilities (`database/backup/exporter.py` and `database/backup/runner.py`).
-- `deprecated/` — Legacy code and vestigial modules retained for historical or referential reasons (multiple submodules present). The folder contains multiple older tools and shows the codebase carried forward historical implementations.
-
-Why these directories exist (concrete reasons inferred from file contents):
-- `utils/logger/` contains a complete structured logging subsystem that writes both to console handlers and to a dedicated logs db; the code includes a programmer-facing "contract" requiring a non-empty structured payload (see [`utils/logger/__init__.py`](utils/logger/__init__.py:1) and [`utils/logger/core.py`](utils/logger/core.py:43)).
-- `database/` separates the main application schema (`database/writer.py`) from logs persistence (`database/logs_writer.py`) indicating deliberate separation of concerns in persistence for audit/logging.
-
----
+Why certain directories exist (observed patterns):
+- `deprecated/` contains many older tool implementations and indicates in-place refactors rather than repository deletion.
+- `tools/` groups concrete tool implementations; `tools/registry.py` is intentionally conservative and whitelists a small set of core tools.
 
 4. Core Concepts & Domain Model
+------------------------------
+Key runtime artifacts and their canonical forms (based on SQL and code usage):
 
-- Jobs & job_items: the code uses a job-based unit of work model stored in persistent tables. Evidence: presence of `database/job_queue.py` and the worker code in `bot/engine/worker.py`.
+- Job record (in `jobs` table): columns used in queries and inserts include (see SQL in [`api/routes.py`](api/routes.py:1) and [`database/schemas/jobs.py`](database/schemas/jobs.py:1)) — `job_id`, `session_id`, `tool_name`, `args_json`, `status`, `result_json`, `retry_count`, `created_at`, `updated_at`. The code assumes `args_json` and `result_json` are JSON-serializable strings.
 
-- Tools / registry: `tools/` modules implement units of executable work; `tools/registry.py` exposes a registry used by the HTTP manifest endpoint (see [`app.py`](app.py:128) which calls `REGISTRY.load_all()` before returning the manifest).
+- Job item record (for fine-grained step tracking): used by scraper partial-resume logic (see queries in [`tools/scraper/task.py`](tools/scraper/task.py:1)). The scraping pipeline writes `job_items` rows using `add_job_item(...)` and updates them with `update_item_status(...)`.
 
-- Logs: There are two log destinations: console/master file (via Python logging) and structured logs persisted to `logs` table in a logs DB handled by [`database/logs_writer.py`](database/logs_writer.py:1). The logging system enforces that log entries must include a non-empty `payload` dictionary — see the hard check in [`utils/logger/core.py`](utils/logger/core.py:43–56).
+- Logs records (in `logs` table): the logger enqueues tuples with fields: `id`, `job_id`, `tag`, `level`, `status_state`, `message`, `payload_json`, `event_id`, `error_json`, `timestamp`. The log-export utilities query these fields directly — see [`utils/logger/core.py`](utils/logger/core.py:1) and [`utils/error_export.py`](utils/error_export.py:1).
 
-- Artifacts: Tools may write artifact files to an `artifacts/` directory using helpers like `tools/scraper/tool.py`'s `write_artifact` (see [`tools/scraper/tool.py`](tools/scraper/tool.py:311)). Artifacts are recorded into an in-memory list and incorporated into final job payloads.
+- ToolResult / BaseTool contract: [`tools/base.py`](tools/base.py:1) defines `ToolResult` (a dataclass with `output: str`, `success: bool`, `attachment_paths: list[str] | None`, `event_id`) and `BaseTool.execute`/`run` semantics. The system expects `execute()` to return a `ToolResult` and `run()` to produce a string suitable for callback. `ToolResult.output` is often JSON-parseable but not required to be.
 
-- Concurrency invariants:
-  - Single writer: All durable writes are serialized through `enqueue_write` and the background writer thread in [`database/writer.py`](database/writer.py:66).
-  - Browser operations are guarded by a `browser_lock` (`utils/browser_lock.py`) to avoid concurrent driver access.
-  - Logger readiness gating: writes to logs DB are avoided until `verify_logs_readiness()` succeeds (see [`utils/startup/database.py`](utils/startup/database.py:75)).
+Invariants enforced by the code (observable):
+- Only one browser-capable tool may run at a time — enforced by `browser_lock` in [`utils/browser_lock.py`](utils/browser_lock.py:1) and used by tools like [`tools/scraper/tool.py`](tools/scraper/tool.py:1).
+- Database reader connections are long-lived per-thread and are refreshed when the writer increments a generation counter. Reader refresh logic is in [`database/connection.py`](database/connection.py:1).
+- Logs are written to a separate database with pragmas tuned for high-throughput writes (`PRAGMA synchronous = OFF`) – see [`database/connection.py`](database/connection.py:1) for the logs manager configuration.
 
----
+5. Detailed Behavior and Failure Modes
+-------------------------------------
+Normal run (end-to-end, mapped to files):
+1. POST /api/tools/{tool_name} -> [`api/routes.py`](api/routes.py:1) validates input (optionally using a tool-supplied `INPUT_MODEL`) and persists a `jobs` row via `enqueue_write()`.
+2. `database/writer.py`'s writer thread dequeues writes and safely executes SQL on `sumanal.db`. If a `no such table` error occurs, the writer attempts a repair script via `database/schemas` (see `_attempt_table_repair`).
+3. `UnifiedWorkerManager` periodically polls (`bot/engine/worker.py`), claims jobs, moves the job to `RUNNING` (via `enqueue_write`), and spawns a thread to run the tool.
+4. Tools are executed under `run_tool_safely` (`bot/engine/tool_runner.py`), which catches unhandled exceptions and writes a `ToolRunner:Error` log to `logs.db`.
+5. If the tool is browser-bound, it acquires the `browser_lock` for the entire `run()` invocation; scrapers use the `botasaurus` driver implementation via [`utils/browser_daemon.py`](utils/browser_daemon.py:1) and page/som extraction helpers in [`tools/scraper/extraction.py`](tools/scraper/extraction.py:1).
+6. Tool results are normalized and either: (a) posted back to an external AnythingLLM callback endpoint, or (b) written to the job `result_json` and job `status` updated. The callback code is in `_do_callback_with_logging` inside [`bot/engine/worker.py`](bot/engine/worker.py:1).
 
-5. Detailed Behavior (Normal execution and failure modes)
+Failure modes & error handling (explicitly evidenced):
+- Logs writer overflow is treated as fatal. In [`database/logs_writer.py`](database/logs_writer.py:1), if the logs queue is full and cannot be enqueued after a 5s block, the process issues a SIGTERM to itself. This is explicit and indicates the system favors fail-fast over silent loss of structured logs.
+- The DB writer (`database/writer.py`) uses a bounded queue and will attempt to restart the writer thread if missing; in `enqueue_write`, if the queue is full it currently logs a warning and drops the write (see `enqueue_write`), which means non-critical writes can be lost under pressure. That behavior is explicit in the code.
+- Worker crashes increment a per-job system error counter and may mark the job `INTERRUPTED` or `ABANDONED` after multiple attempts (see error handling in `_run_job` in [`bot/engine/worker.py`](bot/engine/worker.py:1)).
+- For terminal job failures (`FAILED`, `ABANDONED`, `PARTIAL`) the worker attempts to wait for the `logs_write_queue` to drain (up to 60s) before generating a job-level text export (`utils/error_export.py`), to avoid missing final fatal log entries.
+- Browser warmup failures set a `CRITICAL_FAILURE` status on the daemon and are treated as fatal in startup; see [`utils/browser_daemon.py`](utils/browser_daemon.py:1) and [`utils/startup/browser.py`](utils/startup/browser.py:1).
 
-- Normal startup sequence (as implemented now):
-  1. The FastAPI app's lifespan hook calls [`utils/startup.run_startup()`] (see [`app.py`](app.py:47)). The startup package wires multiple phases.
-  2. The database layer startup routine attempts a "Fresh Start" wipes of `logs.db` (see [`utils/startup/database.py`](utils/startup/database.py:16)). If the file unlink succeeds, the system proceeds. If unlink fails, the startup routine falls back to synchronously dropping and recreating the `logs` table using `LogsDatabaseManager.create_write_connection()` and executing the logs init script (see [`utils/startup/database.py`](utils/startup/database.py:33–41)). This fallback is a deliberate, synchronous remediation for file unlink failures.
-  3. The database writer thread(s) are started (`database/writer.start_writer()`; logs writer started via `database/logs_writer.start_logs_writer()`). The startup verifies logs readiness (`verify_logs_readiness()`) before proceeding (see [`utils/startup/database.py`](utils/startup/database.py:73–81)).
-  4. The worker manager (if any) starts and the system becomes able to process queued jobs.
+6. Public Interfaces
+--------------------
+HTTP endpoints (exposed under `/api` in [`app.py`](app.py:1) via `api/routes.py`):
+- POST /api/tools/{tool_name} — enqueue a job. Input shape is `JobCreateRequest` in [`api/schemas.py`](api/schemas.py:1). The handler validates input (using a tool's optional `INPUT_MODEL`) and enqueues the job.
+- POST /api/backup/export — starts a background export via `database.backup.runner.BackupRunner.run`. See [`api/routes.py`](api/routes.py:1).
+- POST /api/backup/restore — schedules a restore and enforces `browser_lock` in the handler.
+- GET /api/manifest — returns the tool manifest produced by [`tools/registry.py`](tools/registry.py:1).
+- GET /api/jobs/{job_id} — returns job status including recent logs from `logs.db` (see SQL in [`api/routes.py`](api/routes.py:1)).
+- DELETE /api/jobs/{job_id} — request cancellation: sets job status = `CANCELLING` and writes a cancellation log to `logs.db`.
 
-- What happens when a tool runs (scraper example):
-  - The `ScraperTool.run` method delegates to `_run_internal` which orchestrates extraction, curation, artifact writing, backup and finalization (see [`tools/scraper/tool.py`](tools/scraper/tool.py:33–279)).
-  - Extraction results are stored as artifacts via `write_artifact` (see [`tools/scraper/tool.py`](tools/scraper/tool.py:311)). Persisted artifacts are appended to a `artifacts_written` list and included in final job payloads.
-  - Writes to persistent storage are performed via `enqueue_write` (see [`database/writer.py`](database/writer.py:141)), ensuring a single-writer serialized queue.
+Worker-facing APIs (internal):
+- `REGISTRY.create_tool_instance(name)` — instantiate a tool class (factory in [`tools/registry.py`](tools/registry.py:1)).
+- `enqueue_write(sql, params)` and `enqueue_transaction(...)` — schedule DB writes to the single-writer thread (`database/writer.py`).
+- `logs_enqueue_write(sql, params)` — schedule log writes to `logs.db` (`database/logs_writer.py`).
 
-- Error modes and logging behavior:
-  - The `dual_log` API enforces that `payload` is a non-empty dict; failing to pass a valid payload causes a `TypeError` (see [`utils/logger/core.py`](utils/logger/core.py:43–56)). Many modules guard against this by constructing informative `payload` dicts for every `dual_log` invocation.
-  - Startup includes a robust fallback to re-create the `logs` table synchronously if unlinking `logs.db` fails (see [`utils/startup/database.py`](utils/startup/database.py:33–41)). This reduces a class of filesystem permission errors at startup.
-  - Write failures in the writer thread attempt repair for missing tables via `_attempt_table_repair` (see [`database/writer.py`](database/writer.py:42–55)). Transaction failures and foreign-key constraint failures are logged with explanatory `payload` entries.
-
-- Configuration toggles affecting behavior (concrete):
-  - `SUMANAL_ALLOW_SCHEMA_RESET` environment variable is consulted in [`database/management/lifecycle.py`](database/management/lifecycle.py:22) to decide whether a destructive reset is allowed (this is controlled through `os.getenv("SUMANAL_ALLOW_SCHEMA_RESET", "0") == "1"`).
-  - `TELEMETRY_DRY_RUN` in [`config.py`](config.py:1) can cause the `ScraperTool` to short-circuit to a dry-run failure payload (see [`tools/scraper/tool.py`](tools/scraper/tool.py:83–86)).
-
----
-
-6. Public Interfaces (entry points, APIs, CLI)
-
-- HTTP API: The app exposes routes under `/api` via the router in [`api/routes.py`](api/routes.py:1). The app implements API key verification with a header `X-API-Key` validated against [`config.py`](config.py:9) (see [`app.py`](app.py:23–36)).
-- Manifest endpoint: A public manifest is available at the public router `/api/manifest` which calls into the tools registry to enumerate available tools (see [`app.py`](app.py:128–132)).
-- CLI / run command: The top-level comment in [`app.py`](app.py:1) documents starting the HTTP server with `python -m uvicorn app:app --reload --port 8000` — this is the supported local development invocation.
-
----
+Tool contract (developer-facing):
+- `BaseTool` (`tools/base.py`) requires a `run()` coroutine and `execute()` wrapper returns a `ToolResult` dataclass. Tools should use `self.status()` for standardized telemetry messages and rely on `BaseTool.execute` to flush the in-memory tool log buffer to `logs.db` via `flush_tool_buffer_to_job_logs` in [`utils/logger/core.py`](utils/logger/core.py:1).
 
 7. State, Persistence, and Data
+--------------------------------
+Databases and files (explicit):
+- Primary application DB: `data/sumanal.db` (path defined in [`database/connection.py`](database/connection.py:1)). Used for persistent state: `jobs`, `scraped_articles`, `job_items`, etc.
+- Logs DB: `data/logs.db` — an independent SQLite instance tuned for high-throughput writes. The schema is consulted by the logger and by `utils/error_export.py` when assembling text exports.
+- Artifacts directory: `artifacts/` subdirectories per tool (written via `write_artifact` in [`tools/scraper/tool.py`](tools/scraper/tool.py:1)). Current implementation performs atomic writes using a temporary file and `os.replace`.
 
-- Where state is stored: local SQLite files (main DB and a separate logs DB). Database path constants are defined in `database/connection.py` (see [`database/connection.py`](database/connection.py:1)).
-- Schemas: Table DDL and initialization scripts live under [`database/schemas/`](database/schemas/__init__.py:1) (for example logs schema at [`database/schemas/logs.py`](database/schemas/logs.py:1)).
-- Backups & exports: Parquet backup/export code is under [`database/backup/`](database/backup/exporter.py:1), and the backup runner is at [`database/backup/runner.py`](database/backup/runner.py:1).
-- Artifact format: Artifacts are produced as files by tools (example `write_artifact` returns a `Path` and writes JSON in [`tools/scraper/tool.py`](tools/scraper/tool.py:311)).
-- Migration/cleanup: There is lifecycle/reconciler code for schema validation and automatic repairs in [`database/management/lifecycle.py`](database/management/lifecycle.py:1) and [`database/management/reconciler.py`](database/management/reconciler.py:1).
+Data lifecycles (evidence):
+- Writes are serialized by background writer threads. The code calls `await wait_for_writes()` and `shutdown_writer()` in the application shutdown sequence to wait for outstanding writes (see [`app.py`](app.py:1)).
+- Logs buffer flush: `BaseTool.execute` uses a per-job in-memory `_tool_log_buffer` and flushes it to the logs writer queue at the end of execute (see [`tools/base.py`](tools/base.py:1) referencing [`utils/logger/core.py`](utils/logger/core.py:1)).
+- Cleanup tasks: startup cleanup removes `*.tmp.parquet` files and kills zombie Chrome processes conservatively (see [`utils/startup/cleanup.py`](utils/startup/cleanup.py:1)).
 
----
+8. Dependencies & Integration
+-----------------------------
+Explicitly referenced libraries (observed via import statements):
+- `fastapi` and `uvicorn` (server and routing) — imports used in [`app.py`](app.py:1) and [`api/routes.py`](api/routes.py:1).
+- `httpx` — used by `_do_callback_with_logging` for HTTP callbacks (`bot/engine/worker.py`).
+- `bs4` (BeautifulSoup) — used by scraper extraction (`tools/scraper/extraction.py`).
+- `botasaurus` — the code imports `botasaurus.browser.Driver` in [`tools/scraper/task.py`](tools/scraper/task.py:1) indicating a heavy dependency on that external driver abstraction.
+- `psutil` — optionally used by browser process inspectors (`utils/browser_daemon.py`) and startup cleanup (`utils/startup/cleanup.py`). The code guards for `ImportError` and proceeds if `psutil` is not present in some places.
+- `dotenv` — `config.py` calls `load_dotenv()`.
+- `openai` — used by [`tools/scraper/extraction.py`](tools/scraper/extraction.py:1) for error detection (e.g., `BadRequestError`) when interacting with an LLM provider.
+- `sqlite_vec` — optional extension detection in [`database/connection.py`](database/connection.py:1) to provide vector search features if available.
 
-8. Dependencies & Integration (actually relied-upon libraries)
+Coupling points & environment assumptions (evidence):
+- The system assumes a POSIX/Windows filesystem for `data/` and `artifacts/` directories (created via `Path(...).mkdir(parents=True, exist_ok=True)`).
+- `CHROME_USER_DATA_DIR` environment variable provides a Chrome profile path consumed by the browser daemon (`config.py` and [`utils/browser_daemon.py`](utils/browser_daemon.py:1)).
+- External callback integration: `ANYTHINGLLM_BASE_URL`, `ANYTHINGLLM_API_KEY` are read from `config.py` and used to post structured callback messages in [`bot/engine/worker.py`](bot/engine/worker.py:1).
 
-Observably imported libraries in the codebase include (examples, based on in-file imports):
-- `fastapi` and `uvicorn` — used by the HTTP entrypoint (`app.py` imports `FastAPI` and documents `uvicorn`) → required for running the API.
-- `python-telegram-bot` — code imports `telegram.Bot`, `telegram.error.RetryAfter` in [`utils/telegram/telegram_client.py`](utils/telegram/telegram_client.py:4–6).
-- `bs4` (BeautifulSoup) — used for HTML extraction in [`tools/scraper/browser.py`](tools/scraper/browser.py:10).
-- `httpx` — imported by [`tools/scraper/tool.py`](tools/scraper/tool.py:8), used for HTTP requests.
-- `python-dotenv` — loaded in [`config.py`](config.py:4) via `load_dotenv()`.
-- The code also relies on numpy/struct-style binary packing for embeddings in [`tools/scraper/persistence.py`](tools/scraper/persistence.py:100) and Snowflake client integration (`clients/snowflake_client.py`).
+9. Setup, Build, and Execution (as-is)
+--------------------------------------
+Minimum steps (derived from the repository files):
+1. Create a Python environment with the packages required by imports above (e.g., `fastapi`, `uvicorn`, `httpx`, `bs4`, `python-dotenv`, and any LLM provider client used). The repository includes `requirements.txt` but the project relies on the imports shown in code; inspect [`requirements.txt`](requirements.txt:1) for an authoritative list.
+2. Edit environment variables as needed (see [`config.py`](config.py:1) for names and defaults).
+3. Initialize local data directories (the code will create `data/` and `artifacts/` automatically on first run).
+4. Run migrations / DB initialization. The startup sequence in [`utils/startup/core.py`](utils/startup/core.py:1) and [`utils/startup/database.py`](utils/startup/database.py:1) performs initialization when `app` is started. The recommended way is: run the FastAPI app via `uvicorn app:app --reload --port 8000` as the code comments indicate in [`app.py`](app.py:1).
 
-Coupling and assumptions:
-- The logging system assumes availability of a writable logs DB and a running logs writer (see [`utils/logger/core.py`](utils/logger/core.py:65–69)). Startup includes code to ensure the logs writer is running (see [`utils/startup/database.py`](utils/startup/database.py:73–81)).
-- The system expects local filesystem write permissions for `artifacts/` (artifact writing helper in [`tools/scraper/tool.py`](tools/scraper/tool.py:311)).
-
----
-
-9. Setup, Build, and Execution (exact steps observed from code)
-
-Minimal steps to run from a clean clone (based strictly on repository evidence):
-  1. Create a Python virtualenv and install packages from `requirements.txt` (the repository contains a `requirements.txt`).
-  2. Set a working API key via the environment variable `API_KEY` (the code uses `config.py` to read `API_KEY`).
-  3. Start the app in development: `python -m uvicorn app:app --reload --port 8000` (documented in the top-of-file comment in [`app.py`](app.py:1)).
-
-Notes and platform constraints:
-- The startup code includes platform-aware remediation for failing to unlink `logs.db` (see [`utils/startup/database.py`](utils/startup/database.py:24–42)) — this is necessary on Windows where files can be locked.
-- The code performs file I/O (artifact writing) and uses native SQLite; no containers or cloud orchestration is enforced by code artifacts.
-
----
+Platform constraints and explicit timeouts:
+- The browser warmup step has a 60-second timeout (see [`utils/startup/browser.py`](utils/startup/browser.py:1)).
+- The worker drain on shutdown waits up to 60 seconds for active jobs to finish (see [`app.py`](app.py:1)).
 
 10. Testing & Validation
+------------------------
+Tests present in the repo (evidence):
+- [`tests/test_backup.py`](tests/test_backup.py:1)
+- [`tests/test_browser_e2e.py`](tests/test_browser_e2e.py:1)
 
-- Test artifacts: `tests/test_backup.py` and `tests/test_browser_e2e.py` exist under `tests/`. Running `pytest` at the repository root is the conventional invocation; these test files indicate there is at least coverage for backup and a browser end-to-end flow.
-- Gaps visible from the repository: there are many modules (logging, tools, database lifecycle) with complex logic but only two test files visible in `tests/` — this suggests incomplete coverage for many critical paths (e.g., `utils/logger`, `database/writer`, `tools/*` usage). This is an explicit observation, not a judgment.
+Coverage notes (observable):
+- Tests are sparse and focused on a few integration behaviors such as backup and a browser E2E path. There is no comprehensive unit-test suite that isolates all critical modules (e.g., registry, worker manager, DB writer) visible in the `tests/` directory. This is an explicit repository observation.
 
----
+How to run tests: use the typical `pytest` invocation in the project root. See `tests/` for the exact files and what they assert.
 
-11. Known Limitations & Non-Goals (directly evidenced)
+11. Known Limitations & Non-Goals (direct evidence)
+---------------------------------------------------
+- Logs writer overflow is fatal (see `database/logs_writer.py`, where queue overflow triggers SIGTERM). This is an explicit design choice in the code.
+- The main DB writer may drop writes when under pressure — `enqueue_write` logs and drops writes when `write_queue.put_nowait` would raise `queue.Full`. This presents a known, observable trade-off (reduced latency vs guaranteed persistence) in the current implementation.
+- Tool registry is intentionally conservative and not dynamic at runtime — `tools/registry.py` implements whitelisting and has a `_loaded` gate that prevents repeated discovery unless `force=True`.
+- The scraper implements an in-module checkpoint/resume façade, but the current tool wrapper retains a no-op shim (`_check_step` and `_get_step_output`) meaning resumability is visually present in the codebase but functionally disabled. The shim is evidence that resumability was considered but the active code path forces full execution.
 
-- Logging contract: `dual_log` enforces `payload` to be a non-empty dict and will raise a `TypeError` if violated — which forces all call sites to supply structured payloads and means ad-hoc logging (no payload) is not supported by the code as it stands (`utils/logger/core.py`: check lines 43–56).
-- The presence of `deprecated/` demonstrates legacy code retained for reference rather than active use; modules in that directory are not visible to runtime wiring by default and should be considered vestigial.
-- Single-machine operation: the repository uses in-process worker manager and a single-writer SQLite queue; there is no evidence of clustering, distributed locks, or external queueing systems. This constrains scalability to the process/machine boundary.
-
----
-
-12. Change Sensitivity (fragile, tightly-coupled parts)
-
-- `utils/logger/core.py` and the `dual_log` contract are high-impact: many modules call `dual_log` and rely on the logs writer. Changing the signature of `dual_log` or the logs writer semantics will require wide changes across the codebase (`utils/logger/core.py` + every file that calls `dual_log`). Evidence: `dual_log` is invoked across many modules (search results show many call sites).
-- `database/writer.py` and the single-writer queue are central. Any change to write semantics or to the writer thread state machine requires coordinated changes across modules that call `enqueue_write` — see [`database/writer.py`](database/writer.py:141) and call sites throughout the code.
-- Browser concurrency: `browser_lock` and the `browser_daemon` code coordinate a single set of driver resources; adding parallel browser sessions would likely be invasive.
+12. Change Sensitivity (fragile areas)
+--------------------------------------
+Areas where small changes are likely to cause broad effects (observed code coupling):
+- The single-writer DB pattern in [`database/writer.py`](database/writer.py:1) couples write ordering and reader visibility to an in-memory generation token. Changing writer concurrency or swapping to a multi-writer design requires rethinking reader refresh logic across `DatabaseManager` and `LogsDatabaseManager`.
+- The dual-log path: console-then-logs writer design in [`utils/logger/core.py`](utils/logger/core.py:1) assumes the `logs_write_queue` and `logs_writer_worker` exist and are tuned for high throughput. Changing logging semantics will require touching many call sites.
+- Browser lifecycle: `utils/browser_daemon.py`](utils/browser_daemon.py:1) centralizes driver creation and surgical process kills. Changes there affect all browser-capable tools (notably `scraper`). The `browser_lock` concept spans multiple modules; removing it would require careful coordination.

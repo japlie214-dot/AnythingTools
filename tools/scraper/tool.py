@@ -25,6 +25,17 @@ log = get_dual_logger(__name__)
 from clients.llm.factory import get_llm_client, LLMRequest
 
 
+# Checkpoint helpers: no-op shims to preserve legacy call-sites and avoid NameError.
+# These intentionally force full linear execution when invoked.
+def _check_step(step_name: str) -> bool:
+    """Legacy checkpoint shim — always return False to force fresh execution of steps."""
+    return False
+
+
+def _get_step_output(step_name: str) -> dict:
+    """Legacy checkpoint shim — return empty output (no cached step outputs)."""
+    return {}
+
 class ScraperTool(BaseTool):
     name = "scraper"
     description = "Scrape and curate top articles from a target site. Returns a curated top 10 list enriched with insights."
@@ -34,7 +45,22 @@ class ScraperTool(BaseTool):
         """Execute the full scraper pipeline including extraction, curation, artifacts, and backup."""
         import threading
         cancellation_flag = cancellation_flag or threading.Event()
-        return await self._run_internal(args, telemetry, job_id, session_id, cancellation_flag, dry_run, **kwargs)
+        
+        if browser_lock.locked():
+            payload = {
+                "_callback_format": "structured",
+                "tool_name": self.name,
+                "status": "FAILED",
+                "summary": "System busy: another browser task is running.",
+                "details": {},
+            }
+            return json.dumps(payload, ensure_ascii=False)
+            
+        browser_lock.acquire()
+        try:
+            return await self._run_internal(args, telemetry, job_id, session_id, cancellation_flag, dry_run, **kwargs)
+        finally:
+            browser_lock.release()
 
     async def _run_internal(self, args: dict[str, Any], telemetry: Any, job_id: str | None, session_id: str | None, cancellation_flag: threading.Event, dry_run: bool | None, **kwargs) -> str:
         """Internal implementation with full pipeline."""
@@ -131,8 +157,9 @@ class ScraperTool(BaseTool):
             _scrape_driver = get_or_create_driver()
             
             with granular_log("Scraper:Botasaurus", target_site=target_site, job_id=job_id):
+                from tools.scraper.task import _run_botasaurus_scraper as _run_scraper
                 results = await asyncio.to_thread(
-                _run_botasaurus_scraper,
+                _run_scraper,
                 _scrape_driver,
                 {
                     "sync_telemetry": sync_telemetry,
@@ -143,8 +170,9 @@ class ScraperTool(BaseTool):
                 },
             )
             
-            # Release browser lock early so other tools can browse during our heavy I/O/LLM pipeline
-            browser_lock.safe_release()
+            # Browser lock must cover the entire job lifecycle per GOLDEN RULE 2.
+            # Do not release the browser lock early; it will be released in the outer run() finally block.
+            pass
 
             # Persist raw results to artifacts directory
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -173,19 +201,6 @@ class ScraperTool(BaseTool):
                     payload={"error": str(e), "artifact_type": "raw_json", "target_site": target_site}
                 )
 
-            # Extraction Step
-            extraction_meta = make_metadata("extract", batch_id)
-            if not _check_step("extract"):
-                await telemetry(self.status("Validating extraction...", "RUNNING"))
-                if job_id: add_job_item(job_id, extraction_meta, json.dumps({"target_site": target_site}))
-                if not results:
-                    if job_id: update_item_status(job_id, extraction_meta, "FAILED", json.dumps({"error": "Empty results"}))
-                    return _fail_internal("No results extracted.", "Check target site validity and network connectivity.")
-                if job_id: update_item_status(job_id, extraction_meta, "COMPLETED", json.dumps({"count": len(results), "batch_id": batch_id}))
-            else:
-                # Resume from checkpoint
-                out = _get_step_output("extract")
-                results = out.get("results", [])
 
             # Extraction Cleanup (Extract + Slim)
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before extraction cleanup.", "Job canceled.")
@@ -194,107 +209,129 @@ class ScraperTool(BaseTool):
             if not _check_step("slim"):
                 await telemetry(self.status("Extracting article links...", "RUNNING"))
                 if job_id: add_job_item(job_id, slim_meta, json.dumps({"target_site": target_site}))
-                from tools.scraper.extraction import ArticleSlimmer
-                slimmer = ArticleSlimmer()
-                with granular_log("Scraper:Slim", results_count=len(results)):
-                    slim_list = slimmer.slim(results, batch_id=batch_id)
-                if job_id: update_item_status(job_id, slim_meta, "COMPLETED", json.dumps({"slim_count": len(slim_list), "batch_id": batch_id}))
-            else:
-                out = _get_step_output("slim")
-                slim_list = out.get("slim_list", [])
+            # Extraction Step
+            extraction_meta = make_metadata("extract", batch_id)
+            await telemetry(self.status("Validating extraction...", "RUNNING"))
+            if job_id: add_job_item(job_id, extraction_meta, json.dumps({"target_site": target_site}))
+            
+            # results is a dict containing URLs mapped to article data, plus internal keys like _stats
+            _stats = results.get("_stats", {})
+            _job_final_status = results.get("_job_final_status", "COMPLETED")
+            
+            valid_results = {k: v for k, v in results.items() if not k.startswith("_")}
+            if not valid_results:
+                if job_id: update_item_status(job_id, extraction_meta, "FAILED", json.dumps({"error": "Empty results"}))
+                return _fail_internal("No results extracted.", "Check target site validity and network connectivity.")
+            if job_id: update_item_status(job_id, extraction_meta, "COMPLETED", json.dumps({"count": len(valid_results), "batch_id": batch_id}))
 
+            # Extraction Cleanup (Extract + Slim)
+            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before extraction cleanup.", "Job canceled.")
+
+            slim_meta = make_metadata("slim", batch_id)
+            await telemetry(self.status("Extracting article links...", "RUNNING"))
+            if job_id: add_job_item(job_id, slim_meta, json.dumps({"target_site": target_site}))
+            
+            # Inline slim list construction
+            slim_list = []
+            for _url, _res in valid_results.items():
+                if _res.get("status") == "SUCCESS" and _res.get("ulid"):
+                    slim_list.append({
+                        "ulid": _res["ulid"],
+                        "normalized_url": _res.get("normalized_url", ""),
+                        "title": _res.get("title", ""),
+                        "conclusion": _res.get("conclusion", "")
+                    })
+            
+            if job_id: update_item_status(job_id, slim_meta, "COMPLETED", json.dumps({"slim_count": len(slim_list), "batch_id": batch_id}))
+
+            # Curation Step
             # Curation Step
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before curation.", "Job canceled.")
             
             curate_meta = make_metadata("curate", batch_id)
-            if not _check_step("curate"):
-                await telemetry(self.status("Curating top articles...", "RUNNING"))
-                if job_id: add_job_item(job_id, curate_meta, "{}")
-                if slim_list:
+            await telemetry(self.status("Curating top articles...", "RUNNING"))
+            if job_id: add_job_item(job_id, curate_meta, "{}")
+            
+            top_10_list = []
+            target_curated_count = 10
+            if slim_list:
+                try:
                     from tools.scraper.curation import Top10Curator
                     curator = Top10Curator()
                     top_10_list, target_curated_count = curator.curate(slim_list, sync_llm_chat, batch_id=batch_id)
-                if job_id: update_item_status(job_id, curate_meta, "COMPLETED", json.dumps({"top_10": top_10_list, "target_count": target_curated_count}))
-            else:
-                out = _get_step_output("curate")
-                top_10_list = out.get("top_10", [])
-                target_curated_count = out.get("target_count", 10)
+                except Exception as _ce:
+                    log.dual_log(
+                        tag="Scraper:Curation",
+                        message=f"Curation sub-agent failed; falling back to first 10: {_ce}",
+                        level="WARNING",
+                        exc_info=_ce
+                    )
+                    top_10_list = slim_list[:10]
+                    target_curated_count = min(10, len(slim_list))
+            
+            if job_id: update_item_status(job_id, curate_meta, "COMPLETED", json.dumps({"top_10": top_10_list, "target_count": target_curated_count}))
 
             # Save Top 10 Artifact
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before artifact generation.", "Job canceled.")
             
             art_meta = make_metadata("artifacts", batch_id)
-            if not _check_step("artifacts"):
-                if job_id: add_job_item(job_id, art_meta, "{}")
-                try:
-                    top_10_path = write_artifact(
-                        tool_name="scraper", job_id=job_id or batch_id, artifact_type="top10", ext="json",
-                        content=json.dumps(top_10_list, indent=2, ensure_ascii=False)
-                    )
-                    self._last_artifacts = [str(top_10_path)]
-                    _record_artifact(top_10_path, "json", f"Curated Top {target_curated_count} articles")
-                    if job_id: update_item_status(job_id, art_meta, "COMPLETED", json.dumps({"path": str(top_10_path)}))
-                except Exception as e:
-                    log.dual_log(
-                        tag="Scraper:Artifact",
-                        message=f"Failed: {e}",
-                        level="WARNING",
-                        payload={"error": str(e), "artifact_type": "top10_json", "target_site": target_site}
-                    )
-                    top_10_path = raw_filepath
-                    if job_id: update_item_status(job_id, art_meta, "FAILED", "{}")
-            else:
-                out = _get_step_output("artifacts")
-                top_10_path = Path(out.get("path", raw_filepath))
+            if job_id: add_job_item(job_id, art_meta, "{}")
+            try:
+                top_10_path = write_artifact(
+                    tool_name="scraper", job_id=job_id or batch_id, artifact_type="top10", ext="json",
+                    content=json.dumps(top_10_list, indent=2, ensure_ascii=False)
+                )
                 self._last_artifacts = [str(top_10_path)]
-                _record_artifact(top_10_path, "json", f"Curated Top {target_curated_count} articles (Resumed)")
+                _record_artifact(top_10_path, "json", f"Curated Top {target_curated_count} articles")
+                if job_id: update_item_status(job_id, art_meta, "COMPLETED", json.dumps({"path": str(top_10_path)}))
+            except Exception as e:
+                log.dual_log(
+                    tag="Scraper:Artifact",
+                    message=f"Failed: {e}",
+                    level="WARNING",
+                    payload={"error": str(e), "artifact_type": "top10_json", "target_site": target_site}
+                )
+                top_10_path = raw_filepath if raw_filepath else ""
+                if job_id: update_item_status(job_id, art_meta, "FAILED", "{}")
 
             # Backup Sync Step
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before backup.", "Job canceled.")
             
             bak_meta = make_metadata("backup", batch_id)
-            if not _check_step("backup"):
-                await telemetry(self.status("Syncing backup to Parquet...", "RUNNING"))
-                if job_id: add_job_item(job_id, bak_meta, "{}")
-                from database.backup.runner import BackupRunner
-                bak_res = BackupRunner.run(mode="delta", trigger_type="auto")
-                if not bak_res.success and bak_res.error != "Disabled":
-                    if job_id: update_item_status(job_id, bak_meta, "FAILED", json.dumps({"error": bak_res.error}))
-                    return _fail_internal(f"Backup failed: {bak_res.error}", "Resolve disk/permissions and retry job.")
-                if job_id: update_item_status(job_id, bak_meta, "COMPLETED", json.dumps(bak_res.dict()))
-            else:
-                # Backup already completed, continue
-                pass
+            await telemetry(self.status("Syncing backup to Parquet...", "RUNNING"))
+            if job_id: add_job_item(job_id, bak_meta, "{}")
+            from database.backup.runner import BackupRunner
+            bak_res = BackupRunner.run(mode="delta", trigger_type="auto")
+            if not bak_res.success and bak_res.error != "Disabled":
+                if job_id: update_item_status(job_id, bak_meta, "FAILED", json.dumps({"error": bak_res.error}))
+                return _fail_internal(f"Backup failed: {bak_res.error}", "Resolve disk/permissions and retry job.")
+            if job_id: update_item_status(job_id, bak_meta, "COMPLETED", json.dumps(bak_res.dict()))
 
             # Finalization
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before finalization.", "Job canceled.")
 
             final_meta = make_metadata("finalize", batch_id)
-            if not _check_step("finalize"):
-                if job_id: add_job_item(job_id, final_meta, "{}")
-                result_payload = {
-                    "_callback_format": "structured",
-                    "tool_name": self.name,
-                    "status": "COMPLETED",
-                    "summary": f"Scraped and curated top {len(top_10_list)} articles from {target_site}",
-                    "details": {
-                        "target_site": target_site,
-                        "batch_id": batch_id,
-                        "extracted_count": len(results),
-                        "slim_count": len(slim_list),
-                        "curated_count": len(top_10_list),
-                        "target_curated_count": target_curated_count,
-                        "artifacts_written": artifacts_written,
-                    },
-                    "artifacts": [str(a["filename"]) for a in artifacts_written],
-                    "backup_status": bak_res.dict() if bak_res else {"success": True, "message": "Disabled or skipped"}
-                }
-                if job_id: update_item_status(job_id, final_meta, "COMPLETED", json.dumps(result_payload))
-                await telemetry(self.status("Completed", "COMPLETED", result_payload))
-                return json.dumps(result_payload, ensure_ascii=False)
-            else:
-                # Already finalized
-                return json.dumps({"status": "ALREADY_COMPLETED", "batch_id": batch_id}, ensure_ascii=False)
+            if job_id: add_job_item(job_id, final_meta, "{}")
+            result_payload = {
+                "_callback_format": "structured",
+                "tool_name": self.name,
+                "status": "COMPLETED",
+                "summary": f"Scraped and curated top {len(top_10_list)} articles from {target_site}",
+                "details": {
+                    "target_site": target_site,
+                    "batch_id": batch_id,
+                    "extracted_count": len(results),
+                    "slim_count": len(slim_list),
+                    "curated_count": len(top_10_list),
+                    "target_curated_count": target_curated_count,
+                    "artifacts_written": artifacts_written,
+                },
+                "artifacts": [str(a["filename"]) for a in artifacts_written],
+                "backup_status": bak_res.dict() if bak_res else {"success": True, "message": "Disabled or skipped"}
+            }
+            if job_id: update_item_status(job_id, final_meta, "COMPLETED", json.dumps(result_payload))
+            await telemetry(self.status("Completed", "COMPLETED", result_payload))
+            return json.dumps(result_payload, ensure_ascii=False)
 
         except Exception as e:
             log.dual_log(
@@ -311,40 +348,29 @@ class ScraperTool(BaseTool):
         return getattr(self, "_last_artifacts", [])
 
 
-def _check_step(step_name: str) -> bool:
-    """Check if a step was already completed (for resumability)."""
-    # This would check the job_items table for existing completed status
-    # For now, always return False to re-run (legacy behavior)
-    return False
-
-
-def _get_step_output(step_name: str) -> dict:
-    """Get output from a completed step."""
-    return {}
-
-
-def _run_botasaurus_scraper(driver, context) -> List[Dict]:
-    """Extract articles using Botasaurus scraper."""
-    # Implementation would use the scraper browser logic
-    # Placeholder for actual implementation
-    return []
-
+# Checkpoint helpers relocated to module top; no-op placeholder retained for compatibility.
 
 def write_artifact(tool_name: str, job_id: str, artifact_type: str, ext: str, content: str) -> Path:
-    """Write artifact to disk and return Path."""
+    """Write artifact to disk and return Path using atomic replacement.
+
+    Raises an exception on failure so caller can surface fatal errors.
+    """
     from pathlib import Path
     import os
-    
+    import tempfile
+
     # Create artifacts directory
     artifacts_dir = Path("artifacts") / tool_name
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Generate filename
     filename = f"{job_id}_{artifact_type}.{ext}"
     filepath = artifacts_dir / filename
-    
-    # Write content
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
-    
+
+    # Atomic write
+    with tempfile.NamedTemporaryFile("w", dir=artifacts_dir, delete=False, suffix=".tmp", encoding="utf-8") as tf:
+        tf.write(content)
+        temp_name = tf.name
+    os.replace(temp_name, filepath)
+
     return filepath

@@ -203,8 +203,9 @@ class UnifiedWorkerManager:
         """Poll for jobs and spawn execution threads (no session locks)."""
         while not self._stop_event.is_set():
             try:
-                # Refresh registry for new tools
-                REGISTRY.load_all()
+                # Tool registry is loaded at startup; skip repeated loads here.
+                pass
+
                 
                 conn = DatabaseManager.get_read_connection()
                 # Prioritize INTERRUPTED (recovery) jobs, then QUEUED
@@ -407,6 +408,39 @@ class UnifiedWorkerManager:
                     enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("INTERRUPTED", now_iso(), job_id))
             
         finally:
+            # Export job logs to file for any terminal failure state. We must wait
+            # briefly for the asynchronous logs writer queue to drain so that the
+            # final fatal log entries are persisted before we snapshot them.
+            try:
+                final_status = None
+                try:
+                    conn = DatabaseManager.get_read_connection()
+                    row = conn.execute("SELECT status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                    if row:
+                        final_status = row["status"]
+                except Exception:
+                    final_status = None
+
+                if final_status in ("FAILED", "ABANDONED", "PARTIAL"):
+                    try:
+                        from database.logs_writer import logs_write_queue
+                        import time as _t
+                        start_wait = _t.time()
+                        while not logs_write_queue.empty() and (_t.time() - start_wait) < 60:
+                            _t.sleep(0.5)
+
+                        from utils.error_export import export_job_logs_to_file
+                        export_job_logs_to_file(job_id, final_status)
+                    except Exception as export_err:
+                        log.dual_log(
+                            tag="Worker:LogExport",
+                            message=f"Failed to export job logs: {export_err}",
+                            level="WARNING",
+                            payload={"job_id": job_id, "error": str(export_err)}
+                        )
+            except Exception:
+                pass
+
             if job_id in self._active_jobs:
                 del self._active_jobs[job_id]
 
