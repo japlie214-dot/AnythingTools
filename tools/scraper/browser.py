@@ -47,6 +47,7 @@ def _capture_screenshot_b64(driver: Driver) -> str | None:
             tag="Scraper:Screenshot",
             message=f"Screenshot capture failed (non-fatal): {exc}",
             level="WARNING",
+            payload={"error": str(exc), "error_type": type(exc).__name__}
         )
         return None
 
@@ -151,6 +152,7 @@ def extract_hybrid_html(driver: Driver) -> tuple[str, int]:
             tag="Scraper:Extract:Hybrid",
             message=f"Greedy extraction failed: {e}",
             level="ERROR",
-            exc_info=e
+            exc_info=e,
+            payload={"error": str(e), "error_type": type(e).__name__}
         )
         return "INSUFFICIENT_CONTENT", 0

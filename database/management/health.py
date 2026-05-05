@@ -17,13 +17,15 @@ def restore_orphaned_backup(db_path: Path) -> None:
         return
     
     if backup_path.stat().st_size == 0:
-        log.dual_log(tag="DB:Health", level="CRITICAL", 
-                    message=f"Orphaned backup for {db_path.name} is 0 bytes. Halting.")
+        log.dual_log(tag="DB:Health", level="CRITICAL",
+                    message=f"Orphaned backup for {db_path.name} is 0 bytes. Halting.",
+                    payload={"db_name": db_path.name, "backup_path": str(backup_path), "backup_size": 0, "issue": "zero_byte_backup"})
         raise RuntimeError(f"Orphaned backup for {db_path.name} is 0 bytes.")
     
     try:
-        log.dual_log(tag="DB:Health", level="WARNING", 
-                    message=f"Orphaned backup detected for {db_path.name}. Restoring.")
+        log.dual_log(tag="DB:Health", level="WARNING",
+                    message=f"Orphaned backup detected for {db_path.name}. Restoring.",
+                    payload={"db_name": db_path.name, "backup_path": str(backup_path), "backup_size": backup_path.stat().st_size})
         for suffix in ["-wal", "-shm"]:
             sidecar = db_path.with_name(db_path.name + suffix)
             if sidecar.exists():
@@ -31,11 +33,13 @@ def restore_orphaned_backup(db_path: Path) -> None:
         
         shutil.copy2(backup_path, db_path)
         backup_path.unlink()
-        log.dual_log(tag="DB:Health", level="INFO", 
-                    message=f"Orphaned backup for {db_path.name} restored successfully.")
+        log.dual_log(tag="DB:Health", level="INFO",
+                    message=f"Orphaned backup for {db_path.name} restored successfully.",
+                    payload={"db_name": db_path.name, "action": "orphaned_backup_restored"})
     except Exception as e:
-        log.dual_log(tag="DB:Health", level="CRITICAL", 
-                    message=f"Failed to restore orphaned backup for {db_path.name}: {e}")
+        log.dual_log(tag="DB:Health", level="CRITICAL",
+                    message=f"Failed to restore orphaned backup for {db_path.name}: {e}",
+                    payload={"db_name": db_path.name, "error": str(e), "error_type": type(e).__name__})
         raise RuntimeError(f"Failed to restore orphaned backup for {db_path.name}: {e}")
 
 
@@ -77,8 +81,10 @@ def check_tables_exist(conn: sqlite3.Connection, expected_names: List[str]) -> T
     missing = [t for t in expected_names if t not in existing]
     
     if missing:
-        log.dual_log(tag="DB:Health", level="WARNING", message=f"Missing tables: {missing}")
+        log.dual_log(tag="DB:Health", level="WARNING", message=f"Missing tables: {missing}",
+                     payload={"missing_tables": missing, "expected_tables": expected_names, "found_count": len(existing)})
     else:
-        log.dual_log(tag="DB:Health", level="INFO", message="All expected tables verified.")
+        log.dual_log(tag="DB:Health", level="INFO", message="All expected tables verified.",
+                     payload={"verified_count": len(expected_names)})
     
     return len(missing) == 0, missing

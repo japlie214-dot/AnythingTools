@@ -113,6 +113,7 @@ def _persist_scraped_article(parsed_result: dict) -> None:
                     message=f"Failed to generate embedding for article {parsed_result['ulid']}: {e}",
                     level="WARNING",
                     exc_info=e,
+                    payload={"ulid": parsed_result["ulid"], "url": parsed_result["url"], "error": str(e), "error_type": type(e).__name__}
                 )
 
         log.dual_log(
@@ -128,6 +129,7 @@ def _persist_scraped_article(parsed_result: dict) -> None:
             message=f"Failed to persist article: {e}",
             level="ERROR",
             exc_info=e,
+            payload={"error": str(e), "error_type": type(e).__name__, "url": parsed_result.get("url"), "ulid": parsed_result.get("ulid")}
         )
 
 

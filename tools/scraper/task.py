@@ -79,6 +79,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                 log.dual_log(
                     tag="Scraper:Partial",
                     message=f"PARTIAL resumption: restricting to {len(deduped_urls)} failed links.",
+                    payload={"failed_count": len(deduped_urls), "total_links": len(links), "job_id": job_id, "target_site": target_site}
                 )
         except Exception as e:
             log.dual_log(

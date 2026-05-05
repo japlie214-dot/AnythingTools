@@ -56,7 +56,7 @@ async def run_database_lifecycle() -> None:
     )
     
     # 3. Context 2: Logs Database (with clean separation)
-    log.dual_log(tag="DB:Lifecycle", message="---")
+    log.dual_log(tag="DB:Lifecycle", message="---", payload={"separator": True, "next_context": "Logs DB"})
     log.dual_log(tag="DB:Lifecycle", message="Preparing validation for Logs DB", payload={"db": "Logs DB"})
     await _validate_single_db(
         label="Logs DB",
@@ -83,8 +83,9 @@ async def _validate_single_db(
     try:
         restore_orphaned_backup(db_path)
     except Exception as e:
-        log.dual_log(tag="DB:Lifecycle", level="CRITICAL", 
-                    message=f"[{label}] Backup restoration failed: {e}")
+        log.dual_log(tag="DB:Lifecycle", level="CRITICAL",
+                    message=f"[{label}] Backup restoration failed: {e}",
+                    payload={"label": label, "error": str(e), "error_type": type(e).__name__})
         raise
     
     # 2. Check database state (agnostic)
@@ -216,14 +217,17 @@ async def _restore_master_tables(conn: sqlite3.Connection, label: str, expected_
             result = export_all_tables(conn, mode="full")
             
             if result.success:
-                log.dual_log(tag="DB:Lifecycle", level="INFO", 
-                           message=f"[{label}] Cleanup backup complete")
+                log.dual_log(tag="DB:Lifecycle", level="INFO",
+                           message=f"[{label}] Cleanup backup complete",
+                           payload={"label": label, "action": "post_restore_cleanup", "success": True})
             else:
-                log.dual_log(tag="DB:Lifecycle", level="WARNING", 
-                           message=f"[{label}] Cleanup backup failed: {result.error}")
+                log.dual_log(tag="DB:Lifecycle", level="WARNING",
+                           message=f"[{label}] Cleanup backup failed: {result.error}",
+                           payload={"label": label, "action": "post_restore_cleanup", "success": False, "error": result.error})
         else:
-            log.dual_log(tag="DB:Lifecycle", level="CRITICAL", 
-                       message=f"[{label}] Restoration failed: {result.error}")
+            log.dual_log(tag="DB:Lifecycle", level="CRITICAL",
+                       message=f"[{label}] Restoration failed: {result.error}",
+                       payload={"label": label, "error": result.error, "master_tables": master_tables})
     except Exception as e:
         log.dual_log(tag="DB:Lifecycle", level="CRITICAL",
                     message="Restoration error", exc_info=e, payload={"label": label, "error": str(e)})

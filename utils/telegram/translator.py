@@ -122,7 +122,12 @@ class BatchTranslator:
                             "translated_conclusion": t.get("translated_conclusion", "")
                         }
         except Exception as e:
-            log.dual_log(tag="Publisher:Translate:Error", message=f"LLM Error: {e}", level="WARNING")
+            log.dual_log(
+                tag="Publisher:Translate:Error",
+                message=f"LLM Error: {e}",
+                level="WARNING",
+                payload={"error": str(e), "error_type": type(e).__name__, "batch_size": len(batch)}
+            )
         return translations
 
     def _record_failure(self, article: Dict, retry: int) -> None:

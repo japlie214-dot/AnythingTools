@@ -200,6 +200,7 @@ def enqueue_execscript(script_text: str) -> None:
                 message="Failed to start writer thread; execscript dropped.",
                 level="ERROR",
                 exc_info=e,
+                payload={"error": str(e), "error_type": type(e).__name__, "operation": "enqueue_execscript"}
             )
             return
 

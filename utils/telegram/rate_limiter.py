@@ -35,5 +35,9 @@ class GlobalRateLimiter:
             sleep_time = target_send_time - now
 
         if sleep_time > 0:
-            log.dual_log(tag="Telegram:RateLimiter", message=f"Throttling chat {chat_id} for {sleep_time:.2f}s")
+            log.dual_log(
+                tag="Telegram:RateLimiter",
+                message=f"Throttling chat {chat_id} for {sleep_time:.2f}s",
+                payload={"chat_id": chat_id, "sleep_time_s": round(sleep_time, 3), "delay_same_chat": delay_same_chat}
+            )
             await asyncio.sleep(sleep_time)

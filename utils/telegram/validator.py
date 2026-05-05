@@ -30,7 +30,12 @@ class ArticleValidator:
             else:
                 skipped.append(article)
                 ulid = article.get("ulid", "UNKNOWN")
-                log.dual_log(tag="Publisher:Validate:Skip", message=f"Skipping invalid item: {reason}", level="WARNING")
+                log.dual_log(
+                    tag="Publisher:Validate:Skip",
+                    message=f"Skipping invalid item: {reason}",
+                    level="WARNING",
+                    payload={"ulid": ulid, "reason": reason}
+                )
                 if self.job_id:
                     meta = make_metadata(STEP_VALIDATE, ulid, error=f"Skipped: {reason}", is_top10=article.get("_is_top10", False))
                     add_job_item(self.job_id, meta, json.dumps(article, ensure_ascii=False))

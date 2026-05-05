@@ -47,7 +47,12 @@ class TelegramAPIClient:
             except RetryAfter as e:
                 if e.retry_after > self.max_retry_after:
                     return TelegramErrorInfo(success=False, is_transient=True, retry_after=e.retry_after, description="Extreme rate limit")
-                log.dual_log(tag="Telegram:Send:RetryAfter", message=f"PTB caught Rate Limit, sleeping {e.retry_after}s", level="WARNING")
+                log.dual_log(
+                    tag="Telegram:Send:RetryAfter",
+                    message=f"PTB caught Rate Limit, sleeping {e.retry_after}s",
+                    level="WARNING",
+                    payload={"chat_id": chat_id, "retry_after": e.retry_after, "attempt": retries + 1, "max_retries": max_retries}
+                )
                 await asyncio.sleep(e.retry_after)
                 retries += 1
             except TelegramError as e:

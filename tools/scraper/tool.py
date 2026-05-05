@@ -72,9 +72,12 @@ class ScraperTool(BaseTool):
                 }
             }
             try:
-                enqueue_write(
-                    "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (ULID.generate(), job_id, "Scraper:Validation:Failed", "WARNING", "FAILED", summary, json.dumps(payload, ensure_ascii=False), datetime.now(timezone.utc).isoformat())
+                log.dual_log(
+                    tag="Scraper:Validation:Failed",
+                    message=summary,
+                    level="WARNING",
+                    status_state="FAILED",
+                    payload={"job_id": job_id, "batch_id": batch_id, "target_site": target_site, "failure_summary": summary, "next_steps": next_steps}
                 )
             except Exception:
                 pass
@@ -155,12 +158,20 @@ class ScraperTool(BaseTool):
                 )
                 _record_artifact(raw_filepath, "json", f"Raw scraper output for {target_site}")
                 if job_id:
-                    enqueue_write(
-                        "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (ULID.generate(), job_id, "Scraper:Extraction:Complete", "INFO", "COMPLETED", f"Extracted {len(results)} items", json.dumps({"count": len(results), "batch_id": batch_id}), datetime.now(timezone.utc).isoformat())
+                    log.dual_log(
+                        tag="Scraper:Extraction:Complete",
+                        message=f"Extracted {len(results)} items",
+                        level="INFO",
+                        status_state="COMPLETED",
+                        payload={"count": len(results), "batch_id": batch_id, "target_site": target_site, "job_id": job_id}
                     )
             except Exception as e:
-                log.dual_log(tag="Scraper:Artifact", message=f"Failed writing raw artifact: {e}", level="WARNING")
+                log.dual_log(
+                    tag="Scraper:Artifact",
+                    message=f"Failed writing raw artifact: {e}",
+                    level="WARNING",
+                    payload={"error": str(e), "artifact_type": "raw_json", "target_site": target_site}
+                )
 
             # Extraction Step
             extraction_meta = make_metadata("extract", batch_id)
@@ -224,7 +235,12 @@ class ScraperTool(BaseTool):
                     _record_artifact(top_10_path, "json", f"Curated Top {target_curated_count} articles")
                     if job_id: update_item_status(job_id, art_meta, "COMPLETED", json.dumps({"path": str(top_10_path)}))
                 except Exception as e:
-                    log.dual_log(tag="Scraper:Artifact", message=f"Failed: {e}", level="WARNING")
+                    log.dual_log(
+                        tag="Scraper:Artifact",
+                        message=f"Failed: {e}",
+                        level="WARNING",
+                        payload={"error": str(e), "artifact_type": "top10_json", "target_site": target_site}
+                    )
                     top_10_path = raw_filepath
                     if job_id: update_item_status(job_id, art_meta, "FAILED", "{}")
             else:
@@ -281,7 +297,13 @@ class ScraperTool(BaseTool):
                 return json.dumps({"status": "ALREADY_COMPLETED", "batch_id": batch_id}, ensure_ascii=False)
 
         except Exception as e:
-            log.dual_log(tag="Scraper:Unexpected", message=f"Critical failure: {e}", level="ERROR", exc_info=e)
+            log.dual_log(
+                tag="Scraper:Unexpected",
+                message=f"Critical failure: {e}",
+                level="ERROR",
+                exc_info=e,
+                payload={"error": str(e), "error_type": type(e).__name__, "target_site": target_site, "job_id": job_id}
+            )
             return _fail_internal(f"Unexpected error: {str(e)}", "Contact administrator for investigation.")
 
     @property

@@ -89,7 +89,7 @@ def mark_paused_for_hitl(
         tag=tag,
         message=message,
         status_state="PAUSED_FOR_HITL",
-        payload=payload,
+        payload=payload or {"action": "operator_intervention_required", "reason": message},
         level="WARNING",
         notify_user=True,
     )
