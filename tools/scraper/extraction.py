@@ -303,7 +303,12 @@ def process_article(
                     log.dual_log(tag="Scraper:Paywall", message="Paywall detected", level="WARNING", payload={"url": url, "attempt": val_attempt})
                     decision = _hitl_state.request_decision(job_id, url, f"Paywall detected. Indicators: {pw_result.detected_indicators}")
                     if decision == "proceed":
-                        log.dual_log(tag="Scraper:HITL:Proceed", message="User forced paywall proceed", level="INFO", payload={"url": url})
+                        log.dual_log(tag="Scraper:HITL:Proceed", message="User forced paywall proceed. Re-extracting state.", level="INFO", payload={"url": url})
+                        # Do NOT re-navigate. Read the live DOM state the operator has finished setting up.
+                        wait_for_dom_stability(driver)
+                        raw_html, html_len = extract_hybrid_html(driver)
+                        b64_image = _capture_screenshot_b64(driver)
+                        slim_sum = raw_html
                         local_meta["validation_passed"] = True
                         _sync_meta("RUNNING")
                     elif decision == "skip":
@@ -350,7 +355,12 @@ def process_article(
 
                     decision = _hitl_state.request_decision(job_id, url, reason)
                     if decision == "proceed":
-                        log.dual_log(tag="Scraper:HITL:Proceed", message="User forced validation proceed", level="INFO", payload={"url": url})
+                        log.dual_log(tag="Scraper:HITL:Proceed", message="User forced validation proceed. Re-extracting state.", level="INFO", payload={"url": url})
+                        # Do NOT re-navigate. Read the live DOM state the operator has finished setting up.
+                        wait_for_dom_stability(driver)
+                        raw_html, html_len = extract_hybrid_html(driver)
+                        b64_image = _capture_screenshot_b64(driver)
+                        slim_sum = raw_html
                         local_meta["validation_passed"] = True
                         _sync_meta("RUNNING")
                     elif decision == "skip":

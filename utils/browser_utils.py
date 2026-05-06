@@ -6,34 +6,84 @@ from bs4 import BeautifulSoup
 _log = get_dual_logger(__name__)
 
 
+import time
+import concurrent.futures
+
 def safe_google_get(driver: Driver, url: str, *, bypass_cloudflare: bool = True) -> None:
-    """Stealth-aware wrapper around driver.google_get()."""
+    """Stealth-aware wrapper around driver.google_get().
+
+    Uses a ThreadPoolExecutor to enforce a hard network/TTFB timeout compatible with
+    Windows (no signal.SIGALRM). On timeout, raises TimeoutError and leaves the
+    driver instance live for further jobs (no browser restart).
+    """
     _log.dual_log(tag="Browser:Navigate", message=f"Navigating to: {url}", payload={"url": url})
-    try:
-        driver.google_get(url, bypass_cloudflare=bypass_cloudflare)
-        # Enforce single-tab defensively after navigation.
+    start_t = time.monotonic()
+
+    def _do_get():
         try:
-            from utils.som_utils import enforce_single_tab
-            try:
-                enforce_single_tab(driver)
-            except Exception as e:
-                _log.dual_log(tag="Browser:Utils", message=f"enforce_single_tab failed after google_get: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
+            driver.google_get(url, bypass_cloudflare=bypass_cloudflare)
+        except TypeError as exc:
+            if "bypass_cloudflare" not in str(exc):
+                raise
+            _log.dual_log(
+                tag="Browser:Utils",
+                message=(
+                    "bypass_cloudflare kwarg unsupported by installed Botasaurus. "
+                    "Falling back to bare google_get(). Upgrade Botasaurus for stealth mode."
+                ),
+                level="WARNING",
+                payload={"url": url},
+            )
+            driver.google_get(url)
+
+    # Use an explicit executor instance so we can control shutdown behaviour on timeout.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_do_get)
+    try:
+        future.result(timeout=45.0)
+    except concurrent.futures.TimeoutError:
+        _log.dual_log(tag="Browser:Navigate", message=f"Hard network timeout (45s) for: {url}", level="ERROR", payload={"url": url, "timeout": 45.0})
+        # Immediately shut down the executor without waiting to avoid blocking on a hung worker thread.
+        try:
+            executor.shutdown(wait=False)
         except Exception:
-            # Import may fail in constrained environments; ignore and continue.
             pass
-    except TypeError as exc:
-        if "bypass_cloudflare" not in str(exc):
-            raise
-        _log.dual_log(
-            tag="Browser:Utils",
-            message=(
-                "bypass_cloudflare kwarg unsupported by installed Botasaurus. "
-                "Falling back to bare google_get(). Upgrade Botasaurus for stealth mode."
-            ),
-            level="WARNING",
-            payload={"url": url},
-        )
-        driver.google_get(url)
+
+        # Best-effort: attempt to abort page load via window.stop(); run in a separate short-lived worker
+        try:
+            stop_exec = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            stop_future = stop_exec.submit(lambda: driver.run_js("try{window.stop();}catch(e){}"))
+            stop_future.result(timeout=5.0)
+        except Exception as e:
+            _log.dual_log(tag="Browser:Navigate", message=f"Failed to run window.stop after timeout: {e}", level="WARNING", payload={"error": str(e)})
+        finally:
+            try:
+                stop_exec.shutdown(wait=False)
+            except Exception:
+                pass
+
+        # Fail the current URL without restarting the browser session.
+        raise TimeoutError(f"Navigation exceeded 45.0s hard timeout: {url}")
+    else:
+        # Normal completion path; shut down executor cleanly but don't block long.
+        try:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+    elapsed = time.monotonic() - start_t
+    _log.dual_log(tag="Browser:Navigate", message=f"Navigation completed: {url} ({elapsed:.2f}s)", payload={"url": url, "elapsed_s": round(elapsed, 2)})
+
+    # Enforce single-tab defensively after navigation.
+    try:
+        from utils.som_utils import enforce_single_tab
+        try:
+            enforce_single_tab(driver)
+        except Exception as e:
+            _log.dual_log(tag="Browser:Utils", message=f"enforce_single_tab failed after google_get: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
+    except Exception:
+        # Import may fail in constrained environments; ignore and continue.
+        pass
 
 
 def extract_hybrid_html(html_content: str, limit: int = 400000) -> str:

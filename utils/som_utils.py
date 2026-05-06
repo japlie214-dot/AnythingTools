@@ -41,7 +41,8 @@ def wait_for_dom_stability(driver: Driver, timeout: int = 10):
     """Wait for the DOM to stabilize using adaptive CDP checks."""
     import time
     try:
-        if driver.run_js("return document.readyState") == "complete":
+        ready_state = driver.run_js("return document.readyState")
+        if ready_state in ("interactive", "complete"):
             time.sleep(0.3)
     except Exception:
         pass

@@ -119,6 +119,10 @@ class ChromeDaemonManager:
             user_agent="real",  # FIX: Normalize to lowercase as documented
             window_size=(1920, 1080),
             arguments=[f"--user-data-dir={profile_path}"],
+            # Eager load: return at DOMContentLoaded to prevent indefinite hangs when subresources stall.
+            # Content readiness is handled by post-navigation scroll + sleep pattern.
+            # Ref: Botasaurus docs "recommended for faster scraping of SSR pages".
+            wait_for_complete_page_load=False,
         )
         
         # Audit and log the spawned Chrome PID
