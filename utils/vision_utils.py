@@ -160,7 +160,8 @@ def capture_and_optimize(driver: Driver, step_index: int) -> list[dict]:
                                  "status": "Screenshot Analysis Unavailable",
                                  "event_id": event_id}]
                     b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
-                    return [{"b64": b64, "path": jpg_path, "mime": "image/jpeg",
+                    from utils.logger.formatters import Base64Image
+                    return [{"b64": Base64Image(b64), "path": jpg_path, "mime": "image/jpeg",
                              "status": "OK", "event_id": event_id, "total_char_cost": total_char_cost}]
 
                 # ── Multi-slice path (large screenshot) ───────────────────────
@@ -226,9 +227,10 @@ def capture_and_optimize(driver: Driver, step_index: int) -> list[dict]:
                     with open(slice_path, "wb") as fh:
                         fh.write(slice_bytes)
                     b64_slice = base64.b64encode(slice_bytes).decode("utf-8")
+                    from utils.logger.formatters import Base64Image
                     slice_cost = calculate_image_cost(slice_img.width, slice_img.height)
                     results.append({
-                        "b64":      b64_slice,
+                        "b64":      Base64Image(b64_slice),
                         "path":     slice_path,
                         "mime":     "image/jpeg",
                         "status":   "OK",

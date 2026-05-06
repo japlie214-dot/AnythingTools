@@ -217,14 +217,12 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                 try:
                     _emb = _sf.embed(_et)
                     _eb = _struct.pack(f"{len(_emb)}f", *_emb)
-                    _ew(
-                        "INSERT OR REPLACE INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)",
-                        (_existing["vec_rowid"], _eb),
-                    )
-                    _ew(
-                        "UPDATE scraped_articles SET embedding_status = 'EMBEDDED' WHERE id = ?",
-                        (_existing["id"],),
-                    )
+                    from database.writer import enqueue_transaction as _etx
+                    _etx([
+                        ("DELETE FROM scraped_articles_vec WHERE rowid = ?", (_existing["vec_rowid"],)),
+                        ("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", (_existing["vec_rowid"], _eb)),
+                        ("UPDATE scraped_articles SET embedding_status = 'EMBEDDED' WHERE id = ?", (_existing["id"],))
+                    ])
                     _local_meta["embedding_synced"] = True
                     if job_id:
                         _upd(job_id, _meta, "COMPLETED", json.dumps(_local_meta))

@@ -64,17 +64,16 @@ async def process_pdf(file_path: str, file_name: str, chat_id: int):
             try:
                 emb = await generate_embedding(text)
                 pid = ULID.generate()
-                vec_rowid = abs(hash(pid)) % (2**63)
-                # Store text in main table
-                enqueue_write(
-                    "INSERT INTO pdf_parsed_pages (id, chat_id, pdf_name, page_number, content) VALUES (?, ?, ?, ?, ?)",
-                    (str(vec_rowid), chat_id, file_name, num, text)
-                )
-                # Store vector in virtual table
-                enqueue_write(
-                    "INSERT INTO pdf_parsed_pages_vec (rowid, embedding) VALUES (?, ?)",
-                    (vec_rowid, emb)
-                )
+                _id_raw = int.from_bytes(pid[:8].encode('utf-8'), 'big')
+                vec_rowid = (_id_raw % 0x7FFFFFFFFFFFFFFE) + 1
+                from database.writer import enqueue_transaction
+                enqueue_transaction([
+                    ("INSERT INTO pdf_parsed_pages (id, chat_id, pdf_name, page_number, content) VALUES (?, ?, ?, ?, ?)",
+                     (str(vec_rowid), chat_id, file_name, num, text)),
+                    ("DELETE FROM pdf_parsed_pages_vec WHERE rowid = ?", (vec_rowid,)),
+                    ("INSERT INTO pdf_parsed_pages_vec (rowid, embedding) VALUES (?, ?)",
+                     (vec_rowid, emb))
+                ])
             except Exception:
                 pass
             

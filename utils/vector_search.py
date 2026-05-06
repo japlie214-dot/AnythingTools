@@ -36,6 +36,8 @@ async def generate_embedding(text: str, provider_type: str = "azure") -> bytes:
     except AttributeError:
         # Fallback for older clients: run sync embed in a thread
         emb_list = await asyncio.to_thread(snowflake_client.embed, text)
+    from utils.logger.formatters import SensitiveVector
+    emb_list = SensitiveVector(emb_list)
     return struct.pack(f'{len(emb_list)}f', *emb_list)
 
 
@@ -113,18 +115,19 @@ async def store_memory_with_embedding(
 
         embedding = await generate_embedding(f"{topic}: {memory}", provider_type)
 
-        # Compute stable integer rowid from a new ULID string
-        vec_rowid = abs(hash(ULID.generate())) % (2**63)
+        # Compute stable integer rowid ensuring strict 63-bit positive range
+        ulid_str = ULID.generate()
+        _id_raw = int.from_bytes(ulid_str[:8].encode('utf-8'), 'big')
+        vec_rowid = (_id_raw % 0x7FFFFFFFFFFFFFFE) + 1
 
-        enqueue_write(
-            "INSERT INTO long_term_memories (id, agent_domain, topic, memory, type, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (vec_rowid, agent_domain, topic, memory, memory_type, datetime.now(_tz.utc).isoformat()),
-        )
-        enqueue_write(
-            "INSERT INTO long_term_memories_vec (rowid, embedding) VALUES (?, ?)",
-            (vec_rowid, embedding),
-        )
+        from database.writer import enqueue_transaction
+        enqueue_transaction([
+            ("INSERT INTO long_term_memories (id, agent_domain, topic, memory, type, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+             (vec_rowid, agent_domain, topic, memory, memory_type, datetime.now(_tz.utc).isoformat())),
+            ("DELETE FROM long_term_memories_vec WHERE rowid = ?", (vec_rowid,)),
+            ("INSERT INTO long_term_memories_vec (rowid, embedding) VALUES (?, ?)",
+             (vec_rowid, embedding))
+        ])
 
         log.dual_log(
             tag="VectorSearch",
@@ -176,5 +179,6 @@ def generate_embedding_sync(text: str, provider_type: str = "azure") -> bytes:
     import struct
     
     # snowflake_client.embed() internally handles its own thread-safe locks
-    emb_list = snowflake_client.embed(text)
+    from utils.logger.formatters import SensitiveVector
+    emb_list = SensitiveVector(snowflake_client.embed(text))
     return struct.pack(f'{len(emb_list)}f', *emb_list)

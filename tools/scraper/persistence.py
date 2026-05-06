@@ -34,7 +34,9 @@ def _parse_article_result(raw_result: dict, url: str) -> dict:
         return {"status": "FAILED", "reason": "Missing mandatory JSON fields (title or conclusion)"}
 
     ulid_str = ULID.generate()
-    _id = int(ulid_str[:8], 36) % (2 ** 63)
+    _id_raw = int.from_bytes(ulid_str[:8].encode('utf-8'), 'big')
+    # modulo 0x7FFFFFFFFFFFFFFE ensures value is strictly between 1 and 2^63-2, preventing SQLite overflow
+    _id = (_id_raw % 0x7FFFFFFFFFFFFFFE) + 1
 
     return {
         "status":         "SUCCESS",
@@ -99,14 +101,12 @@ def _persist_scraped_article(parsed_result: dict) -> None:
                 from utils.vector_search import generate_embedding_sync
                 embedding_bytes = generate_embedding_sync(content_for_embedding)
 
-                enqueue_write(
-                    "INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)",
-                    (parsed_result["id"], embedding_bytes),
-                )
-                enqueue_write(
-                    "UPDATE scraped_articles SET embedding_status = 'EMBEDDED' WHERE id = ?",
-                    (parsed_result["ulid"],),
-                )
+                from database.writer import enqueue_transaction
+                enqueue_transaction([
+                    ("DELETE FROM scraped_articles_vec WHERE rowid = ?", (parsed_result["id"],)),
+                    ("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", (parsed_result["id"], embedding_bytes)),
+                    ("UPDATE scraped_articles SET embedding_status = 'EMBEDDED' WHERE id = ?", (parsed_result["ulid"],))
+                ])
             except Exception as e:
                 log.dual_log(
                     tag="Scraper:Embedding",

@@ -18,8 +18,55 @@ from utils.text_processing import clean_html_for_agent, parse_llm_json
 from tools.scraper.scraper_prompts import VALIDATION_PROMPT, SUMMARIZATION_PROMPT
 from utils.logger import get_dual_logger
 from utils.metadata_helpers import make_metadata
+import threading
 
 log = get_dual_logger(__name__)
+
+class HITLState:
+    def __init__(self):
+        self.pending_url = None
+        self.pending_reason = None
+        self.lock = threading.Lock()
+        self.decision = threading.Event()
+        self.decision_result = None
+    
+    def request_decision(self, url: str, reason: str) -> str:
+        with self.lock:
+            self.pending_url = url
+            self.pending_reason = reason
+            self.decision.clear()
+            self.decision_result = None
+        
+        log.dual_log(
+            tag="Scraper:HITL:Request",
+            message=f"Validation failed after 3 retries - awaiting human input",
+            level="WARNING",
+            payload={"url": url, "reason": reason}
+        )
+        
+        print(f"\n\n[!!!] HITL VALIDATION ALERT")
+        print(f">>> URL: {url}")
+        print(f">>> Reason: {reason}")
+        print(">>> Type 'ENTER' to force PROCEED, 'SKIP' to skip URL, or 'CANCEL' to abort job.")
+        
+        try:
+            user_input = input("Decision: ").strip().upper()
+        except EOFError:
+            user_input = "CANCEL"
+        
+        with self.lock:
+            if user_input == "SKIP":
+                self.decision_result = "skip"
+            elif user_input == "CANCEL":
+                self.decision_result = "cancel"
+            else:
+                self.decision_result = "proceed"
+            self.pending_url = None
+            self.pending_reason = None
+        
+        return self.decision_result
+
+_hitl_state = HITLState()
 
 
 def extract_links(driver: Driver, target: dict) -> list[str]:
@@ -241,10 +288,20 @@ def process_article(
                     if val_attempt < 3:
                         log.dual_log(tag="Scraper:Paywall:Retry", message="Triggering auto-refresh", level="INFO", payload={"url": url, "attempt": val_attempt})
                         continue
-                    return {
-                        "status": "FAILED",
-                        "reason": f"Scraping failed after 3 attempts: {reason}",
-                    }
+                    
+                    decision = _hitl_state.request_decision(url, reason)
+                    if decision == "proceed":
+                        log.dual_log(tag="Scraper:HITL:Proceed", message="User forced validation proceed", level="INFO", payload={"url": url})
+                        local_meta["validation_passed"] = True
+                        _sync_meta("RUNNING")
+                        break # Exit the validation retry loop and go to summarization
+                    elif decision == "skip":
+                        return {"status": "SKIPPED", "reason": f"User skipped after HITL: {reason}"}
+                    elif decision == "cancel":
+                        if cancellation_flag is not None:
+                            cancellation_flag.set()
+                        return {"status": "CANCELED", "reason": "User requested stop via HITL."}
+                        
                 # Phase 2: Local state update first, then fire-and-forget DB persist.
                 local_meta["validation_passed"] = True
                 _sync_meta("RUNNING")

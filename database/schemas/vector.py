@@ -55,11 +55,16 @@ TRIGGERS = {
     "scraped_articles_ad": """CREATE TRIGGER IF NOT EXISTS scraped_articles_ad AFTER DELETE ON scraped_articles BEGIN
             INSERT INTO scraped_articles_fts(scraped_articles_fts, rowid, title, conclusion, summary)
             VALUES ('delete', old.vec_rowid, old.title, old.conclusion, old.summary);
+            DELETE FROM scraped_articles_vec WHERE rowid = old.vec_rowid;
         END;""",
     "scraped_articles_au": """CREATE TRIGGER IF NOT EXISTS scraped_articles_au AFTER UPDATE ON scraped_articles BEGIN
             INSERT INTO scraped_articles_fts(scraped_articles_fts, rowid, title, conclusion, summary)
             VALUES ('delete', old.vec_rowid, old.title, old.conclusion, old.summary);
             INSERT INTO scraped_articles_fts(rowid, title, conclusion, summary)
             VALUES (new.vec_rowid, new.title, new.conclusion, new.summary);
+        END;""",
+    "scraped_articles_au_vec": """CREATE TRIGGER IF NOT EXISTS scraped_articles_au_vec AFTER UPDATE ON scraped_articles
+        WHEN old.vec_rowid != new.vec_rowid OR new.embedding_status = 'PENDING' BEGIN
+            DELETE FROM scraped_articles_vec WHERE rowid = old.vec_rowid;
         END;""",
 }

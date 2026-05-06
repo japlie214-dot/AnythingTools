@@ -39,6 +39,11 @@ def _is_foreign_key_error(error: Exception) -> bool:
     return "foreign key constraint failed" in str(error).lower()
 
 
+def _is_vec0_rowid_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    return "could not initialize 'insert rowids' statement" in msg or ("vec0" in msg and "rowid" in msg)
+
+
 def _attempt_table_repair(conn, table_name: str) -> bool:
     """Strictly executes DDL repair script. Returns True on success."""
     from database.schemas import get_repair_script
@@ -114,10 +119,14 @@ def db_writer_worker() -> None:
                                 if table_name and _attempt_table_repair(conn, table_name) and attempt < MAX_REPAIR_RETRIES:
                                     continue
                             elif _is_foreign_key_error(e):
-                                log.dual_log(tag="DB:Writer:FK", message="FK Constraint failed", level="ERROR", payload={"sql": sql, "params": str(params)})
+                                log.dual_log(tag="DB:Writer:FK", message="FK Constraint failed", level="ERROR", payload={"sql": sql, "params": params})
                                 conn.rollback()
                                 break
-                            log.dual_log(tag="DB:Writer:Error", message=f"Write failed: {e}", level="ERROR", payload={"sql": sql, "params": str(params)})
+                            elif _is_vec0_rowid_error(e):
+                                log.dual_log(tag="DB:Writer:VecError", message=f"sqlite-vec rowid constraint violation: {e}", level="WARNING", payload={"sql": sql[:200], "error": str(e)})
+                                conn.rollback()
+                                break
+                            log.dual_log(tag="DB:Writer:Error", message=f"Write failed: {e}", level="ERROR", payload={"sql": sql, "params": params})
                             conn.rollback()
                             break
             except Exception as e:
@@ -125,7 +134,7 @@ def db_writer_worker() -> None:
                     tag="DB:Writer:Error",
                     message="Database write failed.",
                     level="ERROR",
-                    payload={"sql": sql, "params": str(params)},
+                    payload={"sql": sql, "params": params},
                     exc_info=e,
                 )
                 conn.rollback()

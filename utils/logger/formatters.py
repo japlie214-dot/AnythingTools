@@ -49,19 +49,63 @@ def _mask_payload_if_large(serialized_str: str, original_payload: Any) -> str:
     return f"[MASKED: {n} chars | type: {desc} | Peek: {redacted_peek}...]"
 
 
-def _serialize_payload(payload: Any) -> Any:
+class MaskableData:
+    """
+    Semantic Type Wrapper Base Interface.
+    
+    OPERATIONAL DOCUMENTATION:
+    For Future Developers: Instead of relying on expensive and fragile regular expressions
+    to sanitize logs, wrap sensitive objects (like base64 strings or high-dimensional embeddings)
+    in a subclass of `MaskableData` at their origin.
+    
+    How to use:
+    1. If you introduce a new binary format or large payload, subclass `MaskableData`.
+    2. Override the `to_masked_string()` method to return a safe placeholder.
+    3. Wrap your data (e.g., `payload={"image": Base64Image(b64_string)}`).
+    The logger will automatically intercept and mask it in O(1) time without regex.
+    """
+    def to_masked_string(self) -> str:
+        return "[MASKED: MaskableData]"
+
+class SensitiveVector(list, MaskableData):
+    def to_masked_string(self) -> str:
+        return f"[MASKED: SensitiveVector | {len(self)} dims]"
+
+class SensitiveBytes(bytes, MaskableData):
+    def to_masked_string(self) -> str:
+        return f"[MASKED: SensitiveBytes | {len(self)} bytes]"
+
+class Base64Image(str, MaskableData):
+    def to_masked_string(self) -> str:
+        return f"[MASKED: Base64Image | {len(self)} chars]"
+
+def _serialize_payload(payload: Any, depth: int = 0) -> Any:
     """Three-tier fallback: JSON-native → repr() → '<unserializable>'."""
+    if depth > 10:
+        return "[MAX_DEPTH_EXCEEDED]"
     if payload is None:
         return None
-    if isinstance(payload, (str, int, float, bool)):
+    if isinstance(payload, MaskableData):
+        return payload.to_masked_string()
+    if isinstance(payload, str):
+        if len(payload) > 1000 and payload.startswith("data:image/"):
+            return f"[MASKED: Legacy Base64Image | {len(payload)} chars]"
+        return payload
+    if isinstance(payload, (bytes, bytearray)):
+        return f"[MASKED: Binary Data | {len(payload)} bytes]"
+    if isinstance(payload, (int, float, bool)):
         return payload
     if hasattr(payload, "to_dict"):
         try:
             return payload.to_dict(orient="records")
         except Exception:
             pass
-    if isinstance(payload, (dict, list, tuple)):
-        return payload
+    if isinstance(payload, dict):
+        return {k: _serialize_payload(v, depth + 1) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_serialize_payload(i, depth + 1) for i in payload]
+    if isinstance(payload, tuple):
+        return tuple(_serialize_payload(i, depth + 1) for i in payload)
     try:
         return repr(payload)
     except Exception:

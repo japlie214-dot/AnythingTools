@@ -1,51 +1,59 @@
 ﻿# tools/scraper/scraper_prompts.py
 """Prompts for the Scraper Tool's validation and summarization agents."""
 
-VALIDATION_PROMPT = """You are a Web Content Validator.
-Determine whether the page displays genuine, readable article content or is blocked by CAPTCHA, paywalls, cookie-consent walls, is empty, or consists primarily of video/audio content with no substantial text.
+VALIDATION_PROMPT = """You are a Web Content Validator specializing in detecting content quality issues.
 
-INSTRUCTIONS:
-1. Evaluate the provided HTML and image for readability.
-2. If the page is a video player, podcast page, or audio-only stream with no article text, mark it invalid.
-3. If the page has no article body, no paragraphs, or is purely a navigation/gallery page, mark it invalid.
-4. Respond with a JSON object.
+TASK: Determine whether the page displays genuine, readable article content or is blocked/unusable.
 
-EXPECTED FORMAT:
+## CONTENT TYPES TO REJECT:
+1. **Paywalls & Subscriptions** ("Subscribe to continue", "Premium access", "Limit reached")
+2. **Consent/Gatekeeper Overlays** (Massive cookie banners blocking content, age gates, newsletter popups)
+3. **Video/Audio Primary** (YouTube embeds as main content, podcasts without transcript)
+4. **Navigation/Gallery Pages** (Homepage link collections, tag listings, search results)
+5. **Empty or Minimal Content** (<300 words of actual paragraph content, 404s)
+
+## CONTENT TYPES TO ACCEPT:
+- News articles with substantial text
+- Opinion/editorial pieces
+- Data-driven reports
+- Product reviews with detailed analysis
+
+## EXPECTED FORMAT:
 {
   "valid": true/false,
-  "reason": "Brief explanation"
+  "reason": "One sentence explaining why valid/invalid"
 }
 
 ### PAGE CONTENT
 """
 
 SUMMARIZATION_PROMPT = """You are a Multimodal Editorial Intelligence system.
-You are provided with two sources of information about a web article:
-1. RAW EXTRACTED HTML: Text fragments extracted from the page's HTML structure
-2. SCREENSHOT: A visual capture of the page as rendered in a browser
+You extract structured summaries from web articles while intelligently filtering noise.
 
-SOURCE OF TRUTH HIERARCHY (Critical - Follow Exactly):
-- SCREENSHOT = Source of Truth for LAYOUT and VISUAL HIERARCHY
-  * Use the screenshot to understand which sections are visually prominent
-  * Identify content in images, charts, or visual elements that may not be in HTML
-  * Recognize the visual structure: headlines, sidebars, main content area
-  
-- HTML = Source of Truth for DATA and PRECISE TEXT
-  * Extract exact names, dates, numbers, and quotes from the HTML
-  * Copy-paste important data points accurately from HTML fragments
-  * Use HTML for verbatim quotes and specific factual information
+## SOURCE OF TRUTH HIERARCHY
+**SCREENSHOT** = Layout, visual prominence, what stands out
+**HTML** = Precise text, numbers, names, quotes
 
-CROSS-REFERENCE PROTOCOL:
-1. First, examine the screenshot to understand the article's visual layout
-2. Identify the main headline, subheadings, and key content areas visually
-3. Then, search the HTML fragments for the text content of those visual elements
-4. Extract precise data (names, numbers, dates) only from HTML
-5. If screenshot shows content (chart, image text) not in HTML, describe it
-6. If HTML contains ads, navigation, or forms, ignore them
+## WHAT TO IGNORE (Filter Out):
+1. **Navigation Elements** (Menu bars, "Home", social sharing buttons)
+2. **Advertising & Promos** (Banner ads, "Recommended articles", newsletter boxes)
+3. **Cookie & Privacy Notices** (Consent banners, "We use cookies")
+4. **Interactive Elements** (Comment section headers, Like buttons)
+5. **Visual Noise** (Background patterns, Loading skeletons)
 
-OUTPUT INSTRUCTIONS:
+## WHAT TO FOCUS ON:
+1. **Main Article Body** (Headline, Author, Lead paragraph, Body paragraphs)
+2. **Data & Facts** (Company names, tickers, Revenue, Growth %, Timelines)
+3. **Key Visual Content** (Charts described in article, infographics)
+
+## EXTRACTION RULES:
+1. **Names & Titles**: Copy exactly from HTML
+2. **Numbers**: Verify from HTML, include units (%, $, €, etc.)
+3. **Quotes**: Use HTML text verbatim with quotation marks
+
+## OUTPUT INSTRUCTIONS:
 Respond strictly in JSON matching the requested schema. Ensure all keys are present.
-If the page is empty, a paywall, CAPTCHA, or unreadable, set the "error" key to "INSUFFICIENT_CONTENT".
+If the page is >80% noise, a paywall, CAPTCHA, or unreadable, set the "error" key to "INSUFFICIENT_CONTENT".
 Otherwise, provide the "title", "conclusion" (the executive "so what"), and "summary" (as an array of bullet points).
 
 ### RAW EXTRACTED HTML:
