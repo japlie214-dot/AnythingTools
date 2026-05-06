@@ -29,6 +29,14 @@ class JobStatusResponse(BaseModel):
     final_payload: Optional[Dict[str, Any]] = None
 
 
+class ResumeResponse(BaseModel):
+    job_id: str
+    tool_name: str
+    status: str
+    items_completed: int
+    items_pending: int
+    message: str
+    details: Optional[Dict[str, Any]] = None
 class WatermarkSchema(BaseModel):
     last_article_id: str = ""
     last_export_ts: Optional[str] = None

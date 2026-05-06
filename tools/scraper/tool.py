@@ -149,7 +149,11 @@ class ScraperTool(BaseTool):
                 return await llm.complete_chat(LLMRequest(messages=messages, response_format=response_format))
             return asyncio.run_coroutine_threadsafe(_call(), loop).result(timeout=300)
 
-        await telemetry(self.status(f"Launching headful scraper for {target_site}..."))
+        is_resume = kwargs.get("is_resume", False)
+        if is_resume:
+            await telemetry(self.status(f"Resuming headful scraper for {target_site}..."))
+        else:
+            await telemetry(self.status(f"Launching headful scraper for {target_site}..."))
 
         try:
             # Run Botasaurus pipeline

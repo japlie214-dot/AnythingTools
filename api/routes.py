@@ -8,7 +8,7 @@ import json
 from datetime import datetime, timezone
 
 import config
-from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry, BackupStatusResponse, ExportQueuedResponse, RestoreQueuedResponse
+from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry, BackupStatusResponse, ExportQueuedResponse, RestoreQueuedResponse, ResumeResponse
 from tools.registry import REGISTRY
 from utils.logger.core import get_dual_logger
 from utils.id_generator import ULID
@@ -61,7 +61,7 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
             raise HTTPException(status_code=503, detail=f"Tool failed to load: {reason}")
         
         raise HTTPException(status_code=404, detail="Tool not found")
-
+    
     # Circuit breaker for browser-bound tools
     if tool_name in ["scraper", "browser_task"]:
         from utils.browser_daemon import daemon_manager, BrowserStatus
@@ -317,3 +317,62 @@ async def metrics():
     except Exception:
         pass
     return {"write_queue_size": qsize, "active_jobs": active_jobs, "registered_tools": len(REGISTRY._tools)}
+
+
+@router.post("/jobs/{job_id}/resume", response_model=ResumeResponse)
+async def resume_job(job_id: str):
+    """Resume an INTERRUPTED, FAILED, or PARTIAL job safely."""
+    conn = DatabaseManager.get_read_connection()
+    row = conn.execute("SELECT tool_name, status, args_json FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    current_status = row["status"]
+    tool_name = row["tool_name"]
+    
+    # 409 Conflict check for active local console locks
+    if current_status == "PAUSED_FOR_HITL":
+        raise HTTPException(
+            status_code=409,
+            detail="Job is currently awaiting local console input."
+        )
+        
+    try:
+        args = json.loads(row["args_json"] or "{}")
+    except Exception:
+        args = {}
+        
+    try:
+        mod = importlib.import_module(f"tools.{tool_name}.resume")
+        handler = mod.ResumeHandler(job_id, args)
+        report = handler.check_resume_state()
+    except ImportError:
+        raise HTTPException(status_code=501, detail=f"Tool '{tool_name}' does not implement resume handlers.")
+    
+    if not report.resumable:
+        raise HTTPException(status_code=400, detail=report.message)
+        
+    enqueue_write(
+        "UPDATE jobs SET status = 'QUEUED', updated_at = ? WHERE job_id = ?",
+        (now_iso(), job_id)
+    )
+    
+    _ensure_writer_running()
+    get_manager().start()
+    
+    log.dual_log(
+        tag="API:Job:Resume",
+        message=f"Job {job_id} queued for resumption.",
+        payload={"job_id": job_id, "tool": tool_name, "report": report.__dict__}
+    )
+    
+    return ResumeResponse(
+        job_id=job_id,
+        tool_name=report.tool_name,
+        status="QUEUED",
+        items_completed=report.items_completed,
+        items_pending=report.items_pending,
+        message=report.message,
+        details=report.details
+    )

@@ -22,6 +22,7 @@ import threading
 
 log = get_dual_logger(__name__)
 
+
 class HITLState:
     def __init__(self):
         self.pending_url = None
@@ -29,31 +30,83 @@ class HITLState:
         self.lock = threading.Lock()
         self.decision = threading.Event()
         self.decision_result = None
-    
-    def request_decision(self, url: str, reason: str) -> str:
+
+    def request_decision(self, job_id: str | None, url: str, reason: str) -> str:
+        """
+        Block the current worker thread and wait for operator input.
+
+        IMPORTANT ARCHITECTURE NOTE:
+        This function intentionally performs a synchronous blocking `input()` call
+        while holding no external locks beyond its internal mutex. The design
+        decision to use blocking stdin is intentional: this server runs on a
+        local Windows machine with a single operator. Blocking the console is
+        the simplest, most reliable way to draw immediate attention to a
+        human-in-the-loop intervention without introducing complex async
+        coordination or race-prone background threads.
+
+        The database status is synchronously updated to PAUSED_FOR_HITL just
+        before blocking so external APIs (like /resume) will observe the
+        job as blocked and reject resume attempts with 409 Conflict. After the
+        operator responds, the job status is reverted to RUNNING (or left as
+        CANCELLING if the operator requested cancellation).
+        """
         with self.lock:
             self.pending_url = url
             self.pending_reason = reason
             self.decision.clear()
             self.decision_result = None
-        
+
+        # Synchronously write DB status to PAUSED_FOR_HITL to lock out concurrent resumes.
+        if job_id:
+            from database.writer import enqueue_write, wait_for_writes
+            from datetime import datetime, timezone
+            import asyncio
+            enqueue_write(
+                "UPDATE jobs SET status = 'PAUSED_FOR_HITL', updated_at = ? WHERE job_id = ?",
+                (datetime.now(timezone.utc).isoformat(), job_id),
+            )
+            # Ensure the writer flushes so external readers see the PAUSED state.
+            try:
+                loop = asyncio.get_running_loop()
+                asyncio.run_coroutine_threadsafe(wait_for_writes(timeout=5.0), loop).result()
+            except RuntimeError:
+                # If we're not in an event loop, run directly.
+                asyncio.run(wait_for_writes(timeout=5.0))
+
         log.dual_log(
             tag="Scraper:HITL:Request",
-            message=f"Validation failed after 3 retries - awaiting human input",
+            message=f"Validation failed - awaiting human input",
             level="WARNING",
-            payload={"url": url, "reason": reason}
+            payload={"url": url, "reason": reason, "job_id": job_id},
         )
-        
+
         print(f"\n\n[!!!] HITL VALIDATION ALERT")
         print(f">>> URL: {url}")
         print(f">>> Reason: {reason}")
         print(">>> Type 'ENTER' to force PROCEED, 'SKIP' to skip URL, or 'CANCEL' to abort job.")
-        
+
+        # ARCHITECTURAL DECISION: Use blocking stdin. See docstring above.
         try:
             user_input = input("Decision: ").strip().upper()
         except EOFError:
             user_input = "CANCEL"
-        
+
+        # Synchronously revert job status -> RUNNING unless operator cancelled.
+        if job_id:
+            from database.writer import enqueue_write
+            from datetime import datetime, timezone
+            if user_input == "CANCEL":
+                # Mark cancellation; worker will observe cancellation flag
+                enqueue_write(
+                    "UPDATE jobs SET status = 'CANCELLING', updated_at = ? WHERE job_id = ?",
+                    (datetime.now(timezone.utc).isoformat(), job_id),
+                )
+            else:
+                enqueue_write(
+                    "UPDATE jobs SET status = 'RUNNING', updated_at = ? WHERE job_id = ?",
+                    (datetime.now(timezone.utc).isoformat(), job_id),
+                )
+
         with self.lock:
             if user_input == "SKIP":
                 self.decision_result = "skip"
@@ -63,8 +116,9 @@ class HITLState:
                 self.decision_result = "proceed"
             self.pending_url = None
             self.pending_reason = None
-        
+
         return self.decision_result
+
 
 _hitl_state = HITLState()
 
@@ -92,7 +146,7 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
                 from utils.browser_daemon import daemon_manager
                 daemon_manager.surgical_kill()
                 raise RuntimeError("SoM Injection hung. Browser killed.")
-            
+
             if last_id > 1:
                 target_id = random.randint(0, last_id - 2)
                 log.dual_log(
@@ -146,7 +200,7 @@ def process_article(
     job_id: str | None = None,
     norm_url: str | None = None,
 ) -> dict:
-    """Validation loop (3 retries) then summarisation loop (3 retries).
+    """Validation loop then summarisation loop.
 
     Optional local_meta enables flag-conditional sub-step skipping on resume.
     local_meta is mutated in place by _sync_meta; callers must preserve the
@@ -166,10 +220,11 @@ def process_article(
             update_item_status(job_id, _meta, status, _json.dumps(local_meta))
 
     # Phase 2: Both prior sub-steps confirmed; signal caller to handle embed-only path.
-    # This guard is a safety net; task.py's pre-loop check normally prevents reaching here.
     if local_meta.get("validation_passed") and local_meta.get("summary_generated"):
         return {"status": "RESUME_EMBED_ONLY"}
-    for val_attempt in range(1, 4):
+
+    # Single attempt: no refresh retries on validation failure
+    for val_attempt in range(1, 2):
         try:
             # ── Load page ──────────────────────────────────────────────────
             log.dual_log(
@@ -246,10 +301,17 @@ def process_article(
                 pw_result = PaywallDetector().detect(raw_html)
                 if pw_result.is_paywalled:
                     log.dual_log(tag="Scraper:Paywall", message="Paywall detected", level="WARNING", payload={"url": url, "attempt": val_attempt})
-                    if val_attempt < 3:
-                        continue
-                    else:
-                        return {"status": "FAILED", "reason": f"Paywall persists after 3 retries. Indicators: {pw_result.detected_indicators}"}
+                    decision = _hitl_state.request_decision(job_id, url, f"Paywall detected. Indicators: {pw_result.detected_indicators}")
+                    if decision == "proceed":
+                        log.dual_log(tag="Scraper:HITL:Proceed", message="User forced paywall proceed", level="INFO", payload={"url": url})
+                        local_meta["validation_passed"] = True
+                        _sync_meta("RUNNING")
+                    elif decision == "skip":
+                        return {"status": "SKIPPED", "reason": f"User skipped after HITL: Paywall detected"}
+                    elif decision == "cancel":
+                        if cancellation_flag is not None:
+                            cancellation_flag.set()
+                        return {"status": "CANCELED", "reason": "User requested stop via HITL."}
 
             # ── Validation ─────────────────────────────────────────────────
             if local_meta.get("validation_passed"):
@@ -263,9 +325,9 @@ def process_article(
                 from utils.text_processing import escape_prompt_separators
                 slim_val  = raw_html[:15000]
                 val_msgs  = _build_multimodal_messages(
-                    VALIDATION_PROMPT, 
-                    escape_prompt_separators(slim_val) + "\n###", 
-                    b64_image
+                    VALIDATION_PROMPT,
+                    escape_prompt_separators(slim_val) + "\n###",
+                    b64_image,
                 )
                 val_resp  = sync_llm_chat(val_msgs, response_format={"type": "json_object"})
                 val_data  = parse_llm_json(val_resp.content or "{}")
@@ -285,29 +347,24 @@ def process_article(
                     )
                     if cancellation_flag is not None and cancellation_flag.is_set():
                         return {"status": "CANCELED", "reason": "User requested stop via Human Help mode."}
-                    if val_attempt < 3:
-                        log.dual_log(tag="Scraper:Paywall:Retry", message="Triggering auto-refresh", level="INFO", payload={"url": url, "attempt": val_attempt})
-                        continue
-                    
-                    decision = _hitl_state.request_decision(url, reason)
+
+                    decision = _hitl_state.request_decision(job_id, url, reason)
                     if decision == "proceed":
                         log.dual_log(tag="Scraper:HITL:Proceed", message="User forced validation proceed", level="INFO", payload={"url": url})
                         local_meta["validation_passed"] = True
                         _sync_meta("RUNNING")
-                        break # Exit the validation retry loop and go to summarization
                     elif decision == "skip":
                         return {"status": "SKIPPED", "reason": f"User skipped after HITL: {reason}"}
                     elif decision == "cancel":
                         if cancellation_flag is not None:
                             cancellation_flag.set()
                         return {"status": "CANCELED", "reason": "User requested stop via HITL."}
-                        
+
                 # Phase 2: Local state update first, then fire-and-forget DB persist.
                 local_meta["validation_passed"] = True
                 _sync_meta("RUNNING")
 
             # ── Summarisation (only on valid page) ─────────────────────────
-            # slim_sum is computed once and refreshed only after re-navigation.
             slim_sum = raw_html
 
             from tools.scraper.scraper_prompts import SUMMARIZATION_SCHEMA
@@ -317,7 +374,7 @@ def process_article(
                 sum_msgs = _build_multimodal_messages(
                     SUMMARIZATION_PROMPT,
                     escape_prompt_separators(slim_sum) + "\n###",
-                    b64_image
+                    b64_image,
                 )
 
                 try:
@@ -325,29 +382,29 @@ def process_article(
                         sum_msgs,
                         response_format={
                             "type": "json_schema",
-                            "json_schema": {"name": "summary", "strict": True, "schema": SUMMARIZATION_SCHEMA}
-                        }
+                            "json_schema": {"name": "summary", "strict": True, "schema": SUMMARIZATION_SCHEMA},
+                        },
                     )
                     used_format = "json_schema"
                 except Exception as format_exc:
                     from openai import BadRequestError
                     from clients.llm.utils import is_context_length_error
-                    
+
                     if is_context_length_error(format_exc):
                         log.dual_log(
                             tag="Scraper:Summarize:ContextLength",
                             message="Context length exceeded during json_schema call",
                             level="WARNING",
-                            payload={"error": str(format_exc)}
+                            payload={"error": str(format_exc)},
                         )
                         raise
-                        
+
                     if isinstance(format_exc, BadRequestError):
                         log.dual_log(
                             tag="Scraper:Summarize:Fallback",
                             message="json_schema format rejected; falling back to json_object",
                             level="WARNING",
-                            payload={"error": str(format_exc)}
+                            payload={"error": str(format_exc)},
                         )
                         sum_resp = sync_llm_chat(sum_msgs, response_format={"type": "json_object"})
                         used_format = "json_object"
@@ -382,7 +439,6 @@ def process_article(
                         message=f"Generated structured summary for {url}",
                         payload={"url": url, "title": sum_data.get("title", "")[:50]},
                     )
-                    # Phase 2: Local state update first, then fire-and-forget DB persist.
                     local_meta["summary_generated"] = True
                     _sync_meta("RUNNING")
                     return {"status": "SUCCESS", "parsed_json": sum_data}
@@ -391,7 +447,7 @@ def process_article(
                         tag="Scraper:Summarize",
                         message="Missing mandatory fields in JSON",
                         level="WARNING",
-                        payload={"parsed": sum_data, "attempt": sum_attempt, "url": url}
+                        payload={"parsed": sum_data, "attempt": sum_attempt, "url": url},
                     )
 
                 # Re-navigate on attempts 1 and 2; attempt 3 falls through to FAILED.
@@ -413,8 +469,6 @@ def process_article(
                                 element.scroll_into_view()
                             break
 
-                    # CRITICAL: refresh all extraction inputs so the next attempt
-                    # builds sum_msgs from the newly captured page state.
                     raw_html, html_len = extract_hybrid_html(driver)
                     b64_image = _capture_screenshot_b64(driver)
                     slim_sum  = raw_html
@@ -433,4 +487,4 @@ def process_article(
                 payload={"url": url, "attempt": val_attempt, "error": str(exc)},
             )
 
-    return {"status": "FAILED", "reason": "Validation failed after 3 attempts"}
+    return {"status": "FAILED", "reason": "Validation failed after 1 attempt"}

@@ -326,8 +326,13 @@ class UnifiedWorkerManager:
             if not tool_instance:
                 result = {"status": "FAILED", "result": f"Tool {tool_name} not found"}
             else:
+                # Determine if this is a resumed job (items already exist in the ledger)
+                conn = DatabaseManager.get_read_connection()
+                items_exist = conn.execute("SELECT 1 FROM job_items WHERE job_id = ? LIMIT 1", (job_id,)).fetchone()
+                is_resume = items_exist is not None
+    
                 from bot.engine.tool_runner import run_tool_safely
-                res = asyncio.run(run_tool_safely(tool_instance, args, telemetry_cb, job_id=job_id, session_id=session_id, cancellation_flag=cancellation_flag))
+                res = asyncio.run(run_tool_safely(tool_instance, args, telemetry_cb, job_id=job_id, session_id=session_id, cancellation_flag=cancellation_flag, is_resume=is_resume))
                 attachments = res.attachment_paths or []
                 if res.success:
                     # Attempt to parse JSON output for structured payloads

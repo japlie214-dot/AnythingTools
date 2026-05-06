@@ -8,19 +8,19 @@ from utils.logger.core import get_dual_logger
 log = get_dual_logger(__name__)
 
 async def run_startup_recovery() -> None:
-    """Startup healing pass: mark stale RUNNING jobs as INTERRUPTED and purge old inactive jobs."""
+    """Startup healing pass: mark stale RUNNING or PAUSED_FOR_HITL jobs as INTERRUPTED and purge old inactive jobs."""
     try:
         conn = DatabaseManager.get_read_connection()
         conn.row_factory = sqlite3.Row
         
-        # Identify jobs stuck in RUNNING status from prior unclean shutdowns
-        running_rows = conn.execute("SELECT job_id FROM jobs WHERE status = 'RUNNING'").fetchall()
+        # Identify jobs stuck in RUNNING or PAUSED_FOR_HITL status from prior unclean shutdowns
+        running_rows = conn.execute("SELECT job_id FROM jobs WHERE status IN ('RUNNING','PAUSED_FOR_HITL')").fetchall()
         for row in running_rows:
             enqueue_write(
                 "UPDATE jobs SET status = 'INTERRUPTED', updated_at = datetime('now') WHERE job_id = ?",
                 (row['job_id'],)
             )
-        log.dual_log(tag="Startup:Recovery", message="Startup recovery scan complete.", payload={"recovered_jobs": len(running_rows)})
+        log.dual_log(tag="Startup:Recovery", message="Startup recovery scan complete. Downgraded stale jobs to INTERRUPTED.", payload={"recovered_jobs": len(running_rows)})
         
         # Purge stale or abandoned job metadata older than 7 days
         stale_rows = conn.execute(
