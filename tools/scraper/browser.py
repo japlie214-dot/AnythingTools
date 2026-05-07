@@ -18,19 +18,95 @@ def _wait_for_any_selector(
     selectors: list[str],
     timeout: float = 15.0,
 ) -> bool:
-    """Poll until any selector matches or timeout elapses. Returns True on match."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    """Poll until any selector matches or timeout elapses using native waits. Returns True on match."""
+    import time as _time
+    per_selector_wait = 2 # seconds
+    deadline = _time.monotonic() + timeout
+    logged_selectors = set()
+
+    while _time.monotonic() < deadline:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+
         for sel in selectors:
             try:
-                if driver.is_element_present(sel):
+                effective_wait = min(per_selector_wait, remaining)
+                if driver.wait_for_element(sel, wait=effective_wait) is not None:
                     return True
-            except Exception:
+            except Exception as exc:
+                if sel not in logged_selectors:
+                    log.dual_log(
+                        tag="Scraper:SelectorWait",
+                        message=f"wait_for_element raised for selector '{sel[:80]}'",
+                        level="WARNING",
+                        payload={"selector": sel, "error": str(exc)}
+                    )
+                    logged_selectors.add(sel)
                 continue
         driver.short_random_sleep()
+
     return False
 
 
+def _safe_wait_for_any_selector(
+    driver: Driver,
+    selectors: list[str],
+    timeout: float = 15.0,
+    hard_timeout_margin: float = 10.0,
+) -> bool:
+    """Safety-net wrapper around _wait_for_any_selector with CDP Ping Probe.
+    
+    Wraps the native polling in a ThreadPoolExecutor. If a hard timeout occurs,
+    this function actively probes the CDP channel's health before deciding to continue or abort.
+    A failing probe will raise RuntimeError to trigger browser nuking via ChromeDaemonManager.
+    """
+    import concurrent.futures
+    
+    hard_timeout = timeout + hard_timeout_margin
+    
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_wait_for_any_selector, driver, selectors, timeout)
+    
+    try:
+        return future.result(timeout=hard_timeout)
+    except concurrent.futures.TimeoutError:
+        log.dual_log(
+            tag="Scraper:SelectorWait:Timeout",
+            message="HARD TIMEOUT: Selector wait exceeded wait. Probing CDP channel.",
+            level="ERROR",
+            payload={"hard_timeout": hard_timeout, "selectors": selectors},
+        )
+        
+        # CDP Responsiveness Probe (Ping Test)
+        probe_exec = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        probe_future = probe_exec.submit(lambda: driver.run_js("return 1;"))
+        try:
+            probe_future.result(timeout=5.0)
+            # Ping succeeded: Channel is alive but selector wait stuck
+            log.dual_log(
+                tag="Scraper:SelectorWait:Probe",
+                message="CDP probe succeeded. Channel is alive. Skipping article.",
+                level="WARNING",
+                payload={"action": "skip_article"}
+            )
+            return False
+        except Exception as probe_exc:
+            # Ping failed: Channel is permanently dead
+            log.dual_log(
+                tag="Scraper:SelectorWait:Probe",
+                message="CDP probe failed. Fatal CDP Stall. Nuking session.",
+                level="CRITICAL",
+                payload={"error": str(probe_exc)}
+            )
+            raise RuntimeError(f"Fatal CDP detected during selector wait: {probe_exc}")
+        finally:
+            probe_exec.shutdown(wait=False)
+    finally:
+        executor.shutdown(wait=False)
+
+
+        
 def _capture_screenshot_b64(driver: Driver) -> str | None:
     """Best-effort screenshot. Returns a Base64 PNG string or None on failure."""
     try:
@@ -127,8 +203,7 @@ def extract_hybrid_html(driver: Driver) -> tuple[str, int]:
             )
             
             if direct_children_text_len > (text_length * 0.8):
-                continue # Skip wrapper; the loop will naturally process its children.
-            # -------------------------
+                continue # Skip wrapper; the loop will naturally process its children.      # -------------------------
             
             # This is a leaf-node container! Capture it and protect its descendants.
             captured_node_ids.add(id(element))

@@ -7,7 +7,7 @@ from botasaurus.browser import Driver
 
 from tools.scraper.targets import ARTICLE_BODY_SELECTORS
 from tools.scraper.browser import (
-    _wait_for_any_selector,
+    _safe_wait_for_any_selector,
     _capture_screenshot_b64,
     _build_multimodal_messages,
     extract_hybrid_html,
@@ -133,8 +133,12 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
             payload={"url": target["url"]},
         )
         safe_google_get(driver, target["url"])
-        _wait_for_any_selector(driver, target["selectors"], timeout=15)
+        driver.sleep(45)  # Wait for Quiet
+        
+        _safe_wait_for_any_selector(driver, target["selectors"], timeout=15)
+        wait_for_dom_stability(driver)
         driver.scroll_to_bottom()
+        driver.short_random_sleep()
         driver.short_random_sleep()
 
         try:
@@ -234,8 +238,12 @@ def process_article(
                 payload={"url": url},
             )
             safe_google_get(driver, url)
-            _wait_for_any_selector(driver, ARTICLE_BODY_SELECTORS, timeout=15)
+            driver.sleep(45)  # Wait for Quiet
+            
+            _safe_wait_for_any_selector(driver, ARTICLE_BODY_SELECTORS, timeout=15)
+            wait_for_dom_stability(driver)
             driver.scroll_to_bottom()
+            driver.short_random_sleep()
             driver.short_random_sleep()
 
             try:
@@ -258,7 +266,7 @@ def process_article(
             driver.short_random_sleep()
 
             for _body_sel in ARTICLE_BODY_SELECTORS:
-                if driver.is_element_present(_body_sel):
+                if driver.is_element_present(_body_sel, wait=2):
                     element = driver.select(_body_sel)
                     if element:
                         element.scroll_into_view()
@@ -469,16 +477,16 @@ def process_article(
                         payload={"url": url, "sum_attempt": sum_attempt},
                     )
                     safe_google_get(driver, url)
-                    _wait_for_any_selector(driver, ARTICLE_BODY_SELECTORS, timeout=15)
+                    driver.sleep(45)  # Wait for Quiet
+                    _safe_wait_for_any_selector(driver, ARTICLE_BODY_SELECTORS, timeout=15)
                     wait_for_dom_stability(driver)
-
+                    
                     for _body_sel in ARTICLE_BODY_SELECTORS:
-                        if driver.is_element_present(_body_sel):
+                        if driver.is_element_present(_body_sel, wait=2):
                             element = driver.select(_body_sel)
                             if element:
                                 element.scroll_into_view()
                             break
-
                     raw_html, html_len = extract_hybrid_html(driver)
                     b64_image = _capture_screenshot_b64(driver)
                     slim_sum  = raw_html
