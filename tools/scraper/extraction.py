@@ -133,8 +133,6 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
             payload={"url": target["url"]},
         )
         safe_google_get(driver, target["url"])
-        driver.sleep(3)
-        driver.short_random_sleep()
 
         _safe_wait_for_any_selector(driver, target["selectors"], timeout=15)
         wait_for_dom_stability(driver)
@@ -242,8 +240,15 @@ def process_article(
                 payload={"url": url},
             )
             safe_google_get(driver, url)
-            driver.sleep(3)
-            driver.short_random_sleep()
+            
+            log.dual_log(
+                tag="DEBUG:PostNav",
+                message="Navigation verification debug",
+                payload={
+                    "url": getattr(driver, 'current_url', 'N/A'),
+                    "html_len": len(driver.page_html or '')
+                }
+            )
             
             _safe_wait_for_any_selector(driver, ARTICLE_BODY_SELECTORS, timeout=15)
             wait_for_dom_stability(driver)
@@ -483,8 +488,14 @@ def process_article(
                         payload={"url": url, "sum_attempt": sum_attempt},
                     )
                     safe_google_get(driver, url)
-                    driver.sleep(3)
-                    driver.short_random_sleep()
+                    log.dual_log(
+                        tag="DEBUG:PostNav",
+                        message="Navigation verification debug",
+                        payload={
+                            "url": getattr(driver, 'current_url', 'N/A'),
+                            "html_len": len(driver.page_html or '')
+                        }
+                    )
                     _safe_wait_for_any_selector(driver, ARTICLE_BODY_SELECTORS, timeout=15)
                     wait_for_dom_stability(driver)
                     log.dual_log(tag="Scraper:Scroll", message="Scrolling to bottom", level="INFO", payload={"url": url})

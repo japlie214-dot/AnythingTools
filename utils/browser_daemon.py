@@ -57,19 +57,11 @@ class ChromeDaemonManager:
         """Lightweight health check."""
         if self._driver is None:
             return False
-        import threading
-        result = [False]
-        def _ping():
-            try:
-                self._driver.run_js("return 1;")
-                result[0] = True
-            except Exception:
-                pass
-                
-        t = threading.Thread(target=_ping, daemon=True)
-        t.start()
-        t.join(timeout=3.0)
-        return result[0]
+        try:
+            self._driver.run_js("return 1;")
+            return True
+        except Exception:
+            return False
     
     def surgical_kill(self) -> None:
         """
@@ -153,7 +145,7 @@ class ChromeDaemonManager:
         
         # PHASE 1 FIX: Add mandatory 5-second stabilization delay
         if self._driver:
-            log.dual_log(tag="Browser:Daemon", message="Waiting 3s for Chrome CDP to settle...", payload={"delay_s": 3})
+            log.dual_log(tag="Browser:Daemon", message="Waiting 5s for Chrome CDP to settle...", payload={"delay_s": 5})
             self._driver.sleep(5)
             
         return self._driver
@@ -164,10 +156,18 @@ class ChromeDaemonManager:
             if self._driver is None or not self.is_driver_alive():
                 log.dual_log(tag="Browser:Daemon", message="Initialising new Driver session.", payload={"status": "INITIALIZING"})
                 if self._driver is not None:
+                    import concurrent.futures
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        self._driver.close()
+                        future = executor.submit(self._driver.close)
+                        future.result(timeout=3.0)
+                    except concurrent.futures.TimeoutError:
+                        log.dual_log(tag="Browser:Daemon", message="driver.close() timed out; forcing process kill", level="WARNING", payload={"action": "surgical_kill"})
+                        self.surgical_kill()
                     except Exception as e:
                         log.dual_log(tag="Browser:Daemon", message=f"Error closing old driver: {e}", level="WARNING", payload={"error": str(e)})
+                    finally:
+                        executor.shutdown(wait=False)
                 self._init_driver()
             return self._driver
     

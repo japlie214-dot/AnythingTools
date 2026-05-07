@@ -2,7 +2,7 @@
 from botasaurus.browser import Driver
 from utils.logger import get_dual_logger
 from bs4 import BeautifulSoup
-import threading
+# removed unused 'threading' import; navigation is performed synchronously in safe_google_get
 import time
 from urllib.parse import urlparse
 
@@ -10,7 +10,7 @@ _log = get_dual_logger(__name__)
 
 
 def safe_google_get(driver: Driver, url: str, *, bypass_cloudflare: bool = True) -> None:
-    """Stealth-aware wrapper around driver.google_get() using daemon threads to avoid atexit hangs."""
+    """Stealth-aware synchronous wrapper around driver.google_get()."""
     _log.dual_log(tag="Browser:Navigate", message=f"Navigating to: {url}", payload={"url": url})
     start_t = time.monotonic()
     
@@ -20,30 +20,17 @@ def safe_google_get(driver: Driver, url: str, *, bypass_cloudflare: bool = True)
             _log.dual_log(tag="Browser:Navigate:Liveness", message="Driver dead before navigation, re-initializing", level="WARNING", payload={"url": url})
             driver = daemon_manager.get_or_create_driver()
 
-        result_container = []
-        def _do_get():
+        try:
             try:
-                try:
-                    driver.google_get(url, bypass_cloudflare=bypass_cloudflare)
-                except TypeError as exc:
-                    if "bypass_cloudflare" not in str(exc):
-                        raise
-                    driver.google_get(url)
-                result_container.append(True)
-            except Exception as e:
-                result_container.append(e)
-
-        t = threading.Thread(target=_do_get, daemon=True)
-        t.start()
-        t.join(timeout=45.0)
-        if t.is_alive():
-            _log.dual_log(tag="Browser:Navigate", message=f"Hard network timeout (45s) for: {url}", level="ERROR", payload={"url": url})
-            raise TimeoutError(f"Navigation exceeded 45.0s hard timeout: {url}")
-            
-        if result_container and isinstance(result_container[0], Exception):
+                driver.google_get(url, bypass_cloudflare=bypass_cloudflare)
+            except TypeError as exc:
+                if "bypass_cloudflare" not in str(exc):
+                    raise
+                driver.google_get(url)
+        except Exception as e:
             if attempt == 0:
                 continue
-            raise result_container[0]
+            raise e
 
         # MANDATORY POST-NAV STABILIZATION
         driver.sleep(3)
