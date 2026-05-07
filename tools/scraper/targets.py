@@ -6,13 +6,20 @@ TARGETS = [
         "name": "FT",
         "url": "https://www.ft.com",
         "selectors": [
+            # Primary: data attribute + URL pattern (most stable)
+            'a[data-trackable="heading-link"][href^="/content/"]',
+            # Fallback 1: UUID pattern (FT article IDs are hyphenated UUIDs)
+            'a[href^="/content/"][href*="-"]',
+            # Fallback 2: data attribute alone
+            'a[data-trackable="heading-link"]',
+            # Fallback 3: class + URL (keep for backward compat)
+            'a.link[href^="/content/"]',
+            # Legacy fallbacks (deprecated but harmless)
             "a.js-teaser-heading-link",
             "a.o-teaser__heading-link",
             "div.o-teaser__heading > a",
-            "div.js-teaser-headline > a",
-            'a[data-trackable="heading-link"]',
         ],
-        "filter": "/content/",
+        "filter": "/content/",  # Keep existing filter
     },
     {
         "name": "Bloomberg",
