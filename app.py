@@ -92,9 +92,8 @@ async def lifespan(app: FastAPI):
             log.dual_log(tag="App:Shutdown", message="Clean shutdown complete", level="INFO", payload={"status": "clean", "startup_failed": startup_failed})
         except Exception as e:
             log.dual_log(tag="App:Shutdown", message=f"Shutdown error: {e}", level="ERROR", payload={"error": str(e)})
-
-        if startup_failed:
-            os._exit(1)
+        finally:
+            os._exit(1 if startup_failed else 0)
 
 
 # Create FastAPI app with lifespan

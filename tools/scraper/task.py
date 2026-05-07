@@ -4,6 +4,7 @@
 import os
 from botasaurus.browser import Driver
 import json
+import math
 
 import config
 from tools.scraper.targets import TARGETS
@@ -35,32 +36,52 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
     if cancellation_flag is not None and cancellation_flag.is_set():
         return {}
 
-    sync_telemetry(f"Extracting links from {target['name']}...")
-    links = extract_links(driver, target)
+    job_id = data.get("job_id")
+    _read_conn = DatabaseManager.get_read_connection()
+    
+    existing_items = []
+    if job_id:
+        existing_items = _read_conn.execute(
+            "SELECT json_extract(item_metadata, '$.ulid') as norm_url "
+            "FROM job_items WHERE job_id = ? "
+            "AND json_extract(item_metadata, '$.step') = 'scrape'",
+            (job_id,)
+        ).fetchall()
 
-    # ── Deduplication ──────────────────────────────────────────────────────
-    normalized_to_raw: dict[str, str] = {normalize_url(link): link for link in links}
-    try:
-        conn         = DatabaseManager.get_read_connection()
-        placeholders = ",".join("?" for _ in normalized_to_raw)
-        # DISTINCT preserves original query semantics.
-        existing = {
-            row[0]
-            for row in conn.execute(
-                f"SELECT DISTINCT normalized_url FROM scraped_articles "
-                f"WHERE normalized_url IN ({placeholders})",
-                list(normalized_to_raw.keys()),
-            ).fetchall()
-        }
-        deduped_urls = [normalized_to_raw[n] for n in normalized_to_raw if n not in existing]
-    except Exception as e:
+    if existing_items:
+        deduped_urls = [r["norm_url"] for r in existing_items if r["norm_url"]]
+        links = deduped_urls
         log.dual_log(
-            tag="Scraper:Dedup",
-            message="Database check failed, proceeding with all links",
-            level="WARNING",
-            payload={"error": str(e)},
+            tag="Scraper:Resume",
+            message=f"Bypassing extract_links. Found {len(deduped_urls)} existing items.",
+            level="INFO",
+            payload={"job_id": job_id, "items": len(deduped_urls)}
         )
-        deduped_urls = links
+    else:
+        sync_telemetry(f"Extracting links from {target['name']}...")
+        links = extract_links(driver, target)
+
+        # ── Deduplication ──────────────────────────────────────────────────────
+        normalized_to_raw: dict[str, str] = {normalize_url(link): link for link in links}
+        try:
+            conn = DatabaseManager.get_read_connection()
+            placeholders = ",".join("?" for _ in normalized_to_raw)
+            existing_db = {
+                row[0] for row in conn.execute(
+                    f"SELECT DISTINCT normalized_url FROM scraped_articles "
+                    f"WHERE normalized_url IN ({placeholders})",
+                    list(normalized_to_raw.keys()),
+                ).fetchall()
+            }
+            deduped_urls = [normalized_to_raw[n] for n in normalized_to_raw if n not in existing_db]
+        except Exception as e:
+            log.dual_log(
+                tag="Scraper:Dedup",
+                message="Database check failed, proceeding with all links",
+                level="WARNING",
+                payload={"error": str(e)},
+            )
+            deduped_urls = links
 
     # Phase 1.5: PARTIAL job resumption - filter to only failed items
     job_id = data.get("job_id")
@@ -128,8 +149,13 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
         "success": 0, "fail": 0, "fail_reasons": [],
     }
 
+    import math
+    max_nav_failures = math.ceil(len(deduped_urls) * 1.2) if deduped_urls else 1
+    consecutive_nav_failures = 0
+
     for idx, link in enumerate(deduped_urls, 1):
         _norm = normalize_url(link)
+        _meta = make_metadata("scrape", _norm)
         _local_meta = {
             "validation_passed": False, "summary_generated": False,
             "embedding_synced": False, "retryable": False,
@@ -254,7 +280,12 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
         parsed_result = _parse_article_result(raw_result, link)
         results[link] = parsed_result
 
-        if parsed_result.get("status") in ("SUCCESS", "SUCCESS_NO_PARSE"):
+        if "Navigation failed" in parsed_result.get("reason", ""):
+            consecutive_nav_failures += 1
+            if consecutive_nav_failures >= max_nav_failures:
+                raise RuntimeError(f"Max consecutive navigation failures reached ({consecutive_nav_failures}). Abandoning job.")
+        elif parsed_result.get("status") in ("SUCCESS", "SUCCESS_NO_PARSE"):
+            consecutive_nav_failures = 0
             _persist_scraped_article(parsed_result)
             _local_meta["embedding_synced"] = True
             if job_id:

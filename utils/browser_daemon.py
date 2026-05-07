@@ -57,11 +57,19 @@ class ChromeDaemonManager:
         """Lightweight health check."""
         if self._driver is None:
             return False
-        try:
-            self._driver.run_js("return 1;")
-            return True
-        except Exception:
-            return False
+        import threading
+        result = [False]
+        def _ping():
+            try:
+                self._driver.run_js("return 1;")
+                result[0] = True
+            except Exception:
+                pass
+                
+        t = threading.Thread(target=_ping, daemon=True)
+        t.start()
+        t.join(timeout=3.0)
+        return result[0]
     
     def surgical_kill(self) -> None:
         """

@@ -14,12 +14,19 @@ class ResumeHandler(BaseResumeHandler):
         
         completed = sum(1 for r in rows if r["status"] == "COMPLETED")
         pending = sum(1 for r in rows if r["status"] in ("PENDING", "FAILED"))
+        needs_link_extraction = len(rows) == 0
         
+        msg = f"Resuming Scraper. {completed} URLs completed, {pending} pending."
+        if needs_link_extraction:
+            msg += " Link extraction required."
+        else:
+            msg += " Link extraction will be bypassed."
+            
         return ResumeReport(
             tool_name="scraper",
             resumable=True,
             items_completed=completed,
             items_pending=pending,
-            message=f"Resuming Scraper. {completed} URLs completed, {pending} pending. Using existing driver.",
-            details=None,
+            message=msg,
+            details={"needs_link_extraction": needs_link_extraction},
         )

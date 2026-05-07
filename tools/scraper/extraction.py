@@ -133,10 +133,14 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
             payload={"url": target["url"]},
         )
         safe_google_get(driver, target["url"])
-        driver.sleep(45)  # Wait for Quiet
-        
+        driver.sleep(3)
+        driver.short_random_sleep()
+
         _safe_wait_for_any_selector(driver, target["selectors"], timeout=15)
         wait_for_dom_stability(driver)
+        log.dual_log(tag="Scraper:Scroll", message="Scrolling to bottom", level="INFO", payload={"url": target["url"]})
+        driver.scroll_to_bottom()
+        log.dual_log(tag="Scraper:Scroll", message="Scroll to bottom completed", level="INFO", payload={"url": target["url"]})
         driver.scroll_to_bottom()
         driver.short_random_sleep()
         driver.short_random_sleep()
@@ -238,12 +242,14 @@ def process_article(
                 payload={"url": url},
             )
             safe_google_get(driver, url)
-            driver.sleep(45)  # Wait for Quiet
+            driver.sleep(3)
+            driver.short_random_sleep()
             
             _safe_wait_for_any_selector(driver, ARTICLE_BODY_SELECTORS, timeout=15)
             wait_for_dom_stability(driver)
+            log.dual_log(tag="Scraper:Scroll", message="Scrolling to bottom", level="INFO", payload={"url": url})
             driver.scroll_to_bottom()
-            driver.short_random_sleep()
+            log.dual_log(tag="Scraper:Scroll", message="Scroll to bottom completed", level="INFO", payload={"url": url})
             driver.short_random_sleep()
 
             try:
@@ -477,9 +483,13 @@ def process_article(
                         payload={"url": url, "sum_attempt": sum_attempt},
                     )
                     safe_google_get(driver, url)
-                    driver.sleep(45)  # Wait for Quiet
+                    driver.sleep(3)
+                    driver.short_random_sleep()
                     _safe_wait_for_any_selector(driver, ARTICLE_BODY_SELECTORS, timeout=15)
                     wait_for_dom_stability(driver)
+                    log.dual_log(tag="Scraper:Scroll", message="Scrolling to bottom", level="INFO", payload={"url": url})
+                    driver.scroll_to_bottom()
+                    log.dual_log(tag="Scraper:Scroll", message="Scroll to bottom completed", level="INFO", payload={"url": url})
                     
                     for _body_sel in ARTICLE_BODY_SELECTORS:
                         if driver.is_element_present(_body_sel, wait=2):
