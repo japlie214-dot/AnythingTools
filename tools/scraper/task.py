@@ -240,10 +240,15 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                             "overview": _existing["summary"]
                         }
                         # Very short sync inject (simplified)
-                        _emb = _sync_scraped_article_atomic(
+                        from database.writer import enqueue_write
+                        _emb_receipt, _embed_ok = _sync_scraped_article_atomic(
                             _entry, job_id, _meta, _local_meta
                         )
-                        _local_meta["embedding_synced"] = True
+                        if _embed_ok:
+                            _local_meta["embedding_synced"] = True
+                        elif job_id:
+                            enqueue_write("UPDATE jobs SET status = 'PARTIAL', updated_at = CURRENT_TIMESTAMP WHERE job_id = ?", (job_id,))
+                            _job_final_status = "PARTIAL"
                     _stats["success"] += 1
                     results[link] = {
                         "status": "SUCCESS", "ulid": _existing["id"],
@@ -274,16 +279,21 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
         elif _parsed_result.get("status") in ("SUCCESS", "SUCCESS_NO_PARSE"):
             consecutive_nav_failures = 0
             # ── ATOM IN: THE BIG ONE ──
-            _receipt = _sync_scraped_article_atomic(
+            from database.writer import enqueue_write
+            _receipt, _embed_ok = _sync_scraped_article_atomic(
                 _parsed_result, job_id, _meta, _local_meta
             )
+            if not _embed_ok and job_id:
+                enqueue_write("UPDATE jobs SET status = 'PARTIAL', updated_at = CURRENT_TIMESTAMP WHERE job_id = ?", (job_id,))
+                _job_final_status = "PARTIAL"
             if _receipt:
                 if not _receipt.wait(timeout=45.0):
                     raise RuntimeError("Critical database write flush timed out after 45s. Aborting.")
                 if _receipt.error:
                     raise _receipt.error
                 # If the receipt resolved without error, the atomic transaction succeeded.
-                _local_meta["embedding_synced"] = True
+                if _embed_ok:
+                    _local_meta["embedding_synced"] = True
             
             _stats["success"] += 1
         else:
@@ -300,7 +310,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
     # Job finalized status
     all_embedded = (_stats["success"] == total_attempted) and (total_attempted > 0)
     job_final_status = "COMPLETED"
-    if _stats["fail"] > 0 or (total_attempted > 0 and not all_embedded):
+    if _stats["fail"] > 0 or (total_attempted > 0 and not all_embedded) or '_job_final_status' in locals() and _job_final_status == "PARTIAL":
         job_final_status = "PARTIAL"
 
     log.dual_log(

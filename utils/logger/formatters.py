@@ -75,6 +75,37 @@ class SensitiveBytes(bytes, MaskableData):
     def to_masked_string(self) -> str:
         return f"[MASKED: SensitiveBytes | {len(self)} bytes]"
 
+class SensitiveEmbeddingResult(MaskableData):
+    def __init__(self, raw_result):
+        self._raw = raw_result
+
+    def _traverse_and_mask(self, obj, depth=0):
+        if depth > 10:
+            return obj
+        if isinstance(obj, dict):
+            return {k: self._traverse_and_mask(v, depth + 1) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            if len(obj) >= 100 and all(isinstance(x, (int, float)) for x in obj[:10]):
+                return f"<Array of {len(obj)} numbers>"
+            return [self._traverse_and_mask(item, depth + 1) for item in obj]
+        return obj
+
+    def to_masked_string(self) -> str:
+        data = self._raw
+        if isinstance(self._raw, str):
+            try:
+                import json
+                data = json.loads(self._raw)
+            except Exception:
+                pass
+        
+        masked = self._traverse_and_mask(data)
+        try:
+            import json
+            return json.dumps(masked, ensure_ascii=False)
+        except Exception:
+            return str(masked)
+
 class Base64Image(str, MaskableData):
     def to_masked_string(self) -> str:
         return f"[MASKED: Base64Image | {len(self)} chars]"

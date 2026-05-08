@@ -77,6 +77,7 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
             """
         )
 
+        embedding_success = False
         embedding_status = "PENDING" if parsed_result.get("status") == "SUCCESS" else "SKIPPED"
         statements.append((
             insert_sql,
@@ -116,6 +117,7 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
                 lm = json.loads(local_meta_json)
                 lm["embedding_synced"] = True
                 local_meta_json = json.dumps(lm)
+                embedding_success = True
 
             except TimeoutError as te:
                 log.dual_log(tag="Scraper:Embedding", message=f"Snowflake timeout for {parsed_result['ulid']}. Marking pending.", level="WARNING", payload={"error": str(te)})
@@ -133,11 +135,11 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
             ))
 
         # Enqueue transaction with tracking
-        return enqueue_transaction(statements, track=True)
+        return enqueue_transaction(statements, track=True), embedding_success
 
     except Exception as e:
         log.dual_log(tag="Scraper:Persist", message=f"Atomic persist failed: {e}", level="ERROR", payload={"error": str(e)})
-        return None
+        return None, False
 
 
 # Backwards compatible fire-and-forget persistence (kept minimal)

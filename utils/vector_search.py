@@ -34,9 +34,19 @@ async def generate_embedding(text: str, provider_type: str = "azure") -> bytes:
     except asyncio.TimeoutError:
         raise TimeoutError("Snowflake embedding API timed out after 60 seconds")
 
-    from utils.logger.formatters import SensitiveVector
-    emb_list = SensitiveVector(emb_list)
-    return struct.pack(f'{len(emb_list)}f', *emb_list)
+    import math
+    if len(emb_list) != 1024:
+        raise ValueError(f"Embedding dimension mismatch: expected 1024, got {len(emb_list)}")
+    if any(math.isnan(x) or math.isinf(x) for x in emb_list):
+        raise ValueError("Embedding contains NaN or Infinity values")
+        
+    packed_bytes = struct.pack('<1024f', *emb_list)
+    
+    if len(packed_bytes) != VOYAGE_EMBEDDING_BYTES:
+        raise ValueError(f"Embedding byte length mismatch: expected {VOYAGE_EMBEDDING_BYTES}, got {len(packed_bytes)}")
+        
+    log.dual_log(tag="Embed:Pack", message="Successfully packed vector", payload={"dimensions": 1024, "bytes": len(packed_bytes)})
+    return packed_bytes
 
 
 async def retrieve_relevant_memories(
@@ -157,6 +167,16 @@ def generate_embedding_sync(text: str, provider_type: str = "azure") -> bytes:
         except concurrent.futures.TimeoutError:
             raise TimeoutError("Snowflake embedding API timed out after 60 seconds")
 
-    from utils.logger.formatters import SensitiveVector
-    emb_list = SensitiveVector(raw_emb)
-    return struct.pack(f'{len(emb_list)}f', *emb_list)
+    import math
+    if len(raw_emb) != 1024:
+        raise ValueError(f"Embedding dimension mismatch: expected 1024, got {len(raw_emb)}")
+    if any(math.isnan(x) or math.isinf(x) for x in raw_emb):
+        raise ValueError("Embedding contains NaN or Infinity values")
+        
+    packed_bytes = struct.pack('<1024f', *raw_emb)
+    
+    if len(packed_bytes) != VOYAGE_EMBEDDING_BYTES:
+        raise ValueError(f"Embedding byte length mismatch: expected {VOYAGE_EMBEDDING_BYTES}, got {len(packed_bytes)}")
+        
+    log.dual_log(tag="Embed:Pack:Sync", message="Successfully packed vector sync", payload={"dimensions": 1024, "bytes": len(packed_bytes)})
+    return packed_bytes

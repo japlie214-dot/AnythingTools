@@ -69,9 +69,9 @@ def _is_foreign_key_error(error: Exception) -> bool:
     return "foreign key constraint failed" in str(error).lower()
 
 
-def _is_vec0_rowid_error(error: Exception) -> bool:
+def _is_vec0_error(error: Exception) -> bool:
     msg = str(error).lower()
-    return "could not initialize" in msg or ("vec0" in msg and "rowid" in msg)
+    return "could not initialize" in msg or ("vec0" in msg and "rowid" in msg) or "could not insert a new vector chunk" in msg or "invalid float32 vector" in msg or "blob length" in msg
 
 
 def _attempt_table_repair(conn, table_name: str) -> bool:
@@ -205,8 +205,9 @@ def db_writer_worker() -> None:
                                 if receipt:
                                     receipt.reject(e)
                                 break
-                            elif _is_vec0_rowid_error(e):
-                                log.dual_log(tag="DB:Writer:VecError", message="sqlite-vec rowid constraint violation", level="WARNING", payload={"sql_preview": str(sql)[:200], "error": str(e)})
+                            elif _is_vec0_error(e):
+                                param_summary = [f"<BLOB: {len(p)} bytes>" if isinstance(p, bytes) else p for p in params]
+                                log.dual_log(tag="DB:Writer:VecError", message="sqlite-vec operational error", level="WARNING", payload={"sql_preview": str(sql)[:200], "params_preview": str(param_summary)[:200], "error": str(e)})
                                 try:
                                     conn.rollback()
                                 except Exception:

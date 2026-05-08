@@ -94,7 +94,43 @@ class SnowflakeClient:
             cursor.execute(sql, (safe_text,))
             result = cursor.fetchone()
             if result and result[0] is not None:
-                return json.loads(result[0]) if isinstance(result[0], str) else list(result[0])
+                from utils.logger.formatters import SensitiveEmbeddingResult
+                log.dual_log(tag="Embed:Raw", message="Raw Snowflake response", payload={"raw": SensitiveEmbeddingResult(result[0])})
+                raw_res = result[0]
+                vec = None
+                
+                if isinstance(raw_res, str):
+                    try:
+                        parsed = json.loads(raw_res)
+                        if isinstance(parsed, dict):
+                            for k, v in parsed.items():
+                                if isinstance(v, list) and len(v) > 0 and isinstance(v[0], (int, float)):
+                                    vec = v
+                                    break
+                                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], list):
+                                    vec = v[0]
+                                    break
+                        elif isinstance(parsed, list):
+                            vec = parsed[0] if len(parsed)>0 and isinstance(parsed[0], list) else parsed
+                    except Exception:
+                        pass
+                elif isinstance(raw_res, dict):
+                    for k, v in raw_res.items():
+                        if isinstance(v, list) and len(v) > 0 and isinstance(v[0], (int, float)):
+                            vec = v
+                            break
+                        elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], list):
+                            vec = v[0]
+                            break
+                elif isinstance(raw_res, list):
+                    vec = raw_res[0] if len(raw_res)>0 and isinstance(raw_res[0], list) else raw_res
+                
+                if not vec or not isinstance(vec, list):
+                    raise ValueError(f"Could not extract vector from {type(raw_res).__name__}")
+                if len(vec) != 1024:
+                    raise ValueError(f"Expected 1024 dimensions, got {len(vec)}")
+                    
+                return [float(x) for x in vec]
             raise ValueError("Snowflake AI_EMBED returned an empty result.")
         finally:
             cursor.close()
