@@ -1,6 +1,6 @@
 # api/routes.py
 from fastapi import APIRouter, HTTPException, status, Request, Depends, BackgroundTasks, Query
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import threading
 import asyncio
 import importlib
@@ -8,13 +8,14 @@ import json
 from datetime import datetime, timezone
 
 import config
-from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry, BackupStatusResponse, ExportQueuedResponse, RestoreQueuedResponse, ResumeResponse
+from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry, ExportQueuedResponse, RestoreQueuedResponse, ResumeResponse
 from tools.registry import REGISTRY
 from utils.logger.core import get_dual_logger
 from utils.id_generator import ULID
 from database.writer import start_writer, enqueue_write
 from database.connection import DatabaseManager, LogsDatabaseManager
 from database.logs_writer import logs_enqueue_write
+from database.diagnostics import get_queue_metrics
 from utils.artifact_manager import artifact_url_from_request
 from bot.engine.worker import get_manager
 from pydantic import ValidationError
@@ -32,10 +33,8 @@ router = APIRouter()
 
 # Durable state exclusively in the database; in-memory mirrors removed.
 
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 def _ensure_writer_running() -> None:
     try:
@@ -43,13 +42,11 @@ def _ensure_writer_running() -> None:
     except Exception:
         log.dual_log(tag="API:Writer:Start", message="start_writer() failed (non-fatal)", payload={"action": "writer_start_failed"})
 
-
 def get_session_id(request: Request) -> str:
-    return "0"  # Hardcoded fallback for legacy DB constraints
-
+    return "0"  # Hardcoded fallback for legacy DB constraints, or read form input
 
 @router.post("/tools/{tool_name}", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
-async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
+async def enqueue_tool(tool_name: str, req: JobCreateRequest):
     session_id = "0"  # Hardcoded fallback for legacy DB constraints
     meta = REGISTRY._tools.get(tool_name)
     if not meta:
@@ -63,15 +60,15 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
         raise HTTPException(status_code=404, detail="Tool not found")
     
     # Circuit breaker for browser-bound tools
-    if tool_name in ["scraper", "browser_task"]:
+    if tool_name in ["skill", "browser_task", "scraper"]:
         from utils.browser_daemon import daemon_manager, BrowserStatus
         if daemon_manager.status != BrowserStatus.READY:
             raise HTTPException(
-                status_code=503, 
+                status_code=503,
                 detail=f"Browser environment is currently {daemon_manager.status.value}. Tool unavailable."
             )
 
-    # Input validation using optional INPUT_MODEL exported by the tool module
+    # Input validation using optional INPUT_MODEL
     InputModel = None
     try:
         module = importlib.import_module(meta.get("module"))
@@ -108,8 +105,7 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
 
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "message": f"Validation failed for tool '{tool_name}'",
+            detail={ "message": f"Validation failed for tool '{tool_name}'",
                 "errors": error_details,
                 "expected_schema": expected_schema
             }
@@ -125,8 +121,7 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
 
     job_id = ULID.generate()
     created = now_iso()
-    
-    # Persist job record (writer will serialize DB writes)
+
     # Log system: intent and pre-execution state
     log.dual_log(
         tag="API:Job:Create",
@@ -154,7 +149,7 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
 
 # --- Backup Administration Routes ---
 
-@router.post("/backup/export", response_model=ExportQueuedResponse)
+@router.post("/backup/export")
 async def trigger_export(
     background_tasks: BackgroundTasks,
     mode: str = Query("full", description="Backup mode: 'full' or 'delta'")
@@ -162,54 +157,52 @@ async def trigger_export(
     config = BackupConfig.from_global_config()
     if not config.enabled:
         raise HTTPException(status_code=503, detail="Backup disabled")
-    
+
     if mode not in ("full", "delta"):
         raise HTTPException(status_code=400, detail="mode must be 'full' or 'delta'")
 
     job_id = ULID.generate()
-    created = now_iso()
     enqueue_write(
         "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (job_id, "0", "backup", json.dumps({"mode": mode}), "QUEUED", created, created)
+        (job_id, "0", "backup", json.dumps({"mode": mode}), "QUEUED", now_iso(), now_iso())
     )
+
     _ensure_writer_running()
-
     background_tasks.add_task(BackupRunner.run, mode=mode, trigger_type="manual", manual_job_id=job_id)
-    return ExportQueuedResponse(status="EXPORT_QUEUED", message=f"{mode.capitalize()} export started in background", job_id=job_id)
+    return {"status": "EXPORT_QUEUED", "message": f"{mode.capitalize()} export started in background", "job_id": job_id}
 
 
-@router.get("/backup/status", response_model=BackupStatusResponse)
+@router.get("/backup/status")
 async def backup_status():
     status = BackupRunner.get_status()
-    return BackupStatusResponse(
-        enabled=status["enabled"],
-        backup_dir=status["backup_dir"],
-        watermark=status["watermark"],
-        file_counts=status["file_counts"],
-        total_size_bytes=status["total_size_bytes"]
-    )
+    return {
+        "enabled": status["enabled"],
+        "backup_dir": status["backup_dir"],
+        "watermark": status["watermark"],
+        "file_counts": status["file_counts"],
+        "total_size_bytes": status["total_size_bytes"]
+    }
 
 
-@router.post("/backup/restore", response_model=RestoreQueuedResponse)
+@router.post("/backup/restore")
 async def trigger_restore(background_tasks: BackgroundTasks):
     config = BackupConfig.from_global_config()
     if not config.enabled:
         raise HTTPException(status_code=503, detail="Backup disabled")
     if browser_lock.locked():
         raise HTTPException(status_code=409, detail="System busy: active scraping job.")
-        
+
     job_id = ULID.generate()
-    created = now_iso()
     enqueue_write(
-        "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (job_id, "0", "backup_restore", "{}", "QUEUED", created, created)
+        "INSERT INTO jobs (job_id, session_id, tool_name, status, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (job_id, "0", "backup_restore", "QUEUED", now_iso(), now_iso())
     )
     _ensure_writer_running()
 
     background_tasks.add_task(BackupRunner.restore, manual_job_id=job_id)
-    return RestoreQueuedResponse(status="RESTORE_QUEUED", message="Restore started in background under browser_lock", job_id=job_id)
+    return {"status": "RESTORE_QUEUED", "message": "Restore started in background under browser_lock", "job_id": job_id}
 
 
 @router.get("/manifest")
@@ -217,13 +210,14 @@ async def manifest():
     return {"tools": REGISTRY.schema_list()}
 
 
-
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str, request: Request):
-    # Attempt to read canonical status from the DB; fall back to in-memory state.
+    # Attempt to read from the DB
     try:
         conn = DatabaseManager.get_read_connection()
-        row = conn.execute("SELECT job_id, tool_name, status, args_json, created_at, updated_at FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        row = conn.execute(
+            "SELECT job_id, tool_name, status, args_json, created_at, updated_at FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
     except Exception:
         row = None
 
@@ -253,21 +247,21 @@ async def get_job_status(job_id: str, request: Request):
         if p and p["payload_json"]:
             try:
                 final_payload = json.loads(p["payload_json"])
+                # If artifacts are present, add artifact_url entries
+                if isinstance(final_payload, dict):
+                    arts = final_payload.get("artifacts") or final_payload.get("attachment_paths")
+                    if arts:
+                        urls = []
+                        for a in arts:
+                            try:
+                                # Normalize relative path and build absolute URL
+                                url = artifact_url_from_request(request, a)
+                                urls.append(url)
+                            except Exception:
+                                pass
+                        final_payload["artifact_urls"] = urls
             except Exception:
                 final_payload = {"raw": p["payload_json"]}
-            # If artifacts are present, add artifact_url entries
-            if isinstance(final_payload, dict):
-                arts = final_payload.get("artifacts") or final_payload.get("attachment_paths")
-                if arts:
-                    urls = []
-                    for a in arts:
-                        try:
-                            # Normalize relative path and build absolute URL
-                            url = artifact_url_from_request(request, a)
-                            urls.append(url)
-                        except Exception:
-                            pass
-                    final_payload["artifact_urls"] = urls
     except Exception:
         pass
 
@@ -277,8 +271,12 @@ async def get_job_status(job_id: str, request: Request):
 @router.delete("/jobs/{job_id}", status_code=status.HTTP_202_ACCEPTED)
 async def delete_job(job_id: str, request: Request):
     """Request job cancellation. Marks job as CANCELLING and sets cancellation flag if running."""
-    mgr = get_manager()
-    flag = mgr.cancellation_flags.get(job_id) if mgr is not None else None
+    flag = None
+    try:
+        mgr = get_manager()
+        flag = mgr.cancellation_flags.get(job_id)
+    except Exception:
+        pass
 
     # Persist cancellation request immediately
     ts = now_iso()
@@ -305,6 +303,7 @@ async def delete_job(job_id: str, request: Request):
 
 @router.get("/metrics")
 async def metrics():
+    # Legacy route
     try:
         from database.writer import write_queue
         qsize = write_queue.qsize()
@@ -319,54 +318,70 @@ async def metrics():
     return {"write_queue_size": qsize, "active_jobs": active_jobs, "registered_tools": len(REGISTRY._tools)}
 
 
+@router.get("/diagnostics")
+async def diagnostics():
+    """Return internal metrics for observability."""
+    from database.diagnostics import get_queue_metrics
+    metrics = get_queue_metrics()
+    # Optionally add jobs active count
+    try:
+        from bot.engine.worker import get_manager
+        mgr = get_manager()
+        active_jobs = len(mgr.cancellation_flags) if mgr else 0
+    except Exception:
+        active_jobs = 0
+    metrics["active_jobs"] = active_jobs
+    return metrics
+
+
 @router.post("/jobs/{job_id}/resume", response_model=ResumeResponse)
 async def resume_job(job_id: str):
     """Resume an INTERRUPTED, FAILED, or PARTIAL job safely."""
     conn = DatabaseManager.get_read_connection()
     row = conn.execute("SELECT tool_name, status, args_json FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-    
+
     if not row:
         raise HTTPException(status_code=404, detail="Job not found")
-        
+
     current_status = row["status"]
     tool_name = row["tool_name"]
-    
+
     # 409 Conflict check for active local console locks
     if current_status == "PAUSED_FOR_HITL":
         raise HTTPException(
             status_code=409,
             detail="Job is currently awaiting local console input."
         )
-        
+
     try:
         args = json.loads(row["args_json"] or "{}")
     except Exception:
         args = {}
-        
+
     try:
         mod = importlib.import_module(f"tools.{tool_name}.resume")
         handler = mod.ResumeHandler(job_id, args)
         report = handler.check_resume_state()
     except ImportError:
         raise HTTPException(status_code=501, detail=f"Tool '{tool_name}' does not implement resume handlers.")
-    
+
     if not report.resumable:
         raise HTTPException(status_code=400, detail=report.message)
-        
+
     enqueue_write(
         "UPDATE jobs SET status = 'QUEUED', updated_at = ? WHERE job_id = ?",
-        (now_iso(), job_id)
+        (now_iso(), job_id),
     )
-    
+
     _ensure_writer_running()
     get_manager().start()
-    
+
     log.dual_log(
         tag="API:Job:Resume",
         message=f"Job {job_id} queued for resumption.",
-        payload={"job_id": job_id, "tool": tool_name, "report": report.__dict__}
+        payload={"job_id": job_id, "tool": tool_name, "report": report.__dict__},
     )
-    
+
     return ResumeResponse(
         job_id=job_id,
         tool_name=report.tool_name,

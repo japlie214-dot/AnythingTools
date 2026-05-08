@@ -24,7 +24,7 @@ def _parse_article_result(raw_result: dict, url: str) -> dict:
     title = str(parsed_json.get("title") or "").strip()
     conclusion = str(parsed_json.get("conclusion") or "").strip()
     summary_raw = parsed_json.get("summary", [])
-    
+
     if isinstance(summary_raw, list):
         summary = "\n".join(f"- {item}" for item in summary_raw if item)
     else:
@@ -51,17 +51,22 @@ def _parse_article_result(raw_result: dict, url: str) -> dict:
     }
 
 
-def _persist_scraped_article(parsed_result: dict) -> None:
-    """Persist article metadata and embedding via paired fire-and-forget writes."""
-    # Lazy imports: avoid connection-pool initialisation at module load time.
-    from database.writer import enqueue_write
+def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_str: str, local_meta_json: str):
+    """Combine article metadata, embedding, and job-items updates into a single transaction.
+
+    Returns a WriteReceipt (or None) that allows the caller to wait for flush completion and detect timeout.
+    """
+    from database.writer import enqueue_transaction
     try:
-        enqueue_write(
+        statements = []
+
+        # Base article insert/update
+        insert_sql = (
             """
             INSERT INTO scraped_articles (
-                id, normalized_url, url, title, conclusion, summary,
-                metadata_json, embedding_status, vec_rowid, scraped_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                id, normalized_url, url, title, conclusion, summary, metadata_json,
+                embedding_status, vec_rowid, scraped_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(normalized_url) DO UPDATE SET
                 url = excluded.url,
                 title = excluded.title,
@@ -69,7 +74,12 @@ def _persist_scraped_article(parsed_result: dict) -> None:
                 summary = excluded.summary,
                 embedding_status = excluded.embedding_status,
                 updated_at = CURRENT_TIMESTAMP
-            """,
+            """
+        )
+
+        embedding_status = "PENDING" if parsed_result.get("status") == "SUCCESS" else "SKIPPED"
+        statements.append((
+            insert_sql,
             (
                 parsed_result["ulid"],
                 parsed_result["normalized_url"],
@@ -77,65 +87,85 @@ def _persist_scraped_article(parsed_result: dict) -> None:
                 parsed_result["title"],
                 parsed_result["conclusion"],
                 parsed_result["summary"],
-                "PENDING" if parsed_result["status"] == "SUCCESS" else "SKIPPED",
+                meta_str,
+                embedding_status,
                 parsed_result["id"],
             ),
-        )
+        ))
 
-        if parsed_result["status"] == "SUCCESS":
-            from clients.snowflake_client import snowflake_client  # lazy: heavy singleton
+        # Embedding generation (time-bounded)
+        if parsed_result.get("status") == "SUCCESS":
             _t = parsed_result["title"]
             _c = parsed_result["conclusion"]
             _s = parsed_result.get("summary", "")
             _header = f"{_t}: {_c}: "
             _avail = 8000 - len(_header)
-            if _avail <= 0:
-                log.dual_log(
-                    tag="Scraper:Embedding",
-                    message="Title+Conclusion exceed 8000-char embedding budget; Summary omitted.",
-                    level="WARNING",
-                    payload={"ulid": parsed_result["ulid"], "header_len": len(_header)},
-                )
             content_for_embedding = _header + (_s[:_avail] if _avail > 0 else "")
+
             try:
                 from utils.vector_search import generate_embedding_sync
                 embedding_bytes = generate_embedding_sync(content_for_embedding)
 
-                from database.writer import enqueue_transaction
-                enqueue_transaction([
+                statements.extend([
                     ("DELETE FROM scraped_articles_vec WHERE rowid = ?", (parsed_result["id"],)),
                     ("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", (parsed_result["id"], embedding_bytes)),
-                    ("UPDATE scraped_articles SET embedding_status = 'EMBEDDED' WHERE id = ?", (parsed_result["ulid"],))
+                    ("UPDATE scraped_articles SET embedding_status = 'EMBEDDED' WHERE id = ?", (parsed_result["ulid"],)),
                 ])
-            except Exception as e:
-                log.dual_log(
-                    tag="Scraper:Embedding",
-                    message=f"Failed to generate embedding for article {parsed_result['ulid']}: {e}",
-                    level="WARNING",
-                    exc_info=e,
-                    payload={"ulid": parsed_result["ulid"], "url": parsed_result["url"], "error": str(e), "error_type": type(e).__name__}
-                )
 
-        log.dual_log(
-            tag="Scraper:Persist",
-            message="Persisted article to database",
-            payload={"id": parsed_result["ulid"], "url": parsed_result["url"],
-                     "status": parsed_result["status"]},
-        )
+                # Update local metadata to mark embedding synced
+                lm = json.loads(local_meta_json)
+                lm["embedding_synced"] = True
+                local_meta_json = json.dumps(lm)
+
+            except TimeoutError as te:
+                log.dual_log(tag="Scraper:Embedding", message=f"Snowflake timeout for {parsed_result['ulid']}. Marking pending.", level="WARNING", payload={"error": str(te)})
+            except Exception as e:
+                log.dual_log(tag="Scraper:Embedding", message=f"Failed embedding: {e}", level="WARNING", payload={"error": str(e)})
+
+        # Job item status update (atomic)
+        if job_id:
+            statements.append((
+                "UPDATE job_items SET status = ?, output_data = ?, item_metadata = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE job_id = ? "
+                "AND json_extract(item_metadata, '$.step') = json_extract(?, '$.step') "
+                "AND json_extract(item_metadata, '$.ulid') = json_extract(?, '$.ulid')",
+                ("COMPLETED", local_meta_json, meta_str, job_id, meta_str, meta_str),
+            ))
+
+        # Enqueue transaction with tracking
+        return enqueue_transaction(statements, track=True)
 
     except Exception as e:
-        log.dual_log(
-            tag="Scraper:Persist",
-            message=f"Failed to persist article: {e}",
-            level="ERROR",
-            exc_info=e,
-            payload={"error": str(e), "error_type": type(e).__name__, "url": parsed_result.get("url"), "ulid": parsed_result.get("ulid")}
+        log.dual_log(tag="Scraper:Persist", message=f"Atomic persist failed: {e}", level="ERROR", payload={"error": str(e)})
+        return None
+
+
+# Backwards compatible fire-and-forget persistence (kept minimal)
+def _persist_scraped_article(parsed_result: dict) -> None:
+    from database.writer import enqueue_write
+    try:
+        enqueue_write(
+            "INSERT INTO scraped_articles (id, normalized_url, url, title, conclusion, summary, metadata_json, embedding_status, vec_rowid, scraped_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(normalized_url) DO UPDATE SET url = excluded.url, title = excluded.title, conclusion = excluded.conclusion, summary = excluded.summary, embedding_status = excluded.embedding_status, updated_at = CURRENT_TIMESTAMP",
+            (
+                parsed_result.get("ulid"),
+                parsed_result.get("normalized_url"),
+                parsed_result.get("url"),
+                parsed_result.get("title"),
+                parsed_result.get("conclusion"),
+                parsed_result.get("summary"),
+                "{}",
+                "PENDING" if parsed_result.get("status") == "SUCCESS" else "SKIPPED",
+                parsed_result.get("id"),
+            ),
         )
+    except Exception as e:
+        log.dual_log(tag="Scraper:Persist", message=f"Fire-and-forget persist failed: {e}", level="WARNING", payload={"error": str(e)})
 
 
-def _curate_articles_drip_feed(results: dict[str, dict]) -> dict:
-    """Trim article pool to 80 % of context budget; return curation payload."""
-    # Both title AND conclusion must be present; SUCCESS_NO_PARSE entries are excluded.
+def _curate_articles_dfeed(results: dict[str, dict]) -> dict:
+    """Trim article pool to 80% of context budget; return curation payload."""
     articles = [
         r for r in results.values()
         if r.get("status") == "SUCCESS" and r.get("title") and r.get("conclusion")
@@ -165,7 +195,7 @@ def _curate_articles_drip_feed(results: dict[str, dict]) -> dict:
             curated.append(entry)
             current_len += item_len
         else:
-            break  # remaining articles exceed budget; stop packing
+            break
 
     return {
         "status":         "READY_FOR_CURATION",

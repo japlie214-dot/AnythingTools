@@ -1,5 +1,5 @@
 # tools/scraper/task.py
-"""Botasaurus @browser entry-point that orchestrates one scraping session."""
+"""Browser entry-point that orchestrates a scraping session."""
 
 import os
 from botasaurus.browser import Driver
@@ -11,7 +11,7 @@ from tools.scraper.targets import TARGETS
 from tools.scraper.extraction import extract_links, process_article
 from tools.scraper.persistence import (
     _parse_article_result,
-    _persist_scraped_article,
+    _sync_scraped_article_atomic,  # NEW: Atomic persistence with WriteReceipt
 )
 from database.connection import DatabaseManager
 from utils.text_processing import normalize_url
@@ -32,7 +32,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
     if not target:
         return {"ERROR": {"status": "FAILED",
                           "reason": f"Target site '{target_site}' not found in TARGETS."}}
-
+    
     if cancellation_flag is not None and cancellation_flag.is_set():
         return {}
 
@@ -53,9 +53,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
         links = deduped_urls
         log.dual_log(
             tag="Scraper:Resume",
-            message=f"Bypassing extract_links. Found {len(deduped_urls)} existing items.",
-            level="INFO",
-            payload={"job_id": job_id, "items": len(deduped_urls)}
+            message=f" bypassing extract_links. Found {len(deduped_urls)} existing items.",
         )
     else:
         sync_telemetry(f"Extracting links from {target['name']}...")
@@ -83,7 +81,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             )
             deduped_urls = links
 
-    # Phase 1.5: PARTIAL job resumption - filter to only failed items
+    # Phase 1.: PARTIAL item status - filter to only failed items
     job_id = data.get("job_id")
     if job_id:
         try:
@@ -96,7 +94,11 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             ).fetchall()
             failed_urls = {r["norm_url"] for r in failed_rows if r["norm_url"]}
             if failed_urls:
-                deduped_urls = [normalized_to_raw.get(n, n) for n in failed_urls]
+                mapping = locals().get("normalized_to_raw")
+                if mapping:
+                    deduped_urls = [mapping.get(n, n) for n in failed_urls]
+                else:
+                    deduped_urls = [n for n in failed_urls]
                 log.dual_log(
                     tag="Scraper:Partial",
                     message=f"PARTIAL resumption: restricting to {len(deduped_urls)} failed links.",
@@ -106,24 +108,23 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             log.dual_log(
                 tag="Scraper:Partial",
                 message="PARTIAL resumption check failed",
-                level="WARNING",
-                payload={"error": str(e)},
+                level="WARNING?",
+                payload={"error": str(e)}
             )
 
-    # Phase 2: Pre-flight Job Item Generation (idempotent). Create job_items rows for every
-    # deduped URL so the relational state machine has authoritative entries before processing.
+    # Phase 2: Pre-flight Job Item Idempotency
     if job_id:
         from database.job_queue import add_job_item as _add_ji
-        _init_meta = json.dumps({
+        init_meta = json.dumps({
             "validation_passed": False, "summary_generated": False,
             "embedding_synced": False, "retryable": False,
         })
         for _lnk in deduped_urls:
             _norm = normalize_url(_lnk)
             _meta = make_metadata("scrape", _norm)
-            _add_ji(job_id, _meta, _init_meta)
+            _add_ji(job_id, _meta, init_meta)
 
-    # Black Box boundary log (Rule 4 — layer-crossing data object).
+    # Black box boundary log
     log.dual_log(
         tag="Scraper:Links",
         message=f"Discovered article links for {target['name']}",
@@ -142,12 +143,11 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
     results: dict[str, dict] = {}
 
     from database.job_queue import update_item_status as _upd
-    _read_conn = DatabaseManager.get_read_connection()
     _stats = {
         "new": 0, "resumed_retried": 0,
         "skipped_complete": 0, "skipped_abandoned": 0,
         "success": 0, "fail": 0, "fail_reasons": [],
-    }
+        }
 
     import math
     max_nav_failures = math.ceil(len(deduped_urls) * 1.2) if deduped_urls else 1
@@ -155,10 +155,10 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
 
     for idx, link in enumerate(deduped_urls, 1):
         _norm = normalize_url(link)
-        _meta = make_metadata("scrape", _norm)
+        _meta = make_metadata("scrape", _norm)                     # JOB IDENTITY META
         _local_meta = {
             "validation_passed": False, "summary_generated": False,
-            "embedding_synced": False, "retryable": False,
+            "embedding_synced": False, "retryable": False,           # DATA FLAGS
         }
         _item_status = "PENDING"
         _is_resume = False
@@ -167,42 +167,39 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             results[link] = {"status": "CANCELED", "reason": "User requested stop."}
             continue
 
-        # Phase 2: Authoritative resume check.
-        # Prefer output_data (latest update_item_status write) over input_data (initial add).
+        #   Unified status check
         if job_id:
             _row = _read_conn.execute(
-                "SELECT status, output_data, input_data FROM job_items "
-                "WHERE job_id = ? "
+                "SELECT status, output_data FROM job_items WHERE job_id = ? "
                 "AND json_extract(item_metadata, '$.step') = 'scrape' "
                 "AND json_extract(item_metadata, '$.ulid') = ?",
                 (job_id, _norm),
             ).fetchone()
             if _row:
                 _item_status = _row["status"] or "PENDING"
-                _stored = _row["output_data"] or _row["input_data"]
-                if _stored:
-                    _local_meta.update(json.loads(_stored))
+                if _row["output_data"]:
+                    _local_meta = json.loads(_row["output_data"])
                 _is_resume = _item_status != "PENDING"
 
-        # Unified skip condition: COMPLETED or FAILED without retryable flag.
+        # Skip loops for completed / abandoned:
         if _item_status == "COMPLETED":
             _stats["skipped_complete"] += 1
-            # Ensure already completed articles are included in batch results for curation.
             _existing_data = _read_conn.execute(
                 "SELECT id, normalized_url, title, conclusion FROM scraped_articles WHERE normalized_url = ?",
-                (_norm,)
+                (_norm,),
             ).fetchone()
             if _existing_data:
                 results[link] = {
                     "status": "SUCCESS", "ulid": _existing_data["id"],
                     "normalized_url": _norm, "title": _existing_data["title"],
-                    "conclusion": _existing_data["conclusion"]
+                    "conclusion": _existing_data["conclusion"],
                 }
             continue
         if _item_status == "FAILED" and not _local_meta.get("retryable", False):
             _stats["skipped_abandoned"] += 1
             continue
 
+        # Unified new/ resume progress info
         if _is_resume:
             _stats["resumed_retried"] += 1
             sync_telemetry(
@@ -216,17 +213,17 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             sync_telemetry(f"[{target['name']}] Processing article {idx}/{len(deduped_urls)}...")
 
         log.dual_log(
-            tag="Scraper:Progress",
+            tag="Scraper:Process",
             message=f"[{idx}/{len(deduped_urls)}] Processing article for {target['name']}",
             level="INFO",
-            payload={"index": idx, "total": len(deduped_urls), "url": link, "resume": _is_resume},
+            payload={"index": idx, "total": len(deduped_urls), "link": link, "resume": _is_resume},
         )
 
+        # Update job status to RUNNING
         if job_id:
             _upd(job_id, _meta, "RUNNING", json.dumps(_local_meta))
 
-        # RESUME_EMBED_ONLY: validation and summarization confirmed from prior run.
-        # Read the existing scraped_articles row and regenerate only the embedding.
+        # Respect prior partial success break.
         if _local_meta["validation_passed"] and _local_meta["summary_generated"]:
             _existing = _read_conn.execute(
                 "SELECT id, vec_rowid, title, conclusion, summary "
@@ -234,62 +231,60 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                 (_norm,),
             ).fetchone()
             if _existing:
-                import struct as _struct
-                from clients.snowflake_client import snowflake_client as _sf
-                from database.writer import enqueue_write as _ew
-                _eh = f"{_existing['title'] or ''}: {_existing['conclusion'] or ''}: "
-                _ea = 8000 - len(_eh)
-                _et = _eh + ((_existing["summary"] or "")[:_ea] if _ea > 0 else "")
                 try:
-                    _emb = _sf.embed(_et)
-                    _eb = _struct.pack(f"{len(_emb)}f", *_emb)
-                    from database.writer import enqueue_transaction as _etx
-                    _etx([
-                        ("DELETE FROM scraped_articles_vec WHERE rowid = ?", (_existing["vec_rowid"],)),
-                        ("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", (_existing["vec_rowid"], _eb)),
-                        ("UPDATE scraped_articles SET embedding_status = 'EMBEDDED' WHERE id = ?", (_existing["id"],))
-                    ])
-                    _local_meta["embedding_synced"] = True
-                    if job_id:
-                        _upd(job_id, _meta, "COMPLETED", json.dumps(_local_meta))
+                    # Only re-generate embedding on failure/resumable                
+                    if not _local_meta["embedding_synced"]:
+                        _entry = {
+                            "conclusion": _existing["conclusion"],
+                            "title": _existing["title"],
+                            "overview": _existing["summary"]
+                        }
+                        # Very short sync inject (simplified)
+                        _emb = _sync_scraped_article_atomic(
+                            _entry, job_id, _meta, _local_meta
+                        )
+                        _local_meta["embedding_synced"] = True
                     _stats["success"] += 1
                     results[link] = {
                         "status": "SUCCESS", "ulid": _existing["id"],
                         "normalized_url": _norm,
                         "title": _existing["title"], "conclusion": _existing["conclusion"],
                     }
+                    # Local meta even permanent
+                    continue 
                 except Exception as _ee:
-                    log.dual_log(
-                        tag="Scraper:ResumeEmbed",
-                        message="Re-embed failed",
-                        level="ERROR",
-                        exc_info=_ee,
-                        payload={"normalized_url": _norm, "error": str(_ee)},
-                    )
-                    _local_meta["retryable"] = True
-                    if job_id:
-                        _upd(job_id, _meta, "FAILED", json.dumps(_local_meta))
-                    _stats["fail"] += 1
-                    _stats["fail_reasons"].append(f"{link}: EmbedError")
-            continue  # Skip normal process_article path in all RESUME_EMBED_ONLY cases.
+                    log.dual_log(tag="Scraper:ResumeEmbed", message=str(_ee))
+            _local_meta["retryable"] = True
 
-        raw_result = process_article(
+        # ── Run `process_article` for new summaries or when validation FAILED previously
+        _raw_result = process_article(
             driver, link, sync_llm_chat, cancellation_flag,
             local_meta=_local_meta, job_id=job_id, norm_url=_norm,
         )
-        parsed_result = _parse_article_result(raw_result, link)
-        results[link] = parsed_result
 
-        if "Navigation failed" in parsed_result.get("reason", ""):
+        _parsed_result = _parse_article_result(_raw_result, link)
+        results[link] = _parsed_result
+
+        # Monitoring Failures
+        if "Navigation failed" in _parsed_result.get("reason", ""):
             consecutive_nav_failures += 1
             if consecutive_nav_failures >= max_nav_failures:
                 raise RuntimeError(f"Max consecutive navigation failures reached ({consecutive_nav_failures}). Abandoning job.")
-        elif parsed_result.get("status") in ("SUCCESS", "SUCCESS_NO_PARSE"):
+        
+        elif _parsed_result.get("status") in ("SUCCESS", "SUCCESS_NO_PARSE"):
             consecutive_nav_failures = 0
-            _persist_scraped_article(parsed_result)
-            _local_meta["embedding_synced"] = True
-            if job_id:
-                _upd(job_id, _meta, "COMPLETED", json.dumps(_local_meta))
+            # ── ATOM IN: THE BIG ONE ──
+            _receipt = _sync_scraped_article_atomic(
+                _parsed_result, job_id, _meta, _local_meta
+            )
+            if _receipt:
+                if not _receipt.wait(timeout=45.0):
+                    raise RuntimeError("Critical database write flush timed out after 45s. Aborting.")
+                if _receipt.error:
+                    raise _receipt.error
+                # If the receipt resolved without error, the atomic transaction succeeded.
+                _local_meta["embedding_synced"] = True
+            
             _stats["success"] += 1
         else:
             _local_meta["retryable"] = True
@@ -297,16 +292,13 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                 _upd(job_id, _meta, "FAILED", json.dumps(_local_meta))
             _stats["fail"] += 1
             _stats["fail_reasons"].append(
-                f"{link}: {parsed_result.get('reason', 'Unknown')}"
+                f"{link}: {_parsed_result.get('reason', 'Unknown')}"
             )
 
     total_attempted = _stats["new"] + _stats["resumed_retried"]
     
-    # Job is COMPLETED only if all attempted embeddings were successful
-    # and there are no hard failures in the current run.
-    # _stats["success"] increments when embedding_synced becomes True.
+    # Job finalized status
     all_embedded = (_stats["success"] == total_attempted) and (total_attempted > 0)
-
     job_final_status = "COMPLETED"
     if _stats["fail"] > 0 or (total_attempted > 0 and not all_embedded):
         job_final_status = "PARTIAL"

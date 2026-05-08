@@ -4,16 +4,16 @@ import queue
 import threading
 import json
 import sys
+import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from database.connection import LogsDatabaseManager
 from utils.id_generator import ULID
 
 # Bounded queue for log writes
 logs_write_queue = queue.Queue(maxsize=10000)
-
-# Fallback mechanism removed per contract; overflow will trigger SIGTERM.
+_logs_dropped_count = 0
+_logs_dropped_lock = threading.Lock()
 
 # Shutdown event for graceful termination
 logs_shutdown_event = threading.Event()
@@ -35,15 +35,23 @@ def get_logs_write_generation():
         return _logs_write_generation
 
 
-# Removed fallback logging; overflow now triggers a fatal SIGTERM.
-
-
-def logs_writer_worker():
+def logs_write_worker():
     """Background worker that consumes log write tasks and persists them to logs.db."""
     global _logs_write_generation
     conn = LogsDatabaseManager.create_write_connection()
     
+    last_wal_checkpoint = time.monotonic()
+    consecutive_errors = 0
+    
     while True:
+        now = time.monotonic()
+        if now - last_wal_checkpoint > 1200.0:  # 20 minutes
+            last_wal_checkpoint = now
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+        
         try:
             task = logs_write_queue.get(timeout=1.0)
             if task is _STOP:
@@ -60,11 +68,28 @@ def logs_writer_worker():
                 # Increment generation to notify readers
                 with _logs_writer_lock:
                     _logs_write_generation += 1
-            except Exception:
+                consecutive_errors = 0
+            except Exception as e:
+                # Rollback; report to stderr to avoid recursive logging into logs DB
                 try:
                     conn.rollback()
                 except Exception:
                     pass
+
+                sys.stderr.write(f"[CRITICAL] Logs writer error: {e}\n")
+
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    sys.stderr.write("[CRITICAL] Logs connection poisoned. Attempting reconnect...\n")
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    try:
+                        conn = LogsDatabaseManager.create_write_connection()
+                        consecutive_errors = 0
+                    except Exception as re_err:
+                        sys.stderr.write(f"[FATAL] Logs reconnection failed: {re_err}\n")
             finally:
                 try:
                     logs_write_queue.task_done()
@@ -81,22 +106,18 @@ def logs_writer_worker():
         pass
 
 
-def logs_enqueue_write(sql, params=()):
+def logs_enqueue_write(sql, params=(), *, track=False):
     """Enqueue a write operation to the logs database with overflow protection."""
-    global _logs_writer_thread
+    global _logs_writer_thread, _logs_dropped_count
     if _logs_writer_thread is None or not _logs_writer_thread.is_alive():
         start_logs_writer()
     
     try:
         logs_write_queue.put_nowait((sql, params))
     except queue.Full:
-        try:
-            # 5s blocking grace before fatal termination
-            logs_write_queue.put((sql, params), timeout=5.0)
-        except queue.Full:
-            import os, signal
-            sys.stderr.write("[FATAL] Logs write queue overflowed. Terminating application to prevent silent data loss.\n")
-            os.kill(os.getpid(), signal.SIGTERM)
+        with _logs_dropped_lock:
+            _logs_dropped_count += 1
+        # Dropped the log entry, do NOT terminate the application
 
 
 def start_logs_writer():
@@ -108,7 +129,7 @@ def start_logs_writer():
         
         logs_shutdown_event.clear()
         _logs_writer_thread = threading.Thread(
-            target=logs_writer_worker,
+            target=logs_write_worker,
             name="logs-writer",
             daemon=True
         )
@@ -129,7 +150,8 @@ def stop_logs_writer():
         _logs_writer_thread.join(timeout=5.0)
         _logs_writer_thread = None
 
-# Phase 1: Verify logger readiness by writing a probe entry and confirming persistence.
+
+# Phase 1: Verify logger readiness by writing a test log entry and confirming persistence.
 def verify_logs_readiness(timeout: float = 5.0) -> bool:
     """Write a test log entry and confirm it is persisted, setting _logger_ready.
 

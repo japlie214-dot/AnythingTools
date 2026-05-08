@@ -1,8 +1,7 @@
-# utils/vector_search.py
-"""
+"""utils/vector_search.py
 Vector Search Utility for RAG Integration
 
-Provides semantic search capabilities using cosine similarity over
+Provides semantic search capability using cosine similarity over
 vector embeddings stored in the long_term_memories table.
 """
 
@@ -10,6 +9,7 @@ import asyncio
 import config
 import struct
 import sqlite3
+import concurrent.futures
 from typing import List, Tuple, Optional
 from clients.snowflake_client import snowflake_client
 from database.connection import DatabaseManager
@@ -24,18 +24,16 @@ VOYAGE_EMBEDDING_BYTES = 1024 * 4  # 4096 bytes
 async def generate_embedding(text: str, provider_type: str = "azure") -> bytes:
     """Generate a 1024-dimensional voyage-multilingual-2 embedding via Snowflake Cortex.
 
-    The `provider_type` parameter is retained for call-site API compatibility
-    but is not used; all embeddings are generated via Snowflake regardless of its value.
-
-    Returns:
-        Raw bytes (struct.pack float32[1024]) compatible with sqlite-vec MATCH queries.
+    Returns packed float32 bytes suitable for sqlite-vec MATCH queries.
     """
-    # Use the async wrapper if available to avoid blocking the event loop
     try:
-        emb_list = await snowflake_client.async_embed(text)
+        emb_list = await asyncio.wait_for(snowflake_client.async_embed(text), timeout=60.0)
     except AttributeError:
-        # Fallback for older clients: run sync embed in a thread
-        emb_list = await asyncio.to_thread(snowflake_client.embed, text)
+        # Fallback for older clients: run sync embed in a thread with timeout
+        emb_list = await asyncio.wait_for(asyncio.to_thread(snowflake_client.embed, text), timeout=60.0)
+    except asyncio.TimeoutError:
+        raise TimeoutError("Snowflake embedding API timed out after 60 seconds")
+
     from utils.logger.formatters import SensitiveVector
     emb_list = SensitiveVector(emb_list)
     return struct.pack(f'{len(emb_list)}f', *emb_list)
@@ -51,8 +49,6 @@ async def retrieve_relevant_memories(
 ) -> List[Tuple[str, str]]:
     """
     Retrieves top-k memories using sqlite-vec MATCH on the vec0 companion table.
-
-    Supports optional agent_domain and optional memory_type filters.
     """
     try:
         query_embedding = await generate_embedding(query, provider_type)
@@ -60,13 +56,12 @@ async def retrieve_relevant_memories(
         conn = DatabaseManager.get_read_connection()
         conn.row_factory = sqlite3.Row
 
-        # Build SQL dynamically based on provided filters
-        sql = """
-            SELECT l.topic, l.memory, (1 - v.distance) AS similarity
-            FROM long_term_memories_vec v
-            JOIN long_term_memories l ON v.rowid = l.id
-            WHERE v.embedding MATCH ? AND k = ?
-        """
+        sql = (
+            "SELECT l.topic, l.memory, (1 - v.distance) AS similarity\n"
+            "FROM long_term_memories_vec v\n"
+            "JOIN long_term_memories l ON v.rowid = l.id\n"
+            "WHERE v.embedding MATCH ? AND k = ?"
+        )
         params = [query_embedding, limit]
         if agent_domain is not None:
             sql += " AND l.agent_domain = ?"
@@ -101,15 +96,8 @@ async def store_memory_with_embedding(
     memory_type: str = "Knowledge",
     provider_type: str = "azure",
 ) -> bool:
-    """
-    Store a memory and its embedding in a paired-write fashion:
-    - Generates a ULID-based stable integer `vec_rowid` used as the explicit id for
-      long_term_memories and as the rowid in long_term_memories_vec.
-
-    Returns True on successful enqueue of both writes.
-    """
     try:
-        from database.writer import enqueue_write
+        from database.writer import enqueue_transaction
         from datetime import datetime, timezone as _tz
         from utils.id_generator import ULID
 
@@ -120,13 +108,11 @@ async def store_memory_with_embedding(
         _id_raw = int.from_bytes(ulid_str[:8].encode('utf-8'), 'big')
         vec_rowid = (_id_raw % 0x7FFFFFFFFFFFFFFE) + 1
 
-        from database.writer import enqueue_transaction
         enqueue_transaction([
             ("INSERT INTO long_term_memories (id, agent_domain, topic, memory, type, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
              (vec_rowid, agent_domain, topic, memory, memory_type, datetime.now(_tz.utc).isoformat())),
             ("DELETE FROM long_term_memories_vec WHERE rowid = ?", (vec_rowid,)),
-            ("INSERT INTO long_term_memories_vec (rowid, embedding) VALUES (?, ?)",
-             (vec_rowid, embedding))
+            ("INSERT INTO long_term_memories_vec (rowid, embedding) VALUES (?, ?)", (vec_rowid, embedding)),
         ])
 
         log.dual_log(
@@ -141,44 +127,36 @@ async def store_memory_with_embedding(
             tag="VectorSearch",
             message=f"Failed to store memory: {e}",
             level="ERROR",
-            payload={"event_type": "vector_search.storage_error", "agent_domain": agent_domain},
+            payload={"event_type": "vector_search.store_error", "agent_domain": agent_domain},
             exc_info=e,
         )
         return False
 
 
 def get_memory_context_string(relevant_memories: List[Tuple[str, str]]) -> str:
-    """
-    Format retrieved memories as a context string for prompts.
-    
-    Args:
-        relevant_memories: List of (topic, memory) tuples
-        
-    Returns:
-        Formatted context string
-    """
     if not relevant_memories:
         return ""
-    
     context_lines = ["<INSTITUTIONAL_CONTEXT>"]
     for topic, memory in relevant_memories:
         context_lines.append(f"<memory topic='{topic}'>")
         context_lines.append(memory)
         context_lines.append("</memory>")
     context_lines.append("</INSTITUTIONAL_CONTEXT>")
-    
     return "\n".join(context_lines)
 
 
 def generate_embedding_sync(text: str, provider_type: str = "azure") -> bytes:
-    """
-    Synchronous bypass for embedding generation.
-    Safely callable from background threads without event-loop acrobatics.
-    """
     from clients.snowflake_client import snowflake_client
     import struct
-    
-    # snowflake_client.embed() internally handles its own thread-safe locks
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(snowflake_client.embed, text)
+        try:
+            raw_emb = future.result(timeout=60.0)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError("Snowflake embedding API timed out after 60 seconds")
+
     from utils.logger.formatters import SensitiveVector
-    emb_list = SensitiveVector(snowflake_client.embed(text))
+    emb_list = SensitiveVector(raw_emb)
     return struct.pack(f'{len(emb_list)}f', *emb_list)
