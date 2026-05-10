@@ -25,83 +25,8 @@ except Exception:
 _VEC_PERMANENTLY_FAILED = False
 _VEC_LOAD_ANNOUNCED = False
 
-# List of all vec0 virtual table names that require pre-warming.
-VEC_TABLE_NAMES: list[str] = []
-
-def _discover_vec_tables(conn: sqlite3.Connection) -> list[str]:
-    """Discover all vec0 virtual tables in the database."""
-    try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%USING vec0%'"
-        ).fetchall()
-        return [r[0] for r in rows]
-    except Exception:
-        return []
-
-def _warm_vec0_tables(conn: sqlite3.Connection) -> None:
-    """Pre-warm vec0 shadow tables on a connection in pure autocommit mode."""
-    global VEC_TABLE_NAMES
-    if not SQLITE_VEC_AVAILABLE or _VEC_PERMANENTLY_FAILED:
-        return
-
-    try:
-        conn.execute("SELECT vec_version()").fetchone()
-    except Exception:
-        return
-
-    if not VEC_TABLE_NAMES:
-        VEC_TABLE_NAMES = _discover_vec_tables(conn)
-
-    if not VEC_TABLE_NAMES:
-        return
-
-    dummy_vector = b'\x00' * 4096
-    warmed = []
-    failed = []
-
-    # DO NOT USE SAVEPOINT or BEGIN. Force true autocommit mode.
-    prev_isolation = getattr(conn, "isolation_level", None)
-    try:
-        conn.isolation_level = None
-        for table_name in VEC_TABLE_NAMES:
-            try:
-                conn.execute(
-                    f"INSERT INTO {table_name}(rowid, embedding) VALUES(999999999999, ?)",
-                    (dummy_vector,)
-                )
-                conn.execute(f"DELETE FROM {table_name} WHERE rowid = 999999999999")
-                warmed.append(table_name)
-            except Exception as e:
-                failed.append((table_name, str(e)))
-    finally:
-        try:
-            conn.isolation_level = prev_isolation
-        except Exception:
-            pass
-
-    if warmed:
-        try:
-            from utils.logger import get_dual_logger
-            get_dual_logger(__name__).dual_log(
-                tag="DB:Vec:Warm",
-                message=f"Pre-warmed {len(warmed)} vec0 table(s)",
-                level="DEBUG",
-                payload={"warmed": warmed, "failed_count": len(failed)}
-            )
-        except Exception:
-            pass
-
-    if failed:
-        try:
-            from utils.logger import get_dual_logger
-            get_dual_logger(__name__).dual_log(
-                tag="DB:Vec:Warm",
-                message=f"Failed to warm {len(failed)} vec0 table(s)",
-                level="WARNING",
-                payload={"failed": failed}
-            )
-        except Exception:
-            pass
+# vec0 startup write-probes removed per PLAN-01: use read-only probes and nuke mechanism instead.
+# See database/management/reconciler.py for read-only verification and nuke implementation.
 
 def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
     global _VEC_PERMANENTLY_FAILED, _VEC_LOAD_ANNOUNCED
@@ -232,9 +157,7 @@ class DatabaseManager:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
-        
-        _warm_vec0_tables(conn)
-        
+
         return conn
 
     @classmethod

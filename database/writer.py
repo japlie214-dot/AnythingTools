@@ -118,13 +118,8 @@ def _attempt_table_repair(conn, table_name: str) -> bool:
 
 
 def _create_fresh_write_connection():
-    from database.connection import VEC_TABLE_NAMES
-    try:
-        VEC_TABLE_NAMES.clear()
-    except Exception:
-        pass
+    # vec0 startup write-probes removed; no need to manage VEC_TABLE_NAMES here.
     return DatabaseManager.create_write_connection()
-
 
 def get_write_generation() -> int:
     with _write_lock:
@@ -216,15 +211,8 @@ def db_writer_worker() -> None:
                                 _vec0_retries += 1
                                 delay = 0.1 * (2 ** (_vec0_retries - 1))
 
-                                if _vec0_retries == 1:
-                                    try:
-                                        from database.connection import _warm_vec0_tables
-                                        _warm_vec0_tables(conn)
-                                        log.dual_log(tag="DB:Writer:Vec0Retry", message=f"vec0 re-warmed connection, retrying ({_vec0_retries}/2)", level="WARNING", payload={"error": str(tx_err)})
-                                    except Exception as warm_err:
-                                        log.dual_log(tag="DB:Writer:Vec0Retry", message=f"vec0 re-warm failed: {warm_err}", level="WARNING", payload={"error": str(warm_err)})
-                                else:
-                                    log.dual_log(tag="DB:Writer:Vec0Retry", message=f"vec0 transaction retry {_vec0_retries}/2", level="WARNING", payload={"delay": delay, "error": str(tx_err)})
+                                # Removed write-probe warm; relying on read-only verification and writer retry logic.
+                                log.dual_log(tag="DB:Writer:Vec0Retry", message=f"vec0 transaction retry {_vec0_retries}/2", level="WARNING", payload={"delay": delay, "error": str(tx_err)})
 
                                 import time as _time
                                 _time.sleep(delay)
@@ -268,11 +256,7 @@ def db_writer_worker() -> None:
                             elif _is_recoverable_vec0_error(e):
                                 param_summary = [f"<BLOB: {len(p)} bytes>" if isinstance(p, bytes) else p for p in params]
                                 log.dual_log(tag="DB:Writer:VecError", message="sqlite-vec recoverable error", level="WARNING", payload={"sql_preview": str(sql)[:200], "params_preview": str(param_summary)[:200], "error": str(e)})
-                                try:
-                                    from database.connection import _warm_vec0_tables
-                                    _warm_vec0_tables(conn)
-                                except Exception:
-                                    pass
+                                # Removed write warm attempts; rely on higher-level reconciliation and nuke if necessary.
                                 try:
                                     conn.rollback()
                                 except Exception:

@@ -72,8 +72,8 @@ class SchemaReconciler:
             # 3. Validate triggers
             self._validate_triggers(report)
 
-            # 4. Probe vec0 integrity
-            self._probe_vec0_integrity(report)
+            # 4. Verify vec0 readability (Read-only probe)
+            self._verify_vec0_readability(report)
             
             self.conn.commit()
             return report
@@ -84,12 +84,6 @@ class SchemaReconciler:
     def _prune_unexpected(self, report: ReconciliationReport):
         """Drop tables not in expected schema with verbose logging."""
         expected = set(self.expected_tables.keys())
-        
-        # FTS5 and vec0 shadow suffixes (EXPANDED)
-        shadow_suffixes = (
-            '_data', '_idx', '_docsize', '_config', '_content',  # FTS5
-            '_chunks', '_rowids', '_nodes', '_info'              # vec0
-        )
         
         existing = [
             r[0] for r in self.conn.execute(
@@ -105,16 +99,10 @@ class SchemaReconciler:
             # Check if it's a shadow table derived from any expected FTS/vec table
             is_shadow = False
             for base_table in self.expected_tables.keys():
-                for suffix in shadow_suffixes:
-                    if table == f"{base_table}{suffix}":
-                        is_shadow = True
-                        break
-                # vec0 may create numbered chunk tables like: <base>_vector_chunks00, _vector_chunks01 etc.
-                if table.startswith(f"{base_table}_vector_chunks"):
+                if table.startswith(f"{base_table}_"):
                     is_shadow = True
-                if is_shadow:
                     break
-            
+
             if is_shadow:
                 log.dual_log(tag="DB:Validate", message=f"[{self.label}] Preserving shadow: {table}", payload={"label": self.label, "table": table, "action": "preserve_shadow"})
                 continue
@@ -214,36 +202,65 @@ class SchemaReconciler:
                 log.dual_log(tag="DB:Validate", message=f"[{self.label}] Trigger {name} valid", payload={"label": self.label, "trigger": name, "status": "valid"})
                 report.add(ReconciliationAction(name, "unchanged"))
 
-    def _probe_vec0_integrity(self, report: ReconciliationReport):
-        dummy_vector = b'\x00' * 4096
+    def _nuke_vec0_table(self, table_name: str) -> None:
+        """Force-remove a corrupted virtual table and its shadows bypassing xDestroy.
+
+        Steps:
+        1. Enumerate shadow tables while sqlite_master is consistent.
+        2. Remove the virtual table row from sqlite_master using PRAGMA writable_schema = ON.
+        3. Force SQLite to refresh its in-memory schema cache by creating and dropping a temp table.
+        4. Finally, drop the shadow tables using safe DROP TABLE statements.
+        """
+        try:
+            self.conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+            return
+        except Exception as e:
+            log.dual_log(tag="DB:Validate:Nuke", level="WARNING", message=f"[{self.label}] Standard drop failed for {table_name}, initiating hard nuke.", payload={"error": str(e)})
+
+        try:
+            # 1. Gather shadow tables before modifying sqlite_master
+            shadows = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ? || '_%'", (table_name,)).fetchall()
+            shadow_names = [row[0] for row in shadows]
+
+            # 2. Excise the virtual table from sqlite_master
+            self.conn.execute("PRAGMA writable_schema = ON")
+            try:
+                self.conn.execute("DELETE FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+            finally:
+                try:
+                    self.conn.execute("PRAGMA writable_schema = OFF")
+                except Exception:
+                    pass
+
+            # 3. Force SQLite to reload the schema cache so it forgets the virtual table
+            self.conn.execute("CREATE TABLE IF NOT EXISTS __schema_reload_temp (id INTEGER)")
+            self.conn.execute("DROP TABLE IF EXISTS __schema_reload_temp")
+
+            # 4. Safely drop the now-orphaned shadow tables using standard DROP TABLE
+            for shadow_name in shadow_names:
+                self.conn.execute(f"DROP TABLE IF EXISTS [{shadow_name}]")
+        except Exception as nuke_err:
+            raise RuntimeError(f"Nuke sequence failed for {table_name}: {nuke_err}")
+
+    def _verify_vec0_readability(self, report: ReconciliationReport) -> None:
+        """Read-only probe to verify vec0 health without causing WAL corruption."""
         for name, ddl in self.expected_tables.items():
-            if not self._is_virtual_table(name):
-                continue
-            if "vec0" not in (ddl or "").lower():
+            if not self._is_virtual_table(name) or "vec0" not in (ddl or "").lower():
                 continue
             
             try:
-                self.conn.execute("SAVEPOINT vec_integrity")
-                self.conn.execute(
-                    f"INSERT INTO {name}(rowid, embedding) VALUES(999999999998, ?)",
-                    (dummy_vector,)
-                )
-                self.conn.execute(f"DELETE FROM {name} WHERE rowid = 999999999998")
-                self.conn.execute("RELEASE SAVEPOINT vec_integrity")
+                self.conn.execute(f"SELECT rowid FROM {name} LIMIT 1").fetchall()
             except Exception as e:
-                try:
-                    self.conn.execute("ROLLBACK TO SAVEPOINT vec_integrity")
-                except Exception:
-                    pass
                 log.dual_log(
                     tag="DB:Validate",
                     level="WARNING",
-                    message=f"[{self.label}] {name}: vec0 integrity probe failed, recreating",
+                    message=f"[{self.label}] {name}: vec0 read probe failed, table corrupted. Nuking.",
                     payload={"label": self.label, "table": name, "error": str(e)}
                 )
-                self.conn.execute(f"DROP TABLE IF EXISTS {name}")
+                is_master = name in self.master_tables
+                self._nuke_vec0_table(name)
                 self.conn.executescript(ddl)
-                report.add(ReconciliationAction(name, "recreated", reason=f"vec0 integrity probe failed: {e}"))
+                report.add(ReconciliationAction(name, "recreated", is_master=is_master, reason=f"vec0 read probe failed: {e}"))
 
     def _snapshot_master(self, table_name: str):
         """Pre-drop snapshot for master tables. If corrupted, log CRITICAL and proceed with reset."""
