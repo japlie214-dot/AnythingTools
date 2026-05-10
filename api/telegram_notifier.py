@@ -1,9 +1,10 @@
 # api/telegram_notifier.py
 """
-Simple, non-blocking Telegram notifier shim used by AnythingTools API.
-This is a light-weight placeholder that can be expanded later to actually
-push messages using python-telegram-bot or any other transport. It is kept
-separate so the worker/telemetry path can call a single function.
+Deprecated Telegram notifier shim.
+
+This module used to provide lightweight helpers for pushing notifications to
+Telegram. The notifier has been intentionally removed; these no-op wrappers
+preserve import compatibility for callers that haven't been migrated yet.
 """
 
 from utils.logger.core import get_dual_logger
@@ -11,18 +12,20 @@ import asyncio
 
 log = get_dual_logger(__name__)
 
-from api.telegram_client import TelegramBot
-
 async def send_notification(text: str) -> None:
-    """Main entry point — formats as transparent chat window."""
-    await TelegramBot.send_chat_message(text)
+    """Compatibility no-op. Logs a deprecation event."""
+    try:
+        log.dual_log(tag="API:Notifier", message="send_notification called on deprecated api.telegram_notifier", payload={"text_len": len(text) if text else 0})
+    except Exception:
+        pass
 
 async def notify_user(text: str) -> None:
-    """Backwards-compatible entry point for legacy callers."""
-    await send_notification(f"📢 {text}")
+    """Backwards-compatible entry point for legacy callers (no-op)."""
+    await send_notification(text)
+
 
 def notify_user_sync(text: str) -> None:
-    """Synchronous wrapper for convenience in threaded contexts."""
+    """Synchronous wrapper that attempts to run the async no-op."""
     try:
         loop = asyncio.get_event_loop()
         if loop and loop.is_running():

@@ -8,7 +8,8 @@ import math
 
 import config
 from tools.scraper.targets import TARGETS
-from tools.scraper.extraction import extract_links, process_article
+from tools.scraper.extraction import extract_links
+from tools.scraper.article_processor import process_article
 from tools.scraper.persistence import (
     _parse_article_result,
     _sync_scraped_article_atomic,  # NEW: Atomic persistence with WriteReceipt

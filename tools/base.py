@@ -88,7 +88,6 @@ class BaseTool(abc.ABC):
         Additional keyword arguments may include:
         - dry_run: bool    - When True, skip external side effects.
         - session_id: str  - Unique identifier for the current session.
-        - chat_id: int     - Telegram chat identifier.
         """
         raise NotImplementedError
 

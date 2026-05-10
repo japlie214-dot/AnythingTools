@@ -71,7 +71,15 @@ def _is_foreign_key_error(error: Exception) -> bool:
 
 def _is_vec0_error(error: Exception) -> bool:
     msg = str(error).lower()
-    return "could not initialize" in msg or ("vec0" in msg and "rowid" in msg) or "could not insert a new vector chunk" in msg or "invalid float32 vector" in msg or "blob length" in msg
+    return any(k in msg for k in [
+        "could not initialize",
+        "could not insert a new vector chunk",
+        "invalid float32 vector",
+        "blob length",
+        "error opening vector blob",
+        "vector_chunks",
+        "vec0",
+    ])
 
 
 def _attempt_table_repair(conn, table_name: str) -> bool:
@@ -116,6 +124,10 @@ def db_writer_worker() -> None:
     """
     global _write_generation
     conn = DatabaseManager.create_write_connection()
+    try:
+        conn.execute("PRAGMA wal_autocheckpoint = 0")
+    except Exception:
+        pass
     log.dual_log(tag="DB:Writer:Start", message="DB writer thread started.", payload={"thread": "sqlite-writer", "queue_maxsize": write_queue.maxsize})
 
     last_wal_checkpoint = time.monotonic()
@@ -159,24 +171,40 @@ def db_writer_worker() -> None:
 
                 elif sql == TRANSACTION_MARKER:
                     statements = params
-                    try:
-                        # Execute statements sequentially
-                        for stmt, binds in statements:
-                            conn.execute(stmt, binds)
-                        conn.commit()
-                        with _write_lock:
-                            _write_generation += 1
-                        if receipt:
-                            receipt.resolve()
-                        consecutive_errors = 0
-                    except Exception as tx_err:
+                    _vec0_retries = 0
+                    while True:
                         try:
-                            conn.rollback()
-                        except Exception:
-                            pass
-                        if receipt:
-                            receipt.reject(tx_err)
-                        raise
+                            # Execute all statements in the transaction
+                            for stmt, binds in statements:
+                                conn.execute(stmt, binds)
+                            conn.commit()
+                            
+                            with _write_lock:
+                                _write_generation += 1
+                            if receipt:
+                                receipt.resolve()
+                            consecutive_errors = 0
+                            break
+                        except Exception as tx_err:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                                
+                            if _is_vec0_error(tx_err) and _vec0_retries < 3:
+                                _vec0_retries += 1
+                                delay = 0.1 * (2 ** (_vec0_retries - 1))
+                                try:
+                                    log.dual_log(tag="DB:Writer:Vec0Retry", message=f"vec0 transaction retry {_vec0_retries}/3", level="WARNING", payload={"delay": delay, "error": str(tx_err)})
+                                except Exception:
+                                    pass
+                                import time as _time
+                                _time.sleep(delay)
+                                continue
+                                
+                            if receipt:
+                                receipt.reject(tx_err)
+                            raise
 
                 else:
                     # Single statement with retry/repair attempts

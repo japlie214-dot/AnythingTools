@@ -23,11 +23,18 @@ except Exception:
     SQLITE_VEC_AVAILABLE = False
 
 _VEC_PERMANENTLY_FAILED = False
+_VEC_LOAD_ANNOUNCED = False
 
 def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
-    global _VEC_PERMANENTLY_FAILED
+    global _VEC_PERMANENTLY_FAILED, _VEC_LOAD_ANNOUNCED
     if not SQLITE_VEC_AVAILABLE:
-        sys.stderr.write("[WARN] sqlite-vec Python package not installed. Vector search disabled.\n")
+        if not _VEC_LOAD_ANNOUNCED:
+            _VEC_LOAD_ANNOUNCED = True
+            try:
+                from utils.logger import get_dual_logger
+                get_dual_logger(__name__).dual_log(tag="DB:Vec:Load", message="sqlite-vec Python package not installed. Vector search disabled.", level="WARNING", payload={"available": False})
+            except Exception:
+                sys.stderr.write("[WARN] sqlite-vec Python package not installed. Vector search disabled.\n")
         return False
     if _VEC_PERMANENTLY_FAILED:
         return False
@@ -44,21 +51,34 @@ def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
     except Exception as exc:
-        sys.stderr.write(
-            f"[CRITICAL] sqlite-vec extension failed to load: {exc}\n"
-            f"  Vector search is DISABLED. Falling back to FTS5 keyword search only.\n"
-        )
+        if not _VEC_LOAD_ANNOUNCED:
+            _VEC_LOAD_ANNOUNCED = True
+            try:
+                from utils.logger import get_dual_logger
+                get_dual_logger(__name__).dual_log(tag="DB:Vec:Load", message="sqlite-vec extension failed to load. Falling back to FTS5.", level="CRITICAL", payload={"error": str(exc), "available": False})
+            except Exception:
+                sys.stderr.write(f"[CRITICAL] sqlite-vec extension failed to load: {exc}\n")
         _VEC_PERMANENTLY_FAILED = True
         return False
 
     try:
         version_row = conn.execute("SELECT vec_version()").fetchone()
         vec_ver = version_row[0] if version_row else "unknown"
-        sys.stderr.write(f"[INFO] sqlite-vec loaded successfully (version: {vec_ver})\n")
+        if not _VEC_LOAD_ANNOUNCED:
+            _VEC_LOAD_ANNOUNCED = True
+            try:
+                from utils.logger import get_dual_logger
+                get_dual_logger(__name__).dual_log(tag="DB:Vec:Load", message="sqlite-vec loaded successfully", level="INFO", payload={"version": vec_ver, "available": True})
+            except Exception:
+                pass
     except Exception as exc:
-        sys.stderr.write(
-            f"[CRITICAL] sqlite-vec loaded but vec_version() query failed: {exc}\n"
-        )
+        if not _VEC_LOAD_ANNOUNCED:
+            _VEC_LOAD_ANNOUNCED = True
+            try:
+                from utils.logger import get_dual_logger
+                get_dual_logger(__name__).dual_log(tag="DB:Vec:Load", message="sqlite-vec loaded but vec_version() query failed", level="CRITICAL", payload={"error": str(exc)})
+            except Exception:
+                sys.stderr.write(f"[CRITICAL] sqlite-vec loaded but vec_version() query failed: {exc}\n")
         _VEC_PERMANENTLY_FAILED = True
         return False
     return True

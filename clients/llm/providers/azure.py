@@ -79,7 +79,6 @@ class AzureProvider(LLMProvider):
         log.dual_log(
             tag="LLM:Azure:Request",
             message=f"Sending request to {_resolved_model}",
-            notify_user=True,
             payload={
                 "model":            _resolved_model,
                 "messages":         request.messages,
@@ -107,7 +106,6 @@ class AzureProvider(LLMProvider):
         log.dual_log(
             tag="LLM:Azure:Response",
             message=f"Received response. {tools_called_str}",
-            notify_user=True,
             payload={
                 "model":         _final_model,
                 "finish_reason": getattr(response, "status", None),

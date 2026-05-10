@@ -42,7 +42,6 @@ def hitl_wait_for_operator(
             tag="HITL:Cancel",
             message="Operator typed 'Stop' — cancellation_flag set.",
             status_state="CANCELLED",
-            notify_user=True,
             payload={"action": "operator_stop"},
         )
         return False
@@ -71,7 +70,6 @@ async def hitl_wait_for_operator_async(
             tag="HITL:Cancel",
             message="Operator typed 'Stop' — cancellation_flag set.",
             status_state="CANCELLED",
-            notify_user=True,
             payload={"action": "operator_stop"},
         )
         return False
@@ -91,7 +89,6 @@ def mark_paused_for_hitl(
         status_state="PAUSED_FOR_HITL",
         payload=payload or {"action": "operator_intervention_required", "reason": message},
         level="WARNING",
-        notify_user=True,
     )
 
 

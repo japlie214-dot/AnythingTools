@@ -49,7 +49,6 @@ class SumAnalLogger:
         payload: dict,
         exc_info: Exception | bool | tuple | None = None,
         status_state: str | None = None,
-        notify_user: bool = False,
     ) -> None:
         """Dual-stream logger: Console (Notification) + Database (Detail)."""
         if not isinstance(payload, dict) or not payload:
@@ -139,8 +138,6 @@ class SumAnalLogger:
                 (status_state, ts, job_id),
             )
 
-        if notify_user:
-            pass  # Telegram notifier removed for pure tool-hosting environment.
 
 
 # ── Public API ───────────────────────────────────────────────────────────────

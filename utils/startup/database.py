@@ -24,11 +24,11 @@ async def init_database_layer() -> None:
                 LOGS_DB_PATH.unlink(missing_ok=True)
                 for s in ["-wal", "-shm"]:
                     (LOGS_DB_PATH.parent / (LOGS_DB_PATH.name + s)).unlink(missing_ok=True)
-                sys.stderr.write("Logs database file unlinked successfully.\n")
+                log.dual_log(tag="Startup:DB", message="Logs database file unlinked successfully", level="INFO", payload={"action": "unlink_logs_db"})
             except Exception as file_e:
-                sys.stderr.write(f"Warning: Could not unlink logs.db ({file_e}). Will drop table via SQL.\n")
+                log.dual_log(tag="Startup:DB", message=f"Could not unlink logs.db: {file_e}", level="WARNING", payload={"error": str(file_e)})
     except Exception as e:
-        sys.stderr.write(f"Warning: Failed during logs.db wipe policy: {e}\n")
+        log.dual_log(tag="Startup:DB", message=f"Failed during logs.db wipe policy: {e}", level="WARNING", payload={"error": str(e)})
 
     # Synchronously ensure the logs table is fresh and exists
     try:
@@ -37,9 +37,9 @@ async def init_database_layer() -> None:
         logs_conn.executescript(get_logs_init_script())
         logs_conn.commit()
         logs_conn.close()
-        sys.stderr.write("Logs DB schema initialized to start fresh.\n")
+        log.dual_log(tag="Startup:DB", message="Logs DB schema initialized to start fresh", level="INFO", payload={"action": "recreate_logs_db"})
     except Exception as e:
-        sys.stderr.write(f"Warning: Failed to synchronously initialize logs DB: {e}\n")
+        log.dual_log(tag="Startup:DB", message=f"Failed to synchronously initialize logs DB: {e}", level="WARNING", payload={"error": str(e)})
 
     # 1. Log file probing
     for label, path in [("Main", DB_PATH), ("Logs", LOGS_DB_PATH)]:
@@ -109,13 +109,34 @@ async def validate_vec0() -> None:
         return
     
     try:
-        conn = DatabaseManager.get_read_connection()
+        # Use a write connection to perform pre-warming
+        conn = DatabaseManager.create_write_connection()
         version = conn.execute("SELECT vec_version();").fetchone()
         log.dual_log(
-            tag="Startup:Vec0", 
+            tag="Startup:Vec0",
             message="sqlite_vec/vec0 extension verified",
             level="INFO",
             payload={"version": version[0]},
         )
+        
+        # PRE-WARM SHADOW TABLES:
+        # sqlite-vec lazily creates shadow tables on the first INSERT. If the first INSERT
+        # is inside an explicit transaction, SQLite rejects sqlite3_blob_open.
+        # We force creation here in autocommit mode using a dummy vector.
+        try:
+            vec_tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%USING vec0%'").fetchall()
+            dummy_vector = b'\x00' * 4096  # 1024 float32 zeros
+            for (t_name,) in vec_tables:
+                conn.execute(f"INSERT INTO {t_name}(rowid, embedding) VALUES(999999999999, ?)", (dummy_vector,))
+                conn.execute(f"DELETE FROM {t_name} WHERE rowid = 999999999999")
+                conn.commit()
+        except Exception:
+            pass # Silently proceed if already warmed
+            
     except Exception as e:
         log.dual_log(tag="Startup:Vec0", message="Vec0 validation skipped", level="WARNING", payload={"error": str(e)})
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass

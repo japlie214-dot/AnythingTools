@@ -153,28 +153,6 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
         return None, False
 
 
-# Backwards compatible fire-and-forget persistence (kept minimal)
-def _persist_scraped_article(parsed_result: dict) -> None:
-    from database.writer import enqueue_write
-    try:
-        enqueue_write(
-            "INSERT INTO scraped_articles (id, normalized_url, url, title, conclusion, summary, metadata_json, embedding_status, vec_rowid, scraped_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(normalized_url) DO UPDATE SET url = excluded.url, title = excluded.title, conclusion = excluded.conclusion, summary = excluded.summary, embedding_status = excluded.embedding_status, updated_at = CURRENT_TIMESTAMP",
-            (
-                parsed_result.get("ulid"),
-                parsed_result.get("normalized_url"),
-                parsed_result.get("url"),
-                parsed_result.get("title"),
-                parsed_result.get("conclusion"),
-                parsed_result.get("summary"),
-                "{}",
-                "PENDING" if parsed_result.get("status") == "SUCCESS" else "SKIPPED",
-                parsed_result.get("id"),
-            ),
-        )
-    except Exception as e:
-        log.dual_log(tag="Scraper:Persist", message=f"Fire-and-forget persist failed: {e}", level="WARNING", payload={"error": str(e)})
 
 
 def _curate_articles_dfeed(results: dict[str, dict]) -> dict:

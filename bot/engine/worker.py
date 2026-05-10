@@ -404,7 +404,7 @@ class UnifiedWorkerManager:
             else:
                 self._system_errors[job_id] += 1
                 if self._system_errors[job_id] >= 3:
-                    log.dual_log(tag="Worker:Job:Abandoned", message=f"Job {job_id} ABANDONED after 3 consecutive system errors", level="CRITICAL", payload={"job_id": job_id, "error": str(e)}, notify_user=True)
+                    log.dual_log(tag="Worker:Job:Abandoned", message=f"Job {job_id} ABANDONED after 3 consecutive system errors", level="CRITICAL", payload={"job_id": job_id, "error": str(e)})
                     enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("ABANDONED", now_iso(), job_id))
                     del self._system_errors[job_id]
                 else:
