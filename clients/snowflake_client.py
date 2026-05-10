@@ -1,6 +1,19 @@
 # clients/snowflake_client.py
 import json
 import threading
+from typing import Any
+
+class EmbeddingError(Exception):
+    """Base class for embedding pipeline failures."""
+
+class EmbeddingTypeError(EmbeddingError):
+    """Raised when Snowflake returns an unparseable VECTOR type."""
+
+class EmbeddingDimensionError(EmbeddingError):
+    """Raised when the extracted vector has wrong dimension count."""
+
+class EmbeddingValidationError(EmbeddingError):
+    """Raised when the vector contains NaN, Inf, or non-finite values."""
 from pathlib import Path
 
 import snowflake.connector
@@ -15,7 +28,7 @@ log = get_dual_logger(__name__)
 
 class SnowflakeClient:
     _instance = None
-    _lock = threading.Lock()
+    _lock = threading.RLock()
 
     def __new__(cls):
         with cls._lock:
@@ -77,63 +90,74 @@ class SnowflakeClient:
                 payload={"account_last4": config.SNOWFLAKE_ACCOUNT[-4:] if config.SNOWFLAKE_ACCOUNT else None, "user": config.SNOWFLAKE_USER, "key_path": str(key_path)},
             )
 
+    @staticmethod
+    def _extract_vector(raw: Any) -> list[float]:
+        if isinstance(raw, list):
+            return raw[0] if raw and isinstance(raw[0], list) else raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except Exception as exc:
+                raise EmbeddingTypeError(f"Snowflake returned str that is not valid JSON: {exc}") from exc
+            return SnowflakeClient._extract_vector(parsed)
+        if isinstance(raw, dict):
+            for v in raw.values():
+                if isinstance(v, list) and v and isinstance(v[0], (int, float)):
+                    return v
+            raise EmbeddingTypeError(f"Snowflake returned dict with no list-of-floats value. Keys: {list(raw.keys())}")
+        try:
+            return list(raw)
+        except Exception as exc:
+            raise EmbeddingTypeError(f"Cannot convert Snowflake result to list: {exc}") from exc
+
     def embed(self, text: str, model: str = "voyage-multilingual-2") -> list[float]:
         """Generate a 1024-dimensional vector embedding using Snowflake Cortex AI_EMBED.
 
         Synchronous — must be called via asyncio.to_thread() in async contexts,
         or via asyncio.run_coroutine_threadsafe() from the botasaurus browser thread.
         """
-        self.verify_or_reconnect()
-        # Truncate only; do NOT manually escape quotes. The text is passed as a
-        # parameterized bind variable (%s), so the connector handles escaping.
-        # Manual replace("'", "''") before parameterization causes double-encoding.
         safe_text = text[:8000]
-        cursor = self.conn.cursor()
-        try:
-            sql = f"SELECT AI_EMBED('{model}', %s)"
-            cursor.execute(sql, (safe_text,))
-            result = cursor.fetchone()
-            if result and result[0] is not None:
-                from utils.logger.formatters import SensitiveEmbeddingResult
-                log.dual_log(tag="Embed:Raw", message="Raw Snowflake response", payload={"raw": SensitiveEmbeddingResult(result[0])})
-                raw_res = result[0]
-                vec = None
+        
+        with self._lock:
+            self.verify_or_reconnect()
+            cursor = self.conn.cursor()
+            try:
+                sql = "SELECT AI_EMBED(%s, %s)"
+                cursor.execute(sql, (model, safe_text))
+                result = cursor.fetchone()
                 
-                if isinstance(raw_res, str):
-                    try:
-                        parsed = json.loads(raw_res)
-                        if isinstance(parsed, dict):
-                            for k, v in parsed.items():
-                                if isinstance(v, list) and len(v) > 0 and isinstance(v[0], (int, float)):
-                                    vec = v
-                                    break
-                                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], list):
-                                    vec = v[0]
-                                    break
-                        elif isinstance(parsed, list):
-                            vec = parsed[0] if len(parsed)>0 and isinstance(parsed[0], list) else parsed
-                    except Exception:
-                        pass
-                elif isinstance(raw_res, dict):
-                    for k, v in raw_res.items():
-                        if isinstance(v, list) and len(v) > 0 and isinstance(v[0], (int, float)):
-                            vec = v
-                            break
-                        elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], list):
-                            vec = v[0]
-                            break
-                elif isinstance(raw_res, list):
-                    vec = raw_res[0] if len(raw_res)>0 and isinstance(raw_res[0], list) else raw_res
-                
-                if not vec or not isinstance(vec, list):
-                    raise ValueError(f"Could not extract vector from {type(raw_res).__name__}")
-                if len(vec) != 1024:
-                    raise ValueError(f"Expected 1024 dimensions, got {len(vec)}")
+                if not result or result[0] is None:
+                    raise EmbeddingTypeError("Snowflake AI_EMBED returned empty result.")
                     
-                return [float(x) for x in vec]
-            raise ValueError("Snowflake AI_EMBED returned an empty result.")
-        finally:
-            cursor.close()
+                raw_res = result[0]
+                raw_type = type(raw_res).__name__
+                vec = self._extract_vector(raw_res)
+                
+                log.dual_log(
+                    tag="Embed:Raw",
+                    message=f"Extracted vector from Snowflake ({raw_type} → list[{len(vec)}])",
+                    payload={"raw_type": raw_type, "dimensions": len(vec)},
+                )
+            finally:
+                cursor.close()
+                
+        if not isinstance(vec, list) or len(vec) == 0:
+            raise EmbeddingTypeError(f"Extracted value is not a non-empty list: {type(vec).__name__}")
+            
+        try:
+            vec = [float(x) for x in vec]
+        except Exception as exc:
+            raise EmbeddingTypeError(f"Cannot coerce vector elements to float: {exc}") from exc
+            
+        if len(vec) != 1024:
+            raise EmbeddingDimensionError(f"Expected 1024 dimensions, got {len(vec)}")
+            
+        import math
+        if any(math.isnan(x) or math.isinf(x) for x in vec):
+            bad_indices = [i for i, x in enumerate(vec) if math.isnan(x) or math.isinf(x)]
+            raise EmbeddingValidationError(f"Embedding contains NaN/Inf at indices: {bad_indices[:10]}")
+            
+        return vec
 
     async def async_embed(self, text: str, model: str = "voyage-multilingual-2") -> list[float]:
         """

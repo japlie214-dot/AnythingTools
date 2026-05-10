@@ -10,7 +10,14 @@ import config
 import struct
 import sqlite3
 import concurrent.futures
+import atexit
 from typing import List, Tuple, Optional
+
+try:
+    import sqlite_vec
+except ImportError:
+    sqlite_vec = None
+
 from clients.snowflake_client import snowflake_client
 from database.connection import DatabaseManager
 from utils.logger import get_dual_logger
@@ -19,6 +26,17 @@ log = get_dual_logger(__name__)
 
 # voyage-multilingual-2 produces 1024-dimensional float32 embeddings.
 VOYAGE_EMBEDDING_BYTES = 1024 * 4  # 4096 bytes
+
+
+def validate_embedding_bytes(emb_bytes: bytes) -> None:
+    if emb_bytes is None:
+        raise ValueError("Embedding bytes cannot be None")
+    if not isinstance(emb_bytes, bytes):
+        raise ValueError(f"Embedding must be bytes, got {type(emb_bytes).__name__}")
+    if len(emb_bytes) != VOYAGE_EMBEDDING_BYTES:
+        raise ValueError(f"Embedding byte length mismatch: expected {VOYAGE_EMBEDDING_BYTES}, got {len(emb_bytes)}")
+    if len(emb_bytes) % 4 != 0:
+        raise ValueError(f"Embedding BLOB length must be divisible by 4, got {len(emb_bytes)}")
 
 
 async def generate_embedding(text: str, provider_type: str = "azure") -> bytes:
@@ -34,18 +52,14 @@ async def generate_embedding(text: str, provider_type: str = "azure") -> bytes:
     except asyncio.TimeoutError:
         raise TimeoutError("Snowflake embedding API timed out after 60 seconds")
 
-    import math
-    if len(emb_list) != 1024:
-        raise ValueError(f"Embedding dimension mismatch: expected 1024, got {len(emb_list)}")
-    if any(math.isnan(x) or math.isinf(x) for x in emb_list):
-        raise ValueError("Embedding contains NaN or Infinity values")
-        
-    packed_bytes = struct.pack('<1024f', *emb_list)
+    if sqlite_vec and hasattr(sqlite_vec, "serialize_float32"):
+        packed_bytes = sqlite_vec.serialize_float32(emb_list)
+    else:
+        packed_bytes = struct.pack('<1024f', *emb_list)
     
-    if len(packed_bytes) != VOYAGE_EMBEDDING_BYTES:
-        raise ValueError(f"Embedding byte length mismatch: expected {VOYAGE_EMBEDDING_BYTES}, got {len(packed_bytes)}")
+    validate_embedding_bytes(packed_bytes)
         
-    log.dual_log(tag="Embed:Pack", message="Successfully packed vector", payload={"dimensions": 1024, "bytes": len(packed_bytes)})
+    log.dual_log(tag="Embed:Pack", message="Successfully packed vector", payload={"dimensions": len(emb_list), "bytes": len(packed_bytes)})
     return packed_bytes
 
 
@@ -155,28 +169,25 @@ def get_memory_context_string(relevant_memories: List[Tuple[str, str]]) -> str:
     return "\n".join(context_lines)
 
 
+_sync_embed_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed-")
+atexit.register(_sync_embed_executor.shutdown, wait=False)
+
 def generate_embedding_sync(text: str, provider_type: str = "azure") -> bytes:
     from clients.snowflake_client import snowflake_client
     import struct
-    import concurrent.futures
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(snowflake_client.embed, text)
-        try:
-            raw_emb = future.result(timeout=60.0)
-        except concurrent.futures.TimeoutError:
-            raise TimeoutError("Snowflake embedding API timed out after 60 seconds")
+    future = _sync_embed_executor.submit(snowflake_client.embed, text)
+    try:
+        raw_emb = future.result(timeout=60.0)
+    except concurrent.futures.TimeoutError:
+        raise TimeoutError("Snowflake embedding API timed out after 60 seconds")
 
-    import math
-    if len(raw_emb) != 1024:
-        raise ValueError(f"Embedding dimension mismatch: expected 1024, got {len(raw_emb)}")
-    if any(math.isnan(x) or math.isinf(x) for x in raw_emb):
-        raise ValueError("Embedding contains NaN or Infinity values")
-        
-    packed_bytes = struct.pack('<1024f', *raw_emb)
+    if sqlite_vec and hasattr(sqlite_vec, "serialize_float32"):
+        packed_bytes = sqlite_vec.serialize_float32(raw_emb)
+    else:
+        packed_bytes = struct.pack('<1024f', *raw_emb)
     
-    if len(packed_bytes) != VOYAGE_EMBEDDING_BYTES:
-        raise ValueError(f"Embedding byte length mismatch: expected {VOYAGE_EMBEDDING_BYTES}, got {len(packed_bytes)}")
+    validate_embedding_bytes(packed_bytes)
         
-    log.dual_log(tag="Embed:Pack:Sync", message="Successfully packed vector sync", payload={"dimensions": 1024, "bytes": len(packed_bytes)})
+    log.dual_log(tag="Embed:Pack:Sync", message="Successfully packed vector sync", payload={"dimensions": len(raw_emb), "bytes": len(packed_bytes)})
     return packed_bytes

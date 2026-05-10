@@ -57,8 +57,15 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
     Returns a WriteReceipt (or None) that allows the caller to wait for flush completion and detect timeout.
     """
     from database.writer import enqueue_transaction
+    from utils.vector_search import validate_embedding_bytes
+    from clients.snowflake_client import EmbeddingError
+    
+    # Coerce to JSON string immediately to guarantee safety across all paths
+    if isinstance(local_meta_json, dict):
+        local_meta_json = json.dumps(local_meta_json)
+
+    statements = []
     try:
-        statements = []
 
         # Base article insert/update
         insert_sql = (
@@ -107,6 +114,8 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
                 from utils.vector_search import generate_embedding_sync
                 embedding_bytes = generate_embedding_sync(content_for_embedding)
 
+                validate_embedding_bytes(embedding_bytes)
+
                 statements.extend([
                     ("DELETE FROM scraped_articles_vec WHERE rowid = ?", (parsed_result["id"],)),
                     ("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", (parsed_result["id"], embedding_bytes)),
@@ -119,10 +128,12 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
                 local_meta_json = json.dumps(lm)
                 embedding_success = True
 
+            except EmbeddingError as ee:
+                log.dual_log(tag="Scraper:Embedding", message=f"Embedding generation failed for {parsed_result['ulid']}: {ee}", level="WARNING", payload={"error_type": type(ee).__name__, "error": str(ee)})
             except TimeoutError as te:
                 log.dual_log(tag="Scraper:Embedding", message=f"Snowflake timeout for {parsed_result['ulid']}. Marking pending.", level="WARNING", payload={"error": str(te)})
             except Exception as e:
-                log.dual_log(tag="Scraper:Embedding", message=f"Failed embedding: {e}", level="WARNING", payload={"error": str(e)})
+                log.dual_log(tag="Scraper:Embedding", message=f"Unexpected embedding failure: {e}", level="WARNING", payload={"error_type": type(e).__name__, "error": str(e)})
 
         # Job item status update (atomic)
         if job_id:

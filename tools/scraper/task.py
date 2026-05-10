@@ -242,7 +242,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                         # Very short sync inject (simplified)
                         from database.writer import enqueue_write
                         _emb_receipt, _embed_ok = _sync_scraped_article_atomic(
-                            _entry, job_id, _meta, _local_meta
+                            _entry, job_id, _meta, json.dumps(_local_meta)
                         )
                         if _embed_ok:
                             _local_meta["embedding_synced"] = True
@@ -281,7 +281,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             # ── ATOM IN: THE BIG ONE ──
             from database.writer import enqueue_write
             _receipt, _embed_ok = _sync_scraped_article_atomic(
-                _parsed_result, job_id, _meta, _local_meta
+                _parsed_result, job_id, _meta, json.dumps(_local_meta)
             )
             if not _embed_ok and job_id:
                 enqueue_write("UPDATE jobs SET status = 'PARTIAL', updated_at = CURRENT_TIMESTAMP WHERE job_id = ?", (job_id,))

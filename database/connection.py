@@ -12,6 +12,7 @@ functionality disabled.
 from pathlib import Path
 import sqlite3
 import threading
+import sys
 
 # Optional sqlite_vec helper; fail gracefully when it's not present.
 try:
@@ -20,6 +21,30 @@ try:
 except Exception:
     sqlite_vec = None  # type: ignore
     SQLITE_VEC_AVAILABLE = False
+
+def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
+    if not SQLITE_VEC_AVAILABLE:
+        sys.stderr.write("[WARN] sqlite-vec Python package not installed. Vector search disabled.\n")
+        return False
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+    except Exception as exc:
+        sys.stderr.write(
+            f"[CRITICAL] sqlite-vec extension failed to load: {exc}\n"
+            f"  Vector search is DISABLED. Falling back to FTS5 keyword search only.\n"
+        )
+        return False
+    try:
+        version_row = conn.execute("SELECT vec_version()").fetchone()
+        vec_ver = version_row[0] if version_row else "unknown"
+        sys.stderr.write(f"[INFO] sqlite-vec loaded successfully (version: {vec_ver})\n")
+    except Exception as exc:
+        sys.stderr.write(
+            f"[CRITICAL] sqlite-vec loaded but vec_version() query failed: {exc}\n"
+        )
+        return False
+    return True
 
 # Path to the SQLite database files. Adjust as needed.
 DB_PATH = Path("data") / "sumanal.db"
@@ -59,14 +84,7 @@ class DatabaseManager:
                 str(DB_PATH), timeout=READ_TIMEOUT_SECONDS, check_same_thread=True
             )
 
-            # Try to load sqlite_vec if available; fail gracefully if not.
-            if SQLITE_VEC_AVAILABLE:
-                try:
-                    conn.enable_load_extension(True)
-                    sqlite_vec.load(conn)
-                except Exception:
-                    # Extension failed to load in this environment - continue without it.
-                    pass
+            _attempt_vec_load(conn)
 
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
@@ -92,13 +110,7 @@ class DatabaseManager:
             str(DB_PATH), timeout=READ_TIMEOUT_SECONDS, check_same_thread=True
         )
 
-        if SQLITE_VEC_AVAILABLE:
-            try:
-                conn.enable_load_extension(True)
-                sqlite_vec.load(conn)
-            except Exception:
-                # Ignore extension failures for write connection as well.
-                pass
+        _attempt_vec_load(conn)
 
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode = WAL")

@@ -54,17 +54,17 @@ Table of contents
 
 - Data flow (step-by-step, observable):
   1. External caller issues HTTP request to enqueue a tool run at [`api/routes.py`](api/routes.py:48). The route persists a new row in `jobs` using `enqueue_write("INSERT INTO jobs ...")` and returns the job id.
-     - Evidence: See the INSERT call at [`api/routes.py:131`](api/routes.py:131) and the use of `enqueue_write` imported from [`database/writer.py`](database/writer.py:1).
+      - Evidence: See the INSERT call at [`api/routes.py:131`](api/routes.py:131) and the use of `enqueue_write` imported from [`database/writer.py`](database/writer.py:1).
   2. `UnifiedWorkerManager` (see [`bot/engine/worker.py`](bot/engine/worker.py:1)) polls `jobs` (SELECT from `jobs`) and, for each job to run, marks it RUNNING with `enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ...)` and spawns a dedicated thread to execute that job.
-     - Evidence: `UnifiedWorkerManager._run_loop` and `_run_job` call `enqueue_write(...)` at [`bot/engine/worker.py:255`](bot/engine/worker.py:255) and spawn threads with `spawn_thread_with_context(...)`.
+      - Evidence: `UnifiedWorkerManager._run_loop` and `_run_job` call `enqueue_write(...)` at [`bot/engine/worker.py:255`](bot/engine/worker.py:255) and spawn threads with `spawn_thread_with_context(...)`.
   3. The job execution thread uses `tools/registry` to instantiate the tool, then delegates execution to `bot/engine/tool_runner.py` using `asyncio.run(run_tool_safely(...))`.
-     - Evidence: lines where `res = asyncio.run(run_tool_safely(...))` in [`bot/engine/worker.py`](bot/engine/worker.py:1).
+      - Evidence: lines where `res = asyncio.run(run_tool_safely(...))` in [`bot/engine/worker.py`](bot/engine/worker.py:1).
   4. The tool runs (tool implementation lives under `tools/`), which may interact with headful browser helper code (`utils/browser_daemon.py` + `tools/scraper/browser.py`) or with external LLM/embedding clients (`clients/llm/*`, `clients/snowflake_client.py`). Tool code updates intermediate state (job_items, scraped_articles) by calling `enqueue_write` or the high-level persistence helper in `tools/scraper/persistence.py` that constructs atomic transactions and returns a `WriteReceipt` to allow the caller to wait for persistence.
-     - Evidence: [`tools/scraper/persistence.py`](tools/scraper/persistence.py:1) exposes `_sync_scraped_article_atomic`, which returns a receipt; caller waits for the receipt in [`tools/scraper/task.py`](tools/scraper/task.py:272).
+      - Evidence: [`tools/scraper/persistence.py`](tools/scraper/persistence.py:1) exposes `_sync_scraped_article_atomic`, which returns a receipt; caller waits for the receipt in [`tools/scraper/task.py`](tools/scraper/task.py:272).
   5. The single-writer thread (`database/writer.py`) serially performs SQL statements, commits, optionally resolves `WriteReceipt` objects so the original caller can block until on-disk commit.
-     - Evidence: `WriteReceipt` dataclass is at [`database/writer.py:25`](database/writer.py:25) and writer loop resolves/rejects receipts after executing statements (`receipt.resolve()` / `receipt.reject(...)`).
+      - Evidence: `WriteReceipt` dataclass is at [`database/writer.py:25`](database/writer.py:25) and writer loop resolves/rejects receipts after executing statements (`receipt.resolve()` / `receipt.reject(...)`).
   6. Structured logs are authored via `log.dual_log(...)` (from `utils/logger/core.py`); that function enqueues inserts into the logs writer queue via `logs_enqueue_write(...)` (implemented in [`database/logs_writer.py`](database/logs_writer.py:1)) so that logs are persisted independently of main DB writes.
-     - Evidence: `SumAnalLogger.dual_log` calls `logs_enqueue_write` (see [`utils/logger/core.py:126`](utils/logger/core.py:126)).
+      - Evidence: `SumAnalLogger.dual_log` calls `logs_enqueue_write` (see [`utils/logger/core.py:126`](utils/logger/core.py:126)).
 
 - Execution model & concurrency primitives (explicit):
   - The system is primarily single-process and multi-threaded. The API uses `async` functions but delegates CPU/IO-bound tool execution into threads or `asyncio.run(...)` calls. The durable coordination primitive for persistence is a single, long-running writer thread (not a distributed broker).
