@@ -5,14 +5,26 @@ VALIDATION_PROMPT = """You are a Web Content Validator specializing in detecting
 
 TASK: Determine whether the page displays genuine, readable article content or is blocked/unusable.
 
-## CONTENT TYPES TO REJECT:
-1. **Paywalls & Subscriptions** ("Subscribe to continue", "Premium access", "Limit reached")
-2. **Consent/Gatekeeper Overlays** (Massive cookie banners blocking content, age gates, newsletter popups)
-3. **Video/Audio Primary** (YouTube embeds as main content, podcasts without transcript)
-4. **Navigation/Gallery Pages** (Homepage link collections, tag listings, search results)
-5. **Empty or Minimal Content** (<300 words of actual paragraph content, 404s)
+## CLASSIFICATION ACTIONS:
+- **proceed**: Page has genuine, readable article content. Proceed to summarization.
+- **auto_skip**: Page is empty, non-textual, or primarily audio/video with no transcript. Skip automatically.
+- **human_help**: Page appears to have content but is blocked by a popup, CAPTCHA, consent overlay, or paywall.
 
-## CONTENT TYPES TO ACCEPT:
+## AUTO_SKIP TRIGGERS (no human needed):
+1. Podcast/audio-only pages without transcript
+2. Video-only pages (YouTube embeds, video players) without article text
+3. Empty or minimal content pages (<300 words of paragraph text)
+4. 404/error pages, redirect-only pages
+5. Navigation pages, tag listings, search results with no article
+
+## HUMAN_HELP TRIGGERS (operator must intervene):
+1. Cookie/consent banners blocking the entire page
+2. CAPTCHA challenges (reCAPTCHA, hCaptcha, etc.)
+3. Newsletter/subscription popups covering article content
+4. Age gates or region locks
+5. Paywalls where content exists but requires login/subscription
+
+## PROCEED TRIGGERS:
 - News articles with substantial text
 - Opinion/editorial pieces
 - Data-driven reports
@@ -21,11 +33,36 @@ TASK: Determine whether the page displays genuine, readable article content or i
 ## EXPECTED FORMAT:
 {
   "valid": true/false,
-  "reason": "One sentence explaining why valid/invalid"
+  "action": "proceed"/"auto_skip"/"human_help",
+  "reason": "One sentence explaining the classification"
 }
+
+When valid=true, action MUST be "proceed".
+When valid=false, action MUST be either "auto_skip" or "human_help".
 
 ### PAGE CONTENT
 """
+
+VALIDATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "valid": {
+            "type": "boolean",
+            "description": "Whether the page contains genuine, readable article content"
+        },
+        "action": {
+            "type": "string",
+            "enum": ["proceed", "auto_skip", "human_help"],
+            "description": "Recommended action: proceed to summarization, auto-skip without human, or request human_help"
+        },
+        "reason": {
+            "type": "string",
+            "description": "One sentence explaining the classification decision"
+        }
+    },
+    "required": ["valid", "action", "reason"],
+    "additionalProperties": False
+}
 
 SUMMARIZATION_PROMPT = """You are a Multimodal Editorial Intelligence system.
 You extract structured summaries from web articles while intelligently filtering noise.

@@ -106,6 +106,9 @@ class SchemaReconciler:
                     if table == f"{base_table}{suffix}":
                         is_shadow = True
                         break
+                # vec0 may create numbered chunk tables like: <base>_vector_chunks00, _vector_chunks01 etc.
+                if table.startswith(f"{base_table}_vector_chunks"):
+                    is_shadow = True
                 if is_shadow:
                     break
             

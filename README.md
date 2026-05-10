@@ -1,281 +1,245 @@
-# AnythingTools — Codebase Snapshot
+# AnythingTools — Precise Codebase Snapshot
 
-This README documents the repository exactly as it exists in this workspace. Every statement below is grounded in concrete, inspectable artifacts in the repository (files, functions, constants, SQL DDL). Where a claim is an inference about historical change, the claim is labeled with a confidence level and the precise code artifacts used as evidence.
-
-This README is structured to be reconstructable: a competent engineer should be able to navigate to the referenced files, follow the code paths cited, and verify each assertion.
-
----
+This README documents the repository exactly as it exists in this workspace. Every claim below is grounded in inspectable artifacts in the repository (files, functions, constants, SQL DDL). Where an assertion is an inference about historical change it is labeled with a confidence level and the precise code artifacts used as evidence. Follow the clickable references to verify each statement.
 
 Table of contents
-- Project Overview
-- High-Level Architecture
-- Repository Structure (top-level walkthrough)
-- Core Concepts & Domain Model
-- Detailed Behavior (normal execution + edge cases)
-- Public Interfaces (APIs / entry points)
-- State, Persistence, and Data
-- Dependencies & Integration
-- Setup, Build, and Execution (how to run, exact files)
-- Testing & Validation
-- Known Limitations & Non-Goals
-- Change Sensitivity (fragile areas)
-- Changes (Evolutionary Analysis, code-evidenced)
+- 1. Project Overview
+- 2. High-Level Architecture
+- 3. Repository Structure (top-level walkthrough)
+- 4. Core Concepts & Domain Model
+- 5. Detailed Behavior (normal execution + edge cases)
+- 6. Public Interfaces
+- 7. State, Persistence, and Data
+- 8. Dependencies & Integration
+- 9. Setup, Build, and Execution
+- 10. Testing & Validation
+- 11. Known Limitations & Non-Goals
+- 12. Change Sensitivity
+- 13. Changes (Evolutionary Analysis from Current Code)
 
 ---
 
 1. Project Overview
 
-- What the system does (concrete):
-  - This codebase implements a job orchestration and tooling runner backed by a SQLite datastore. The API accepts tool run requests and persists job metadata to the main operational SQLite file. A background manager polls the jobs table and executes tool implementations (from `tools/`) in threads. Persistent writes are serialized through a single-writer background thread; structured application logs are written to a separate logs database.
-    - Evidence: API routes are implemented in [`api/routes.py`](api/routes.py:1) (see the job-creation path that INSERTs into `jobs`), the background manager is implemented in [`bot/engine/worker.py`](bot/engine/worker.py:1), the write-serialization implementation is in [`database/writer.py`](database/writer.py:1), and the separate logs writer is implemented in [`database/logs_writer.py`](database/logs_writer.py:1).
+- What the system does (concrete, code-observed):
+  - Accepts tool-run requests via an HTTP API, stores persistent job and item state in a local SQLite database, and executes registered tool implementations in worker threads. Evidence: API enqueue + DB persist in [`api/routes.py:131`](api/routes.py:131); worker polling + execution in [`bot/engine/worker.py:210`](bot/engine/worker.py:210).
+  - Serializes all writes to the main application DB through a single dedicated writer thread that consumes a bounded queue and exposes an optional synchronization primitive (WriteReceipt). Evidence: writer loop, queue, and WriteReceipt in [`database/writer.py:47`](database/writer.py:47) and [`database/writer.py:25`](database/writer.py:25).
+  - Persists structured application logs to a separate logs DB using a separate bounded writer to avoid coupling logs to the main write path. Evidence: logs writer queue and write thread in [`database/logs_writer.py:14`](database/logs_writer.py:14) and logger enqueuing in [`utils/logger/core.py:126`](utils/logger/core.py:126).
 
-- The problem it actually solves (code-observed):
-  - Provides a runtime environment to accept, persist, coordinate, and execute long-running tool jobs (scrapers, publishers, etc.) with explicit job lifecycle persisted to an on-disk database and with structured logging persisted separately.
-    - Evidence: `jobs` and `job_items` DDL in [`database/schemas/jobs.py`](database/schemas/jobs.py:1), job lifecycle transitions written by [`bot/engine/worker.py`](bot/engine/worker.py:1) using `enqueue_write(...)` in [`api/routes.py`](api/routes.py:1).
+- What problem this codebase actually solves (code-observed):
+  - Provides an on-disk, single-process job orchestration runtime with durability guarantees for write operations (via WriteReceipt) and a decoupled logs persistence path. Evidence: job data model DDL in [`database/schemas/jobs.py:3`](database/schemas/jobs.py:3), enqueue_write usage in [`api/routes.py:131`](api/routes.py:131), writer synchronization in [`database/writer.py:30`](database/writer.py:30).
 
 - What it explicitly does NOT do (observable absences):
-  - There are no container orchestration manifests, no multi-node clustering support, and no external queue system (e.g., Redis) is used — the system relies on SQLite files and in-process threads. There is no evidence of a distributed task broker.
-    - Evidence: database connections use local file paths `Path("data") / "sumanal.db"` and `LOGS_DB_PATH` in [`database/connection.py`](database/connection.py:1); write queues are Python in-memory `queue.Queue` objects in [`database/writer.py`](database/writer.py:1) and [`database/logs_writer.py`](database/logs_writer.py:1).
+  - No distributed task broker or multi-node orchestration. The code uses local SQLite files and in-process threading rather than external queues (e.g., Redis). Evidence: DB paths in [`database/connection.py:66`](database/connection.py:66) and use of `queue.Queue` in [`database/writer.py:47`](database/writer.py:47).
 
 ---
 
 2. High-Level Architecture
 
-- Major components and the files that implement them (direct references):
-  - HTTP API / router: [`api/routes.py`](api/routes.py:1) and request/response models in [`api/schemas.py`](api/schemas.py:1).
-  - Tool registry and tool definitions: [`tools/registry.py`](tools/registry.py:1) and `tools/` subpackages (tool implementations live under `tools/` and are dynamically imported by the API and the worker).
-  - Worker manager and job executor: [`bot/engine/worker.py`](bot/engine/worker.py:1) (class `UnifiedWorkerManager`, module-level `_manager` and `get_manager()` singleton).
-  - Tool runner sandbox / safe execution: [`bot/engine/tool_runner.py`](bot/engine/tool_runner.py:1) (the worker delegates invocation to this module using `asyncio.run()` to execute tool coroutine wrappers).
-  - Single-writer serializer for main DB: [`database/writer.py`](database/writer.py:1) (single thread consuming `write_queue`, implements `WriteReceipt` synchronization primitive used to wait for durability).
-  - Separate logs DB writer for structured telemetry: [`database/logs_writer.py`](database/logs_writer.py:1) (bounded queue, drop counter, non-fatal overflow policy).
-  - Database connection helpers and pragmas: [`database/connection.py`](database/connection.py:1) (thread-local read connections, `create_write_connection()` for writer thread, optional `sqlite_vec` extension handling).
-  - Scraper pipeline: `tools/scraper/*` (notably orchestration in [`tools/scraper/task.py`](tools/scraper/task.py:1), extraction in [`tools/scraper/extraction.py`](tools/scraper/extraction.py:1), persistence in [`tools/scraper/persistence.py`](tools/scraper/persistence.py:1)).
-  - Dual-stream logging API (console + DB): `utils/logger/core.py` (`SumAnalLogger.dual_log`) routes console logs to Python logging and enqueues structured logs into the logs writer queue via [`database/logs_writer.py`](database/logs_writer.py:1).
+- Major components (file-level mapping):
+  - HTTP API / router: [`api/routes.py:1`](api/routes.py:1) (FastAPI `APIRouter` handlers, input validation, and job enqueue logic).
+  - Registry & tool discovery: [`tools/registry.py:1`](tools/registry.py:1) (tool metadata and create/inspect helpers used by API and worker).
+  - Worker manager and job execution: [`bot/engine/worker.py:177`](bot/engine/worker.py:177) (`UnifiedWorkerManager`) that polls jobs and spawns per-job threads.
+  - Tool runner sandbox: [`bot/engine/tool_runner.py:1`](bot/engine/tool_runner.py:1) (wrapping tool calls and capturing results).
+  - Single-writer DB serializer: [`database/writer.py:108`](database/writer.py:108) (writer loop and public enqueue helpers).
+  - Separate logs writer: [`database/logs_writer.py:38`](database/logs_writer.py:38) (bounded queue, writer thread, and dropped-log policy).
+  - DB connection management and optional vector extension loading: [`database/connection.py:75`](database/connection.py:75).
+  - Scraper tool (example tool implementation family): [`tools/scraper/task.py:24`](tools/scraper/task.py:24), [`tools/scraper/extraction.py:1`](tools/scraper/extraction.py:1), [`tools/scraper/persistence.py:1`](tools/scraper/persistence.py:1).
+  - Dual-stream logging API (console + DB): [`utils/logger/core.py:27`](utils/logger/core.py:27) (`SumAnalLogger.dual_log`).
 
-- Data flow (step-by-step, observable):
-  1. External caller issues HTTP request to enqueue a tool run at [`api/routes.py`](api/routes.py:48). The route persists a new row in `jobs` using `enqueue_write("INSERT INTO jobs ...")` and returns the job id.
-      - Evidence: See the INSERT call at [`api/routes.py:131`](api/routes.py:131) and the use of `enqueue_write` imported from [`database/writer.py`](database/writer.py:1).
-  2. `UnifiedWorkerManager` (see [`bot/engine/worker.py`](bot/engine/worker.py:1)) polls `jobs` (SELECT from `jobs`) and, for each job to run, marks it RUNNING with `enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ...)` and spawns a dedicated thread to execute that job.
-      - Evidence: `UnifiedWorkerManager._run_loop` and `_run_job` call `enqueue_write(...)` at [`bot/engine/worker.py:255`](bot/engine/worker.py:255) and spawn threads with `spawn_thread_with_context(...)`.
-  3. The job execution thread uses `tools/registry` to instantiate the tool, then delegates execution to `bot/engine/tool_runner.py` using `asyncio.run(run_tool_safely(...))`.
-      - Evidence: lines where `res = asyncio.run(run_tool_safely(...))` in [`bot/engine/worker.py`](bot/engine/worker.py:1).
-  4. The tool runs (tool implementation lives under `tools/`), which may interact with headful browser helper code (`utils/browser_daemon.py` + `tools/scraper/browser.py`) or with external LLM/embedding clients (`clients/llm/*`, `clients/snowflake_client.py`). Tool code updates intermediate state (job_items, scraped_articles) by calling `enqueue_write` or the high-level persistence helper in `tools/scraper/persistence.py` that constructs atomic transactions and returns a `WriteReceipt` to allow the caller to wait for persistence.
-      - Evidence: [`tools/scraper/persistence.py`](tools/scraper/persistence.py:1) exposes `_sync_scraped_article_atomic`, which returns a receipt; caller waits for the receipt in [`tools/scraper/task.py`](tools/scraper/task.py:272).
-  5. The single-writer thread (`database/writer.py`) serially performs SQL statements, commits, optionally resolves `WriteReceipt` objects so the original caller can block until on-disk commit.
-      - Evidence: `WriteReceipt` dataclass is at [`database/writer.py:25`](database/writer.py:25) and writer loop resolves/rejects receipts after executing statements (`receipt.resolve()` / `receipt.reject(...)`).
-  6. Structured logs are authored via `log.dual_log(...)` (from `utils/logger/core.py`); that function enqueues inserts into the logs writer queue via `logs_enqueue_write(...)` (implemented in [`database/logs_writer.py`](database/logs_writer.py:1)) so that logs are persisted independently of main DB writes.
-      - Evidence: `SumAnalLogger.dual_log` calls `logs_enqueue_write` (see [`utils/logger/core.py:126`](utils/logger/core.py:126)).
+- Data flow (concrete step-by-step, with file references):
+  1. Client POSTs a job to `POST /tools/{tool_name}`. Handler validates input (optionally using a tool module's `INPUT_MODEL`) and writes a `jobs` row via `enqueue_write(...)`. Evidence: [`api/routes.py:48`](api/routes.py:48), validation branch at [`api/routes.py:71`](api/routes.py:71), INSERT at [`api/routes.py:131`](api/routes.py:131).
+  2. `UnifiedWorkerManager` polls `jobs` for `QUEUED`/`INTERRUPTED` items and marks them `RUNNING` via `enqueue_write(...)`, then spawns a job thread. Evidence: poll SQL in [`bot/engine/worker.py:214`](bot/engine/worker.py:214) and `enqueue_write` call at [`bot/engine/worker.py:256`](bot/engine/worker.py:256).
+  3. The job thread uses the registry to instantiate the tool and invokes it through `run_tool_safely` (which uses `asyncio.run`). Evidence: registry usage at [`bot/engine/worker.py:325`](bot/engine/worker.py:325) and `asyncio.run(run_tool_safely(...))` at [`bot/engine/worker.py:334`](bot/engine/worker.py:334).
+  4. Tool code may call helpers (browser automation, scraping pipelines, LLM/embedding clients) and persist results using persistence helpers that construct an atomic transaction and return a `WriteReceipt` so the tool can wait for durability. Evidence: `_sync_scraped_article_atomic(...)` returns a receipt in [`tools/scraper/persistence.py:54`](tools/scraper/persistence.py:54) and the caller waits on the receipt in [`tools/scraper/task.py:290`](tools/scraper/task.py:290).
+  5. The single-writer thread dequeues tasks and executes them serially, committing and updating a write-generation counter used by read connections to refresh stale readers. Evidence: writer loop increments `_write_generation` in [`database/writer.py:155`](database/writer.py:155) and read connection refresh logic in [`database/connection.py:87`](database/connection.py:87).
+  6. Logs are emitted via `log.dual_log(...)` which enqueues inserts into `logs_writer` rather than the main writer. Evidence: logger enqueues a logs write at [`utils/logger/core.py:128`](utils/logger/core.py:128) and the logs writer consumes `logs_write_queue` in [`database/logs_writer.py:56`](database/logs_writer.py:56).
 
-- Execution model & concurrency primitives (explicit):
-  - The system is primarily single-process and multi-threaded. The API uses `async` functions but delegates CPU/IO-bound tool execution into threads or `asyncio.run(...)` calls. The durable coordination primitive for persistence is a single, long-running writer thread (not a distributed broker).
-    - Evidence: `write_queue = queue.Queue(maxsize=1000)` in [`database/writer.py`](database/writer.py:47); `UnifiedWorkerManager` uses `threading.Thread(...)` for the manager and per-job threads in [`bot/engine/worker.py`](bot/engine/worker.py:1).
+- Execution model & concurrency primitives:
+  - Single process, multi-threaded. Writer has a dedicated (single) non-daemon thread by default (`start_writer()` spawns `sqlite-writer` thread at [`database/writer.py:355`](database/writer.py:355)). Worker manager spawns threads per job (see [`bot/engine/worker.py:193`](bot/engine/worker.py:193)).
+  - Durable synchronization for specific writes is implemented through `WriteReceipt` (see [`database/writer.py:25`](database/writer.py:25)).
 
 ---
 
 3. Repository Structure (top-level walkthrough)
 
-This section lists each top-level item in the repository and its precise role as evidenced by the code. Each entry links to a representative file.
+Below is every top-level directory/file that materially participates in runtime behavior, with its exact role and a primary code pointer (click to open line).
 
-- [`app.py`](app.py:1)
-  - FastAPI application startup lifecycle is coordinated here (startup/shutdown hooks). The file references `log.dual_log(...)` at startup/shutdown points and imports the API routes. Use this as the process entry point for serving the web API.
+- [`app.py:1`](app.py:1)
+  - FastAPI application module used as a primary process entrypoint. It wires startup/shutdown lifecycle hooks and includes the API router.
 
-- [`config.py`](config.py:1)
-  - Centralized runtime configuration constants referenced by many modules (the codebase reads values from `config`). Check `bot/engine/worker.py` and `clients/*` for usage.
+- [`config.py:1`](config.py:1)
+  - Central configuration constants referenced throughout (worker timeouts, external URLs, directory paths). Search for usages in [`bot/engine/worker.py:213`](bot/engine/worker.py:213) and client modules.
 
-- [`requirements.txt`](requirements.txt:1)
-  - Declares Python package dependencies used by the code (server, HTTP clients, DB libraries, etc.). Inspect it to reproduce the Python environment.
+- [`requirements.txt:1`](requirements.txt:1)
+  - Exact dependencies present in the environment; note `openai>=1.47.0` (structured output fallbacks are present) and `sqlite-vec>=0.1.0` (optional extension). Evidence: [`requirements.txt:48`](requirements.txt:48) and [`requirements.txt:39`](requirements.txt:39).
 
-- [`api/`](api/)
-  - [`api/routes.py`](api/routes.py:1): FastAPI router implementing endpoints: job creation (`/tools/{tool_name}`), backup admin (`/backup`), job status (`/jobs/{job_id}`), metrics (`/metrics`), diagnostics (`/diagnostics`), and resume (`/jobs/{job_id}/resume`). The file directly uses `enqueue_write(...)` for all persistent state changes.
-  - [`api/schemas.py`](api/schemas.py:1): Pydantic models used as input/output shapes for the API.
-  - [`api/telegram_client.py`](api/telegram_client.py:1), [`api/telegram_notifier.py`](api/telegram_notifier.py:1): Optional notifier integrations; used but not central to job lifecycle.
+- [`api/`]
+  - [`api/routes.py:1`](api/routes.py:1): All HTTP endpoints (enqueue tools, job status, backup management, metrics, diagnostics, resume). The handlers are explicit about persistence via `enqueue_write`.
+  - [`api/schemas.py:1`](api/schemas.py:1): Pydantic models used for request and response validation (referenced at validation points in [`api/routes.py:71`](api/routes.py:71)).
 
-- [`bot/`](bot/)
-  - [`bot/engine/worker.py`](bot/engine/worker.py:1): The worker manager, polling loop, job execution thread logic, callback logic. This is the core runtime orchestrator that claims jobs and runs them.
-  - [`bot/engine/tool_runner.py`](bot/engine/tool_runner.py:1): Implements safe tool invocation wrappers used by the worker.
-  - Other modules under `bot/` provide constants and orchestration utilities.
+- [`bot/`]
+  - [`bot/engine/worker.py:177`](bot/engine/worker.py:177): `UnifiedWorkerManager`, job execution lifecycle, resumption and callback retry logic.
+  - [`bot/engine/tool_runner.py:1`](bot/engine/tool_runner.py:1): Runner that isolates tool execution and returns a normalized result object consumed by the worker.
 
-- [`clients/`](clients/)
-  - `clients/llm/*` (e.g., [`clients/llm/providers/azure.py`](clients/llm/providers/azure.py:1)) and [`clients/snowflake_client.py`](clients/snowflake_client.py:1) provide external service integration (LLM providers and Snowflake-based embeddings).
-  - Evidence of use: `tools/scraper/persistence.py` calls into embedding functions and catches `TimeoutError` for Snowflake embedding calls.
+- [`database/`]
+  - [`database/connection.py:75`](database/connection.py:75): Thread-local read connections, `create_write_connection`, optional `sqlite_vec` loading and the module-level `_VEC_PERMANENTLY_FAILED` flag to avoid repeated load attempts.
+  - [`database/writer.py:108`](database/writer.py:108): Single-writer background loop, `enqueue_write`, `enqueue_transaction`, `WriteReceipt`, WAL checkpointing, and repair attempts for missing tables.
+  - [`database/logs_writer.py:14`](database/logs_writer.py:14): Separate logs DB writer with bounded queue and drop counter.
+  - [`database/schemas/`](database/schemas/): Canonical DDL definitions for the main DB; `jobs` and `job_items` DDL live in [`database/schemas/jobs.py:3`](database/schemas/jobs.py:3).
+  - [`database/management/reconciler.py:81`](database/management/reconciler.py:81): Schema reconciler used by startup/repair paths; contains logic to preserve FTS/vec shadow tables (including `_vector_chunks*`).
 
-- [`database/`](database/)
-  - [`database/connection.py`](database/connection.py:1): Connection factory and thread-local read connections; sets PRAGMAs (WAL, busy_timeout, synchronous) and conditionally loads `sqlite_vec` extension.
-  - [`database/writer.py`](database/writer.py:1): Single-writer background thread and public enqueue functions (`enqueue_write`, `enqueue_execscript`, `enqueue_transaction`). Exposes `wait_for_writes()` for synchronous flush.
-  - [`database/logs_writer.py`](database/logs_writer.py:1): Separate bounded queue for structured logs with drop-and-count policy and reconnect-on-errors.
-  - [`database/schemas/`](database/schemas/): SQL DDL text for the canonical database schema used by the writer and initialization scripts — inspect these files to see table definitions (e.g., [`database/schemas/jobs.py`](database/schemas/jobs.py:1), [`database/schemas/logs.py`](database/schemas/logs.py:1)).
-  - [`database/reader.py`](database/reader.py:1): Read helpers using `DatabaseManager.get_read_connection()`; interacts with the write generation counter to force refreshes.
+- [`tools/`]
+  - [`tools/registry.py:1`](tools/registry.py:1): Tool registration/discovery used by API and worker to instantiate tools.
+  - Example concrete tool family: `tools/scraper/` implementing scraping orchestration and persistence (`tools/scraper/task.py:24`, `tools/scraper/extraction.py:1`, `tools/scraper/persistence.py:1`).
+  - Deprecated/legacy implementations aggregated under [`deprecated/`](deprecated/) (evidence of earlier designs and iterative refactors).
 
-- [`tools/`](tools/)
-  - [`tools/registry.py`](tools/registry.py:1): The tool registration and discovery system; the API and worker use this registry to find tool modules and metadata (e.g., `module` path, `INPUT_MODEL`).
-  - Tool implementations are under `tools/` (e.g., `tools/scraper/`, `tools/publisher/`, `tools/draft_editor/`), each with an implementation and sometimes `INPUT_MODEL` schema. For example, the scraper tool's orchestration code is in [`tools/scraper/task.py`](tools/scraper/task.py:1), and the lower-level browser helpers are in [`tools/scraper/browser.py`](tools/scraper/browser.py:1).
-  - Deprecated implementations are collected under [`deprecated/`](deprecated/) (evidence of iterative evolution — see `deprecated/tools/*`).
+- [`utils/`]
+  - `utils/logger/*`: Dual-stream logger implementation and utilities. See [`utils/logger/core.py:27`](utils/logger/core.py:27) and `flush`/buffer helpers.
+  - `utils/browser_daemon.py`: headful browser daemon lifecycle and surgical kill behavior used by scraper tools (referenced by scraper code).
+  - `utils/hitl.py` and `tools/scraper/extraction.py:42`](tools/scraper/extraction.py:42): Human-in-the-loop primitives (blocking stdin) used by the scraper.
 
-- [`utils/`](utils/)
-  - `utils/logger/` (core logger and handlers) implements the dual-stream logger that both emits console logs and enqueues structured logs for separate persistence. See [`utils/logger/core.py`](utils/logger/core.py:1) and [`utils/logger/state.py`](utils/logger/state.py:1).
-  - `utils/browser_daemon.py` manages a headful browser daemon used by scrapers and includes driver lifecycle and `surgical_kill` behavior.
-  - `utils/id_generator.py` provides `ULID.generate()` used as primary ID generator across jobs and logs.
-  - `utils/hitl.py` contains human-in-the-loop primitives used by the scraper to pause and request decisions.
-
-- [`tests/`](tests/)
-  - `tests/test_backup.py` and `tests/test_browser_e2e.py` exist — see these for example usage patterns of the backup system and for an end-to-end browser-based test. They are evidence used to infer how certain subsystems should be exercised.
+- [`tests/`]
+  - `tests/test_backup.py:1`](tests/test_backup.py:1) is a concrete set of unit tests that validate backup DDL and embedding byte-length invariants.
 
 ---
 
 4. Core Concepts & Domain Model (observed)
 
-- Jobs and Job Items (persistent domain objects):
-  - `jobs` table: top-level job descriptor with `job_id`, `session_id`, `tool_name`, `args_json`, `status`, `retry_count`, `created_at`, `updated_at`, `result_json`. See DDL in [`database/schemas/jobs.py`](database/schemas/jobs.py:1).
-  - `job_items` table: granular steps under a job (item metadata JSON, status, input/output data) — used by the scraper to track each article step. See `job_items` DDL in [`database/schemas/jobs.py`](database/schemas/jobs.py:18).
+- Jobs & job_items (canonical persisted objects):
+  - `jobs` DDL: `job_id TEXT PRIMARY KEY`, `session_id`, `tool_name`, `args_json`, `status` with explicit `CHECK(...)` constraint including `'SKIPPED'`. See [`database/schemas/jobs.py:3`](database/schemas/jobs.py:3) and the `job_items` DDL at [`database/schemas/jobs.py:18`](database/schemas/jobs.py:18).
+  - `job_items` records per-step metadata (JSON in `item_metadata`) and a `status` column constrained by the schema. The scraper uses `job_items` to track per-article progress; this is visible in [`tools/scraper/task.py:116`](tools/scraper/task.py:116) where items are pre-seeded and updated.
 
 - Persistence primitives and invariants:
-  - Single-writer invariant: all application writes to the main DB are serialized through a single dedicated thread reading from `write_queue` implemented in [`database/writer.py`](database/writer.py:1). The public API for persistence is `enqueue_write(...)`, `enqueue_execscript(...)`, and `enqueue_transaction(...)`.
-    - Evidence: `write_queue: queue.Queue(maxsize=1000)` and writer loop handling of `(receipt, sql, params)` in [`database/writer.py`](database/writer.py:47).
-  - Logs are **separated** from the main DB: `SumAnalLogger.dual_log` writes console logs and enqueues an insert into the logs writer (`logs_enqueue_write`) rather than using the main writer. See [`utils/logger/core.py`](utils/logger/core.py:1) and [`database/logs_writer.py`](database/logs_writer.py:1). This separation is enforced through two independent queues and two write threads.
+  - Single-writer invariant: only the writer thread executes SQL commits for the main DB; callers use `enqueue_*` helpers. Evidence: `enqueue_transaction(...)` and writer loop flow in [`database/writer.py:329`](database/writer.py:329).
+  - WriteReceipt contract: callers can request tracking (blocking on `receipt.wait(timeout)`) to get durable confirmation of a write. Evidence: `WriteReceipt.wait()` and usage in `_sync_scraped_article_atomic` (`tools/scraper/persistence.py:149`](tools/scraper/persistence.py:149) and usage of wait in [`tools/scraper/task.py:300`](tools/scraper/task.py:300).
 
-- Strong consistency primitive exposed to callers: `WriteReceipt`
-  - The `WriteReceipt` dataclass in [`database/writer.py`](database/writer.py:25) is an Event-based synchronization primitive returned by enqueue functions when `track=True`. Callers can block on `receipt.wait(timeout=...)` and check `receipt.error` to ensure write succeeded. The scraper uses this to make persistence synchronous for critical flushes (45s wait in [`tools/scraper/task.py`](tools/scraper/task.py:272)).
+- Logging contract & separation:
+  - `SumAnalLogger.dual_log` requires `payload` to be a non-empty dict or raises `TypeError`. Evidence: contract check at [`utils/logger/core.py:55`](utils/logger/core.py:55).
+  - Logs persisted to `logs.db` via `logs_enqueue_write(...)` to avoid interfering with main DB writes. Evidence: enqueue call in [`utils/logger/core.py:128`](utils/logger/core.py:128) and logs writer implementation in [`database/logs_writer.py:14`](database/logs_writer.py:14).
 
-- WAL pragmas and WAL checkpointing
-  - Main write connection sets `PRAGMA journal_mode = WAL` (see [`database/connection.py`](database/connection.py:88-107)). The writer loop triggers a `PRAGMA wal_checkpoint(TRUNCATE)` every 1200 seconds to control WAL growth (see [`database/writer.py:126-129`](database/writer.py:126)).
-
-- Retry / repair behavior
-  - The writer loop has logic to detect 'no such table' errors and attempt a best-effort table repair using `get_repair_script` from [`database/schemas/__init__.py`](database/schemas/__init__.py:1). It retries up to `MAX_REPAIR_RETRIES` (set in [`database/writer.py`](database/writer.py:56)).
-
-- Logging contract
-  - `SumAnalLogger.dual_log` enforces `payload` must be a non-empty dict (it raises `TypeError` otherwise) — see the strict contract in [`utils/logger/core.py`](utils/logger/core.py:43-56).
+- Vector / embedding handling:
+  - Embeddings are stored in vector tables and are optional depending on `sqlite_vec` availability. The code validates embedding byte lengths and uses `utils.vector_search` helpers; embedding insertion into `scraped_articles_vec` is performed as part of atomic persistence in [`tools/scraper/persistence.py:119`](tools/scraper/persistence.py:119).
+  - The writer detects vec-specific errors and logs them distinctly via `_is_vec0_error(...)` and the `DB:Writer:VecError` tag. Evidence: vector error detection in [`database/writer.py:72`](database/writer.py:72) and handling at [`database/writer.py:208`](database/writer.py:208).
 
 ---
 
 5. Detailed Behavior
 
-Normal execution (precise, step-by-step):
-1. HTTP client POSTs to `POST /tools/{tool_name}` (`api/routes.py`). Request body shape is `JobCreateRequest` in [`api/schemas.py`](api/schemas.py:7). The route validates the arguments (if the tool module exposes `INPUT_MODEL`) and then persists a row into `jobs` using `enqueue_write(...)` (see [`api/routes.py:131`](api/routes.py:131)).
-2. `UnifiedWorkerManager` polls `jobs` table for jobs with status `QUEUED` or `INTERRUPTED` (see SQL selection in [`bot/engine/worker.py:214-219`](bot/engine/worker.py:214)). If found, the manager marks the job `RUNNING` (via `enqueue_write`) and spawns a job thread.
-3. The job thread obtains a tool instance via `REGISTRY.create_tool_instance(tool_name)` and delegates execution to `bot/engine/tool_runner.py` via `asyncio.run(run_tool_safely(...))` (see [`bot/engine/worker.py:334-335`](bot/engine/worker.py:334)).
-4. Tool logic (for example `tools/scraper/task.py`) may call into browser helpers (`tools/scraper/browser.py`, `utils/browser_daemon.py`) to navigate pages and extract content. Processing functions return results which the tool code feeds into persistence helper functions (e.g., `_sync_scraped_article_atomic` in [`tools/scraper/persistence.py`](tools/scraper/persistence.py:54)).
-5. The persistence helper composes an atomic set of statements (INSERT/UPDATE of `scraped_articles`, vector insert/delete statements, and `job_items` updates) and enqueues them as a transaction via `enqueue_transaction(..., track=True)` in the writer. The worker (tool code) blocks on the returned `WriteReceipt` to ensure commit is durable before proceeding (typical wait is 45s in the scraper).
-6. The single-writer thread executes the transaction, commits, and resolves the `WriteReceipt` so the caller continues.
-7. Tools that need to call back to an external endpoint use the `callback` logic in the worker (`_do_callback_with_logging`) which uses `httpx` to POST to a configured URL (see [`bot/engine/worker.py:45-55`](bot/engine/worker.py:45)).
+Normal execution (precise step-by-step):
+1. Client POSTs to `POST /tools/{tool_name}` (`api/routes.py:48`](api/routes.py:48)). The route optionally validates `req.args` with a tool-provided `INPUT_MODEL` (if present) and persists a `jobs` row via `enqueue_write(...)` at [`api/routes.py:131`](api/routes.py:131).
+2. The background manager (`UnifiedWorkerManager`) polls `jobs` with status in `('QUEUED','INTERRUPTED')` (query at [`bot/engine/worker.py:214`](bot/engine/worker.py:214)) and marks selected jobs as `RUNNING` (e.g., [`bot/engine/worker.py:256`](bot/engine/worker.py:256)).
+3. The manager spawns a per-job thread and executes tool code via `run_tool_safely(...)` (`bot/engine/worker.py:334`](bot/engine/worker.py:334)).
+4. Tool code uses persistence helpers (example: `_sync_scraped_article_atomic()` in [`tools/scraper/persistence.py:54`](tools/scraper/persistence.py:54)) which build a `TRANSACTION_MARKER` statements list and call `enqueue_transaction(..., track=True)`; the returned `WriteReceipt` is waited on by the caller to ensure commit durability (see waiter in [`tools/scraper/task.py:300`](tools/scraper/task.py:300)).
+5. Writer thread executes transactions and increments a generation counter used by read connections to refresh thread-local connections (`database/writer.py:163`](database/writer.py:163) and [`database/connection.py:87`](database/connection.py:87)).
 
-Edge cases and failure modes (observed in code):
-- Write queue overflow: `enqueue_*` functions call `write_queue.put_nowait(...)` and on `queue.Full` they log a warning and, if tracking was requested, reject the corresponding `WriteReceipt` with `RuntimeError('Write queue full')` (see [`database/writer.py:298-306`](database/writer.py:298)).
-- Logs queue overflow: `database/logs_writer.py` uses a bounded queue `maxsize=10000`, but instead of terminating, it increments `_logs_dropped_count` when full; it deliberately does not crash the process (drop-and-count policy) (see [`database/logs_writer.py:14, 116-121`](database/logs_writer.py:14)).
-- Writer reconnection: after several consecutive errors (>= 3), the writer will attempt to re-create the write connection (see [`database/writer.py:251-262`](database/writer.py:251)). The logs writer has a similar reconnect-on-errors loop.
-- No-such-table repair attempt: the writer recognizes "no such table" errors and will try to obtain a repair DDL from [`database/schemas/__init__.py`](database/schemas/__init__.py:62) and execute it. If there is no script, it gives up and rejects the receipt.
+Edge cases and failure modes (observed):
+- Write queue overflow: `enqueue_*` functions attempt `put_nowait(...)` and reject `WriteReceipt` if queue is full. Evidence: overflow handling at [`database/writer.py:293`](database/writer.py:293).
+- No-such-table repair attempt: the writer matches "no such table" errors and attempts a repair script via `get_repair_script(...)`. Evidence: `_is_no_such_table_error` and `_attempt_table_repair` at [`database/writer.py:64`](database/writer.py:64) and [`database/writer.py:77`](database/writer.py:77).
+- vec0/sqlite-vec problems: the writer has explicit handling for vec-related insert errors and logs detailed payload previews (`database/writer.py:208`](database/writer.py:208)).
+- Human-in-the-loop behavior: the scraper's HITL implementation performs a synchronous blocking `input()` call and updates job status to `PAUSED_FOR_HITL` before waiting. This is an explicit design choice documented in [`tools/scraper/extraction.py:42`](tools/scraper/extraction.py:42) and implemented at [`tools/scraper/extraction.py:72`](tools/scraper/extraction.py:72).
 
-Configuration paths and toggles (observable):
-- The system reads many runtime constants from [`config.py`](config.py:1). The worker’s callback behavior depends on `config.ANYTHINGLLM_BASE_URL`, `config.ANYTHINGLLM_API_KEY`, and timeouts (see `bot/engine/worker.py`).
-- The optional `sqlite_vec` extension is loaded only if `sqlite_vec` imports successfully — the code sets a module-level `SQLITE_VEC_AVAILABLE` flag in [`database/connection.py`](database/connection.py:16-22) and `database/schemas/__init__.py` conditionally includes vector DDL depending on that flag.
+Configuration paths and how they alter behavior:
+- `config.py` contains toggles and external URLs used by callback and worker logic (used by [`bot/engine/worker.py:42`](bot/engine/worker.py:42)).
+- `sqlite_vec` behavior is conditional on the import succeeding; `database/connection.py` sets `SQLITE_VEC_AVAILABLE` and will try to load the native extension (`database/connection.py:18`](database/connection.py:18) and `_attempt_vec_load` function at [`database/connection.py:27`](database/connection.py:27)).
 
 ---
 
 6. Public Interfaces
 
-- HTTP API endpoints (exact list and models):
-  - `POST /tools/{tool_name}`: create a job; request model `JobCreateRequest` (`api/schemas.py`) and response `JobCreateResponse`.
-    - Writes a DB row via `enqueue_write(...)` in [`api/routes.py:131`](api/routes.py:131).
-  - `GET /jobs/{job_id}`: returns job status and job logs; response model `JobStatusResponse` (`api/schemas.py`).
-  - `DELETE /jobs/{job_id}`: request job cancellation. The handler updates `jobs` row with status `CANCELLING` and enqueues a cancellation log insert into the logs DB.
-  - Backup endpoints: `POST /backup/export`, `GET /backup/status`, `POST /backup/restore` implemented in [`api/routes.py`](api/routes.py:150).
-  - `GET /metrics` (legacy) and `GET /diagnostics` (returns queue metrics via [`database/diagnostics.py`](database/diagnostics.py:1)).
-  - `POST /jobs/{job_id}/resume`: tries to import `tools.{tool_name}.resume` and call resume handler to check resume state before re-queuing (see [`api/routes.py:361`](api/routes.py:361)).
+- HTTP API endpoints (direct, exact references):
+  - `POST /tools/{tool_name}` — enqueue job: code at [`api/routes.py:48`](api/routes.py:48) and persistent write at [`api/routes.py:131`](api/routes.py:131). Request/response models in [`api/schemas.py:7`](api/schemas.py:7).
+  - `GET /jobs/{job_id}` — fetch job status and job logs via `LogsDatabaseManager.get_read_connection()` at [`api/routes.py:213`](api/routes.py:213).
+  - `DELETE /jobs/{job_id}` — request cancellation (writes `CANCELLING` via `enqueue_write`) at [`api/routes.py:271`](api/routes.py:271).
+  - `POST /backup/export`, `GET /backup/status`, `POST /backup/restore` — backup administration handlers are in [`api/routes.py:152`](api/routes.py:152).
+  - `POST /jobs/{job_id}/resume` — resume handler loads `tools.{tool_name}.resume` and calls its `ResumeHandler` (if implemented) — handler code at [`api/routes.py:337`](api/routes.py:337).
 
-- Tool implementation interface (observable pattern):
-  - Tools are dynamically imported and are expected to register themselves in `tools/registry.py`. The API may use an `INPUT_MODEL` attribute on a tool module for Pydantic validation. The worker expects `REGISTRY.create_tool_instance(tool_name)` and that `run_tool_safely` can call into the tool instance.
-    - Evidence: `module = importlib.import_module(meta.get("module"))` and `InputModel = getattr(module, "INPUT_MODEL", None)` in [`api/routes.py`](api/routes.py:72-76) and `REGISTRY.create_tool_instance(tool_name)` in [`bot/engine/worker.py`](bot/engine/worker.py:325).
+- Tool interface (observed expectations):
+  - Tools register themselves in `tools/registry.py` and may expose an `INPUT_MODEL` attribute for API-level validation. Evidence: `InputModel` handling in [`api/routes.py:71`](api/routes.py:71) and dynamic import at [`api/routes.py:74`](api/routes.py:74).
+  - Tool results returned to the worker are normalized and may trigger callbacks (see `_do_callback_with_logging` in [`bot/engine/worker.py:37`](bot/engine/worker.py:37)).
 
-- No CLI interface is evident in top-level scripts (there is no `console_scripts` entry in the repo). The primary process entrypoint for serving the API is [`app.py`](app.py:1).
+- No CLI entrypoint or console tool is defined in packaging; primary run model is the FastAPI app (`app.py:1`](app.py:1)).
 
 ---
 
 7. State, Persistence, and Data
 
-- Databases and file locations:
-  - Operational DB file: `data/sumanal.db` (path assembled in [`database/connection.py`](database/connection.py:25)).
-  - Logs DB file: `data/logs.db` (path assembled in [`database/connection.py`](database/connection.py:26)).
+- Database files and locations:
+  - Main application DB: `data/sumanal.db` (path defined in [`database/connection.py:66`](database/connection.py:66)).
+  - Logs DB: `data/logs.db` (path defined in [`database/connection.py:68`](database/connection.py:68)).
 
-- Table formats and fields (select, concrete examples):
-  - `jobs` table (DDL in [`database/schemas/jobs.py`](database/schemas/jobs.py:3)): `job_id TEXT PRIMARY KEY`, `session_id`, `tool_name`, `args_json`, `status`, `retry_count`, timestamps, `result_json`.
-  - `job_items` table (DDL in same file): contains JSON fields `item_metadata`, `input_data`, `output_data`, `status`, `updated_at`, `job_id` foreign key.
-  - `logs` table DDL is in [`database/schemas/logs.py`](database/schemas/logs.py:1) (refer to that file for exact columns — note `id` is the primary id used by logging inserts).
+- Schema specifics (concrete column examples):
+  - `jobs` DDL excerpt: `job_id`, `session_id`, `tool_name`, `args_json`, `status` with `CHECK(...)` including `'SKIPPED'` — see [`database/schemas/jobs.py:4`](database/schemas/jobs.py:4).
+  - `job_items` DDL excerpt: `item_metadata` JSON, `status` column with `CHECK(... 'SKIPPED')`, `input_data`, `output_data` — see [`database/schemas/jobs.py:18`](database/schemas/jobs.py:18).
 
-- Data formats: many columns store JSON strings (`args_json`, `item_metadata`, `output_data`, `payload_json` for log payloads). Code uses `json.dumps` and `json.loads` at call sites (e.g., [`api/routes.py`](api/routes.py:131), [`tools/scraper/task.py`](tools/scraper/task.py:121)).
+- Data formats & lifecycle:
+  - Many fields store JSON-serialized strings (e.g., `args_json`, `item_metadata`, `payload_json` for logs). Call sites use `json.dumps`/`json.loads` consistently (see e.g. [`api/routes.py:132`](api/routes.py:132) and [`tools/scraper/task.py:181`](tools/scraper/task.py:181)).
+  - WAL checkpointing is done periodically by the writer loop (see `PRAGMA wal_checkpoint(TRUNCATE)` at [`database/writer.py:128`](database/writer.py:128)).
 
-- State lifecycle and cleanup:
-  - The system uses `enqueue_write` to apply all durable changes; readers use `DatabaseManager.get_read_connection()` which refreshes per-thread read connections when the writer's generation increases. There are no automatic archive or compaction scripts present; WAL checkpointing is done opportunistically by the writer thread.
-    - Evidence: `DatabaseManager.get_read_connection()` consults `get_write_generation()` (see [`database/connection.py:37-43`](database/connection.py:37)) and the writer updates `_write_generation` upon commits in [`database/writer.py`](database/writer.py:160-174).
-
----
-
-8. Dependencies & Integration (observable)
-
-- Python-level packages are declared in [`requirements.txt`](requirements.txt:1). Notable direct usage in code:
-  - `fastapi` (API router usage in [`api/routes.py`](api/routes.py:1)); `pydantic` (models in `api/schemas.py`) is used for request/response validation.
-  - `httpx` used for external callbacks in [`bot/engine/worker.py`](bot/engine/worker.py:121).
-  - `sqlite3` is used via Python stdlib for DB access; optional `sqlite_vec` extension is loaded when available (`database/connection.py`).
-  - `concurrent.futures` and `threading` are used widely for thread-based concurrency.
-  - `snowflake` (client integration) is used by embedding helper code (`clients/snowflake_client.py`) and wrapped in `utils/vector_search.py`.
-
-- Coupling points and environment assumptions:
-  - The code assumes local disk access is available for `data/` (see `DB_PATH = Path("data") / "sumanal.db"` in [`database/connection.py`](database/connection.py:25)).
-  - External callbacks depend on `config.ANYTHINGLLM_BASE_URL` and `config.ANYTHINGLLM_API_KEY` configuration to be present for callbacks to execute (`bot/engine/worker.py`).
+- Migration / repair hooks:
+  - The writer can attempt a best-effort table repair by requesting a repair script via `get_repair_script(table_name)` from `database/schemas` and running it; the reconciler can recreate missing tables. Evidence: `_attempt_table_repair` in [`database/writer.py:77`](database/writer.py:77) and `SchemaReconciler` in [`database/management/reconciler.py:59`](database/management/reconciler.py:59).
 
 ---
 
-9. Setup, Build, and Execution (exact steps to run from this repository state)
+8. Dependencies & Integration
 
-These steps are derived from the files present and conventional usage in the code; adapt to your environment as necessary:
+- Primary Python libraries used (from `requirements.txt` and usage evidence):
+  - `fastapi` and `uvicorn` — used to serve the API (`api/routes.py:1`, `app.py:1`).
+  - `pydantic` — request/response models in [`api/schemas.py:1`](api/schemas.py:1) and `InputModel` validation in [`api/routes.py:71`](api/routes.py:71).
+  - `httpx` — used by `_do_callback_with_logging` to perform HTTP callbacks (`bot/engine/worker.py:128`](bot/engine/worker.py:128)).
+  - `sqlite-vec` — optional native extension; referenced in [`database/connection.py:18`](database/connection.py:18) and guarded with `_VEC_PERMANENTLY_FAILED` (`database/connection.py:25`](database/connection.py:25)). If absent, system falls back to FTS5/keyword behaviors.
+  - `openai>=1.47.0` — referenced in `requirements.txt` (`requirements.txt:49`](requirements.txt:49)) and the code uses structured-output calls with fallbacks to `json_object` (see `tools/scraper/extraction.py:368`](tools/scraper/extraction.py:368)).
 
-1. Create a Python 3.10+ virtual environment and install dependencies from [`requirements.txt`](requirements.txt:1):
+- Coupling points & environment assumptions (observable):
+  - The code assumes writable local disk (`data/` directory) for DBs. Evidence: `DB_PATH = Path("data") / "sumanal.db"` in [`database/connection.py:66`](database/connection.py:66).
+  - Optional external systems: AnythingLLM callback endpoints rely on `config.ANYTHINGLLM_BASE_URL` and `config.ANYTHINGLLM_API_KEY` to be present for callback delivery (`bot/engine/worker.py:42`](bot/engine/worker.py:42)).
+
+---
+
+9. Setup, Build, and Execution (exact steps)
+
+These steps reproduce how the repository is launched given the current files:
+
+1. Create and activate Python virtualenv (Python 3.10+ is compatible with type usages seen). Install dependencies:
 
    - python -m venv .venv
    - .\.venv\Scripts\activate (Windows) or source .venv/bin/activate (Unix)
-   - pip install -r requirements.txt
+   - pip install -r [`requirements.txt:1`](requirements.txt:1)
 
-   (The exact package list is in [`requirements.txt`](requirements.txt:1).)
+2. Provide configuration values required by `config.py` (see uses in `bot/engine/worker.py:42`](bot/engine/worker.py:42) and other modules).
 
-2. Provide runtime configuration:
-   - Edit or export any required runtime values expected by `config.py` (not all are environment-driven in the code; `bot/engine/worker.py` expects `ANYTHINGLLM_BASE_URL`, `ANYTHINGLLM_API_KEY` for callbacks if used).
+3. Initialize DB schema (the code offers schema DDL under `database/schemas/` and an initialization helper used at startup—see [`database/schemas/__init__.py:39`](database/schemas/__init__.py:39) for `get_init_script()` and [`utils/startup/database.py:1`](utils/startup/database.py:1) for startup wiring).
 
-3. Initialize DB schema if not present:
-   - The code base provides schema DDL under `database/schemas/` and a `get_init_script()` helper in [`database/schemas/__init__.py`](database/schemas/__init__.py:39) to stitch the master init script. There is startup logic in `utils/startup/database.py` that expects to run at application start.
+4. Start the API process: `uvicorn app:app --reload` or `python app.py` (the `app.py` module contains a FastAPI app and startup hooks at [`app.py:1`](app.py:1)).
 
-4. Start the server API (typical):
-   - `uvicorn app:app --reload` or `python app.py` depending on your deployment pattern — `app.py` contains the FastAPI app and startup hooks.
-
-5. Enqueue a tool using the API `POST /tools/{tool_name}` with JSON body matching `api/schemas.JobCreateRequest`.
+5. Use `POST /tools/{tool_name}` to enqueue jobs, then observe worker activity and logs via `GET /jobs/{job_id}` (handlers in [`api/routes.py:48`](api/routes.py:48) and [`api/routes.py:213`](api/routes.py:213)).
 
 ---
 
-10. Testing & Validation (what tests exist and what they cover)
+10. Testing & Validation
 
-- Existing tests:
-  - `tests/test_backup.py`: exercises backup/export/restore flows. See file for concrete assertions.
-  - `tests/test_browser_e2e.py`: an end-to-end test that interacts with browser-oriented code paths (evidence that a headful browser path is exercised in tests).
+- Tests present in the workspace (examples):
+  - `tests/test_backup.py:1`](tests/test_backup.py:1) — unit tests validating backup schema and embedding byte-length invariants.
+  - `tests/test_browser_e2e.py` (exists but not expanded here) — indicates an end-to-end browser exercise is included.
 
-- How to run tests: run `pytest` in the repository root (standard pattern — tests are located under `tests/`).
+- How to run: `pytest` in repository root. Evidence: test file headers and standard pytest conventions (`tests/test_backup.py:3`](tests/test_backup.py:3)).
 
-- Gaps visible in repository:
-  - No comprehensive unit-test coverage is present for the single-writer queue and the logs writer (no mocks shown around `database/writer.py` in `tests/`).
-  - Many `tools/*` implementations are not covered by unit tests in `tests/` (some e2e only). This is visible by the sparse set of test files.
-
----
-
-11. Known Limitations & Non-Goals (explicit, code-evident)
-
-- Single-process assumptions: the code relies on local SQLite files and in-process queues. It is not designed for multi-process concurrency across hosts (no distributed queue). This is enforced by the use of `sqlite3` file connections and in-memory `queue.Queue` objects. See [`database/connection.py`](database/connection.py:58) and [`database/writer.py`](database/writer.py:47).
-
-- Logs/backpressure policy: logs queue overflow is handled by dropping entries and incrementing a counter rather than blocking or expanding capacity. That means observed logs may be lost under extreme load. See [`database/logs_writer.py`](database/logs_writer.py:14-16).
-
-- Optional vector extension: vector table behavior depends on whether the optional `sqlite_vec` extension is loadable at runtime. If the extension is unavailable, the schema-building code in [`database/schemas/__init__.py`](database/schemas/__init__.py:46-53) falls back to a minimal table shape. This means vector performance/behavior depends on environment.
+- Visible gaps in tests (observed):
+  - No unit tests specifically asserting writer boundary/error handling are visible; writer behavior and race conditions are only covered indirectly if at all (see `database/writer.py` but no matching `tests/` files focused on the writer).
 
 ---
 
-12. Change Sensitivity (fragile or tightly-coupled parts)
+11. Known Limitations & Non-Goals (code-evident)
 
-- Single-writer thread and writer queue shape: many parts of the code assume a specific task tuple shape `(receipt, sql, params)`. Changing the writer API shape would require coordinated changes in `enqueue_write`, `enqueue_transaction`, `enqueue_execscript`, and every caller (e.g., `tools/scraper/persistence.py`) and the worker. See [`database/writer.py`](database/writer.py:284-351) and consumer sites such as [`tools/scraper/persistence.py`](tools/scraper/persistence.py:54).
+- Single-process design: not suitable for multi-node scaling due to reliance on local SQLite + in-process queues. Evidence: `queue.Queue`-based writer and local DB paths in [`database/writer.py:47`](database/writer.py:47) and [`database/connection.py:66`](database/connection.py:66).
+- Log-dropping policy: logs writer drops entries when its bounded queue is full instead of back-pressuring application code (`database/logs_writer.py:116`](database/logs_writer.py:116)). That means logs may be lost under sustained high-throughput.
+- HITL is blocking: the HITL path in the scraper blocks worker thread with `input()` and expects a local operator console as shown in [`tools/scraper/extraction.py:96`](tools/scraper/extraction.py:96). This is explicit and not asynchronous.
+- Vector extension optionality: runtime behavior and performance vary depending on `sqlite-vec` availability; the code contains a permanent-failure flag to avoid repeated load attempts (see [`database/connection.py:25`](database/connection.py:25)).
 
-- Dual-logging contract: `SumAnalLogger.dual_log` mandates `payload` be a non-empty dict (it raises otherwise). Upstream code must construct payloads accordingly. Changing the signature or behavior of `dual_log` is high-impact across many modules (`utils/logger/core.py` is referenced in dozens of files).
+---
 
-- DB schema DDL centralization: the `database/schemas/*` set is the source of truth for init/repair scripts. Modifying the schema set without adjusting `_attempt_table_repair` and init scripts would cause runtime errors. See [`database/schemas/__init__.py`](database/schemas/__init__.py:39).
+12. Change Sensitivity (fragile parts — what to avoid changing lightly)
+
+- Writer API shape and task tuple format: callers assume tasks are 3-tuples `(receipt, sql, params)` and special markers `EXEC_SCRIPT` / `TRANSACTION_MARKER`. Changing that shape breaks callers across the codebase (see normalization in `database/writer.py:145`](database/writer.py:145) and places where `enqueue_transaction` is used (e.g., [`tools/scraper/persistence.py:149`](tools/scraper/persistence.py:149)).
+- Dual-logging contract: `dual_log` strictness (non-empty dict payload) is enforced and many modules depend on that; changing it requires updates across modules (see [`utils/logger/core.py:55`](utils/logger/core.py:55)).
+- DB schema DDL centralization: `database/schemas/*` is used as the source of truth and the reconciler/writer rely on those scripts for repair and init. Modifying schemas must be coordinated with `database/management/reconciler.py` and `database/writer.py` repair hooks (see [`database/schemas/__init__.py:39`](database/schemas/__init__.py:39) and [`database/writer.py:77`](database/writer.py:77)).

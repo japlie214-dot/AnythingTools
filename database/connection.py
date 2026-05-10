@@ -22,19 +22,35 @@ except Exception:
     sqlite_vec = None  # type: ignore
     SQLITE_VEC_AVAILABLE = False
 
+_VEC_PERMANENTLY_FAILED = False
+
 def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
+    global _VEC_PERMANENTLY_FAILED
     if not SQLITE_VEC_AVAILABLE:
         sys.stderr.write("[WARN] sqlite-vec Python package not installed. Vector search disabled.\n")
         return False
+    if _VEC_PERMANENTLY_FAILED:
+        return False
+
+    try:
+        version_row = conn.execute("SELECT vec_version()").fetchone()
+        if version_row:
+            return True
+    except Exception:
+        pass
+
     try:
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
     except Exception as exc:
         sys.stderr.write(
             f"[CRITICAL] sqlite-vec extension failed to load: {exc}\n"
             f"  Vector search is DISABLED. Falling back to FTS5 keyword search only.\n"
         )
+        _VEC_PERMANENTLY_FAILED = True
         return False
+
     try:
         version_row = conn.execute("SELECT vec_version()").fetchone()
         vec_ver = version_row[0] if version_row else "unknown"
@@ -43,6 +59,7 @@ def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
         sys.stderr.write(
             f"[CRITICAL] sqlite-vec loaded but vec_version() query failed: {exc}\n"
         )
+        _VEC_PERMANENTLY_FAILED = True
         return False
     return True
 

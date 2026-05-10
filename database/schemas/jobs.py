@@ -7,7 +7,7 @@ TABLES = {
             tool_name TEXT NOT NULL,
             args_json TEXT NOT NULL DEFAULT '{}',
             status TEXT NOT NULL DEFAULT 'PENDING'
-                CHECK(status IN ('PENDING','QUEUED','RUNNING','INTERRUPTED','PAUSED_FOR_HITL','COMPLETED','PARTIAL','PENDING_CALLBACK','FAILED','ABANDONED','CANCELLING')),
+                CHECK(status IN ('PENDING','QUEUED','RUNNING','INTERRUPTED','PAUSED_FOR_HITL','COMPLETED','PARTIAL','PENDING_CALLBACK','FAILED','ABANDONED','CANCELLING','SKIPPED')),
             retry_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -19,7 +19,7 @@ CREATE INDEX idx_jobs_session_status ON jobs(session_id, status);
             item_id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id TEXT NOT NULL,
             item_metadata TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','RUNNING','COMPLETED','FAILED')),
+            status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','RUNNING','COMPLETED','FAILED','SKIPPED')),
             input_data TEXT,
             output_data TEXT,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

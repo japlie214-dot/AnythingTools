@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 class PaywallResult:
     is_paywalled: bool
     detected_indicators: list[str]
+    blocker_type: str = "paywall"
 
 
 class PaywallDetector:
@@ -76,16 +77,17 @@ class PaywallDetector:
         # Check Financial Times (requires 2+ matches for confidence)
         ft_matches = [f for f in self.FT_FRAGMENTS if f in text]
         if len(ft_matches) >= 2:
-            return PaywallResult(is_paywalled=True, detected_indicators=ft_matches)
+            return PaywallResult(is_paywalled=True, detected_indicators=ft_matches, blocker_type="paywall")
             
         # Check Bloomberg (requires 1+ matches)
         bb_matches = [f for f in self.BLOOMBERG_FRAGMENTS if f in text]
         if bb_matches:
-            return PaywallResult(is_paywalled=True, detected_indicators=bb_matches)
+            return PaywallResult(is_paywalled=True, detected_indicators=bb_matches, blocker_type="paywall")
             
         # Check generic fragments (requires 2+ matches to avoid false positives)
         generic_matches = [f for f in self.GENERIC_FRAGMENTS if f in text]
         if len(generic_matches) >= 2:
-            return PaywallResult(is_paywalled=True, detected_indicators=generic_matches)
+            b_type = "gatekeeper" if any(kw in text for kw in ["log in", "sign up", "continue"]) else "paywall"
+            return PaywallResult(is_paywalled=True, detected_indicators=generic_matches, blocker_type=b_type)
             
         return PaywallResult(is_paywalled=False, detected_indicators=[])

@@ -22,6 +22,14 @@ import threading
 
 log = get_dual_logger(__name__)
 
+from enum import Enum
+
+class ValidationAction(Enum):
+    """Routing decision for a validation failure."""
+    PROCEED = "proceed"
+    AUTO_SKIP = "auto_skip"
+    HUMAN_HELP = "human_help"
+
 
 class HITLState:
     def __init__(self):
@@ -311,16 +319,18 @@ def process_article(
                 if video_audio_tags or has_video_embed:
                     paragraph_text = " ".join(p.get_text(strip=True) for p in soup_pre.find_all("p"))
                     if len(paragraph_text) < 500:
-                        log.dual_log(tag="Scraper:Validation", message="Page rejected: video/audio primary content", level="WARNING", payload={"url": url})
-                        return {"status": "FAILED", "reason": "Page primary content is video/audio with insufficient article text."}
+                        log.dual_log(tag="Scraper:Validation:AutoSkip", message="Page auto-skipped: video/audio primary content", level="WARNING", payload={"url": url})
+                        local_meta["retryable"] = False
+                        _sync_meta("SKIPPED")
+                        return {"status": "SKIPPED", "reason": "Auto-skipped: Page primary content is video/audio with insufficient article text."}
 
             # ── Paywall Detection ───────────────────────────────────────────
             if not local_meta.get("validation_passed"):
                 from tools.scraper.paywall import PaywallDetector
                 pw_result = PaywallDetector().detect(raw_html)
                 if pw_result.is_paywalled:
-                    log.dual_log(tag="Scraper:Paywall", message="Paywall detected", level="WARNING", payload={"url": url, "attempt": val_attempt})
-                    decision = _hitl_state.request_decision(job_id, url, f"Paywall detected. Indicators: {pw_result.detected_indicators}")
+                    log.dual_log(tag="Scraper:Paywall", message=f"{pw_result.blocker_type.title()} detected", level="WARNING", payload={"url": url, "attempt": val_attempt, "type": pw_result.blocker_type})
+                    decision = _hitl_state.request_decision(job_id, url, f"BLOCKED PAGE - Action Required: {pw_result.blocker_type.title()} detected (Indicators: {pw_result.detected_indicators})")
                     if decision == "proceed":
                         log.dual_log(tag="Scraper:HITL:Proceed", message="User forced paywall proceed. Re-extracting state.", level="INFO", payload={"url": url})
                         # Do NOT re-navigate. Read the live DOM state the operator has finished setting up.
@@ -347,51 +357,86 @@ def process_article(
                 )
             else:
                 from utils.text_processing import escape_prompt_separators
+                from tools.scraper.scraper_prompts import VALIDATION_SCHEMA
                 slim_val  = raw_html[:15000]
                 val_msgs  = _build_multimodal_messages(
                     VALIDATION_PROMPT,
                     escape_prompt_separators(slim_val) + "\n###",
                     b64_image,
                 )
-                val_resp  = sync_llm_chat(val_msgs, response_format={"type": "json_object"})
+                try:
+                    val_resp = sync_llm_chat(
+                        val_msgs,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {"name": "validation", "strict": True, "schema": VALIDATION_SCHEMA},
+                        },
+                    )
+                    used_format = "json_schema"
+                except Exception as format_exc:
+                    from openai import BadRequestError
+                    if isinstance(format_exc, BadRequestError):
+                        log.dual_log(
+                            tag="Scraper:Validation:Fallback",
+                            message="json_schema format rejected; falling back to json_object",
+                            level="WARNING",
+                            payload={"error": str(format_exc)},
+                        )
+                        val_resp = sync_llm_chat(val_msgs, response_format={"type": "json_object"})
+                        used_format = "json_object"
+                    else:
+                        raise
+
                 val_data  = parse_llm_json(val_resp.content or "{}")
                 # Phase 2: Boundary log — raw LLM validation response.
                 log.dual_log(
                     tag="Scraper:Validation:Response",
                     message="LLM validation response received",
-                    payload={"url": url, "raw": val_resp.content, "parsed": val_data},
+                    payload={"url": url, "raw": val_resp.content, "parsed": val_data, "format": used_format},
                 )
                 if not val_data.get("valid", False):
                     reason = val_data.get("reason", "unknown")
-                    log.dual_log(
-                        tag="Scraper:Validation",
-                        message="Page invalid",
-                        level="WARNING",
-                        payload={"reason": reason, "attempt": val_attempt, "url": url},
-                    )
-                    if cancellation_flag is not None and cancellation_flag.is_set():
-                        return {"status": "CANCELED", "reason": "User requested stop via Human Help mode."}
+                    action_str = val_data.get("action", "human_help")
+                    try:
+                        action = ValidationAction(action_str)
+                    except ValueError:
+                        log.dual_log(tag="Scraper:Validation", message=f"Unknown action '{action_str}', defaulting to human_help", level="WARNING", payload={"url": url})
+                        action = ValidationAction.HUMAN_HELP
 
-                    decision = _hitl_state.request_decision(job_id, url, reason)
-                    if decision == "proceed":
-                        log.dual_log(tag="Scraper:HITL:Proceed", message="User forced validation proceed. Re-extracting state.", level="INFO", payload={"url": url})
-                        # Do NOT re-navigate. Read the live DOM state the operator has finished setting up.
-                        wait_for_dom_stability(driver)
-                        raw_html, html_len = extract_hybrid_html(driver)
-                        b64_image = _capture_screenshot_b64(driver)
-                        slim_sum = raw_html
-                        local_meta["validation_passed"] = True
-                        _sync_meta("RUNNING")
-                    elif decision == "skip":
-                        return {"status": "SKIPPED", "reason": f"User skipped after HITL: {reason}"}
-                    elif decision == "cancel":
-                        if cancellation_flag is not None:
-                            cancellation_flag.set()
-                        return {"status": "CANCELED", "reason": "User requested stop via HITL."}
+                    if action == ValidationAction.AUTO_SKIP:
+                        log.dual_log(tag="Scraper:Validation:AutoSkip", message=f"Page auto-skipped: {reason}", level="WARNING", payload={"url": url, "reason": reason, "action": "auto_skip"})
+                        local_meta["retryable"] = False
+                        _sync_meta("SKIPPED")
+                        return {"status": "SKIPPED", "reason": f"Auto-skipped: {reason}"}
+                    else:
+                        log.dual_log(
+                            tag="Scraper:Validation",
+                            message="Page invalid - human help needed",
+                            level="WARNING",
+                            payload={"reason": reason, "attempt": val_attempt, "url": url},
+                        )
+                        if cancellation_flag is not None and cancellation_flag.is_set():
+                            return {"status": "CANCELED", "reason": "User requested stop via Human Help mode."}
 
-                # Phase 2: Local state update first, then fire-and-forget DB persist.
-                local_meta["validation_passed"] = True
-                _sync_meta("RUNNING")
+                        decision = _hitl_state.request_decision(job_id, url, f"BLOCKED PAGE - Action Required: {reason}")
+                        if decision == "proceed":
+                            log.dual_log(tag="Scraper:HITL:Proceed", message="User forced validation proceed. Re-extracting state.", level="INFO", payload={"url": url})
+                            wait_for_dom_stability(driver)
+                            raw_html, html_len = extract_hybrid_html(driver)
+                            b64_image = _capture_screenshot_b64(driver)
+                            slim_sum = raw_html
+                            local_meta["validation_passed"] = True
+                            _sync_meta("RUNNING")
+                        elif decision == "skip":
+                            return {"status": "SKIPPED", "reason": f"User skipped after HITL: {reason}"}
+                        elif decision == "cancel":
+                            if cancellation_flag is not None:
+                                cancellation_flag.set()
+                            return {"status": "CANCELED", "reason": "User requested stop via HITL."}
+                else:
+                    # Phase 2: Local state update first, then fire-and-forget DB persist.
+                    local_meta["validation_passed"] = True
+                    _sync_meta("RUNNING")
 
             # ── Summarisation (only on valid page) ─────────────────────────
             slim_sum = raw_html

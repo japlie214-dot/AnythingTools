@@ -146,6 +146,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
     _stats = {
         "new": 0, "resumed_retried": 0,
         "skipped_complete": 0, "skipped_abandoned": 0,
+        "skipped_auto": 0, "skipped_auto_current": 0,
         "success": 0, "fail": 0, "fail_reasons": [],
         }
 
@@ -197,6 +198,9 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             continue
         if _item_status == "FAILED" and not _local_meta.get("retryable", False):
             _stats["skipped_abandoned"] += 1
+            continue
+        if _item_status == "SKIPPED":
+            _stats["skipped_auto"] += 1
             continue
 
         # Unified new/ resume progress info
@@ -276,6 +280,13 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             if consecutive_nav_failures >= max_nav_failures:
                 raise RuntimeError(f"Max consecutive navigation failures reached ({consecutive_nav_failures}). Abandoning job.")
         
+        elif _parsed_result.get("status") == "SKIPPED":
+            consecutive_nav_failures = 0
+            _stats["skipped_auto"] += 1
+            _stats["skipped_auto_current"] += 1
+            sync_telemetry(f"[{target['name']}] Auto-skipped article {idx}/{len(deduped_urls)}: {_parsed_result.get('reason', 'N/A')}")
+            if job_id:
+                _upd(job_id, _meta, "SKIPPED", json.dumps(_local_meta))
         elif _parsed_result.get("status") in ("SUCCESS", "SUCCESS_NO_PARSE"):
             consecutive_nav_failures = 0
             # ── ATOM IN: THE BIG ONE ──
@@ -308,7 +319,8 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
     total_attempted = _stats["new"] + _stats["resumed_retried"]
     
     # Job finalized status
-    all_embedded = (_stats["success"] == total_attempted) and (total_attempted > 0)
+    total_successful_outcomes = _stats["success"] + _stats["skipped_auto_current"]
+    all_embedded = (total_successful_outcomes == total_attempted) and (total_attempted > 0)
     job_final_status = "COMPLETED"
     if _stats["fail"] > 0 or (total_attempted > 0 and not all_embedded) or '_job_final_status' in locals() and _job_final_status == "PARTIAL":
         job_final_status = "PARTIAL"
