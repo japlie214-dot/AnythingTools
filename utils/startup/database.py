@@ -118,25 +118,11 @@ async def validate_vec0() -> None:
             level="INFO",
             payload={"version": version[0]},
         )
-        
-        # PRE-WARM SHADOW TABLES:
-        # sqlite-vec lazily creates shadow tables on the first INSERT. If the first INSERT
-        # is inside an explicit transaction, SQLite rejects sqlite3_blob_open.
-        # We force creation here in autocommit mode using a dummy vector.
-        try:
-            vec_tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%USING vec0%'").fetchall()
-            dummy_vector = b'\x00' * 4096  # 1024 float32 zeros
-            for (t_name,) in vec_tables:
-                conn.execute(f"INSERT INTO {t_name}(rowid, embedding) VALUES(999999999999, ?)", (dummy_vector,))
-                conn.execute(f"DELETE FROM {t_name} WHERE rowid = 999999999999")
-                conn.commit()
-        except Exception:
-            pass # Silently proceed if already warmed
-            
     except Exception as e:
         log.dual_log(tag="Startup:Vec0", message="Vec0 validation skipped", level="WARNING", payload={"error": str(e)})
     finally:
         try:
-            conn.close()
+            if 'conn' in locals() and conn:
+                conn.close()
         except Exception:
             pass

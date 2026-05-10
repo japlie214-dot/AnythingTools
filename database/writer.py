@@ -69,18 +69,30 @@ def _is_foreign_key_error(error: Exception) -> bool:
     return "foreign key constraint failed" in str(error).lower()
 
 
-def _is_vec0_error(error: Exception) -> bool:
+def _is_recoverable_vec0_error(error: Exception) -> bool:
     msg = str(error).lower()
-    return any(k in msg for k in [
-        "could not initialize",
-        "could not insert a new vector chunk",
-        "invalid float32 vector",
-        "blob length",
+    recoverable_patterns = [
         "error opening vector blob",
         "vector_chunks",
-        "vec0",
-    ])
+        "could not insert a new vector chunk",
+        "could not initialize",
+    ]
+    return any(p in msg for p in recoverable_patterns)
 
+
+def _is_fatal_vec0_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    fatal_patterns = [
+        "invalid float32 vector",
+        "blob length",
+        "invalid float32 vector blob length",
+    ]
+    return any(p in msg for p in fatal_patterns)
+
+
+def _is_vec0_error(error: Exception) -> bool:
+    # Backwards compatible broad check
+    return _is_recoverable_vec0_error(error) or _is_fatal_vec0_error(error)
 
 def _attempt_table_repair(conn, table_name: str) -> bool:
     """Attempt best-effort repair of a missing table using repair script hooks."""
@@ -103,6 +115,15 @@ def _attempt_table_repair(conn, table_name: str) -> bool:
         except Exception:
             pass
         return False
+
+
+def _create_fresh_write_connection():
+    from database.connection import VEC_TABLE_NAMES
+    try:
+        VEC_TABLE_NAMES.clear()
+    except Exception:
+        pass
+    return DatabaseManager.create_write_connection()
 
 
 def get_write_generation() -> int:
@@ -190,21 +211,32 @@ def db_writer_worker() -> None:
                                 conn.rollback()
                             except Exception:
                                 pass
-                                
-                            if _is_vec0_error(tx_err) and _vec0_retries < 3:
+
+                            if _is_recoverable_vec0_error(tx_err) and _vec0_retries < 2:
                                 _vec0_retries += 1
                                 delay = 0.1 * (2 ** (_vec0_retries - 1))
-                                try:
-                                    log.dual_log(tag="DB:Writer:Vec0Retry", message=f"vec0 transaction retry {_vec0_retries}/3", level="WARNING", payload={"delay": delay, "error": str(tx_err)})
-                                except Exception:
-                                    pass
+
+                                if _vec0_retries == 1:
+                                    try:
+                                        from database.connection import _warm_vec0_tables
+                                        _warm_vec0_tables(conn)
+                                        log.dual_log(tag="DB:Writer:Vec0Retry", message=f"vec0 re-warmed connection, retrying ({_vec0_retries}/2)", level="WARNING", payload={"error": str(tx_err)})
+                                    except Exception as warm_err:
+                                        log.dual_log(tag="DB:Writer:Vec0Retry", message=f"vec0 re-warm failed: {warm_err}", level="WARNING", payload={"error": str(warm_err)})
+                                else:
+                                    log.dual_log(tag="DB:Writer:Vec0Retry", message=f"vec0 transaction retry {_vec0_retries}/2", level="WARNING", payload={"delay": delay, "error": str(tx_err)})
+
                                 import time as _time
                                 _time.sleep(delay)
                                 continue
-                                
+
+                            if _is_fatal_vec0_error(tx_err):
+                                log.dual_log(tag="DB:Writer:Vec0Fatal", message="Fatal vec0 data error, rejecting transaction", level="ERROR", payload={"error": str(tx_err)})
+
                             if receipt:
                                 receipt.reject(tx_err)
                             raise
+
 
                 else:
                     # Single statement with retry/repair attempts
@@ -233,9 +265,14 @@ def db_writer_worker() -> None:
                                 if receipt:
                                     receipt.reject(e)
                                 break
-                            elif _is_vec0_error(e):
+                            elif _is_recoverable_vec0_error(e):
                                 param_summary = [f"<BLOB: {len(p)} bytes>" if isinstance(p, bytes) else p for p in params]
-                                log.dual_log(tag="DB:Writer:VecError", message="sqlite-vec operational error", level="WARNING", payload={"sql_preview": str(sql)[:200], "params_preview": str(param_summary)[:200], "error": str(e)})
+                                log.dual_log(tag="DB:Writer:VecError", message="sqlite-vec recoverable error", level="WARNING", payload={"sql_preview": str(sql)[:200], "params_preview": str(param_summary)[:200], "error": str(e)})
+                                try:
+                                    from database.connection import _warm_vec0_tables
+                                    _warm_vec0_tables(conn)
+                                except Exception:
+                                    pass
                                 try:
                                     conn.rollback()
                                 except Exception:
@@ -243,7 +280,17 @@ def db_writer_worker() -> None:
                                 if receipt:
                                     receipt.reject(e)
                                 break
-
+                            elif _is_fatal_vec0_error(e):
+                                param_summary = [f"<BLOB: {len(p)} bytes>" if isinstance(p, bytes) else p for p in params]
+                                log.dual_log(tag="DB:Writer:VecFatal", message="sqlite-vec fatal error", level="ERROR", payload={"sql_preview": str(sql)[:200], "params_preview": str(param_summary)[:200], "error": str(e)})
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+                                if receipt:
+                                    receipt.reject(e)
+                                break
+    
                             # Unhandled error: reject receipt and break
                             log.dual_log(tag="DB:Writer:Error", message=f"Write failed: {e}", level="ERROR", payload={"sql_preview": str(sql)[:200], "params_preview": str(params)[:200]} , exc_info=e)
                             try:

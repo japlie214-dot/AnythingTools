@@ -62,7 +62,6 @@ class SchemaReconciler:
         log.dual_log(tag="DB:Validate", message=f"Starting Validation: {self.label}", payload={"label": self.label, "action": "validation_start"})
         
         self.conn.execute("PRAGMA foreign_keys = OFF")
-        
         try:
             # 1. Prune unexpected tables
             self._prune_unexpected(report)
@@ -72,9 +71,13 @@ class SchemaReconciler:
             
             # 3. Validate triggers
             self._validate_triggers(report)
+
+            # 4. Probe vec0 integrity
+            self._probe_vec0_integrity(report)
             
             self.conn.commit()
             return report
+
         finally:
             self.conn.execute("PRAGMA foreign_keys = ON")
 
@@ -210,6 +213,37 @@ class SchemaReconciler:
             else:
                 log.dual_log(tag="DB:Validate", message=f"[{self.label}] Trigger {name} valid", payload={"label": self.label, "trigger": name, "status": "valid"})
                 report.add(ReconciliationAction(name, "unchanged"))
+
+    def _probe_vec0_integrity(self, report: ReconciliationReport):
+        dummy_vector = b'\x00' * 4096
+        for name, ddl in self.expected_tables.items():
+            if not self._is_virtual_table(name):
+                continue
+            if "vec0" not in (ddl or "").lower():
+                continue
+            
+            try:
+                self.conn.execute("SAVEPOINT vec_integrity")
+                self.conn.execute(
+                    f"INSERT INTO {name}(rowid, embedding) VALUES(999999999998, ?)",
+                    (dummy_vector,)
+                )
+                self.conn.execute(f"DELETE FROM {name} WHERE rowid = 999999999998")
+                self.conn.execute("RELEASE SAVEPOINT vec_integrity")
+            except Exception as e:
+                try:
+                    self.conn.execute("ROLLBACK TO SAVEPOINT vec_integrity")
+                except Exception:
+                    pass
+                log.dual_log(
+                    tag="DB:Validate",
+                    level="WARNING",
+                    message=f"[{self.label}] {name}: vec0 integrity probe failed, recreating",
+                    payload={"label": self.label, "table": name, "error": str(e)}
+                )
+                self.conn.execute(f"DROP TABLE IF EXISTS {name}")
+                self.conn.executescript(ddl)
+                report.add(ReconciliationAction(name, "recreated", reason=f"vec0 integrity probe failed: {e}"))
 
     def _snapshot_master(self, table_name: str):
         """Pre-drop snapshot for master tables. If corrupted, log CRITICAL and proceed with reset."""
