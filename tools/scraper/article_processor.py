@@ -42,7 +42,7 @@ def process_article(
 
     for val_attempt in range(1, 2):
         try:
-            log.dual_log(tag="Scraper:Navigate", message=f"Navigating to article: {url}", level="INFO", payload={"url": url})
+            log.dual_log(tag="Scraper:Navigation:Request", message=f"Navigating to article: {url}", level="INFO", payload={"url": url})
             safe_google_get(driver, url)
             
             _safe_wait_for_any_selector(driver, ARTICLE_BODY_SELECTORS, timeout=15)
@@ -130,6 +130,6 @@ def process_article(
             return result
 
         except Exception as exc:
-            log.dual_log(tag="Scraper:Process", message="Error processing article", level="ERROR", exc_info=exc, payload={"url": url, "attempt": val_attempt, "error": str(exc)})
+            log.dual_log(tag="Scraper:Process:Error", message="Error processing article", level="ERROR", exc_info=exc, payload={"url": url, "attempt": val_attempt, "error": str(exc)})
 
     return {"status": "FAILED", "reason": "Validation failed after 1 attempt"}

@@ -59,7 +59,7 @@ async def generate_embedding(text: str, provider_type: str = "azure") -> bytes:
     
     validate_embedding_bytes(packed_bytes)
         
-    log.dual_log(tag="Embed:Pack", message="Successfully packed vector", payload={"dimensions": len(emb_list), "bytes": len(packed_bytes)})
+    log.dual_log(tag="Embed:Vector:Pack", message="Successfully packed vector", payload={"dimensions": len(emb_list), "bytes": len(packed_bytes)})
     return packed_bytes
 
 

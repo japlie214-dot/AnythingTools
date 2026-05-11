@@ -79,6 +79,10 @@ class SumAnalLogger:
                 pass
 
         # ── Logger Agent buffer capture ──────────────────────────────────────
+        # Tag format validation (non-blocking WARNING on violation)
+        from utils.logger.validation import validate_tag
+        validate_tag(tag, caller_name=self.name)
+
         _buf = _tool_log_buffer.get()
         if _buf is not None:
             _ser = _serialize_payload(payload)
@@ -90,6 +94,7 @@ class SumAnalLogger:
                 "payload": _ser,
                 "status_state": status_state,
                 "event_id": event_id,
+                "_persisted": True, # FIX: prevent flush re-inserting
             })
 
         # ── Structured Persistence (logs.db) ─────────────────────────────────
@@ -187,7 +192,7 @@ def flush_tool_buffer_to_job_logs(job_id: str, buf: list[dict] | None) -> None:
             )
         except Exception as e:
             try:
-                get_dual_logger(__name__).dual_log(tag="Logger:Flush", message=f"Failed to enqueue job_log: {e}", level="ERROR", exc_info=e, payload={"error": str(e)})
+                get_dual_logger(__name__).dual_log(tag="Logger:Core:Flush", message=f"Failed to enqueue job_log: {e}", level="ERROR", exc_info=e, payload={"error": str(e)})
             except Exception:
                 pass
 

@@ -59,7 +59,7 @@ class SchemaReconciler:
     def reconcile(self) -> ReconciliationReport:
         """Execute strict schema reconciliation with full observability."""
         report = ReconciliationReport()
-        log.dual_log(tag="DB:Validate", message=f"Starting Validation: {self.label}", payload={"label": self.label, "action": "validation_start"})
+        log.dual_log(tag="Database:Schema:ValidationStart", message=f"Starting Validation: {self.label}", payload={"label": self.label, "action": "validation_start"})
         
         self.conn.execute("PRAGMA foreign_keys = OFF")
         try:
@@ -104,11 +104,11 @@ class SchemaReconciler:
                     break
 
             if is_shadow:
-                log.dual_log(tag="DB:Validate", message=f"[{self.label}] Preserving shadow: {table}", payload={"label": self.label, "table": table, "action": "preserve_shadow"})
+                log.dual_log(tag="Database:Schema:PreserveShadow", message=f"[{self.label}] Preserving shadow: {table}", payload={"label": self.label, "table": table, "action": "preserve_shadow"})
                 continue
             
             if table not in expected:
-                log.dual_log(tag="DB:Validate", level="WARNING", message=f"[{self.label}] Dropping unexpected table: {table}", payload={"label": self.label, "table": table, "action": "drop_unexpected"})
+                log.dual_log(tag="Database:Schema:DropUnexpected", level="WARNING", message=f"[{self.label}] Dropping unexpected table: {table}", payload={"label": self.label, "table": table, "action": "drop_unexpected"})
                 self.conn.execute(f"DROP TABLE IF EXISTS {table}")
                 report.add(ReconciliationAction(table, "pruned"))
 
@@ -122,20 +122,20 @@ class SchemaReconciler:
     def _validate_structures(self, report: ReconciliationReport):
         """Deep validation of tables and columns with granular logging."""
         for name, ddl in self.expected_tables.items():
-            log.dual_log(tag="DB:Validate", message=f"[{self.label}] Checking table: {name}", payload={"label": self.label, "table": name})
+            log.dual_log(tag="Database:Schema:CheckTable", message=f"[{self.label}] Checking table: {name}", payload={"label": self.label, "table": name})
             
             exists = table_exists(self.conn, name)
             is_virtual = self._is_virtual_table(name)
             
             if not exists:
-                log.dual_log(tag="DB:Validate", message=f"[{self.label}] Table {name} missing. Creating.", payload={"label": self.label, "table": name, "action": "create"})
+                log.dual_log(tag="Database:Schema:CreateTable", message=f"[{self.label}] Table {name} missing. Creating.", payload={"label": self.label, "table": name, "action": "create"})
                 self.conn.executescript(ddl)
                 report.add(ReconciliationAction(name, "created"))
                 continue
 
             # Virtual Table Immunity: Skip deep column validation
             if is_virtual:
-                log.dual_log(tag="DB:Validate", message=f"[{self.label}] {name}: Virtual table detected, skipping column check.", payload={"label": self.label, "table": name, "virtual": True})
+                log.dual_log(tag="Database:Schema:VirtualImmunity", message=f"[{self.label}] {name}: Virtual table detected, skipping column check.", payload={"label": self.label, "table": name, "virtual": True})
                 report.add(ReconciliationAction(name, "unchanged"))
                 continue
 
@@ -150,7 +150,7 @@ class SchemaReconciler:
             for col_name, d_col in desired_cols.items():
                 if col_name not in actual_cols:
                     missing.append(col_name)
-                    log.dual_log(tag="DB:Validate", level="WARNING",
+                    log.dual_log(tag="Database:Schema:MissingColumn", level="WARNING",
                                message=f"[{self.label}] {name}: Missing column '{col_name}'",
                                payload={"label": self.label, "table": name, "missing_column": col_name})
                 else:
@@ -158,7 +158,7 @@ class SchemaReconciler:
                     # Use type affinity normalization
                     if _normalize_type_affinity(a_col.type) != _normalize_type_affinity(d_col.type):
                         type_mismatches.append((col_name, a_col.type, d_col.type))
-                        log.dual_log(tag="DB:Validate", level="WARNING", message=f"[{self.label}] {name}: Type mismatch '{col_name}' (expected: {d_col.type}, actual: {a_col.type})", payload={"label": self.label, "table": name, "column": col_name, "expected": d_col.type, "actual": a_col.type})
+                        log.dual_log(tag="Database:Schema:TypeMismatch", level="WARNING", message=f"[{self.label}] {name}: Type mismatch '{col_name}' (expected: {d_col.type}, actual: {a_col.type})", payload={"label": self.label, "table": name, "column": col_name, "expected": d_col.type, "actual": a_col.type})
                     if a_col.notnull != d_col.notnull:
                         constraint_mismatches.append((col_name, 'NOT NULL', d_col.notnull))
                     if a_col.pk != d_col.pk:
@@ -167,7 +167,7 @@ class SchemaReconciler:
             # Check for extra columns
             extra = set(actual_cols.keys()) - set(desired_cols.keys())
             for col_name in extra:
-                log.dual_log(tag="DB:Validate", level="WARNING", message=f"[{self.label}] {name}: Extra column '{col_name}'", payload={"label": self.label, "table": name, "extra_column": col_name})
+                log.dual_log(tag="Database:Schema:ExtraColumn", level="WARNING", message=f"[{self.label}] {name}: Extra column '{col_name}'", payload={"label": self.label, "table": name, "extra_column": col_name})
             
             has_drift = any([missing, type_mismatches, constraint_mismatches, extra])
             
@@ -182,12 +182,12 @@ class SchemaReconciler:
                 if extra: reason_parts.append(f"extra: {', '.join(extra)}")
                 reason = '; '.join(reason_parts)
                 
-                log.dual_log(tag="DB:Validate", level="WARNING", message=f"[{self.label}] Recreating {name} due to: {reason}", payload={"label": self.label, "table": name, "reason": reason})
+                log.dual_log(tag="Database:Schema:RecreateTable", level="WARNING", message=f"[{self.label}] Recreating {name} due to: {reason}", payload={"label": self.label, "table": name, "reason": reason})
                 self.conn.execute(f"DROP TABLE IF EXISTS {name}")
                 self.conn.executescript(ddl)
                 report.add(ReconciliationAction(name, "recreated", is_master, reason))
             else:
-                log.dual_log(tag="DB:Validate", message=f"[{self.label}] {name}: Structure valid", payload={"label": self.label, "table": name, "status": "valid"})
+                log.dual_log(tag="Database:Schema:StructureValid", message=f"[{self.label}] {name}: Structure valid", payload={"label": self.label, "table": name, "status": "valid"})
                 report.add(ReconciliationAction(name, "unchanged"))
 
     def _validate_triggers(self, report: ReconciliationReport):
@@ -195,11 +195,11 @@ class SchemaReconciler:
         for name, ddl in self.expected_triggers.items():
             exists = trigger_exists(self.conn, name)
             if not exists:
-                log.dual_log(tag="DB:Validate", message=f"[{self.label}] Creating trigger: {name}", payload={"label": self.label, "trigger": name})
+                log.dual_log(tag="Database:Schema:CreateTrigger", message=f"[{self.label}] Creating trigger: {name}", payload={"label": self.label, "trigger": name})
                 self.conn.executescript(ddl)
                 report.add(ReconciliationAction(name, "created"))
             else:
-                log.dual_log(tag="DB:Validate", message=f"[{self.label}] Trigger {name} valid", payload={"label": self.label, "trigger": name, "status": "valid"})
+                log.dual_log(tag="Database:Schema:TriggerValid", message=f"[{self.label}] Trigger {name} valid", payload={"label": self.label, "trigger": name, "status": "valid"})
                 report.add(ReconciliationAction(name, "unchanged"))
 
     def _nuke_vec0_table(self, table_name: str) -> None:
@@ -215,7 +215,7 @@ class SchemaReconciler:
             self.conn.execute(f"DROP TABLE IF EXISTS {table_name}")
             return
         except Exception as e:
-            log.dual_log(tag="DB:Validate:Nuke", level="WARNING", message=f"[{self.label}] Standard drop failed for {table_name}, initiating hard nuke.", payload={"error": str(e)})
+            log.dual_log(tag="Database:Schema:Nuke", level="WARNING", message=f"[{self.label}] Standard drop failed for {table_name}, initiating hard nuke.", payload={"error": str(e)})
 
         try:
             # 1. Gather shadow tables before modifying sqlite_master
@@ -252,7 +252,7 @@ class SchemaReconciler:
                 self.conn.execute(f"SELECT rowid FROM {name} LIMIT 1").fetchall()
             except Exception as e:
                 log.dual_log(
-                    tag="DB:Validate",
+                    tag="Database:Schema:Vec0ProbeFailed",
                     level="WARNING",
                     message=f"[{self.label}] {name}: vec0 read probe failed, table corrupted. Nuking.",
                     payload={"label": self.label, "table": name, "error": str(e)}
@@ -274,11 +274,11 @@ class SchemaReconciler:
             chunks = export_table_chunks(self.conn, table_name, cfg, mode="full")
             written = write_table_batch(table_name, chunks, cfg)
             
-            log.dual_log(tag="DB:Validate", level="INFO", message=f"[{self.label}] Pre-drop snapshot complete: {table_name} ({written} rows)", payload={"label": self.label, "table": table_name, "rows_written": written})
+            log.dual_log(tag="Database:Schema:SnapshotComplete", level="INFO", message=f"[{self.label}] Pre-drop snapshot complete: {table_name} ({written} rows)", payload={"label": self.label, "table": table_name, "rows_written": written})
         except Exception as e:
             # FAIL-OPEN POLICY: Log CRITICAL, allow DROP/CREATE to proceed
             log.dual_log(
-                tag="DB:Validate",
+                tag="Database:Schema:SnapshotFailed",
                 level="CRITICAL",
                 message=f"[{self.label}] {table_name} corrupted/unreadable. Snapshot failed. "
                         f"Proceeding with destructive reset to restore availability. Error: {e}",

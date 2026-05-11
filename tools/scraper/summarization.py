@@ -59,15 +59,15 @@ def summarize_article(raw_html: str, b64_image: str | None, url: str, driver, sy
         )
 
         if sum_data.get("error") == "INSUFFICIENT_CONTENT":
-            log.dual_log(tag="Scraper:Summarize", message="Insufficient content", level="WARNING", payload={"attempt": sum_attempt, "url": url})
+            log.dual_log(tag="Scraper:Summarization:Error", message="Insufficient content", level="WARNING", payload={"attempt": sum_attempt, "url": url})
         elif sum_data.get("title") and sum_data.get("conclusion"):
-            log.dual_log(tag="Scraper:Summarize", message=f"Generated structured summary for {url}", payload={"url": url, "title": sum_data.get("title", "")[:50]})
+            log.dual_log(tag="Scraper:Summarization:Success", message=f"Generated structured summary for {url}", payload={"url": url, "title": sum_data.get("title", "")[:50]})
             return {"status": "SUCCESS", "parsed_json": sum_data}
         else:
-            log.dual_log(tag="Scraper:Summarize", message="Missing mandatory fields in JSON", level="WARNING", payload={"parsed": sum_data, "attempt": sum_attempt, "url": url})
+            log.dual_log(tag="Scraper:Summarization:Error", message="Missing mandatory fields in JSON", level="WARNING", payload={"parsed": sum_data, "attempt": sum_attempt, "url": url})
 
         if sum_attempt < 3:
-            log.dual_log(tag="Scraper:Navigate", message="Re-navigating for summarisation retry", level="INFO", payload={"url": url, "sum_attempt": sum_attempt})
+            log.dual_log(tag="Scraper:Navigation:Retry", message="Re-navigating for summarisation retry", level="INFO", payload={"url": url, "sum_attempt": sum_attempt})
             safe_google_get(driver, url)
             _safe_wait_for_any_selector(driver, ARTICLE_BODY_SELECTORS, timeout=15)
             wait_for_dom_stability(driver)

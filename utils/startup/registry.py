@@ -23,7 +23,7 @@ async def load_tool_registry() -> None:
     
     level = "WARNING" if failed_tools else "INFO"
     log.dual_log(
-        tag="Startup:Registry",
+        tag="Startup:Registry:Load",
         message=f"Tool registry loaded: {len(loaded_tools)} successful, {len(failed_tools)} failed/missing",
         level=level,
         payload=payload

@@ -130,7 +130,7 @@ class ScraperTool(BaseTool):
         # Scout initialization (legacy ledger removed) — log for auditing
         if job_id and session_id != "0":
             msg = f"The Scout: Starting extraction for {target_site}."
-            log.dual_log(tag="Scraper:Init", level="INFO", message=msg, payload={"job_id": job_id, "session_id": session_id, "batch_id": batch_id})
+            log.dual_log(tag="Scraper:Lifecycle:Init", level="INFO", message=msg, payload={"job_id": job_id, "session_id": session_id, "batch_id": batch_id})
 
         loop = asyncio.get_running_loop()
         
@@ -206,13 +206,7 @@ class ScraperTool(BaseTool):
                 )
 
 
-            # Extraction Cleanup (Extract + Slim)
-            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before extraction cleanup.", "Job canceled.")
 
-            slim_meta = make_metadata("slim", batch_id)
-            if not _check_step("slim"):
-                await telemetry(self.status("Extracting article links...", "RUNNING"))
-                if job_id: add_job_item(job_id, slim_meta, json.dumps({"target_site": target_site}))
             # Extraction Step
             extraction_meta = make_metadata("extract", batch_id)
             await telemetry(self.status("Validating extraction...", "RUNNING"))
@@ -228,8 +222,8 @@ class ScraperTool(BaseTool):
                 return _fail_internal("No results extracted.", "Check target site validity and network connectivity.")
             if job_id: update_item_status(job_id, extraction_meta, "COMPLETED", json.dumps({"count": len(valid_results), "batch_id": batch_id}))
 
-            # Extraction Cleanup (Extract + Slim)
-            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before extraction cleanup.", "Job canceled.")
+            # Extraction Step
+            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before extraction.", "Job canceled.")
 
             slim_meta = make_metadata("slim", batch_id)
             await telemetry(self.status("Extracting article links...", "RUNNING"))
@@ -334,7 +328,7 @@ class ScraperTool(BaseTool):
                 "backup_status": bak_res.dict() if bak_res else {"success": True, "message": "Disabled or skipped"}
             }
             if job_id: update_item_status(job_id, final_meta, "COMPLETED", json.dumps(result_payload))
-            await telemetry(self.status("Completed", "COMPLETED", result_payload))
+            await telemetry(self.status("Completed", "COMPLETED", payload=result_payload))
             return json.dumps(result_payload, ensure_ascii=False)
 
         except Exception as e:

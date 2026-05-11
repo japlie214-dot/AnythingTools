@@ -15,7 +15,7 @@ log = get_dual_logger(__name__)
 async def send_notification(text: str) -> None:
     """Compatibility no-op. Logs a deprecation event."""
     try:
-        log.dual_log(tag="API:Notifier", message="send_notification called on deprecated api.telegram_notifier", payload={"text_len": len(text) if text else 0})
+        log.dual_log(tag="API:Notifier:Deprecated", message="send_notification called on deprecated api.telegram_notifier", payload={"text_len": len(text) if text else 0})
     except Exception:
         pass
 
@@ -34,6 +34,6 @@ def notify_user_sync(text: str) -> None:
             asyncio.run(notify_user(text))
     except Exception:
         try:
-            log.dual_log(tag="API:Notifier", message=f"notify_user_sync fallback: {text}", payload={"text_len": len(text) if text else 0, "text_preview": text[:200]})
+            log.dual_log(tag="API:Notifier:Fallback", message=f"notify_user_sync fallback: {text}", payload={"text_len": len(text) if text else 0, "text_preview": text[:200]})
         except Exception:
             pass

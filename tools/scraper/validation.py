@@ -30,7 +30,7 @@ def check_paywall(raw_html: str, url: str, job_id: str | None, cancellation_flag
     from tools.scraper.paywall import PaywallDetector
     pw_result = PaywallDetector().detect(raw_html)
     if pw_result.is_paywalled:
-        log.dual_log(tag="Scraper:Paywall", message=f"{pw_result.blocker_type.title()} detected", level="WARNING", payload={"url": url, "type": pw_result.blocker_type})
+        log.dual_log(tag="Scraper:Validation:Paywall", message=f"{pw_result.blocker_type.title()} detected", level="WARNING", payload={"url": url, "type": pw_result.blocker_type})
         decision = _hitl_state.request_decision(job_id, url, f"BLOCKED PAGE - Action Required: {pw_result.blocker_type.title()} detected (Indicators: {pw_result.detected_indicators})")
         if decision == "cancel" and cancellation_flag is not None:
             cancellation_flag.set()
@@ -67,7 +67,7 @@ def validate_article(raw_html: str, b64_image: str | None, url: str, sync_llm_ch
         try:
             action = ValidationAction(action_str)
         except ValueError:
-            log.dual_log(tag="Scraper:Validation", message=f"Unknown action '{action_str}', defaulting to human_help", level="WARNING", payload={"url": url})
+            log.dual_log(tag="Scraper:Validation:Error", message=f"Unknown action '{action_str}', defaulting to human_help", level="WARNING", payload={"url": url})
             action = ValidationAction.HUMAN_HELP
         return action, val_data
 

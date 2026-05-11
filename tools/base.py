@@ -65,15 +65,18 @@ class BaseTool(abc.ABC):
         """Return True if this tool supports mid-run resume for the given args."""
         return False
 
-    def status(self, message: str, status: str = "RUNNING") -> dict:
+    def status(self, message: str, status: str = "RUNNING", payload: dict | None = None) -> dict:
         """Convenience helper to create a status update for this tool."""
         from datetime import datetime, timezone
-        return {
+        result = {
             "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             "tool_name": self.name,
             "message": message,
             "status": status,
         }
+        if payload is not None:
+            result["payload"] = payload
+        return result
 
     @abc.abstractmethod
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:

@@ -117,6 +117,11 @@ class SnowflakeClient:
         or via asyncio.run_coroutine_threadsafe() from the botasaurus browser thread.
         """
         safe_text = text[:8000]
+        log.dual_log(
+            tag="Snowflake:Embed:Request",
+            message=f"Sending embedding request ({len(safe_text)} chars)",
+            payload={"text_length": len(safe_text), "text_preview": safe_text[:500], "model": model}
+        )
         
         with self._lock:
             self.verify_or_reconnect()

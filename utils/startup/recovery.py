@@ -20,7 +20,7 @@ async def run_startup_recovery() -> None:
                 "UPDATE jobs SET status = 'INTERRUPTED', updated_at = datetime('now') WHERE job_id = ?",
                 (row['job_id'],)
             )
-        log.dual_log(tag="Startup:Recovery", message="Startup recovery scan complete. Downgraded stale jobs to INTERRUPTED.", payload={"recovered_jobs": len(running_rows)})
+        log.dual_log(tag="Startup:Recovery:HealJobs", message="Startup recovery scan complete. Downgraded stale jobs to INTERRUPTED.", payload={"recovered_jobs": len(running_rows)})
         
         # Purge stale or abandoned job metadata older than 7 days
         stale_rows = conn.execute(
@@ -31,6 +31,6 @@ async def run_startup_recovery() -> None:
             enqueue_write("UPDATE jobs SET status = 'FAILED' WHERE job_id = ?", (row['job_id'],))
             enqueue_write("DELETE FROM job_items WHERE job_id = ?", (row['job_id'],))
 
-        log.dual_log(tag="Startup:Cleanup", message="Stale job cleanup complete.", payload={"stale_jobs": len(stale_rows)})
+        log.dual_log(tag="Startup:Cleanup:StaleJobs", message="Stale job cleanup complete.", payload={"stale_jobs": len(stale_rows)})
     except Exception as e:
-        log.dual_log(tag="Startup:Recovery", message=f"Recovery scan error: {e}", level="ERROR", payload={"error": str(e)})
+        log.dual_log(tag="Startup:Recovery:Error", message=f"Recovery scan error: {e}", level="ERROR", payload={"error": str(e)})

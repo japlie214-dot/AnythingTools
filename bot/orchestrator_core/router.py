@@ -44,7 +44,7 @@ class OrchestratorRouter:
             
             return result
         except Exception as error:
-            log.dual_log(tag="Orchestrator:Error", message="Orchestrator error", level="ERROR", exc_info=error, payload={"error": str(error)})
+            log.dual_log(tag="Orchestrator:Core:Error", message="Orchestrator error", level="ERROR", exc_info=error, payload={"error": str(error)})
             return ToolResult(output=f"Orchestrator error: {str(error)}", success=False)
         finally:
             if browser_daemon:

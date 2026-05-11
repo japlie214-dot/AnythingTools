@@ -35,9 +35,9 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
 
         _safe_wait_for_any_selector(driver, target["selectors"], timeout=15)
         wait_for_dom_stability(driver)
-        log.dual_log(tag="Scraper:Scroll", message="Scrolling to bottom", level="INFO", payload={"url": target["url"]})
+        log.dual_log(tag="Scraper:Navigation:Scroll", message="Scrolling to bottom", level="INFO", payload={"url": target["url"]})
         driver.scroll_to_bottom()
-        log.dual_log(tag="Scraper:Scroll", message="Scroll to bottom completed", level="INFO", payload={"url": target["url"]})
+        log.dual_log(tag="Scraper:Navigation:Scroll", message="Scroll to bottom completed", level="INFO", payload={"url": target["url"]})
         driver.scroll_to_bottom()
         driver.short_random_sleep()
         driver.short_random_sleep()
@@ -64,7 +64,7 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
                 if element:
                     element.scroll_into_view()
         except Exception as e:
-            log.dual_log(tag="Scraper:Engagement", message="Engagement scroll failed", level="DEBUG", payload={"error": str(e)})
+            log.dual_log(tag="Scraper:Navigation:Engagement", message="Engagement scroll failed", level="DEBUG", payload={"error": str(e)})
 
         driver.long_random_sleep()
 

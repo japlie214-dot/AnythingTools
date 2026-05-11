@@ -22,9 +22,9 @@ async def cleanup_zombie_chrome() -> None:
                     zombie_count += 1
                     p.kill()
         if zombie_count > 0:
-            log.dual_log(tag="Startup:ChromeCleanup", message=f"Cleaned up {zombie_count} zombie chrome processes", level="INFO", payload={"zombie_count": zombie_count})
+            log.dual_log(tag="Startup:Cleanup:ChromeZombies", message=f"Cleaned up {zombie_count} zombie chrome processes", level="INFO", payload={"zombie_count": zombie_count})
     except Exception as e:
-        log.dual_log(tag="Startup:ChromeCleanup", message=f"Chrome cleanup warning: {e}", level="WARNING", payload={"error": str(e)})
+        log.dual_log(tag="Startup:Cleanup:ChromeError", message=f"Chrome cleanup warning: {e}", level="WARNING", payload={"error": str(e)})
 
     try:
         os.makedirs("chrome_download", exist_ok=True)
@@ -42,6 +42,6 @@ async def cleanup_temp_files() -> None:
                     removed_count += 1
                 except Exception:
                     pass
-            log.dual_log(tag="Startup:Cleanup", message="Cleaned up temp Parquet files", level="INFO", payload={"files_removed": removed_count})
+            log.dual_log(tag="Startup:Cleanup:TempFiles", message="Cleaned up temp Parquet files", level="INFO", payload={"files_removed": removed_count})
     except Exception as e:
-        log.dual_log(tag="Startup:Cleanup", message=f"Temp file cleanup warning: {e}", level="WARNING", payload={"error": str(e)})
+        log.dual_log(tag="Startup:Cleanup:TempError", message=f"Temp file cleanup warning: {e}", level="WARNING", payload={"error": str(e)})

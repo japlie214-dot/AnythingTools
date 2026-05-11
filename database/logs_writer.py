@@ -73,8 +73,8 @@ def logs_write_worker():
                 # Rollback; report to stderr to avoid recursive logging into logs DB
                 try:
                     conn.rollback()
-                except Exception:
-                    pass
+                except Exception as rb_err:
+                    sys.stderr.write(f"[FATAL] Logs rollback failed: {rb_err}\n")
 
                 sys.stderr.write(f"[CRITICAL] Logs writer error: {e}\n")
 

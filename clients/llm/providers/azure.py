@@ -75,6 +75,8 @@ class AzureProvider(LLMProvider):
         self.default_model = getattr(config, "AZURE_DEPLOYMENT", "gpt-5.4-mini")
 
     async def complete_chat(self, request: LLMRequest) -> LLMResponse:
+        import time
+        _start = time.monotonic()
         _resolved_model = request.model or self.default_model
         log.dual_log(
             tag="LLM:Azure:Request",
@@ -91,6 +93,7 @@ class AzureProvider(LLMProvider):
                 **payload, extra_headers={"X-Enable-Thinking": "true"}
             )
         )
+        _latency_ms = (time.monotonic() - _start) * 1000
         _content, _tool_calls = _extract_responses_content_and_tools(response)
         _final_model          = getattr(response, "model", None) or _resolved_model
 
@@ -105,15 +108,18 @@ class AzureProvider(LLMProvider):
         )
         log.dual_log(
             tag="LLM:Azure:Response",
-            message=f"Received response. {tools_called_str}",
+            message=f"Received response from {_final_model}",
             payload={
-                "model":         _final_model,
+                "model": _final_model,
                 "finish_reason": getattr(response, "status", None),
-                "usage":         _extract_responses_usage(response),
-                "content":       _content,
-                "tool_calls":    _tool_calls,
-                "tools_called":  tool_names,
-            },
+                "usage": _extract_responses_usage(response),
+                "content_preview": (_content or "")[:500],
+                "content_length": len(_content or ""),
+                "latency_ms": round(_latency_ms, 1),
+                "request_id": getattr(response, "_request_id", None),
+                "tool_calls": _tool_calls,
+                "tools_called": tool_names,
+            }
         )
         return LLMResponse(
             content=_content,

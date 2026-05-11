@@ -11,7 +11,7 @@ _log = get_dual_logger(__name__)
 
 def safe_google_get(driver: Driver, url: str, *, bypass_cloudflare: bool = True) -> None:
     """Stealth-aware synchronous wrapper around driver.google_get()."""
-    _log.dual_log(tag="Browser:Navigate", message=f"Navigating to: {url}", payload={"url": url})
+    _log.dual_log(tag="Browser:Navigation:Request", message=f"Navigating to: {url}", payload={"url": url})
     start_t = time.monotonic()
     
     for attempt in range(2):
@@ -43,7 +43,7 @@ def safe_google_get(driver: Driver, url: str, *, bypass_cloudflare: bool = True)
                 break
             else:
                 if attempt == 0:
-                    _log.dual_log(tag="Browser:Navigate", message="URL mismatch detected, retrying", level="WARNING", payload={"url": url, "actual": actual})
+                    _log.dual_log(tag="Browser:Navigation:Verify", message="URL mismatch detected, retrying", level="WARNING", payload={"url": url, "actual": actual})
                     continue
                 else:
                     raise RuntimeError(f"Navigation verification failed: expected {url}, got {actual}")
@@ -53,13 +53,13 @@ def safe_google_get(driver: Driver, url: str, *, bypass_cloudflare: bool = True)
             raise e
 
     elapsed = time.monotonic() - start_t
-    _log.dual_log(tag="Browser:Navigate", message=f"Navigation completed: {url} ({elapsed:.2f}s)", payload={"url": url, "elapsed_s": round(elapsed, 2)})
+    _log.dual_log(tag="Browser:Navigation:Response", message=f"Navigation completed: {url} ({elapsed:.2f}s)", payload={"url": url, "elapsed_s": round(elapsed, 2)})
 
     try:
         from utils.som_utils import enforce_single_tab
         enforce_single_tab(driver)
     except Exception as e:
-        _log.dual_log(tag="Browser:Utils", message=f"enforce_single_tab failed: {e}", level="WARNING", payload={"error": str(e)})
+        _log.dual_log(tag="Browser:Utils:TabManagement", message=f"enforce_single_tab failed: {e}", level="WARNING", payload={"error": str(e)})
 
 
 def extract_hybrid_html(html_content: str, limit: int = 400000) -> str:

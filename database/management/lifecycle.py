@@ -42,7 +42,7 @@ async def run_database_lifecycle() -> None:
     )
     
     # 2. Context 1: Main Operational Database
-    log.dual_log(tag="DB:Lifecycle", message="Preparing validation for Operational DB", payload={"db": "Operational DB"})
+    log.dual_log(tag="Database:Lifecycle:Prepare", message="Preparing validation for Operational DB", payload={"db": "Operational DB"})
     main_tables = {**ALL_TABLES, **ALL_VEC_TABLES, **ALL_FTS_TABLES}
     
     # Handle orphaned backup for main DB
@@ -56,8 +56,8 @@ async def run_database_lifecycle() -> None:
     )
     
     # 3. Context 2: Logs Database (with clean separation)
-    log.dual_log(tag="DB:Lifecycle", message="---", payload={"separator": True, "next_context": "Logs DB"})
-    log.dual_log(tag="DB:Lifecycle", message="Preparing validation for Logs DB", payload={"db": "Logs DB"})
+    log.dual_log(tag="Database:Lifecycle:Separator", message="---", payload={"separator": True, "next_context": "Logs DB"})
+    log.dual_log(tag="Database:Lifecycle:Prepare", message="Preparing validation for Logs DB", payload={"db": "Logs DB"})
     await _validate_single_db(
         label="Logs DB",
         db_manager=LogsDatabaseManager,
@@ -77,13 +77,13 @@ async def _validate_single_db(
     master_tables: list
 ) -> None:
     """Validate a single database file - completely agnostic logic."""
-    log.dual_log(tag="DB:Lifecycle", message="Initiating validation sequence", payload={"label": label})
+    log.dual_log(tag="Database:Lifecycle:Initiate", message="Initiating validation sequence", payload={"label": label})
     
     # 1. Restore orphaned backups if present (agnostic)
     try:
         restore_orphaned_backup(db_path)
     except Exception as e:
-        log.dual_log(tag="DB:Lifecycle", level="CRITICAL",
+        log.dual_log(tag="Database:Lifecycle:RestoreFailed", level="CRITICAL",
                     message=f"[{label}] Backup restoration failed: {e}",
                     payload={"label": label, "error": str(e), "error_type": type(e).__name__})
         raise
@@ -93,7 +93,7 @@ async def _validate_single_db(
     
     # 3. Handle fresh initialization
     if not exists:
-        log.dual_log(tag="DB:Lifecycle", level="INFO",
+        log.dual_log(tag="Database:Lifecycle:Missing", level="INFO",
                     message="Database not found, running fresh init", payload={"label": label})
         await _initialize_database(db_manager, label, expected_tables, expected_triggers)
         return
@@ -101,7 +101,7 @@ async def _validate_single_db(
     # 4. Handle corrupted database
     if is_corrupted or db_path.stat().st_size == 0:
         if ALLOW_DESTRUCTIVE_RESET:
-            log.dual_log(tag="DB:Lifecycle", level="CRITICAL",
+            log.dual_log(tag="Database:Lifecycle:Corrupted", level="CRITICAL",
                         message="Corrupted DB detected, executing destructive reset", payload={"label": label})
             _remove_db_files(db_path)
             await _initialize_database(db_manager, label, expected_tables, expected_triggers)
@@ -130,7 +130,7 @@ async def _validate_single_db(
             msg = f"[{label}] {action.action.upper()}: {action.table_name}"
             if action.reason:
                 msg += f" ({action.reason})"
-            log.dual_log(tag="DB:Lifecycle", level=level, message=msg, payload={"label": label, "action": action.action, "table": action.table_name, "reason": action.reason})
+            log.dual_log(tag="Database:Lifecycle:Action", level=level, message=msg, payload={"label": label, "action": action.action, "table": action.table_name, "reason": action.reason})
         
         # Handle master table restoration
         if report.master_tables_recreated:
@@ -139,11 +139,11 @@ async def _validate_single_db(
         # Final checkpoint
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.commit()
-        log.dual_log(tag="DB:Lifecycle", level="INFO",
+        log.dual_log(tag="Database:Lifecycle:Validated", level="INFO",
                     message="Validation complete", payload={"label": label})
         
     except Exception as e:
-        log.dual_log(tag="DB:Lifecycle", level="CRITICAL",
+        log.dual_log(tag="Database:Lifecycle:ValidationError", level="CRITICAL",
                     message="Validation failed", exc_info=e, payload={"label": label, "error": str(e)})
         conn.rollback()
         raise RuntimeError(f"[{label}] Validation failed: {e}") from e
@@ -153,7 +153,7 @@ async def _validate_single_db(
 
 async def _initialize_database(db_manager, label: str, expected_tables: dict, expected_triggers: dict):
     """Initialize a fresh database with provided schemas."""
-    log.dual_log(tag="DB:Lifecycle", level="INFO", message="Initializing fresh database", payload={"label": label})
+    log.dual_log(tag="Database:Lifecycle:Initializing", level="INFO", message="Initializing fresh database", payload={"label": label})
     
     try:
         # Start writer
@@ -176,18 +176,18 @@ async def _initialize_database(db_manager, label: str, expected_tables: dict, ex
         
         await wait_for_writes(timeout=10.0)
         
-        log.dual_log(tag="DB:Lifecycle", level="INFO",
+        log.dual_log(tag="Database:Lifecycle:Initialized", level="INFO",
                     message="Initialization successful", payload={"label": label})
         
     except Exception as e:
-        log.dual_log(tag="DB:Lifecycle", level="ERROR",
+        log.dual_log(tag="Database:Lifecycle:InitFailed", level="ERROR",
                     message="Initialization failed", exc_info=e, payload={"label": label, "error": str(e)})
         raise RuntimeError(f"[{label}] Failed to initialize: {e}") from e
 
 
 async def _restore_master_tables(conn: sqlite3.Connection, label: str, expected_tables: dict, master_tables: list):
     """Restore master tables from backup after recreation - agnostic."""
-    log.dual_log(tag="DB:Lifecycle", level="WARNING",
+    log.dual_log(tag="Database:Lifecycle:RestoreRequired", level="WARNING",
                 message="Master tables need restoration", payload={"label": label, "master_tables": master_tables})
     
     try:
@@ -195,7 +195,7 @@ async def _restore_master_tables(conn: sqlite3.Connection, label: str, expected_
         result = restore_master_tables_direct(conn, master_tables)
         
         if result.success:
-            log.dual_log(tag="DB:Lifecycle", level="INFO",
+            log.dual_log(tag="Database:Lifecycle:Restored", level="INFO",
                        message="Restored master tables", payload={"label": label, "restored_counts": result.restored_counts})
             
             # Agnostic FTS rebuild: Check if any expected FTS table targets the restored tables
@@ -205,30 +205,30 @@ async def _restore_master_tables(conn: sqlite3.Connection, label: str, expected_
                     if fts_name.endswith("_fts") and fts_name.startswith(table_name.replace("_vec", "")):
                         try:
                             conn.execute(f"INSERT INTO {fts_name}({fts_name}) VALUES('rebuild')")
-                            log.dual_log(tag="DB:Lifecycle", level="INFO",
-                                       message="FTS5 index rebuilt", payload={"label": label, "fts_name": fts_name})
+                            log.dual_log(tag="Database:Lifecycle:FTSRebuilt", level="INFO",
+                                        message="FTS5 index rebuilt", payload={"label": label, "fts_name": fts_name})
                         except sqlite3.OperationalError:
                             pass
             
             # Post-restore cleanup backup
-            log.dual_log(tag="DB:Lifecycle", level="INFO",
+            log.dual_log(tag="Database:Lifecycle:BackupStart", level="INFO",
                         message="Running post-restore backup", payload={"label": label})
             from database.backup.storage import export_all_tables
             result = export_all_tables(conn, mode="full")
             
             if result.success:
-                log.dual_log(tag="DB:Lifecycle", level="INFO",
+                log.dual_log(tag="Database:Lifecycle:BackupComplete", level="INFO",
                            message=f"[{label}] Cleanup backup complete",
                            payload={"label": label, "action": "post_restore_cleanup", "success": True})
             else:
-                log.dual_log(tag="DB:Lifecycle", level="WARNING",
+                log.dual_log(tag="Database:Lifecycle:BackupFailed", level="WARNING",
                            message=f"[{label}] Cleanup backup failed: {result.error}",
                            payload={"label": label, "action": "post_restore_cleanup", "success": False, "error": result.error})
         else:
-            log.dual_log(tag="DB:Lifecycle", level="CRITICAL",
+            log.dual_log(tag="Database:Lifecycle:RestoreError", level="CRITICAL",
                        message=f"[{label}] Restoration failed: {result.error}",
                        payload={"label": label, "error": result.error, "master_tables": master_tables})
     except Exception as e:
-        log.dual_log(tag="DB:Lifecycle", level="CRITICAL",
+        log.dual_log(tag="Database:Lifecycle:CriticalRestoreError", level="CRITICAL",
                     message="Restoration error", exc_info=e, payload={"label": label, "error": str(e)})
         raise

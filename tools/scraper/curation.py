@@ -217,7 +217,17 @@ class Top10Curator:
                         previous_errors.append(err_msg)
                         log.dual_log(tag="Scraper:Curation:Partial", message=err_msg, level="WARNING", payload={"attempt": attempt})
 
+                except json.JSONDecodeError as jde:
+                    _resp_preview = (resp.content or "")[:500] if 'resp' in locals() else "N/A"
+                    log.dual_log(
+                        tag="Scraper:Curation:ParseError",
+                        message=f"JSON decode failed on attempt {attempt}",
+                        level="ERROR",
+                        payload={"error": str(jde), "response_preview": _resp_preview, "attempt": attempt}
+                    )
+                    previous_errors.append(f"JSONDecodeError: {jde}")
                 except Exception as e:
+                    log.dual_log(tag="Scraper:Curation:Error", message=f"Unexpected error: {e}", level="ERROR", payload={"error": str(e), "attempt": attempt})
                     previous_errors.append(f"Parse error: {e}")
 
         # Fallback: Retry exhaustion

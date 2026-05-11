@@ -35,7 +35,7 @@ def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
             _VEC_LOAD_ANNOUNCED = True
             try:
                 from utils.logger import get_dual_logger
-                get_dual_logger(__name__).dual_log(tag="DB:Vec:Load", message="sqlite-vec Python package not installed. Vector search disabled.", level="WARNING", payload={"available": False})
+                get_dual_logger(__name__).dual_log(tag="Database:Vector:LoadError", message="sqlite-vec Python package not installed. Vector search disabled.", level="WARNING", payload={"available": False})
             except Exception:
                 sys.stderr.write("[WARN] sqlite-vec Python package not installed. Vector search disabled.\n")
         return False
@@ -58,7 +58,7 @@ def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
             _VEC_LOAD_ANNOUNCED = True
             try:
                 from utils.logger import get_dual_logger
-                get_dual_logger(__name__).dual_log(tag="DB:Vec:Load", message="sqlite-vec extension failed to load. Falling back to FTS5.", level="CRITICAL", payload={"error": str(exc), "available": False})
+                get_dual_logger(__name__).dual_log(tag="Database:Vector:LoadError", message="sqlite-vec extension failed to load. Falling back to FTS5.", level="CRITICAL", payload={"error": str(exc), "available": False})
             except Exception:
                 sys.stderr.write(f"[CRITICAL] sqlite-vec extension failed to load: {exc}\n")
         _VEC_PERMANENTLY_FAILED = True
@@ -71,7 +71,7 @@ def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
             _VEC_LOAD_ANNOUNCED = True
             try:
                 from utils.logger import get_dual_logger
-                get_dual_logger(__name__).dual_log(tag="DB:Vec:Load", message="sqlite-vec loaded successfully", level="INFO", payload={"version": vec_ver, "available": True})
+                get_dual_logger(__name__).dual_log(tag="Database:Vector:LoadSuccess", message="sqlite-vec loaded successfully", level="INFO", payload={"version": vec_ver, "available": True})
             except Exception:
                 pass
     except Exception as exc:
@@ -79,7 +79,7 @@ def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
             _VEC_LOAD_ANNOUNCED = True
             try:
                 from utils.logger import get_dual_logger
-                get_dual_logger(__name__).dual_log(tag="DB:Vec:Load", message="sqlite-vec loaded but vec_version() query failed", level="CRITICAL", payload={"error": str(exc)})
+                get_dual_logger(__name__).dual_log(tag="Database:Vector:LoadError", message="sqlite-vec loaded but vec_version() query failed", level="CRITICAL", payload={"error": str(exc)})
             except Exception:
                 sys.stderr.write(f"[CRITICAL] sqlite-vec loaded but vec_version() query failed: {exc}\n")
         _VEC_PERMANENTLY_FAILED = True

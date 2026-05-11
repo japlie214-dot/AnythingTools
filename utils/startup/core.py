@@ -30,7 +30,7 @@ class StartupOrchestrator:
     async def run(self, ctx: StartupContext) -> None:
         for tier in self._tiers:
             if not ctx.ok:
-                log.dual_log(tag="Startup:Orchestrator", message="Skipping remaining phases due to prior failure", level="WARNING", payload={"reason": "prior_failure"})
+                log.dual_log(tag="Startup:Lifecycle:Orchestrator", message="Skipping remaining phases due to prior failure", level="WARNING", payload={"reason": "prior_failure"})
                 break
 
             if len(tier) == 1:
@@ -42,7 +42,7 @@ class StartupOrchestrator:
     async def _run_step(self, ctx: StartupContext, name: str, step: StartupStep) -> None:
         try:
             log.dual_log(
-                tag="Startup:Phase",
+                tag="Startup:Lifecycle:PhaseStarted",
                 message=f"Starting: {name}",
                 level="INFO",
                 payload={"phase": name, "status": "STARTED"},
@@ -52,7 +52,7 @@ class StartupOrchestrator:
             dur = round(time.monotonic() - start_t, 3)
             ctx.phases_completed.append(name)
             log.dual_log(
-                tag="Startup:Phase",
+                tag="Startup:Lifecycle:PhaseSuccess",
                 message=f"Completed: {name}",
                 level="INFO",
                 payload={"phase": name, "status": "SUCCESS", "duration_s": dur},
@@ -61,7 +61,7 @@ class StartupOrchestrator:
             ctx.ok = False
             ctx.failures.append(name)
             log.dual_log(
-                tag="Startup:Phase",
+                tag="Startup:Lifecycle:PhaseError",
                 message=f"Failed: {name}",
                 level="CRITICAL",
                 exc_info=e,

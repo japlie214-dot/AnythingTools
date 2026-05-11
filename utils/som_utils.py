@@ -33,7 +33,7 @@ def inject_som(driver: Driver, start_id: int = 1) -> int:
         # The adapter returns flat "bid_N" format, so we return 1 + count
         return res.get("marked_count", 0) + 1
     except Exception as e:
-        log.dual_log(tag="SoM:Inject", message=f"SoM injection failed entirely: {e}", level="ERROR", payload={"error": str(e)})
+        log.dual_log(tag="SoM:Core:Inject", message=f"SoM injection failed entirely: {e}", level="ERROR", payload={"error": str(e)})
         return start_id
 
 
@@ -114,7 +114,7 @@ def remove_overlays(driver: Driver) -> None:
             })();"""
         )
     except Exception as e:
-        log.dual_log(tag="SoM:Overlays", message=f"Failed to remove overlays: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
+        log.dual_log(tag="SoM:Core:Overlays", message=f"Failed to remove overlays: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
 
 
 def read_visible_html(driver: Driver) -> str:
@@ -123,7 +123,7 @@ def read_visible_html(driver: Driver) -> str:
         raw = driver.page_html or ""
         return clean_html_for_agent(raw)
     except Exception as e:
-        log.dual_log(tag="SoM:ReadHTML", message=f"Failed to read HTML: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
+        log.dual_log(tag="SoM:Core:ReadHTML", message=f"Failed to read HTML: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
         return ""
 
 
@@ -157,7 +157,7 @@ def get_element_by_hint(driver: Driver, hint: str) -> Tuple[str | None, str | No
         if ai_id:
             return f'[data-ai-id="{ai_id}"]', 'data-ai-id'
     except Exception as e:
-        log.dual_log(tag="SoM:Locator", message=f"Locator failed for hint '{hint}': {e}", level="WARNING", exc_info=e, payload={"hint": hint, "error": str(e)})
+        log.dual_log(tag="SoM:Core:Locator", message=f"Locator failed for hint '{hint}': {e}", level="WARNING", exc_info=e, payload={"hint": hint, "error": str(e)})
     return None, None
 
 
@@ -194,7 +194,7 @@ def enforce_single_tab(driver: Driver) -> None:
         )
     except Exception as e:
         # Fail silently with a log; non-fatal to the tool
-        log.dual_log(tag="SingleTab", message=f"Failed to enforce single-tab policy: {e}", level="WARNING", payload={"error": str(e)})
+        log.dual_log(tag="SoM:Core:TabPolicy", message=f"Failed to enforce single-tab policy: {e}", level="WARNING", payload={"error": str(e)})
 
 
 # ── MutationObserver for DOM stability (allowed run_js) ───────────────────────
@@ -216,4 +216,4 @@ def setup_dom_stability_observer(driver: Driver) -> None:
             })();"""
         )
     except Exception as e:
-        log.dual_log(tag="SoM:Observer", message=f"Failed to set up DOM observer: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
+        log.dual_log(tag="SoM:Core:Observer", message=f"Failed to set up DOM observer: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})

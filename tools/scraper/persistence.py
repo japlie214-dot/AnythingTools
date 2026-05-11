@@ -129,11 +129,11 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
                 embedding_success = True
 
             except EmbeddingError as ee:
-                log.dual_log(tag="Scraper:Embedding", message=f"Embedding generation failed for {parsed_result['ulid']}: {ee}", level="WARNING", payload={"error_type": type(ee).__name__, "error": str(ee)})
+                log.dual_log(tag="Scraper:Embedding:Error", message=f"Embedding generation failed for {parsed_result['ulid']}: {ee}", level="WARNING", payload={"error_type": type(ee).__name__, "error": str(ee)})
             except TimeoutError as te:
-                log.dual_log(tag="Scraper:Embedding", message=f"Snowflake timeout for {parsed_result['ulid']}. Marking pending.", level="WARNING", payload={"error": str(te)})
+                log.dual_log(tag="Scraper:Embedding:Timeout", message=f"Snowflake timeout for {parsed_result['ulid']}. Marking pending.", level="WARNING", payload={"error": str(te)})
             except Exception as e:
-                log.dual_log(tag="Scraper:Embedding", message=f"Unexpected embedding failure: {e}", level="WARNING", payload={"error_type": type(e).__name__, "error": str(e)})
+                log.dual_log(tag="Scraper:Embedding:Error", message=f"Unexpected embedding failure: {e}", level="WARNING", payload={"error_type": type(e).__name__, "error": str(e)})
 
         # Job item status update (atomic)
         if job_id:
@@ -149,7 +149,7 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
         return enqueue_transaction(statements, track=True), embedding_success
 
     except Exception as e:
-        log.dual_log(tag="Scraper:Persist", message=f"Atomic persist failed: {e}", level="ERROR", payload={"error": str(e)})
+        log.dual_log(tag="Scraper:Persistence:Error", message=f"Atomic persist failed: {e}", level="ERROR", payload={"error": str(e)})
         return None, False
 
 

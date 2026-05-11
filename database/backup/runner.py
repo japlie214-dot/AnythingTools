@@ -77,7 +77,7 @@ class BackupRunner:
         start = time.monotonic()
 
         # Block in background queue until scraper finishes
-        log.dual_log(tag="Backup:Restore", level="INFO", message="Waiting for browser_lock...", payload={"action": "wait_lock"})
+        log.dual_log(tag="Backup:Restore:Lock", level="INFO", message="Waiting for browser_lock...", payload={"action": "wait_lock"})
         browser_lock.acquire()
         try:
             # Restore only requires read access to schema info; writes are routed via enqueue_transaction.

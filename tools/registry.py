@@ -139,9 +139,9 @@ class ToolRegistry:
             if prev != current:
                 status = current.get("status")
                 if status == "LOADED":
-                    log.dual_log(tag="Registry:Register", message=f"Registered tool: {tool_name}", level="INFO", payload=current)
+                    log.dual_log(tag="Registry:Tool:Registered", message=f"Registered tool: {tool_name}", level="INFO", payload=current)
                 elif status in ("FAILED", "REJECTED", "MISSING"):
-                    log.dual_log(tag="Registry:Discover", message=f"Tool discovery failed for {tool_name}: {current.get('error')}", level="ERROR", payload={"tool": tool_name, "status": status})
+                    log.dual_log(tag="Registry:Tool:DiscoveryFailed", message=f"Tool discovery failed for {tool_name}: {current.get('error')}", level="ERROR", payload={"tool": tool_name, "status": status})
 
 
     def _register_module_tools(self, module, temp_tools: dict, temp_discovery: dict, primary_tool: str = None, module_name: str = None) -> bool:
@@ -156,7 +156,7 @@ class ToolRegistry:
                 try:
                     input_schema = InputModel.schema()
                 except Exception as e:
-                    log.dual_log(tag="Registry:Schema", message=f"Failed to serialize INPUT_MODEL for {module_name}: {e}", level="WARNING", payload={"module": module_name})
+                    log.dual_log(tag="Registry:Tool:SchemaError", message=f"Failed to serialize INPUT_MODEL for {module_name}: {e}", level="WARNING", payload={"module": module_name})
         except Exception:
             input_schema = None
 
@@ -222,7 +222,7 @@ class ToolRegistry:
             }
             found_any = True
 
-            log.dual_log(tag="Registry:Register", message=f"Registered tool: {tool_name}", level="DEBUG", payload={"module": module.__name__, "class": obj.__name__})
+            log.dual_log(tag="Registry:Tool:RegisteredDebug", message=f"Registered tool: {tool_name}", level="DEBUG", payload={"module": module.__name__, "class": obj.__name__})
 
         return found_any
 
@@ -246,7 +246,7 @@ class ToolRegistry:
             try:
                 return cls()
             except Exception as e:
-                log.dual_log(tag="Registry:Instantiate", message=f"Failed to instantiate tool {name}: {e}", level="ERROR", payload={"tool": name})
+                log.dual_log(tag="Registry:Tool:InstantiationError", message=f"Failed to instantiate tool {name}: {e}", level="ERROR", payload={"tool": name})
                 return None
 
     def schema_list(self) -> list[Dict[str, Any]]:
@@ -289,7 +289,7 @@ class ToolRegistry:
             schema = schema_map.get(name)
             if not schema:
                 log.dual_log(
-                    tag="Registry:Tools",
+                    tag="Registry:Tool:Missing",
                     message=f"Allowed tool '{name}' not found in registry",
                     level="WARNING",
                     payload={"tool": name, "status": "MISSING"},

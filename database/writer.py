@@ -342,7 +342,7 @@ def enqueue_write(sql: str, params: tuple = (), *, track: bool = False) -> Optio
             start_writer()
         except Exception as e:
             try:
-                log.dual_log(tag="DB:Writer", message="Failed to start writer thread; write dropped.", level="ERROR", exc_info=e, payload={"error": str(e)})
+                log.dual_log(tag="DB:Writer:Error", message="Failed to start writer thread; write dropped.", level="ERROR", exc_info=e, payload={"error": str(e)})
             except Exception:
                 pass
             return None
@@ -352,7 +352,7 @@ def enqueue_write(sql: str, params: tuple = (), *, track: bool = False) -> Optio
         write_queue.put_nowait((receipt, sql, params))
     except queue.Full:
         try:
-            log.dual_log(tag="DB:Writer", message="Write queue full; dropping write.", level="WARNING", payload={"sql_preview": sql[:200], "qsize": write_queue.qsize()})
+            log.dual_log(tag="DB:Writer:Overflow", message="Write queue full; dropping write.", level="WARNING", payload={"sql_preview": sql[:200], "qsize": write_queue.qsize()})
         except Exception:
             pass
         if receipt:
@@ -367,7 +367,7 @@ def enqueue_execscript(script_text: str, *, track: bool = False) -> Optional[Wri
             start_writer()
         except Exception as e:
             try:
-                log.dual_log(tag="DB:Writer", message="Failed to start writer thread; execscript dropped.", level="ERROR", exc_info=e, payload={"error": str(e)})
+                log.dual_log(tag="DB:Writer:Error", message="Failed to start writer thread; execscript dropped.", level="ERROR", exc_info=e, payload={"error": str(e)})
             except Exception:
                 pass
             return None
@@ -377,7 +377,7 @@ def enqueue_execscript(script_text: str, *, track: bool = False) -> Optional[Wri
         write_queue.put_nowait((receipt, EXEC_SCRIPT, (script_text,)))
     except queue.Full:
         try:
-            log.dual_log(tag="DB:Writer", message="Write queue full; dropping execscript.", level="WARNING", payload={"script_head": script_text[:200], "qsize": write_queue.qsize()})
+            log.dual_log(tag="DB:Writer:Overflow", message="Write queue full; dropping execscript.", level="WARNING", payload={"script_head": script_text[:200], "qsize": write_queue.qsize()})
         except Exception:
             pass
         if receipt:
@@ -397,7 +397,7 @@ def enqueue_transaction(statements: List[Tuple[str, Tuple]], *, track: bool = Fa
         write_queue.put_nowait((receipt, TRANSACTION_MARKER, statements))
     except queue.Full:
         try:
-            log.dual_log(tag="DB:Writer", message="Write queue full; dropping transaction.", level="WARNING", payload={"qsize": write_queue.qsize(), "attempted_statements": len(statements)})
+            log.dual_log(tag="DB:Writer:Overflow", message="Write queue full; dropping transaction.", level="WARNING", payload={"qsize": write_queue.qsize(), "attempted_statements": len(statements)})
         except Exception:
             pass
         if receipt:
@@ -423,7 +423,7 @@ async def wait_for_writes(timeout: Optional[float] = None) -> bool:
         return True
     except Exception as e:
         try:
-            log.dual_log(tag="DB:Writer", message=f"wait_for_writes failed: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
+            log.dual_log(tag="DB:Writer:Wait", message=f"wait_for_writes failed: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
         except Exception:
             pass
         return False

@@ -1,21 +1,49 @@
 # utils/logger/__init__.py
 """
 ================================================================================
-DEVELOPER CONTRACT: Dual Logger — The Rule of Detail
+DEVELOPER CONTRACT: THE RULE OF TOTAL RECONSTRUCTION
 ================================================================================
-Dual logging means every log entry goes to TWO destinations:
-1. CONSOLE (stdout) → Notification stream (Brief/Human-readable).
-2. DATABASE (logs.db) → Complete structured audit trail (Detailed/JSON).
+The primary goal of logging in AnythingTools is RECONSTRUCTABILITY.
+A developer must be able to reconstruct the entire state, input, and output
+of a failed job using ONLY the logs.db, without ever looking at the source code.
 
-RULE 1: Console tells you SOMETHING happened.
-RULE 2: Database tells you EXACTLY what happened.
-RULE 3: payload=None is a CONTRACT VIOLATION. Payload must contain detailed untruncated data.
+COMMANDMENT 1: LOG EVERY GRANULAR ACTION
+Do not just log 'Tool Started' and 'Tool Finished'. Log every internal decision,
+every loop iteration, and every state change. If the code "branches" (if/else),
+both paths must be logged.
 
-MANDATORY TAG FORMAT: Category:Sub-Category:Action
+COMMANDMENT 2: THE I/O SYMMETRY RULE (Audit Boundaries)
+Every time data crosses a boundary (LLM call, Database write, Filesystem read,
+Snowflake embedding), you MUST log two entries:
+    1. THE REQUEST (Input): Full prompt, parameters, or SQL.
+    2. THE RESPONSE (Output): Full raw content, latency, and row counts.
 
-PAYLOAD EXAMPLES:
-Startup:DB:Probing → {phase: "probing", db_path: "...", status: "EXISTS"}
-DB:Validate:Success → {db: "Main", table: "jobs", columns: [...], indexes: [...]}
+COMMANDMENT 3: PAYLOADS ARE DATA, NOT STATUS
+Logging payload={"status": "success"} is a CONTRACT VIOLATION.
+Payloads must contain the actual content being processed.
+    - BAD:  payload={"result": "success"}
+    - GOOD: payload={"input_text": "...", "output_vector": [...], "latency_ms": 450}
+
+COMMANDMENT 4: MANDATORY TAG FORMAT (Category:Sub-Category:Action)
+Tags must follow a 3-part hierarchy for SQL-based filtering.
+    - Valid:   LLM:Azure:Request, DB:Writer:Commit, Scraper:Curation:Selected
+    - Invalid: Scraper:Curation (2 parts), Process_Started (No parts)
+
+================================================================================
+I/O LOGGING EXAMPLES (MANDATORY PATTERNS)
+================================================================================
+
+1. LLM Boundary:
+   log.dual_log(tag="LLM:Azure:Request", ..., payload={"prompt": prompt, "temp": 0.3})
+   log.dual_log(tag="LLM:Azure:Response", ..., payload={"content": raw_resp, "usage": usage})
+
+2. Embedding Boundary:
+   log.dual_log(tag="Embed:Snowflake:Request", ..., payload={"text_len": 1200, "preview": text[:500]})
+   log.dual_log(tag="Embed:Snowflake:Response", ..., payload={"dims": 1024, "vector": Base64Vector(v)})
+
+3. Database Boundary:
+   log.dual_log(tag="DB:Writer:Insert", ..., payload={"table": "jobs", "rows": 1, "data": row_dict})
+
 ================================================================================
 """
 # Submodules are imported in strict DAG order so each module's dependencies

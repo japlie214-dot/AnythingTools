@@ -53,8 +53,9 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
         deduped_urls = [r["norm_url"] for r in existing_items if r["norm_url"]]
         links = deduped_urls
         log.dual_log(
-            tag="Scraper:Resume",
-            message=f" bypassing extract_links. Found {len(deduped_urls)} existing items.",
+            tag="Scraper:Resume:SkipExtract",
+            message=f"Bypassing extract_links. Found {len(deduped_urls)} existing items.",
+            payload={"existing_count": len(existing_items)}
         )
     else:
         sync_telemetry(f"Extracting links from {target['name']}...")
@@ -263,7 +264,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                     # Local meta even permanent
                     continue 
                 except Exception as _ee:
-                    log.dual_log(tag="Scraper:ResumeEmbed", message=str(_ee))
+                    log.dual_log(tag="Scraper:ResumeEmbed:Error", message=f"Resume embedding failed: {_ee}", level="ERROR", payload={"error": str(_ee)})
             _local_meta["retryable"] = True
 
         # ── Run `process_article` for new summaries or when validation FAILED previously

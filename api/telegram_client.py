@@ -34,7 +34,7 @@ class TelegramBot:
     def set_chat_id(cls, chat_id: str):
         cls._chat_id = str(chat_id)
         try:
-            log.dual_log(tag="TelegramBot:Handshake", message=f"Deprecated api.telegram_client.set_chat_id called", payload={"chat_id_last4": str(chat_id)[-4:] if chat_id else None})
+            log.dual_log(tag="Telegram:Bot:Handshake", message=f"Deprecated api.telegram_client.set_chat_id called", payload={"chat_id_last4": str(chat_id)[-4:] if chat_id else None})
         except Exception:
             pass
 
