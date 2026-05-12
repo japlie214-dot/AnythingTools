@@ -26,7 +26,7 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
     """Navigate to a site front page and return deduplicated article URLs."""
     try:
         log.dual_log(
-            tag="Scraper:Navigate",
+            tag="Scraper:Navigation:Start",
             message=f"Navigating to extract links: {target['url']}",
             level="INFO",
             payload={"url": target["url"]},
@@ -55,7 +55,7 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
             if last_id > 1:
                 target_id = random.randint(0, last_id - 2)
                 log.dual_log(
-                    tag="Scraper:Engagement",
+                    tag="Scraper:Engagement:Scroll",
                     message=f"Engagement scroll to data-ai-id bid_{target_id}",
                     level="INFO",
                     payload={"ai_id": f"bid_{target_id}"},
@@ -87,7 +87,7 @@ def extract_links(driver: Driver, target: dict) -> list[str]:
 
     except Exception as exc:
         log.dual_log(
-            tag="Scraper:Extract",
+            tag="Scraper:Extraction:Error",
             message="Link extraction failed",
             level="ERROR",
             exc_info=exc,

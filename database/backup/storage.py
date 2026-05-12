@@ -130,6 +130,8 @@ def export_all_tables(conn, config: Optional[BackupConfig] = None, mode: str = "
     try:
         current_ts = datetime.now(timezone.utc).isoformat()
         for table_name in TABLE_SCHEMAS.keys():
+            if table_name in ["scraped_articles", "scraped_articles_vec"]:
+                continue
             last_ts = wm.table_watermarks.get(table_name, "") if mode == "delta" else ""
             chunks = export_table_chunks(conn, table_name, config, mode=mode, last_ts=last_ts)
             written = write_table_batch(table_name, chunks, config)

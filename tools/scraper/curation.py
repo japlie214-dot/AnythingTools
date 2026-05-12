@@ -24,60 +24,59 @@ class Top10Curator:
     
     MAX_RETRIES = 3
 
-    def _pack_context(self, candidates: list[dict]) -> tuple[list[dict], int]:
+    def _pack_context(self, candidates: list[dict]) -> tuple[list[dict], int, str]:
         """
-        Pack articles smartly up to 80% of the LLM context limit.
-        
-        Algorithm:
-        1. Sort by conclusion length (descending) then title (ascending)
-        2. Greedily add whole articles until budget reached
-        3. Calculate dynamic target count
-        
-        Args:
-            candidates: List of article dictionaries with 'ulid', 'title', 'conclusion'
-            
-        Returns:
-            tuple: (packed_articles, target_count)
+        Pack articles smartly up to 80% of the LLM context limit using a tiered approach.
         """
-        # Calculate budget (80% of context limit)
         budget = int(getattr(config, "LLM_CONTEXT_CHAR_LIMIT", 40000) * 0.8)
         
-        # Tie-breaker: Conclusion length DESC, then Title ASC
         sorted_cands = sorted(
             candidates,
             key=lambda x: (-len(str(x.get("conclusion") or "")), str(x.get("title") or ""))
         )
         
+        def _calc_len(mode):
+            total = 0
+            for c in sorted_cands:
+                if mode == "full": total += len(json.dumps({"title": c.get("title"), "conclusion": c.get("conclusion"), "ulid": c.get("ulid")}))
+                elif mode == "lite": total += len(json.dumps({"conclusion": c.get("conclusion"), "ulid": c.get("ulid")}))
+                else: total += len(json.dumps({"title": c.get("title"), "ulid": c.get("ulid")}))
+            return total
+
+        mode = "full"
+        if _calc_len("full") > budget:
+            mode = "lite"
+            if _calc_len("lite") > budget:
+                mode = "liter"
+                if _calc_len("liter") > budget:
+                    mode = "truncate"
+        
         packed = []
         current_len = 0
         
-        # Greedily pack whole articles without slicing
-        for art in sorted_cands:
-            art_str = json.dumps(art, ensure_ascii=False)
-            if current_len + len(art_str) <= budget:
-                packed.append(art)
-                current_len += len(art_str)
-            else:
-                # Cannot fit this article, and all following are smaller
+        for c in sorted_cands:
+            if mode == "full": item = {"title": c.get("title"), "conclusion": c.get("conclusion"), "ulid": c.get("ulid")}
+            elif mode == "lite": item = {"conclusion": c.get("conclusion"), "ulid": c.get("ulid")}
+            else: item = {"title": c.get("title"), "ulid": c.get("ulid")}
+            
+            item_str = json.dumps(item, ensure_ascii=False)
+            if mode == "truncate" and current_len + len(item_str) > budget:
                 break
-        
-        # Dynamic target count: min of 10 or packed count
+                
+            packed.append(item)
+            current_len += len(item_str)
+            
         target_count = min(10, len(packed))
         
         if target_count < 10 and len(candidates) >= 10:
             log.dual_log(
-                tag="Scraper:Curation",
+                tag="Scraper:Curation:BudgetLimit",
                 message=f"Context budget forced dynamic reduction to Top {target_count}",
                 level="WARNING",
-                payload={
-                    "budget": budget,
-                    "used": current_len,
-                    "available": len(candidates),
-                    "count": target_count
-                }
+                payload={"budget": budget, "used": current_len, "available": len(candidates), "count": target_count, "mode": mode}
             )
-        
-        return packed, target_count
+            
+        return packed, target_count, mode
 
     def _score_curation_quality(self, curated: list[dict], packed_candidates: list[dict], target_count: int) -> dict:
         candidate_ulids = {item["ulid"] for item in packed_candidates}
@@ -147,7 +146,9 @@ class Top10Curator:
 
         # Phase 1: Smart packing
         with granular_log("Scraper:Curation:Pack", valid_count=len(valid_candidates)):
-            packed_candidates, target_count = self._pack_context(valid_candidates)
+            packed_candidates, target_count, content_mode = self._pack_context(valid_candidates)
+            log_ctx["content_mode"] = content_mode
+            
         if target_count == 0:
             return [], 0
 
@@ -173,7 +174,7 @@ class Top10Curator:
                     log.dual_log(
                         tag="LLM:Azure:Request",
                         message="Sending request to Azure OpenAI (Curation)",
-                        payload={**log_ctx, "attempt": attempt}
+                        payload={**log_ctx, "attempt": attempt, "prompt_length": len(prompt), "candidate_count": len(packed_candidates)}
                     )
                     resp = sync_llm_chat(
                         [{"role": "user", "content": prompt}],
@@ -182,7 +183,7 @@ class Top10Curator:
                     log.dual_log(
                         tag="LLM:Azure:Response",
                         message="Received response from Azure OpenAI.",
-                        payload={**log_ctx, "attempt": attempt}
+                        payload={**log_ctx, "attempt": attempt, "model": getattr(resp, "model", "unknown"), "usage": getattr(resp, "usage", {}), "response_length": len(resp.content or "")}
                     )
                     
                     parsed = json.loads(resp.content or "{}")

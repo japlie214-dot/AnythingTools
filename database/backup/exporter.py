@@ -30,8 +30,8 @@ def export_table_chunks(conn: sqlite3.Connection, table_name: str, config: Backu
     params = ()
     # Delta mode strictly handles append/update based on updated_at.
     if mode == "delta" and last_ts:
-        # Check if table has updated_at column safely
-        cursor = conn.execute("PRAGMA table_info(?)", (table_name,))
+        # Check if table has updated_at column safely (table_name is already validated against MASTER_TABLES)
+        cursor = conn.execute(f"PRAGMA table_info('{table_name}')")
         cols = [r[1] for r in cursor.fetchall()]
         if "updated_at" in cols:
             query += " WHERE updated_at > ?"

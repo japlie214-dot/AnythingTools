@@ -120,7 +120,7 @@ class ScraperTool(BaseTool):
         if target_site not in VALID_TARGET_NAMES:
             valid_list = ", ".join(sorted(VALID_TARGET_NAMES))
             log.dual_log(
-                tag="Scraper:Validation",
+                tag="Scraper:Validation:Rejected",
                 message=f"Invalid target_site rejected: {target_site}",
                 level="ERROR",
                 payload={"received": target_site, "valid_options": list(VALID_TARGET_NAMES)},
@@ -160,7 +160,7 @@ class ScraperTool(BaseTool):
             from utils.browser_daemon import get_or_create_driver
             _scrape_driver = get_or_create_driver()
             
-            with granular_log("Scraper:Botasaurus", target_site=target_site, job_id=job_id):
+            with granular_log("Scraper:Botasaurus:Run", target_site=target_site, job_id=job_id):
                 from tools.scraper.task import _run_botasaurus_scraper as _run_scraper
                 results = await asyncio.to_thread(
                 _run_scraper,
@@ -199,7 +199,7 @@ class ScraperTool(BaseTool):
                     )
             except Exception as e:
                 log.dual_log(
-                    tag="Scraper:Artifact",
+                    tag="Scraper:Artifact:Error",
                     message=f"Failed writing raw artifact: {e}",
                     level="WARNING",
                     payload={"error": str(e), "artifact_type": "raw_json", "target_site": target_site}
@@ -284,7 +284,7 @@ class ScraperTool(BaseTool):
                 if job_id: update_item_status(job_id, art_meta, "COMPLETED", json.dumps({"path": str(top_10_path)}))
             except Exception as e:
                 log.dual_log(
-                    tag="Scraper:Artifact",
+                    tag="Scraper:Artifact:Error",
                     message=f"Failed: {e}",
                     level="WARNING",
                     payload={"error": str(e), "artifact_type": "top10_json", "target_site": target_site}
@@ -292,18 +292,16 @@ class ScraperTool(BaseTool):
                 top_10_path = raw_filepath if raw_filepath else ""
                 if job_id: update_item_status(job_id, art_meta, "FAILED", "{}")
 
-            # Backup Sync Step
-            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before backup.", "Job canceled.")
+            # Backup Sync Step - Acknowledgment
+            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before backup acknowledgment.", "Job canceled.")
             
-            bak_meta = make_metadata("backup", batch_id)
-            await telemetry(self.status("Syncing backup to Parquet...", "RUNNING"))
-            if job_id: add_job_item(job_id, bak_meta, "{}")
-            from database.backup.runner import BackupRunner
-            bak_res = BackupRunner.run(mode="delta", trigger_type="auto")
-            if not bak_res.success and bak_res.error != "Disabled":
-                if job_id: update_item_status(job_id, bak_meta, "FAILED", json.dumps({"error": bak_res.error}))
-                return _fail_internal(f"Backup failed: {bak_res.error}", "Resolve disk/permissions and retry job.")
-            if job_id: update_item_status(job_id, bak_meta, "COMPLETED", json.dumps(bak_res.dict()))
+            log.dual_log(
+                tag="Scraper:Backup:Inline",
+                level="INFO",
+                message="Article backup is handled inline by database/articles writer pipeline",
+                payload={"batch_id": batch_id, "article_count": len(top_10_list)}
+            )
+            bak_res = None
 
             # Finalization
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before finalization.", "Job canceled.")
@@ -333,7 +331,7 @@ class ScraperTool(BaseTool):
 
         except Exception as e:
             log.dual_log(
-                tag="Scraper:Unexpected",
+                tag="Scraper:Unexpected:Error",
                 message=f"Critical failure: {e}",
                 level="ERROR",
                 exc_info=e,

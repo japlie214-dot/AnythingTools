@@ -52,56 +52,19 @@ def _parse_article_result(raw_result: dict, url: str) -> dict:
 
 
 def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_str: str, local_meta_json: str):
-    """Combine article metadata, embedding, and job-items updates into a single transaction.
-
-    Returns a WriteReceipt (or None) that allows the caller to wait for flush completion and detect timeout.
-    """
-    from database.writer import enqueue_transaction
+    """Write article metadata and embeddings directly to the unified SQLite + Parquet pipeline."""
+    from database.articles import enqueue_article_write
     from utils.vector_search import validate_embedding_bytes
     from clients.snowflake_client import EmbeddingError
     
-    # Coerce to JSON string immediately to guarantee safety across all paths
     if isinstance(local_meta_json, dict):
         local_meta_json = json.dumps(local_meta_json)
 
-    statements = []
+    embedding_bytes = None
+    embedding_status = "PENDING" if parsed_result.get("status") == "SUCCESS" else "SKIPPED"
+    embedding_success = False
+
     try:
-
-        # Base article insert/update
-        insert_sql = (
-            """
-            INSERT INTO scraped_articles (
-                id, normalized_url, url, title, conclusion, summary, metadata_json,
-                embedding_status, vec_rowid, scraped_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ON CONFLICT(normalized_url) DO UPDATE SET
-                url = excluded.url,
-                title = excluded.title,
-                conclusion = excluded.conclusion,
-                summary = excluded.summary,
-                embedding_status = excluded.embedding_status,
-                updated_at = CURRENT_TIMESTAMP
-            """
-        )
-
-        embedding_success = False
-        embedding_status = "PENDING" if parsed_result.get("status") == "SUCCESS" else "SKIPPED"
-        statements.append((
-            insert_sql,
-            (
-                parsed_result["ulid"],
-                parsed_result["normalized_url"],
-                parsed_result["url"],
-                parsed_result["title"],
-                parsed_result["conclusion"],
-                parsed_result["summary"],
-                meta_str,
-                embedding_status,
-                parsed_result["id"],
-            ),
-        ))
-
-        # Embedding generation (time-bounded)
         if parsed_result.get("status") == "SUCCESS":
             _t = parsed_result["title"]
             _c = parsed_result["conclusion"]
@@ -115,14 +78,8 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
                 embedding_bytes = generate_embedding_sync(content_for_embedding)
 
                 validate_embedding_bytes(embedding_bytes)
+                embedding_status = "EMBEDDED"
 
-                statements.extend([
-                    ("DELETE FROM scraped_articles_vec WHERE rowid = ?", (parsed_result["id"],)),
-                    ("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", (parsed_result["id"], embedding_bytes)),
-                    ("UPDATE scraped_articles SET embedding_status = 'EMBEDDED' WHERE id = ?", (parsed_result["ulid"],)),
-                ])
-
-                # Update local metadata to mark embedding synced
                 lm = json.loads(local_meta_json)
                 lm["embedding_synced"] = True
                 local_meta_json = json.dumps(lm)
@@ -135,21 +92,29 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
             except Exception as e:
                 log.dual_log(tag="Scraper:Embedding:Error", message=f"Unexpected embedding failure: {e}", level="WARNING", payload={"error_type": type(e).__name__, "error": str(e)})
 
-        # Job item status update (atomic)
-        if job_id:
-            statements.append((
-                "UPDATE job_items SET status = ?, output_data = ?, item_metadata = ?, updated_at = CURRENT_TIMESTAMP "
-                "WHERE job_id = ? "
-                "AND json_extract(item_metadata, '$.step') = json_extract(?, '$.step') "
-                "AND json_extract(item_metadata, '$.ulid') = json_extract(?, '$.ulid')",
-                ("COMPLETED", local_meta_json, meta_str, job_id, meta_str, meta_str),
-            ))
+        article_data = {
+            "id": parsed_result["ulid"],
+            "normalized_url": parsed_result["normalized_url"],
+            "url": parsed_result["url"],
+            "title": parsed_result["title"],
+            "conclusion": parsed_result["conclusion"],
+            "summary": parsed_result["summary"],
+            "metadata_json": meta_str,
+            "embedding_status": embedding_status,
+            "vec_rowid": parsed_result["id"],
+        }
 
-        # Enqueue transaction with tracking
-        return enqueue_transaction(statements, track=True), embedding_success
+        res = enqueue_article_write(
+            article_data=article_data,
+            embedding_bytes=embedding_bytes,
+            job_id=job_id,
+            item_metadata=meta_str,
+            local_metadata=local_meta_json
+        )
+        return res.receipt, embedding_success
 
     except Exception as e:
-        log.dual_log(tag="Scraper:Persistence:Error", message=f"Atomic persist failed: {e}", level="ERROR", payload={"error": str(e)})
+        log.dual_log(tag="Scraper:Persistence:Error", message=f"Unified persist failed: {e}", level="ERROR", payload={"error": str(e)})
         return None, False
 
 
