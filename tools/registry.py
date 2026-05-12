@@ -99,7 +99,7 @@ class ToolRegistry:
             }
 
         # Attempt to import conventional submodules
-        for sub in ("tool", "Skill"):
+        for sub in ("tool",):
             sub_module_name = f"tools.{child.name}.{sub}"
             try:
                 submod = importlib.import_module(sub_module_name)

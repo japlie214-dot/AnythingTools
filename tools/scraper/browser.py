@@ -37,7 +37,7 @@ def _wait_for_any_selector(
             except Exception as exc:
                 if sel not in logged_selectors:
                     log.dual_log(
-                        tag="Scraper:SelectorWait",
+                        tag="Scraper:Selector:WaitStart",
                         message=f"wait_for_element raised for selector '{sel[:80]}'",
                         level="WARNING",
                         payload={"selector": sel, "error": str(exc)}
@@ -72,7 +72,7 @@ def _safe_wait_for_any_selector(
         return future.result(timeout=hard_timeout)
     except concurrent.futures.TimeoutError:
         log.dual_log(
-            tag="Scraper:SelectorWait:Timeout",
+            tag="Scraper:Selector:WaitStart",
             message="HARD TIMEOUT: Selector wait exceeded wait. Probing CDP channel.",
             level="ERROR",
             payload={"hard_timeout": hard_timeout, "selectors": selectors},
@@ -120,7 +120,7 @@ def _capture_screenshot_b64(driver: Driver) -> str | None:
         return b64
     except Exception as exc:
         log.dual_log(
-            tag="Scraper:Screenshot",
+            tag="Scraper:Screenshot:Capture",
             message=f"Screenshot capture failed (non-fatal): {exc}",
             level="WARNING",
             payload={"error": str(exc), "error_type": type(exc).__name__}

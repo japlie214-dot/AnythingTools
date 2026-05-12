@@ -7,6 +7,7 @@ from .database import init_database_layer, run_db_migrations, validate_vec0
 from .registry import load_tool_registry
 from .browser import warmup_browser
 from .recovery import run_startup_recovery
+from .hydration import hydrate_from_backup
 
 async def run_startup(app_instance=None) -> StartupContext:
     ctx = StartupContext()
@@ -22,6 +23,7 @@ async def run_startup(app_instance=None) -> StartupContext:
 
     # Tier 2: Dependent Database logic (Sequential)
     orchestrator.add_sequential("run_db_migrations", run_db_migrations)
+    orchestrator.add_sequential("hydrate_from_backup", hydrate_from_backup)
     orchestrator.add_sequential("validate_vec0", validate_vec0)
     orchestrator.add_sequential("startup_recovery", run_startup_recovery)
 

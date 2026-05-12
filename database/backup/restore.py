@@ -120,16 +120,29 @@ def restore_master_tables_direct(conn: sqlite3.Connection, table_names: Optional
                     statements.append((sql, tuple(params)))
 
                 if statements:
+                    from database.writer import write_queue
+                    # Throttle PyArrow output if the writer queue gets congested
+                    while write_queue.maxsize > 0 and write_queue.qsize() >= write_queue.maxsize - 5:
+                        import time
+                        time.sleep(0.05)
                     enqueue_transaction(statements)
                     count += len(statements)
 
-            # Synchronously wait for the background writer to commit transactions for this table
-            try:
-                loop = asyncio.get_running_loop()
-                asyncio.run_coroutine_threadsafe(wait_for_writes(timeout=120.0), loop).result()
-            except RuntimeError:
-                # No running loop in this thread; run synchronously
-                asyncio.run(wait_for_writes(timeout=120.0))
+            # Synchronously poll the writer queue to drain (avoiding async/sync thread loop bugs)
+            import time
+            _max_wait = 120.0
+            _start = time.monotonic()
+            from database.writer import write_queue
+            while not write_queue.empty() and (time.monotonic() - _start < _max_wait):
+                time.sleep(0.3)
+            
+            if not write_queue.empty():
+                log.dual_log(
+                    tag="Backup:Restore:Timeout",
+                    level="WARNING",
+                    message=f"Write queue drain timeout after {_max_wait}s",
+                    payload={"remaining": write_queue.qsize()}
+                )
 
         except Exception as e:
             log.dual_log(tag="Backup:Restore:Error", level="ERROR", message=f"Transaction failed during restore of {table_name}: {e}", payload={"table": table_name, "error": str(e)})
@@ -138,20 +151,5 @@ def restore_master_tables_direct(conn: sqlite3.Connection, table_names: Optional
         restored_counts[table_name] = count
         log.dual_log(tag="Backup:Restore:Success", level="INFO", message=f"Restored {count} rows into {table_name}", payload={"table": table_name, "rows_restored": count, "file": latest_file.name if latest_file else None})
 
-    # Synchronous FTS rebuild at the tail-end
-    if restored_counts.get("scraped_articles", 0) > 0:
-        log.dual_log(tag="Backup:Restore:FTS", level="INFO", message="Rebuilding FTS index synchronously...", payload={"affected_table": "scraped_articles", "restored_rows": restored_counts.get("scraped_articles", 0)})
-        from database.writer import enqueue_write, wait_for_writes
-        import asyncio
-        enqueue_write("INSERT INTO scraped_articles_fts(scraped_articles_fts) VALUES('rebuild')")
-        try:
-            try:
-                loop = asyncio.get_running_loop()
-                asyncio.run_coroutine_threadsafe(wait_for_writes(timeout=300.0), loop).result()
-            except RuntimeError:
-                asyncio.run(wait_for_writes(timeout=300.0))
-            log.dual_log(tag="Backup:Restore:FTS", level="INFO", message="FTS index rebuilt successfully.", payload={"fts_rebuilt": True})
-        except Exception as e:
-            log.dual_log(tag="Backup:Restore:FTS", level="ERROR", message=f"FTS rebuild failed: {e}", payload={"error": str(e)})
 
     return RestoreResult(success=True, restored_counts=restored_counts, duration_seconds=time.monotonic() - start)

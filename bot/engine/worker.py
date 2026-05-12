@@ -438,7 +438,7 @@ class UnifiedWorkerManager:
                         export_job_logs_to_file(job_id, final_status)
                     except Exception as export_err:
                         log.dual_log(
-                            tag="Worker:LogExport",
+                            tag="Worker:LogExport:Write",
                             message=f"Failed to export job logs: {export_err}",
                             level="WARNING",
                             payload={"job_id": job_id, "error": str(export_err)}

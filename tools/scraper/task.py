@@ -53,6 +53,12 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
         deduped_urls = [r["norm_url"] for r in existing_items if r["norm_url"]]
         links = deduped_urls
         log.dual_log(
+            tag="Scraper:Dedup:Resume",
+            message=f"Bypassing extract_links. Resuming with {len(deduped_urls)} pre-deduplicated URLs.",
+            level="INFO",
+            payload={"existing_count": len(existing_items), "deduped_links": deduped_urls[:500]}
+        )
+        log.dual_log(
             tag="Scraper:Resume:SkipExtract",
             message=f"Bypassing extract_links. Found {len(deduped_urls)} existing items.",
             payload={"existing_count": len(existing_items)}
@@ -74,12 +80,34 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                 ).fetchall()
             }
             deduped_urls = [normalized_to_raw[n] for n in normalized_to_raw if n not in existing_db]
+            
+            _duplicates_removed = [{"normalized_url": n, "raw_url": normalized_to_raw[n]} for n in normalized_to_raw if n in existing_db]
+            log.dual_log(
+                tag="Scraper:Dedup:Result",
+                message=f"Deduplication complete for {target['name']}: {len(links)} raw -> {len(deduped_urls)} deduplicated",
+                level="INFO",
+                payload={
+                    "target": target["name"],
+                    "total_raw_links": len(links),
+                    "deduped_count": len(deduped_urls),
+                    "duplicates_removed_count": len(_duplicates_removed),
+                    "raw_links": links[:500],
+                    "deduped_links": deduped_urls[:500],
+                    "duplicates": _duplicates_removed[:500],
+                    "db_query_success": True,
+                },
+            )
         except Exception as e:
             log.dual_log(
-                tag="Scraper:Dedup",
+                tag="Scraper:Dedup:Check",
                 message="Database check failed, proceeding with all links",
                 level="WARNING",
-                payload={"error": str(e)},
+                payload={
+                    "error": str(e),
+                    "total_raw_links": len(links),
+                    "raw_links": links[:500],
+                    "db_query_success": False,
+                },
             )
             deduped_urls = links
 
@@ -102,15 +130,15 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
                 else:
                     deduped_urls = [n for n in failed_urls]
                 log.dual_log(
-                    tag="Scraper:Partial",
+                    tag="Scraper:Partial:Save",
                     message=f"PARTIAL resumption: restricting to {len(deduped_urls)} failed links.",
                     payload={"failed_count": len(deduped_urls), "total_links": len(links), "job_id": job_id, "target_site": target_site}
                 )
         except Exception as e:
             log.dual_log(
-                tag="Scraper:Partial",
+                tag="Scraper:Partial:Save",
                 message="PARTIAL resumption check failed",
-                level="WARNING?",
+                level="WARNING",
                 payload={"error": str(e)}
             )
 
@@ -128,7 +156,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
 
     # Black box boundary log
     log.dual_log(
-        tag="Scraper:Links",
+        tag="Scraper:Links:Discover",
         message=f"Discovered article links for {target['name']}",
         payload={
             "target":          target["name"],
@@ -219,7 +247,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
             sync_telemetry(f"[{target['name']}] Processing article {idx}/{len(deduped_urls)}...")
 
         log.dual_log(
-            tag="Scraper:Process",
+            tag="Scraper:Process:Execute",
             message=f"[{idx}/{len(deduped_urls)}] Processing article for {target['name']}",
             level="INFO",
             payload={"index": idx, "total": len(deduped_urls), "link": link, "resume": _is_resume},

@@ -354,7 +354,7 @@ def parse_llm_json(text: str) -> Dict[str, Any]:
         return json.loads(json_string)
     except json.JSONDecodeError:
         log.dual_log(
-            tag="Text:Parse",
+            tag="Text:Parse:Execute",
             message="Failed to parse JSON from AI response.",
             level="ERROR",
             payload={"event_type": "json.parse_error", "raw_content": text[:500]},
@@ -468,7 +468,7 @@ def clean_html_for_agent(html_content: str, max_chars: int = 40000,
 
     if len(slimmed) > max_chars:
         log.dual_log(
-            tag="Text:CleanHTML",
+            tag="Text:CleanHTML:Execute",
             message=f"HTML truncated to {max_chars} chars.",
             level="INFO",
             payload={"event_type": "html.truncate", "original_size": len(slimmed)},

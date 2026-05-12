@@ -259,7 +259,7 @@ class ScraperTool(BaseTool):
                     top_10_list, target_curated_count = curator.curate(slim_list, sync_llm_chat, batch_id=batch_id)
                 except Exception as _ce:
                     log.dual_log(
-                        tag="Scraper:Curation",
+                        tag="Scraper:Curation:Execute",
                         message=f"Curation sub-agent failed; falling back to first 10: {_ce}",
                         level="WARNING",
                         exc_info=_ce

@@ -85,7 +85,7 @@ class SnowflakeClient:
                 client_session_keep_alive=True,
             )
             log.dual_log(
-                tag="Snowflake",
+                tag="Snowflake:Client:Init",
                 message="Established new Snowflake connection via .p8 key-pair.",
                 payload={"account_last4": config.SNOWFLAKE_ACCOUNT[-4:] if config.SNOWFLAKE_ACCOUNT else None, "user": config.SNOWFLAKE_USER, "key_path": str(key_path)},
             )
@@ -139,7 +139,7 @@ class SnowflakeClient:
                 vec = self._extract_vector(raw_res)
                 
                 log.dual_log(
-                    tag="Embed:Raw",
+                    tag="Embed:Snowflake:Raw",
                     message=f"Extracted vector from Snowflake ({raw_type} → list[{len(vec)}])",
                     payload={"raw_type": raw_type, "dimensions": len(vec)},
                 )

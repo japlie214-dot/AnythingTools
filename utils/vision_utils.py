@@ -50,14 +50,14 @@ def _optimize_image_for_api(image_path: str, target_mb: int = 10) -> str | None:
                     break
                 quality -= 10
             log.dual_log(
-                tag="Vision:Optimize",
+                tag="Vision:Optimize:Resize",
                 message=f"Image optimized. Final size: {size / 1024 / 1024:.2f}MB",
                 payload={"final_size_bytes": size},
             )
             return base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception as e:
         log.dual_log(
-            tag="Vision:Optimize",
+            tag="Vision:Optimize:Resize",
             message="Image optimization failed.",
             level="ERROR",
             exc_info=e,
@@ -93,7 +93,7 @@ def capture_and_optimize(driver: Driver, step_index: int) -> list[dict]:
         driver.save_screenshot(raw_path)
     except Exception as exc:
         log.dual_log(
-            tag="Vision:Capture",
+            tag="Vision:Capture:Screenshot",
             message=f"save_screenshot failed: {exc}",
             level="ERROR",
             exc_info=exc,
@@ -106,7 +106,7 @@ def capture_and_optimize(driver: Driver, step_index: int) -> list[dict]:
     raw_size = os.path.getsize(raw_path)
     if raw_size > IMAGE_OPEN_MAX_BYTES:
         log.dual_log(
-            tag="Vision:Guard",
+            tag="Vision:Guard:Check",
             message=f"Raw PNG exceeds {IMAGE_OPEN_MAX_BYTES // (1024**2)} MB pre-open limit. Skipping PIL.",
             level="WARNING",
             payload={"bytes": raw_size},
@@ -151,7 +151,7 @@ def capture_and_optimize(driver: Driver, step_index: int) -> list[dict]:
                         os.remove(raw_path)
                     if len(jpeg_bytes) > _IMAGE_PAYLOAD_LIMIT_BYTES:
                         log.dual_log(
-                            tag="Vision:Guard",
+                            tag="Vision:Guard:Check",
                             message="Single-slice JPEG exceeds 20 MB payload limit. HTML-only.",
                             level="WARNING",
                             payload={"bytes": len(jpeg_bytes)},

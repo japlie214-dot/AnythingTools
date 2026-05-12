@@ -129,7 +129,7 @@ class PublisherTool(BaseTool):
         from utils.logger import get_dual_logger
         log = get_dual_logger(__name__)
         log.dual_log(
-            tag="Publisher:Inventory",
+            tag="Publisher:Inventory:Check",
             message=f"Sanitized raw data: {valid_raw_count}/{raw_count} valid articles, {len(inventory)} inventory items.",
             payload={"batch_id": batch_id, "valid_articles": valid_raw_count, "inventory": len(inventory)}
         )

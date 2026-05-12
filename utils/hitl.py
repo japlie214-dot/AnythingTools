@@ -39,7 +39,7 @@ def hitl_wait_for_operator(
     if user_input.strip().lower() == "stop":
         cancellation_flag.set()
         log.dual_log(
-            tag="HITL:Cancel",
+            tag="HITL:Cancel:Request",
             message="Operator typed 'Stop' — cancellation_flag set.",
             status_state="CANCELLED",
             payload={"action": "operator_stop"},
@@ -67,7 +67,7 @@ async def hitl_wait_for_operator_async(
     if user_input.strip().lower() == "stop":
         cancellation_flag.set()
         log.dual_log(
-            tag="HITL:Cancel",
+            tag="HITL:Cancel:Request",
             message="Operator typed 'Stop' — cancellation_flag set.",
             status_state="CANCELLED",
             payload={"action": "operator_stop"},

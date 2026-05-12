@@ -104,7 +104,7 @@ async def retrieve_relevant_memories(
 
     except Exception as e:
         log.dual_log(
-            tag="VectorSearch",
+            tag="Search:Vector:Query",
             message=f"Memory retrieval failed: {e}",
             level="ERROR",
             payload={"event_type": "vector_search.retrieval_error", "query": query},
@@ -140,7 +140,7 @@ async def store_memory_with_embedding(
         ])
 
         log.dual_log(
-            tag="VectorSearch",
+            tag="Search:Vector:Query",
             message=f"Stored memory with embedding (vec_rowid={vec_rowid}): {topic}",
             payload={"event_type": "vector_search.memory_stored", "agent_domain": agent_domain},
         )
@@ -148,7 +148,7 @@ async def store_memory_with_embedding(
 
     except Exception as e:
         log.dual_log(
-            tag="VectorSearch",
+            tag="Search:Vector:Query",
             message=f"Failed to store memory: {e}",
             level="ERROR",
             payload={"event_type": "vector_search.store_error", "agent_domain": agent_domain},

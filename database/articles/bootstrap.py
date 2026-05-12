@@ -43,14 +43,29 @@ def bootstrap_from_backup() -> None:
                         statements.append((sql, tuple(row.get(c) for c in cols)))
                         
                     if statements:
+                        from database.writer import write_queue
+                        while write_queue.maxsize > 0 and write_queue.qsize() >= write_queue.maxsize - 5:
+                            import time
+                            time.sleep(0.05)
                         enqueue_transaction(statements)
             except Exception as e:
                 log.dual_log(tag="Backup:Bootstrap:Error", level="ERROR", message=f"Failed reading {pq_file.name}", payload={"file": str(pq_file), "error": str(e)})
                 
     try:
-        loop = asyncio.get_running_loop()
-        asyncio.run_coroutine_threadsafe(wait_for_writes(timeout=300.0), loop)
-    except RuntimeError:
-        asyncio.run(wait_for_writes(timeout=300.0))
+        import time
+        from database.writer import write_queue
+        _max_wait = 300.0
+        _start = time.monotonic()
+        
+        while not write_queue.empty() and (time.monotonic() - _start < _max_wait):
+            time.sleep(0.5)
+            
+        if not write_queue.empty():
+            log.dual_log(
+                tag="Backup:Bootstrap:Timeout",
+                level="WARNING",
+                message=f"Write queue not empty after {_max_wait}s",
+                payload={"remaining": write_queue.qsize()}
+            )
     except Exception as e:
         log.dual_log(tag="Backup:Bootstrap:WaitError", level="WARNING", message=f"Wait for writes failed: {e}", payload={"error": str(e)})

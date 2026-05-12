@@ -106,7 +106,7 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
             for filepath in mapped_files:
                 if not os.path.exists(filepath):
                     _log.dual_log(
-                        tag="Debugger:ContextAssembly",
+                        tag="Debugger:Context:Assembly",
                         message=f"Mapped file not found, skipping: {filepath}",
                         level="WARNING",
                         payload={"file": str(filepath)},
@@ -117,7 +117,7 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
                         content = fh.read()
                 except Exception as read_err:
                     _log.dual_log(
-                        tag="Debugger:ContextAssembly",
+                        tag="Debugger:Context:Assembly",
                         message=f"Cannot read {filepath}: {read_err}",
                         level="WARNING",
                         payload={"file": str(filepath), "error": str(read_err)},
@@ -169,7 +169,7 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
                     retried = True
                     new_budget = max(int(budget * 0.5), min_budget)
                     _log.dual_log(
-                        tag="Debugger:ContextHalving",
+                        tag="Debugger:Context:Halving",
                         message="Context-limit error intercepted; halving budget.",
                         level="WARNING",
                         payload={"old_budget": budget, "new_budget": new_budget},
@@ -179,7 +179,7 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
 
                 # On any other failure or if retry already used → abort final report generation.
                 _log.dual_log(
-                    tag="Debugger:Error",
+                    tag="Debugger:Agent:Error",
                     message="Debugger Agent aborted after context-retry failure",
                     level="ERROR",
                     exc_info=exc,
@@ -199,7 +199,7 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
 
         # INFO level → the Phase 3 level gate exits before any trigger logic fires.
         _log.dual_log(
-            tag="Debugger:Report",
+            tag="Debugger:Agent:Report",
             message=f"Debugger Agent report generated: {report_path}",
             level="INFO",
             payload={"report_path": str(report_path)},
@@ -209,7 +209,7 @@ async def run_debugger_agent(trigger_tag: str, log_history: list[dict]) -> None:
         # Tag prefix "Debugger:" guarantees the Infinite Loop Guard fires on
         # re-entry; this branch can never cause recursive agent invocation.
         _log.dual_log(
-            tag="Debugger:Error",
+            tag="Debugger:Agent:Error",
             message=f"Debugger Agent failed: {agent_err}",
             level="ERROR",
             exc_info=agent_err,

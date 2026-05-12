@@ -25,7 +25,7 @@ class BlackboardService:
 
         Logs a SYS:BLACKBOARD:INIT entry with the step list.
         """
-        log.dual_log(tag="SYS:BLACKBOARD:INIT", message=f"Initializing {len(steps)} steps", payload={"steps": steps})
+        log.dual_log(tag="Sys:Blackboard:Init", message=f"Initializing {len(steps)} steps", payload={"steps": steps})
         for step in steps:
             meta = make_metadata("blackboard", step)
             enqueue_write(
@@ -39,7 +39,7 @@ class BlackboardService:
 
         Emits a SYS:BLACKBOARD:CLAIM log entry.
         """
-        log.dual_log(tag="SYS:BLACKBOARD:CLAIM", message=f"Claiming step {step_identifier}", payload={"job_id": job_id, "step": step_identifier})
+        log.dual_log(tag="Sys:Blackboard:Claim", message=f"Claiming step {step_identifier}", payload={"job_id": job_id, "step": step_identifier})
         enqueue_write(
             "UPDATE job_items SET status = 'RUNNING', updated_at = ? WHERE job_id = ? "
             "AND json_extract(item_metadata, '$.step') = 'blackboard' "
@@ -53,14 +53,14 @@ class BlackboardService:
 
         Logs DB:WRITE:START/END around the persistence operation.
         """
-        log.dual_log(tag="DB:WRITE:START", message=f"Saving results for {step_identifier}", payload=output_data)
+        log.dual_log(tag="Db:Write:Start", message=f"Saving results for {step_identifier}", payload=output_data)
         enqueue_write(
             "UPDATE job_items SET status = 'COMPLETED', output_data = ?, updated_at = ? WHERE job_id = ? "
             "AND json_extract(item_metadata, '$.step') = 'blackboard' "
             "AND json_extract(item_metadata, '$.ulid') = ?",
             (json.dumps(output_data), datetime.now(timezone.utc).isoformat(), job_id, step_identifier),
         )
-        log.dual_log(tag="DB:WRITE:END", message=f"Step {step_identifier} persisted successfully", payload={"step": step_identifier})
+        log.dual_log(tag="Db:Write:End", message=f"Step {step_identifier} persisted successfully", payload={"step": step_identifier})
 
     @staticmethod
     def fail_step(job_id: str, step_identifier: str, error: str) -> None:
@@ -68,7 +68,7 @@ class BlackboardService:
 
         Emits a SYS:BLACKBOARD:FAILURE log entry.
         """
-        log.dual_log(tag="SYS:BLACKBOARD:FAILURE", message=f"Step {step_identifier} failed", level="ERROR", payload={"error": error})
+        log.dual_log(tag="Sys:Blackboard:Failure", message=f"Step {step_identifier} failed", level="ERROR", payload={"error": error})
         enqueue_write(
             "UPDATE job_items SET status = 'FAILED', output_data = ?, updated_at = ? WHERE job_id = ? "
             "AND json_extract(item_metadata, '$.step') = 'blackboard' "
