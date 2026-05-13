@@ -41,6 +41,7 @@ class LLMRequest:
     timeout_s: Optional[float] = None
     response_format: Optional[Dict[str, Any]] = None
     file_attachments: Optional[List[Dict[str, Any]]] = None  # complete_chat only
+    call_context: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)

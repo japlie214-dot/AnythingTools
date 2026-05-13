@@ -7,6 +7,7 @@ Implements knapsack-style greedy packing and validated LLM curation with retry l
 import json
 import config
 from utils.logger import get_dual_logger
+from tools.scraper.prompts import CURATION_SYS_PROMPT
 
 log = get_dual_logger(__name__)
 
@@ -169,26 +170,46 @@ class Top10Curator:
                     prompt += "\nDo NOT repeat these mistakes.\n"
                 
                 prompt += f"\nCandidates:\n{json.dumps(packed_candidates, ensure_ascii=False)}"
+                
+                call_ctx = {
+                    **log_ctx,
+                    "phase": "curation",
+                    "attempt": attempt,
+                    "target_count": target_count,
+                    "candidate_count": len(packed_candidates)
+                }
 
                 try:
-                    log.dual_log(
-                        tag="LLM:Azure:Request",
-                        message="Sending request to Azure OpenAI (Curation)",
-                        payload={**log_ctx, "attempt": attempt, "prompt_length": len(prompt), "candidate_count": len(packed_candidates)}
-                    )
                     resp = sync_llm_chat(
-                        [{"role": "user", "content": prompt}],
-                        response_format={"type": "json_object"}
-                    )
-                    log.dual_log(
-                        tag="LLM:Azure:Response",
-                        message="Received response from Azure OpenAI.",
-                        payload={**log_ctx, "attempt": attempt, "model": getattr(resp, "model", "unknown"), "usage": getattr(resp, "usage", {}), "response_length": len(resp.content or "")}
+                        messages=[
+                            {"role": "system", "content": CURATION_SYS_PROMPT},
+                            {"role": "user", "content": prompt}
+                        ],
+                        response_format={"type": "json_object"},
+                        call_context=call_ctx
                     )
                     
-                    parsed = json.loads(resp.content or "{}")
+                    if not resp.content or not resp.content.strip():
+                        log.dual_log(
+                            tag="Scraper:Curation:EmptyResponse",
+                            message=f"LLM returned empty response on attempt {attempt}",
+                            level="WARNING",
+                            payload={**call_ctx, "finish_reason": getattr(resp, 'finish_reason', None)}
+                        )
+                        previous_errors.append("LLM returned empty response")
+                        continue
+                        
+                    parsed = json.loads(resp.content)
                     key = f"top_{target_count}"
                     top_ulids = parsed.get(key) or parsed.get("top_10") or []
+                    
+                    if top_ulids and not parsed.get(key):
+                        log.dual_log(
+                            tag="Scraper:Curation:KeyMismatch",
+                            message=f"LLM returned unexpected JSON key on attempt {attempt}",
+                            level="WARNING",
+                            payload={**call_ctx, "expected_key": key, "actual_keys": list(parsed.keys())}
+                        )
                     
                     seen = set()
                     valid_ulids = []
@@ -218,17 +239,27 @@ class Top10Curator:
                         previous_errors.append(err_msg)
                         log.dual_log(tag="Scraper:Curation:Partial", message=err_msg, level="WARNING", payload={"attempt": attempt})
 
+                except TimeoutError as te:
+                    log.dual_log(
+                        tag="Scraper:Curation:Timeout",
+                        message=f"LLM call timed out on attempt {attempt}",
+                        level="ERROR",
+                        payload={**call_ctx, "error": str(te)},
+                        exc_info=te
+                    )
+                    previous_errors.append(f"TimeoutError: {te}")
                 except json.JSONDecodeError as jde:
                     _resp_preview = (resp.content or "")[:500] if 'resp' in locals() else "N/A"
                     log.dual_log(
                         tag="Scraper:Curation:ParseError",
                         message=f"JSON decode failed on attempt {attempt}",
                         level="ERROR",
-                        payload={"error": str(jde), "response_preview": _resp_preview, "attempt": attempt}
+                        payload={**call_ctx, "error": str(jde), "error_type": type(jde).__name__, "response_preview": _resp_preview},
+                        exc_info=jde
                     )
                     previous_errors.append(f"JSONDecodeError: {jde}")
                 except Exception as e:
-                    log.dual_log(tag="Scraper:Curation:Error", message=f"Unexpected error: {e}", level="ERROR", payload={"error": str(e), "attempt": attempt})
+                    log.dual_log(tag="Scraper:Curation:Error", message=f"Unexpected error: {e}", level="ERROR", payload={**call_ctx, "error": str(e)})
                     previous_errors.append(f"Parse error: {e}")
 
         # Fallback: Retry exhaustion

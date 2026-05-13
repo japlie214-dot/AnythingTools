@@ -1,5 +1,6 @@
 # database/articles/bootstrap.py
 import asyncio
+import time
 from pathlib import Path
 import pyarrow.parquet as pq
 from database.backup.config import BackupConfig
@@ -45,14 +46,12 @@ def bootstrap_from_backup() -> None:
                     if statements:
                         from database.writer import write_queue
                         while write_queue.maxsize > 0 and write_queue.qsize() >= write_queue.maxsize - 5:
-                            import time
                             time.sleep(0.05)
                         enqueue_transaction(statements)
             except Exception as e:
                 log.dual_log(tag="Backup:Bootstrap:Error", level="ERROR", message=f"Failed reading {pq_file.name}", payload={"file": str(pq_file), "error": str(e)})
                 
     try:
-        import time
         from database.writer import write_queue
         _max_wait = 300.0
         _start = time.monotonic()

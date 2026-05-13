@@ -106,10 +106,9 @@ def restore_master_tables_direct(conn: sqlite3.Connection, table_names: Optional
 
         count = 0
         # Route all writes through the single-writer queue in transaction-sized batches
-        from database.writer import enqueue_transaction, wait_for_writes
-        import asyncio
-
         try:
+            from database.writer import enqueue_transaction, write_queue
+            
             for batch in parquet_file.iter_batches(batch_size=500):
                 pylist = batch.to_pylist()
                 statements: list[tuple[str, tuple]] = []
@@ -120,19 +119,15 @@ def restore_master_tables_direct(conn: sqlite3.Connection, table_names: Optional
                     statements.append((sql, tuple(params)))
 
                 if statements:
-                    from database.writer import write_queue
                     # Throttle PyArrow output if the writer queue gets congested
                     while write_queue.maxsize > 0 and write_queue.qsize() >= write_queue.maxsize - 5:
-                        import time
                         time.sleep(0.05)
                     enqueue_transaction(statements)
                     count += len(statements)
 
             # Synchronously poll the writer queue to drain (avoiding async/sync thread loop bugs)
-            import time
             _max_wait = 120.0
             _start = time.monotonic()
-            from database.writer import write_queue
             while not write_queue.empty() and (time.monotonic() - _start < _max_wait):
                 time.sleep(0.3)
             

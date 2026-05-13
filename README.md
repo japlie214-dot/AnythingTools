@@ -1,168 +1,114 @@
-# AnythingTools: Technical Specification & Architecture
+# AnythingTools
 
 ## 1. Project Overview
-AnythingTools is a high-reliability, tool-augmented intelligence system designed to execute complex, multi-step web scraping, data curation, and intelligence delivery pipelines. It operates as a backend service that integrates with LLM orchestrators (e.g., AnythingLLM) via a job-based asynchronous API.
+AnythingTools is a high-reliability tool execution system designed to bridge LLM-driven orchestration with durable, stateful tool execution. It provides a robust framework for running long-running, browser-based, and data-intensive tasks (such as web scraping, curation, and financial data extraction) while ensuring execution continuity, crash recovery, and strict observability.
 
-### Operational Purpose
-The system solves the problem of unreliable, long-running web automation tasks by implementing a "Job-Worker" architecture with strong persistence, crash recovery, and a single-writer database pattern to ensure data integrity in a highly concurrent environment.
+The system solves the "transient execution" problem by treating every tool call as a durable `Job` persisted in a database, allowing for interrupted jobs to be resumed and for every state transition to be audited via a dual-logging system.
 
-### Explicit Non-Goals
-- **Real-time Interactive Chat:** The system does not manage chat sessions; it executes tools and reports results back to a caller.
-- **Direct LLM Orchestration:** It does not decide *which* tool to run; it provides the execution environment and the tools themselves.
-- **Distributed Scaling:** The current architecture is designed for a single-node deployment with a local SQLite database.
-
----
+**What it explicitly does NOT do:**
+- It is not a general-purpose chatbot; it is an execution engine for tools.
+- It does not manage LLM prompt engineering for the primary agent; it provides the *infrastructure* (context, tool definitions, and execution) that an external agent (like AnythingLLM) uses.
 
 ## 2. High-Level Architecture
-
-### Major Components
-- **API Layer (`api/`):** A FastAPI wrapper that enqueues jobs and provides status/metrics endpoints.
-- **Unified Worker Manager (`bot/engine/worker.py`):** A singleton polling loop that monitors the `jobs` table and spawns execution threads for `QUEUED` or `INTERRUPTED` tasks.
-- **Tool Registry (`tools/registry.py`):** A dynamic discovery system that loads tool classes from the `tools/` directory and instantiates them on demand.
-- **Single-Writer DB Layer (`database/writer.py`):** A serialized background thread that handles all writes to the primary SQLite DB to prevent `SQLITE_BUSY` locks.
-- **SoM (Semantic Object Model) Orchestrator (`bot/orchestrator_core/`):** A specialized execution wrapper for browser tools that injects semantic markers into the DOM to improve LLM targeting precision.
-- **Hydration System (`utils/startup/hydration.py`):** A startup process that restores database state from Parquet backups using PyArrow.
+The system follows a **Producer-Consumer** architecture with a **Durable Ledger** as the synchronization point.
 
 ### Data Flow
-1. **Request:** API receives a POST to `/tools/{tool_name}` $\rightarrow$ Job is inserted into `jobs` table with status `QUEUED`.
-2. **Polling:** `UnifiedWorkerManager` detects the job $\rightarrow$ Marks status as `RUNNING` $\rightarrow$ Spawns a thread.
-3. **Execution:** `tool_runner.py` invokes the tool. If it's a browser tool, the `OrchestratorRouter` injects SoM markers into the browser.
-4. **Persistence:** Tool results and telemetry are sent to the `write_queue` $\rightarrow$ `db_writer_worker` persists them to SQLite.
-5. **Callback:** Upon completion, `_do_callback_with_logging` sends a structured markdown result to the AnythingLLM API.
-6. **Logging:** All events are routed through `utils/logger/core.py` to both a standard log and a separate `logs.db`.
+1. **Ingress**: A request arrives via the FastAPI `api/routes.py`.
+2. **Job Persistence**: The request is validated and persisted as a `QUEUED` job in the `jobs` table of the SQLite database.
+3. **Polling & Execution**: The `UnifiedWorkerManager` (`bot/engine/worker.py`) polls the database for `QUEUED` or `INTERRUPTED` jobs.
+4. **Safe Execution**: The worker spawns a thread and uses `run_tool_safely` (`bot/engine/tool_runner.py`) to invoke the tool.
+5. **Orchestration (SoM)**: For browser-bound tools, the `OrchestratorRouter` (`bot/orchestrator_core/router.py`) injects Semantic Object Model (SoM) markers into the DOM to provide the LLM with precise element targeting.
+6. **Callback**: Upon completion, the worker executes an HTTP callback to the orchestrating LLM (e.g., AnythingLLM) with a structured markdown summary of the result.
+7. **Persistence**: Final results and logs are persisted via the `database/writer.py` background thread.
 
----
+### Control Flow & Lifecycle
+- **Startup**: Managed by `utils/startup`, involving zombie-chrome cleanup, DB migration, and tool registry loading.
+- **Runtime**: Asynchronous API handling combined with synchronous, threaded tool execution.
+- **Shutdown**: A phased drain sequence that stops the worker polling, cancels active jobs, and flushes the DB write queue.
 
 ## 3. Repository Structure
-
-- `app.py`: Entry point. Manages the FastAPI lifespan and the sequential startup pipeline.
-- `api/`: 
-    - `routes.py`: API endpoints for job management, backups, and diagnostics.
-    - `schemas.py`: Pydantic models for request/response validation.
+- `api/`: FastAPI routes and schemas. The entry point for all external tool triggers.
 - `bot/`:
-    - `engine/`: Core execution logic. `worker.py` is the heartbeat of the system.
-    - `orchestrator_core/`: Logic for SoM (Semantic Object Model) injection and context building.
+    - `engine/`: The core execution logic. `worker.py` manages the job lifecycle; `tool_runner.py` handles safe execution.
+    - `orchestrator_core/`: Logic for SoM (Semantic Object Model) context building and element targeting.
 - `clients/`: External service integrations.
-    - `snowflake_client.py`: Handles embeddings via Snowflake Cortex AI.
-    - `llm/`: Provider-agnostic LLM client factory (Azure, Chutes).
-- `database/`:
-    - `connection.py`: Manages thread-local read connections and `sqlite-vec` extension loading.
-    - `writer.py`: The single-writer thread implementing `WriteReceipt` for read-after-write consistency.
-    - `articles/`: Logic for managing scraped content and Parquet streaming.
-    - `backup/`: Export/Restore logic for Parquet-based state backups.
-    - `schemas/`: SQL definitions for jobs, logs, and vector tables.
-- `tools/`:
-    - `base.py`: `BaseTool` abstract class.
-    - `registry.py`: Dynamic tool discovery and instantiation.
-    - `scraper/`: Complex pipeline for web extraction, curation, and validation.
-    - `publisher/`: Intelligence delivery pipeline to Telegram.
-- `utils/`:
-    - `logger/`: Custom "Rule of Three" logging system (`Category:SubCategory:Action`).
-    - `startup/`: Orchestrated startup sequence (Cleanup $\rightarrow$ Migration $\rightarrow$ Hydration $\rightarrow$ Recovery).
-    - `vector_search.py`: Semantic retrieval using `sqlite-vec`.
-    - `text_processing.py`: HTML cleaning and Telegram message splitting.
-- `deprecated/`: Archive of legacy patterns (e.g., `Skill.py` descriptors).
-
----
+    - `llm/`: Unified interface for LLM providers (Azure, Chutes), including request/response types.
+- `database/`: Persistence layer.
+    - `connection.py`: Thread-local SQLite connection management.
+    - `writer.py`: A dedicated background thread for all writes to prevent database locks.
+    - `articles/`: Specific logic for scraping and storing article data.
+    - `backup/`: Parquet-based backup and restore system.
+- `tools/`: The tool library.
+    - `registry.py`: Dynamic discovery and instantiation of `BaseTool` subclasses.
+    - `scraper/`: Complex pipeline for extracting and curating web content.
+- `utils/`: Shared utilities.
+    - `logger/`: A "dual-logger" system that writes to both standard logs and a durable SQLite `logs.db`.
+    - `browser_daemon.py`: Manages a persistent headless Chrome instance.
+- `deprecated/`: Historical versions of agents and tools, serving as evidence of architectural evolution.
 
 ## 4. Core Concepts & Domain Model
-
-### The "Rule of Three" Logging
-Logging is strictly categorized as `Category:SubCategory:Action` (e.g., `Worker:Job:Recovery`). This allows for precise filtering and automated observability.
-
-### Single-Writer Pattern
-To overcome SQLite's concurrency limitations, the system uses a dedicated writer thread. Callers use `enqueue_write()`. If a caller needs to ensure a write is committed before reading, it uses a `WriteReceipt` to block until the writer thread resolves the event.
+### The Job Ledger
+The `jobs` table is the single source of truth. A job's state transitions are:
+`QUEUED` $\rightarrow$ `RUNNING` $\rightarrow$ (`COMPLETED` | `FAILED` | `PARTIAL` | `ABANDONED` | `PAUSED_FOR_HITL`).
 
 ### SoM (Semantic Object Model)
-For browser automation, the system doesn't just pass raw HTML. It injects `data-ai-id` attributes into the DOM, creating a map of the page that the LLM can reference using precise integer IDs, significantly reducing "hallucinated" selectors.
+To solve the fragility of CSS selectors, the system injects `data-ai-id` attributes into the DOM. The `OrchestratorRouter` ensures the LLM knows the range of available markers, allowing it to reference elements by ID rather than fragile paths.
 
-### Job Lifecycle
-`PENDING` $\rightarrow$ `QUEUED` $\rightarrow$ `RUNNING` $\rightarrow$ (`COMPLETED` | `FAILED` | `PARTIAL` | `INTERRUPTED`).
-- `INTERRUPTED`: A job that crashed or was killed. The `UnifiedWorkerManager` prioritizes these for recovery.
-- `PARTIAL`: A job that completed its primary task but failed its callback to the orchestrator.
-
----
+### Write-Ahead-Log (WAL) & Generation Tracking
+Because the system uses a single-writer model, `database/writer.py` increments a `_write_generation` counter. Read connections in `DatabaseManager` monitor this generation to force a connection refresh when new data is committed, ensuring read-after-write consistency.
 
 ## 5. Detailed Behavior
+### Normal Execution
+1. API receives `/tools/scraper` $\rightarrow$ Job created in DB.
+2. Worker picks up job $\rightarrow$ Spawns thread $\rightarrow$ Instantiates `ScraperTool`.
+3. `ScraperTool` runs a pipeline: Extraction $\rightarrow$ Slimming $\rightarrow$ Curation $\rightarrow$ Artifact Generation.
+4. Curation uses a 3-retry loop with a "Budget" (knapsack-style) to fit as many candidates as possible into the LLM context.
+5. Worker sends callback to AnythingLLM $\rightarrow$ Job marked `COMPLETED`.
 
-### Startup Sequence
-The system follows a strict tiered startup in `utils/startup/__init__.py`:
-1. **Concurrent Tier:** Mounts artifacts, cleans zombie Chrome processes, and initializes the DB layer.
-2. **Sequential Tier:** Runs migrations $\rightarrow$ Hydrates state from Parquet backups $\rightarrow$ Validates vector tables $\rightarrow$ Recovers interrupted jobs.
-3. **Application Tier:** Loads the tool registry and warms up the browser daemon.
-
-### Error Handling & Recovery
-- **Transient Errors:** The worker implements exponential backoff for HTTP callbacks.
-- **Poisoned Connections:** If the DB writer encounters 3 consecutive errors, it closes the connection and reconnects.
-- **Fatal Vector Errors:** If `sqlite-vec` encounters a fatal blob length error, the transaction is rejected to prevent DB corruption.
-- **HITL (Human-In-The-Loop):** Tools can raise a `PAUSED_FOR_HITL` exception, which moves the job to a paused state and blocks the thread until an operator resolves the challenge.
-
----
+### Failure Modes & Resilience
+- **Crash Recovery**: If the process dies, jobs remain as `RUNNING`. On restart, the `UnifiedWorkerManager` identifies these as `INTERRUPTED` and allows them to be resumed.
+- **HITL (Human-In-The-Loop)**: Tools can raise a `PAUSED_FOR_HITL` exception, stopping execution and updating the job status until a manual resume is triggered via API.
+- **Database Poisoning**: If the writer thread encounters 3 consecutive errors, it assumes the connection is poisoned and forces a reconnection.
 
 ## 6. Public Interfaces
-
 ### REST API
-- `POST /tools/{tool_name}`: Enqueues a tool execution. Returns `job_id`.
-- `GET /jobs/{job_id}`: Returns current status and associated logs.
-- `POST /backup/export`: Triggers a Parquet export of the current state.
-- `POST /backup/restore`: Triggers a restoration from backup.
-- `GET /metrics`: Returns internal system health and queue depths.
+- `POST /api/tools/{tool_name}`: Enqueues a tool execution. Requires `X-API-Key`.
+- `GET /api/jobs/{job_id}`: Returns status, logs, and final payload.
+- `DELETE /api/jobs/{job_id}`: Requests cancellation.
+- `POST /api/jobs/{job_id}/resume`: Resumes an interrupted/failed job.
+- `GET /api/manifest`: Returns the list of registered tools and their JSON schemas.
 
-### Tool Interface
-All tools must inherit from `BaseTool` and implement `async def execute(args, telemetry, **kwargs)`. They must return a `ToolResult` object.
-
----
+### Tool Registry
+Tools must subclass `BaseTool` and be located in `tools/`. They can optionally define an `INPUT_MODEL` (Pydantic) for automatic API validation.
 
 ## 7. State, Persistence, and Data
-
-### Databases
-- **Primary DB (`main.db`):** Stores jobs, articles, and long-term memories. Uses WAL mode.
-- **Logs DB (`logs.db`):** A high-throughput database dedicated to telemetry.
-
-### Vector Search
-Implemented via the `sqlite-vec` extension. Embeddings (1024-dim) are stored as blobs. Semantic search is performed using cosine similarity within SQLite.
-
-### Backup & Hydration
-State is persisted as Parquet files. During startup, `hydrate_from_backup` streams these files into SQLite using PyArrow to avoid OOM errors and minimize downtime.
-
----
+- **Primary DB (`sumanal.db`)**: Stores jobs, job items, and scraped articles.
+- **Logs DB (`logs.db`)**: High-throughput storage for all system events.
+- **Vector Storage**: Uses the `sqlite-vec` extension for float32 vector embeddings. If the extension is missing, the system falls back to FTS5.
+- **Artifacts**: JSON and PDF files are stored in the `artifacts/` directory, mapped to job IDs.
+- **Backups**: Periodic exports of tables to Parquet files using `pyarrow`.
 
 ## 8. Dependencies & Integration
-
-- **FastAPI/Uvicorn:** Web interface.
-- **Botasaurus:** Browser automation and driver management.
-- **PyArrow/Pandas:** High-performance data streaming for Parquet backups.
-- **Snowflake Cortex:** Vector embedding generation.
-- **sqlite-vec:** Vector similarity search within SQLite.
-- **python-telegram-bot:** Intelligence delivery.
-
----
+- **FastAPI/Uvicorn**: Web layer.
+- **Botasaurus**: Browser automation and scraping.
+- **OpenAI/Azure**: LLM providers for curation and tool orchestration.
+- **SQLite (with sqlite-vec)**: Durable state and vector search.
+- **PyArrow**: High-performance data serialization for backups.
+- **AnythingLLM**: The primary external consumer of the tool results via HTTP callbacks.
 
 ## 9. Setup, Build, and Execution
-
-1. **Environment:** Install Python 3.10+.
-2. **Dependencies:** `pip install -r requirements.txt`.
-3. **Binary Assets:** Install the `sqlite-vec` extension binary in the library path.
-4. **Configuration:** Create a `.env` file with `API_KEY`, `AZURE_OPENAI_KEY`, and `SNOWFLAKE_ACCOUNT`.
-5. **Execution:** `python app.py`.
-
----
+1. **Environment**: Python 3.10+
+2. **Binary Requirement**: Install `sqlite-vec` extension for vector search.
+3. **Configuration**: Set variables in `config.py` (API keys, DB paths).
+4. **Run**: `python -m uvicorn app:app --reload --port 8000`
+5. **Lifespan**: The app automatically handles startup (migrations, cleanup) and shutdown (draining jobs).
 
 ## 10. Testing & Validation
-- **E2E Browser Tests:** `tests/test_browser_e2e.py` validates the browser daemon and SoM injection.
-- **Backup Tests:** `tests/test_backup.py` validates Parquet export/import integrity.
-- **Gaps:** No unit tests for individual tools; testing is primarily integration-based.
-
----
+- **E2E Tests**: `tests/test_browser_e2e.py` validates the full browser-to-result pipeline.
+- **Backup Tests**: `tests/test_backup.py` ensures data integrity during export/restore.
+- **Gaps**: There is limited unit testing for individual tool logic; validation relies heavily on E2E tests and manual log auditing.
 
 ## 11. Known Limitations & Non-Goals
-- **SQLite Lock Contention:** While the single-writer pattern mitigates this, extremely high write volumes may still saturate the `write_queue`.
-- **Memory Spikes:** Large Parquet restorations are throttled, but very large datasets may still cause memory pressure during the `Symmetric` phase of hydration.
-- **Single-Node:** No support for distributed workers or shared database clusters.
-
----
-
-## 12. Change Sensitivity
-- **Database Schemas:** High sensitivity. Changes to `database/schemas/` require coordinated migration scripts.
-- **Tool Registry:** Low sensitivity. New tools can be added by creating a new directory in `tools/` without modifying core logic.
-- **Writer Logic:** Critical sensitivity. Any change to `database/writer.py` can introduce deadlocks or data loss.
+- **Concurrency**: The system uses a single-writer thread for SQLite. While this prevents locks, it creates a bottleneck for extremely high-write volumes.
+- **Browser Isolation**: All tools share a single browser daemon. While `browser_lock` prevents simultaneous use, it means one tool's crash can potentially impact the daemon's stability.
+- **Session ID**: Currently hardcoded to `"0"` in several API routes, limiting multi-tenant session tracking.

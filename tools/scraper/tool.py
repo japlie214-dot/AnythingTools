@@ -142,11 +142,15 @@ class ScraperTool(BaseTool):
             except Exception:
                 pass
 
-        def sync_llm_chat(messages, response_format=None):
+        def sync_llm_chat(messages, response_format=None, call_context=None):
             """Synchronous LLM wrapper for curation."""
             async def _call():
                 llm = get_llm_client("azure")
-                return await llm.complete_chat(LLMRequest(messages=messages, response_format=response_format))
+                return await llm.complete_chat(LLMRequest(
+                    messages=messages,
+                    response_format=response_format,
+                    call_context=call_context
+                ))
             return asyncio.run_coroutine_threadsafe(_call(), loop).result(timeout=300)
 
         is_resume = kwargs.get("is_resume", False)

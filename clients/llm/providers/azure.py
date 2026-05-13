@@ -78,13 +78,21 @@ class AzureProvider(LLMProvider):
         import time
         _start = time.monotonic()
         _resolved_model = request.model or self.default_model
+        _msg_preview = [
+            {"role": m.get("role"), "content_preview": str(m.get("content", ""))[:500] + ("..." if len(str(m.get("content", ""))) > 500 else "")}
+            for m in request.messages
+        ]
         log.dual_log(
             tag="LLM:Azure:Request",
             message=f"Sending request to {_resolved_model}",
             payload={
                 "model":            _resolved_model,
-                "messages":         request.messages,
+                "messages":         _msg_preview,
                 "tools":            request.tools,
+                "response_format":  request.response_format,
+                "temperature":      request.temperature,
+                "max_tokens":       request.max_tokens,
+                **(request.call_context or {})
             },
         )
         payload  = _build_responses_payload(request, self.default_model)
@@ -119,6 +127,7 @@ class AzureProvider(LLMProvider):
                 "request_id": getattr(response, "_request_id", None),
                 "tool_calls": _tool_calls,
                 "tools_called": tool_names,
+                **(request.call_context or {})
             }
         )
         return LLMResponse(
