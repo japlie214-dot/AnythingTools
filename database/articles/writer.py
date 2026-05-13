@@ -1,8 +1,8 @@
 # database/articles/writer.py
 from typing import Optional
 from database.writer import WriteReceipt, enqueue_transaction, start_writer
-from database.articles.models import ArticleWriteTask, ArticleWriteResult
-from database.articles.parquet_stream import get_streaming_writer
+from database.articles.models import ArticleWriteTask, ArticleWriteResult, ArticleDeleteTask, ArticleDeleteResult
+from database.articles.store import get_article_store
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
@@ -14,6 +14,7 @@ def enqueue_article_write(
     item_metadata: Optional[str] = None,
     local_metadata: Optional[str] = None,
 ) -> ArticleWriteResult:
+    """Legacy create-only API seamlessly backed by ArticleStore."""
     task = ArticleWriteTask(
         article_id=article_data["id"],
         normalized_url=article_data["normalized_url"],
@@ -29,36 +30,75 @@ def enqueue_article_write(
         item_metadata=item_metadata,
         local_metadata=local_metadata,
     )
-    
+
     start_writer()
-    
+
     try:
-        streaming_writer = get_streaming_writer()
-        article_path = None
-        
+        store_success = False
         try:
-            article_path = streaming_writer.write_article(task)
-            if task.embedding_bytes:
-                streaming_writer.write_vector(task)
-        except Exception as pq_err:
-            log.dual_log(tag="Backup:Storage:Rollback", level="ERROR", message=f"Parquet write failed: {pq_err}", payload={"article_id": task.article_id, "error": str(pq_err)})
-        
-        db_statements = task.to_db_statements()
-        
-        try:
-            receipt = enqueue_transaction(db_statements, track=True)
-        except Exception as db_err:
-            log.dual_log(tag="Backup:Storage:Rollback", level="ERROR", message=f"DB write failed: {db_err}. Orphaned Parquet row retained.", payload={"article_id": task.article_id, "error": str(db_err)})
-            return ArticleWriteResult(success=False, article_id=task.article_id, error=str(db_err))
-        
+            store = get_article_store()
+            store.upsert_article(
+                article_id=task.article_id,
+                meta=task.to_store_meta(),
+                embedding_bytes=task.embedding_bytes,
+            )
+            store_success = True
+        except Exception as store_err:
+            log.dual_log(
+                tag="Article:Write:StoreError",
+                level="WARNING",
+                message=f"ArticleStore write failed: {store_err}",
+                payload={"article_id": task.article_id, "error": str(store_err)},
+            )
+
+        # Enqueue only the job_items tracking SQL, Store handled the core article upsert.
+        db_statements = task.to_upsert_statements()
+        job_statements = [
+            (sql, params) for sql, params in db_statements if "job_items" in sql.lower()
+        ]
+
+        # Fallback to all statements if store failed
+        if store_success:
+            all_statements = job_statements
+        else:
+            all_statements = db_statements
+
+        receipt = None
+        if all_statements:
+            try:
+                receipt = enqueue_transaction(all_statements, track=True)
+            except Exception as db_err:
+                return ArticleWriteResult(success=False, article_id=task.article_id, error=str(db_err))
+
         return ArticleWriteResult(
             success=True,
             article_id=task.article_id,
-            parquet_path=str(article_path) if article_path else None,
             receipt=receipt,
-            embedding_success=(task.embedding_status == "EMBEDDED")
+            embedding_success=(task.embedding_status == "EMBEDDED"),
         )
-        
     except Exception as e:
-        log.dual_log(tag="Article:Write:Error", level="ERROR", message=f"Article write failed: {e}", payload={"article_id": task.article_id, "error": str(e)}, exc_info=e)
         return ArticleWriteResult(success=False, article_id=task.article_id, error=str(e))
+
+def upsert_article(article_id: str, meta: dict, embedding_bytes: Optional[bytes] = None) -> ArticleWriteResult:
+    start_writer()
+    try:
+        store = get_article_store()
+        store.upsert_article(article_id, meta, embedding_bytes)
+        return ArticleWriteResult(
+            success=True,
+            article_id=article_id,
+            embedding_success=meta.get("embedding_status") == "EMBEDDED",
+        )
+    except Exception as e:
+        log.dual_log(tag="Article:Upsert:Error", level="ERROR", message=f"Article upsert failed: {e}", payload={"error": str(e)})
+        return ArticleWriteResult(success=False, article_id=article_id, error=str(e))
+
+def delete_article(article_id: str) -> ArticleDeleteResult:
+    start_writer()
+    try:
+        store = get_article_store()
+        store.delete_article(article_id)
+        return ArticleDeleteResult(success=True, article_id=article_id)
+    except Exception as e:
+        log.dual_log(tag="Article:Delete:Error", level="ERROR", message=f"Article delete failed: {e}", payload={"error": str(e)})
+        return ArticleDeleteResult(success=False, article_id=article_id, error=str(e))

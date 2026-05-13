@@ -22,7 +22,7 @@ The system follows a **Producer-Consumer** architecture with a **Durable Ledger*
 7. **Persistence**: Final results and logs are persisted via the `database/writer.py` background thread.
 
 ### Control Flow & Lifecycle
-- **Startup**: Managed by `utils/startup`, involving zombie-chrome cleanup, DB migration, and tool registry loading.
+- **Startup**: Managed by `utils/startup`, involving zombie-chrome cleanup, DB migration, tool registry loading, and a critical delta reconciliation of the article store.
 - **Runtime**: Asynchronous API handling combined with synchronous, threaded tool execution.
 - **Shutdown**: A phased drain sequence that stops the worker polling, cancels active jobs, and flushes the DB write queue.
 
@@ -36,8 +36,8 @@ The system follows a **Producer-Consumer** architecture with a **Durable Ledger*
 - `database/`: Persistence layer.
     - `connection.py`: Thread-local SQLite connection management.
     - `writer.py`: A dedicated background thread for all writes to prevent database locks.
-    - `articles/`: Specific logic for scraping and storing article data.
-    - `backup/`: Parquet-based backup and restore system.
+    - `articles/`: Mutable storage engine (`store.py`), reconciliation logic (`reconcile.py`), and data models.
+    - `backup/`: Configuration and tools for system-wide backups.
 - `tools/`: The tool library.
     - `registry.py`: Dynamic discovery and instantiation of `BaseTool` subclasses.
     - `scraper/`: Complex pipeline for extracting and curating web content.
@@ -57,6 +57,9 @@ To solve the fragility of CSS selectors, the system injects `data-ai-id` attribu
 ### Write-Ahead-Log (WAL) & Generation Tracking
 Because the system uses a single-writer model, `database/writer.py` increments a `_write_generation` counter. Read connections in `DatabaseManager` monitor this generation to force a connection refresh when new data is committed, ensuring read-after-write consistency.
 
+### Article Manifest System
+The article pipeline uses a mutable JSON/BIN manifest system. `manifest.json` tracks the authoritative state of scraped articles, while individual `.json` (metadata) and `.bin` (embeddings) files ensure per-article atomic I/O.
+
 ## 5. Detailed Behavior
 ### Normal Execution
 1. API receives `/tools/scraper` $\rightarrow$ Job created in DB.
@@ -69,6 +72,7 @@ Because the system uses a single-writer model, `database/writer.py` increments a
 - **Crash Recovery**: If the process dies, jobs remain as `RUNNING`. On restart, the `UnifiedWorkerManager` identifies these as `INTERRUPTED` and allows them to be resumed.
 - **HITL (Human-In-The-Loop)**: Tools can raise a `PAUSED_FOR_HITL` exception, stopping execution and updating the job status until a manual resume is triggered via API.
 - **Database Poisoning**: If the writer thread encounters 3 consecutive errors, it assumes the connection is poisoned and forces a reconnection.
+- **Article Store Self-Healing**: During startup, the `reconcile_delta` process identifies "ghost" entries (manifest entries without corresponding files) and purges them.
 
 ## 6. Public Interfaces
 ### REST API
@@ -84,16 +88,19 @@ Tools must subclass `BaseTool` and be located in `tools/`. They can optionally d
 ## 7. State, Persistence, and Data
 - **Primary DB (`sumanal.db`)**: Stores jobs, job items, and scraped articles.
 - **Logs DB (`logs.db`)**: High-throughput storage for all system events.
-- **Vector Storage**: Uses the `sqlite-vec` extension for float32 vector embeddings. If the extension is missing, the system falls back to FTS5.
+- **Vector Storage**: Uses the `sqlite-vec` extension for float32 vector embeddings.
+- **Article Store**: 
+    - `manifest.json`: authoritative state and checksums.
+    - `articles/*.json`: Per-article metadata.
+    - `articles/*.bin`: Binary embedding data.
 - **Artifacts**: JSON and PDF files are stored in the `artifacts/` directory, mapped to job IDs.
-- **Backups**: Periodic exports of tables to Parquet files using `pyarrow`.
 
 ## 8. Dependencies & Integration
 - **FastAPI/Uvicorn**: Web layer.
 - **Botasaurus**: Browser automation and scraping.
 - **OpenAI/Azure**: LLM providers for curation and tool orchestration.
 - **SQLite (with sqlite-vec)**: Durable state and vector search.
-- **PyArrow**: High-performance data serialization for backups.
+- **PyArrow**: Used in backup systems for table exports.
 - **AnythingLLM**: The primary external consumer of the tool results via HTTP callbacks.
 
 ## 9. Setup, Build, and Execution
@@ -101,14 +108,19 @@ Tools must subclass `BaseTool` and be located in `tools/`. They can optionally d
 2. **Binary Requirement**: Install `sqlite-vec` extension for vector search.
 3. **Configuration**: Set variables in `config.py` (API keys, DB paths).
 4. **Run**: `python -m uvicorn app:app --reload --port 8000`
-5. **Lifespan**: The app automatically handles startup (migrations, cleanup) and shutdown (draining jobs).
+5. **Concurrency Constraint**: Must be run with `workers=1` (enforced in `app.py` via `WEB_CONCURRENCY` check) to prevent manifest corruption.
 
 ## 10. Testing & Validation
 - **E2E Tests**: `tests/test_browser_e2e.py` validates the full browser-to-result pipeline.
 - **Backup Tests**: `tests/test_backup.py` ensures data integrity during export/restore.
-- **Gaps**: There is limited unit testing for individual tool logic; validation relies heavily on E2E tests and manual log auditing.
+- **Gaps**: Limited unit testing for individual tool logic; validation relies heavily on E2E tests and manual log auditing.
 
 ## 11. Known Limitations & Non-Goals
 - **Concurrency**: The system uses a single-writer thread for SQLite. While this prevents locks, it creates a bottleneck for extremely high-write volumes.
 - **Browser Isolation**: All tools share a single browser daemon. While `browser_lock` prevents simultaneous use, it means one tool's crash can potentially impact the daemon's stability.
 - **Session ID**: Currently hardcoded to `"0"` in several API routes, limiting multi-tenant session tracking.
+
+## 12. Change Sensitivity
+- **Database Schema**: Changes to `scraped_articles` or `jobs` require migrations and may affect the `ArticleStore` reconciliation logic.
+- **Manifest Format**: Modifications to `manifest.json` structure require updates to `ArticleStore` and `reconcile_delta`.
+- **Worker Logic**: The polling loop in `worker.py` is tightly coupled to the `jobs` table state transitions.

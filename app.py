@@ -42,6 +42,10 @@ log = get_dual_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Enforce single-process execution to protect manifest integrity
+    if int(os.environ.get("WEB_CONCURRENCY", "1")) > 1:
+        raise RuntimeError("CRITICAL: AnythingTools must be run with workers=1 to prevent manifest corruption.")
+        
     startup_failed = False
     try:
         from utils.startup import run_startup

@@ -20,12 +20,12 @@ async def hydrate_from_backup() -> None:
     log.dual_log(tag="Startup:Hydration:Started", message="Starting Parquet backup hydration", level="INFO", payload={"backup_dir": str(config.backup_dir)})
     
     try:
-        from database.articles.bootstrap import bootstrap_from_backup
-        await asyncio.to_thread(bootstrap_from_backup)
-        log.dual_log(tag="Startup:Hydration:Articles", message="Article hydration complete", level="INFO", payload={"phase": "articles", "status": "success"})
+        from database.articles.bootstrap import reconcile_article_store
+        await asyncio.to_thread(reconcile_article_store)
+        log.dual_log(tag="Startup:Hydration:Articles", message="Article reconciliation complete", level="INFO", payload={"phase": "articles", "status": "success"})
     except Exception as e:
-        log.dual_log(tag="Startup:Hydration:ArticleError", message=f"Article hydration failed: {e}", level="CRITICAL", exc_info=e, payload={"phase": "articles", "error": str(e)})
-        raise RuntimeError(f"Article hydration failed: {e}") from e
+        log.dual_log(tag="Startup:Hydration:ArticleError", message=f"Article reconciliation failed: {e}", level="CRITICAL", exc_info=e, payload={"phase": "articles", "error": str(e)})
+        raise RuntimeError(f"Article reconciliation failed: {e}") from e
         
     try:
         from database.backup.restore import restore_master_tables_direct
@@ -39,4 +39,4 @@ async def hydrate_from_backup() -> None:
         log.dual_log(tag="Startup:Hydration:MasterTableError", message=f"Master table hydration failed: {e}", level="CRITICAL", exc_info=e, payload={"phase": "master_tables", "error": str(e)})
         raise RuntimeError(f"Master table hydration failed: {e}") from e
 
-    log.dual_log(tag="Startup:Hydration:Complete", message="Parquet backup hydration completed successfully", level="INFO", payload={"status": "success"})
+    log.dual_log(tag="Startup:Hydration:Complete", message="Backup hydration completed successfully", level="INFO", payload={"status": "success"})

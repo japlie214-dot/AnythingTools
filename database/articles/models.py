@@ -18,7 +18,10 @@ class ArticleWriteTask:
     item_metadata: Optional[str] = None
     local_metadata: Optional[str] = None
 
-    def to_db_statements(self) -> list[tuple[str, tuple]]:
+    def to_upsert_statements(self) -> list[tuple[str, tuple]]:
+        """Build SQLite statements for article upsert.
+        Omits 'id = excluded.id' to prevent PK mutation on conflict.
+        """
         statements = []
         insert_sql = """
             INSERT INTO scraped_articles (
@@ -26,10 +29,12 @@ class ArticleWriteTask:
                 metadata_json, embedding_status, scraped_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(normalized_url) DO UPDATE SET
+                vec_rowid = excluded.vec_rowid,
                 url = excluded.url,
                 title = excluded.title,
                 conclusion = excluded.conclusion,
                 summary = excluded.summary,
+                metadata_json = excluded.metadata_json,
                 embedding_status = excluded.embedding_status,
                 updated_at = CURRENT_TIMESTAMP
         """
@@ -48,12 +53,40 @@ class ArticleWriteTask:
         
         if self.job_id and self.item_metadata and self.local_metadata:
             statements.append((
-                """UPDATE job_items SET status = ?, output_data = ?, item_metadata = ?, updated_at = CURRENT_TIMESTAMP 
+                """UPDATE job_items SET status = ?, output_data = ?, item_metadata = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE job_id = ? AND json_extract(item_metadata, '$.step') = json_extract(?, '$.step')
                 AND json_extract(item_metadata, '$.ulid') = json_extract(?, '$.ulid')""",
                 ("COMPLETED", self.local_metadata, self.item_metadata, self.job_id, self.item_metadata, self.item_metadata)
             ))
         return statements
+
+    def to_store_meta(self) -> dict:
+        """Convert to metadata dict for ArticleStore.upsert_article()."""
+        from datetime import datetime, timezone
+        return {
+            "id": self.article_id,
+            "normalized_url": self.normalized_url,
+            "url": self.url,
+            "title": self.title,
+            "conclusion": self.conclusion,
+            "summary": self.summary,
+            "metadata_json": self.metadata_json,
+            "embedding_status": self.embedding_status,
+            "vec_rowid": self.vec_rowid,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+@dataclass
+class ArticleDeleteTask:
+    """Task for deleting an article from the system."""
+    article_id: str
+
+@dataclass
+class ArticleDeleteResult:
+    """Result of an article delete operation."""
+    success: bool
+    article_id: str
+    error: Optional[str] = None
 
 @dataclass
 class ArticleWriteResult:
