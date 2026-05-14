@@ -116,45 +116,4 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
     except Exception as e:
         log.dual_log(tag="Scraper:Persistence:Error", message=f"Unified persist failed: {e}", level="ERROR", payload={"error": str(e)})
         return None, False
-
-
-
-
-def _curate_articles_dfeed(results: dict[str, dict]) -> dict:
-    """Trim article pool to 80% of context budget; return curation payload."""
-    articles = [
-        r for r in results.values()
-        if r.get("status") == "SUCCESS" and r.get("title") and r.get("conclusion")
-    ]
-
-    if not articles:
-        return {"status": "NO_CONTENT", "articles": []}
-
-    sorted_articles = sorted(
-        articles,
-        key=lambda x: len(str(x.get("conclusion", ""))),
-        reverse=True,
-    )
-
-    budget_80 = int(getattr(config, "LLM_CONTEXT_CHAR_LIMIT", 40_000) * 0.8)
-    curated: list[dict] = []
-    current_len = 0
-
-    for art in sorted_articles:
-        entry = {
-            "title":      art.get("title", ""),
-            "conclusion": art.get("conclusion", ""),
-            "url":        art.get("url", ""),
-        }
-        item_len = len(json.dumps(entry))
-        if current_len + item_len <= budget_80:
-            curated.append(entry)
-            current_len += item_len
-        else:
-            break
-
-    return {
-        "status":         "READY_FOR_CURATION",
-        "total_eligible": len(articles),
-        "articles":       curated,
-    }
+    

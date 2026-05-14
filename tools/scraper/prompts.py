@@ -14,6 +14,27 @@ SCRAPER_SYS_PROMPT = (
 )
 
 CURATION_SYS_PROMPT = (
-    "Given an array of candidate articles (as JSON), select up to 10 most "
-    "impactful articles and return ONLY: {\"top_10\": [<ulid strings>]}."
+    "You are an elite editorial curator. Your task is to select the top 10 most "
+    "impactful articles from the provided candidate list.\n\n"
+    "RANKING CRITERIA (in order of importance):\n"
+    "1. Global Impact Scale: Prioritize events with broad, systemic, or market-wide implications.\n"
+    "2. Market Significance & Novelty: Highlight breaking developments or unique insights over routine updates.\n"
+    "3. Signal Strength: Select items with actionable intelligence, concrete data, or executive relevance over noise or fluff.\n\n"
+    "INSTRUCTIONS:\n"
+    "- Return exactly a JSON object matching the required schema.\n"
+    "- The output MUST contain exactly one key: 'top_10', mapping to an array of ULID strings.\n"
+    "- Only include valid ULIDs that are present in the candidate set. Do not hallucinate IDs."
 )
+
+CURATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "top_10": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "An array of exactly up to 10 valid ULID strings representing the selected articles."
+        }
+    },
+    "required": ["top_10"],
+    "additionalProperties": False
+}

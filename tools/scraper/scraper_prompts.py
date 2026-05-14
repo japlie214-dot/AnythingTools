@@ -124,13 +124,3 @@ SUMMARIZATION_SCHEMA = {
     "additionalProperties": False
 }
 
-CURATOR_GLOBAL_INTELLIGENCE_PROMPT = """You are a financial intelligence curator. Your task is to analyze scraped articles and select the top 10 most valuable articles for executive consumption.
-
-Instructions:
-1. Trim content to 80% of available context budget to respect token limits
-2. Rank articles by: market impact, novelty, executive relevance, signal strength
-3. Select exactly TOP 10 articles for drip-feed delivery
-4. Preserve titles, conclusions, and key insights
-5. Eliminate noise, fluff, and low-signal content
-Output format: JSON with selected articles and their distilled summaries.
-"""

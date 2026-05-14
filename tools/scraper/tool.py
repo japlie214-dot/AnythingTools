@@ -25,16 +25,6 @@ log = get_dual_logger(__name__)
 from clients.llm.factory import get_llm_client, LLMRequest
 
 
-# Checkpoint helpers: no-op shims to preserve legacy call-sites and avoid NameError.
-# These intentionally force full linear execution when invoked.
-def _check_step(step_name: str) -> bool:
-    """Legacy checkpoint shim — always return False to force fresh execution of steps."""
-    return False
-
-
-def _get_step_output(step_name: str) -> dict:
-    """Legacy checkpoint shim — return empty output (no cached step outputs)."""
-    return {}
 
 class ScraperTool(BaseTool):
     name = "scraper"
@@ -108,6 +98,18 @@ class ScraperTool(BaseTool):
             except Exception:
                 pass
             return json.dumps(payload, ensure_ascii=False)
+
+        def _build_slim_list(valid_res: dict) -> list[dict]:
+            s_list = []
+            for _url, _res in valid_res.items():
+                if _res.get("status") == "SUCCESS" and _res.get("ulid"):
+                    s_list.append({
+                        "ulid": _res["ulid"],
+                        "normalized_url": _res.get("normalized_url", ""),
+                        "title": _res.get("title", ""),
+                        "conclusion": _res.get("conclusion", "")
+                    })
+            return s_list
 
         if dry_run is None:
             dry_run = config.TELEMETRY_DRY_RUN
@@ -184,6 +186,7 @@ class ScraperTool(BaseTool):
 
             # Persist raw results to artifacts directory
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            raw_filepath = None
             try:
                 raw_filepath = write_artifact(
                     tool_name="scraper",
@@ -226,52 +229,68 @@ class ScraperTool(BaseTool):
                 return _fail_internal("No results extracted.", "Check target site validity and network connectivity.")
             if job_id: update_item_status(job_id, extraction_meta, "COMPLETED", json.dumps({"count": len(valid_results), "batch_id": batch_id}))
 
-            # Extraction Step
-            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before extraction.", "Job canceled.")
+            # Slim List Step
+            if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before processing candidate list.", "Job canceled.")
 
             slim_meta = make_metadata("slim", batch_id)
             await telemetry(self.status("Extracting article links...", "RUNNING"))
             if job_id: add_job_item(job_id, slim_meta, json.dumps({"target_site": target_site}))
             
-            # Inline slim list construction
-            slim_list = []
-            for _url, _res in valid_results.items():
-                if _res.get("status") == "SUCCESS" and _res.get("ulid"):
-                    slim_list.append({
-                        "ulid": _res["ulid"],
-                        "normalized_url": _res.get("normalized_url", ""),
-                        "title": _res.get("title", ""),
-                        "conclusion": _res.get("conclusion", "")
-                    })
+            slim_list = _build_slim_list(valid_results)
             
+            try:
+                slim_path = write_artifact(
+                    tool_name="scraper", job_id=job_id or batch_id, artifact_type="slim_candidates", ext="json",
+                    content=json.dumps(slim_list, indent=2, ensure_ascii=False)
+                )
+                _record_artifact(slim_path, "json", f"Pre-curation candidate pool for {target_site}")
+            except Exception as e:
+                log.dual_log(tag="Scraper:Artifact:Error", message=f"Failed writing slim_list artifact: {e}", level="WARNING", payload={"error": str(e)})
+
             if job_id: update_item_status(job_id, slim_meta, "COMPLETED", json.dumps({"slim_count": len(slim_list), "batch_id": batch_id}))
 
-            # Curation Step
             # Curation Step
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before curation.", "Job canceled.")
             
             curate_meta = make_metadata("curate", batch_id)
-            await telemetry(self.status("Curating top articles...", "RUNNING"))
             if job_id: add_job_item(job_id, curate_meta, "{}")
             
             top_10_list = []
             target_curated_count = 10
+            fallback_used = False
+            
             if slim_list:
                 try:
                     from tools.scraper.curation import Top10Curator
                     curator = Top10Curator()
-                    top_10_list, target_curated_count = curator.curate(slim_list, sync_llm_chat, batch_id=batch_id)
+                    curation_result = await curator.curate(slim_list, telemetry, batch_id=batch_id)
+                    top_10_list = curation_result.curated_list
+                    target_curated_count = curation_result.target_count
+                    fallback_used = curation_result.fallback_used
+                    
+                    if job_id:
+                        update_item_status(job_id, curate_meta, "COMPLETED", json.dumps({
+                            "top_10": top_10_list,
+                            "target_count": target_curated_count,
+                            "fallback_used": fallback_used
+                        }))
                 except Exception as _ce:
                     log.dual_log(
                         tag="Scraper:Curation:Execute",
-                        message=f"Curation sub-agent failed; falling back to first 10: {_ce}",
-                        level="WARNING",
+                        message=f"Curation sub-agent crashed; falling back to first 10: {_ce}",
+                        level="ERROR",
                         exc_info=_ce
                     )
                     top_10_list = slim_list[:10]
                     target_curated_count = min(10, len(slim_list))
-            
-            if job_id: update_item_status(job_id, curate_meta, "COMPLETED", json.dumps({"top_10": top_10_list, "target_count": target_curated_count}))
+                    fallback_used = True
+                    if job_id:
+                        update_item_status(job_id, curate_meta, "COMPLETED", json.dumps({
+                            "top_10": top_10_list,
+                            "target_count": target_curated_count,
+                            "fallback_used": True,
+                            "error": str(_ce)
+                        }))
 
             # Save Top 10 Artifact
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before artifact generation.", "Job canceled.")
@@ -324,6 +343,7 @@ class ScraperTool(BaseTool):
                     "slim_count": len(slim_list),
                     "curated_count": len(top_10_list),
                     "target_curated_count": target_curated_count,
+                    "fallback_used": fallback_used if 'fallback_used' in locals() else False,
                     "artifacts_written": artifacts_written,
                 },
                 "artifacts": [str(a["filename"]) for a in artifacts_written],
@@ -348,7 +368,6 @@ class ScraperTool(BaseTool):
         return getattr(self, "_last_artifacts", [])
 
 
-# Checkpoint helpers relocated to module top; no-op placeholder retained for compatibility.
 
 def write_artifact(tool_name: str, job_id: str, artifact_type: str, ext: str, content: str) -> Path:
     """Write artifact to disk and return Path using atomic replacement.

@@ -1,7 +1,7 @@
 # AnythingTools
 
 ## 1. Project Overview
-AnythingTools is a high-reliability tool execution system designed to bridge LLM-driven orchestration with durable, stateful tool execution. It provides a robust framework for running long-running, browser-based, and data-intensive tasks (such as web scraping, curation, and financial data extraction) while ensuring execution continuity, crash recovery, and strict observability.
+AnythingTools is a high-reliability tool execution system that bridges LLM-driven orchestration with durable, stateful tool execution. It provides a robust framework for running long-running, browser-based, and data-intensive tasks (such as web scraping, curation, and financial data extraction) while ensuring execution continuity, crash recovery, and strict observability.
 
 The system solves the "transient execution" problem by treating every tool call as a durable `Job` persisted in a database, allowing for interrupted jobs to be resumed and for every state transition to be audited via a dual-logging system.
 
