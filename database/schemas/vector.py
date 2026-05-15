@@ -4,8 +4,7 @@ TABLES = {
     "scraped_articles": """CREATE TABLE scraped_articles (
             id TEXT NOT NULL PRIMARY KEY,
             vec_rowid INTEGER NOT NULL,
-            normalized_url TEXT NOT NULL UNIQUE,
-            url TEXT NOT NULL,
+            url TEXT NOT NULL UNIQUE,
             title TEXT,
             conclusion TEXT,
             summary TEXT,
@@ -14,7 +13,7 @@ TABLES = {
             scraped_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-CREATE INDEX idx_scraped_articles_norm_url ON scraped_articles(normalized_url);
+CREATE INDEX idx_scraped_articles_url ON scraped_articles(url);
 CREATE INDEX idx_scraped_articles_status ON scraped_articles(embedding_status);
 CREATE INDEX idx_scraped_articles_vec_rowid ON scraped_articles(vec_rowid);
 """,

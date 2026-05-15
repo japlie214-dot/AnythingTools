@@ -99,15 +99,52 @@ class ScraperTool(BaseTool):
                 pass
             return json.dumps(payload, ensure_ascii=False)
 
+        def _merge_completed_articles(results: dict, job_id: str | None) -> dict:
+            if not job_id:
+                return results
+            try:
+                from database.connection import DatabaseManager
+                conn = DatabaseManager.get_read_connection()
+                completed = conn.execute(
+                    "SELECT id, url, title, conclusion, summary "
+                    "FROM scraped_articles WHERE url IN ("
+                    "  SELECT json_extract(item_metadata, '$.ulid') "
+                    "  FROM job_items WHERE job_id = ? AND status = 'COMPLETED' "
+                    "  AND json_extract(item_metadata, '$.step') = 'scrape'"
+                    ")",
+                    (job_id,)
+                ).fetchall()
+                stats = results.get("_stats", {})
+                added_count = 0
+                for row in completed:
+                    url = row["url"]
+                    if url not in results:
+                        results[url] = {
+                            "status": "SUCCESS",
+                            "ulid": row["id"],
+                            "url": url,
+                            "title": row["title"],
+                            "conclusion": row["conclusion"],
+                            "summary": row["summary"],
+                        }
+                        added_count += 1
+                if "success" in stats:
+                    stats["success"] += added_count
+                    stats["skipped_complete"] = stats.get("skipped_complete", 0) + added_count
+            except Exception as e:
+                log.dual_log(tag="Scraper:Merge:Error", message=f"Failed to merge completed articles: {e}", level="WARNING", payload={"error": str(e)})
+            return results
+
         def _build_slim_list(valid_res: dict) -> list[dict]:
             s_list = []
             for _url, _res in valid_res.items():
                 if _res.get("status") == "SUCCESS" and _res.get("ulid"):
                     s_list.append({
                         "ulid": _res["ulid"],
-                        "normalized_url": _res.get("normalized_url", ""),
+                        "url": _res.get("url", ""),
                         "title": _res.get("title", ""),
-                        "conclusion": _res.get("conclusion", "")
+                        "conclusion": _res.get("conclusion", ""),
+                        "summary": _res.get("summary", "")
                     })
             return s_list
 
@@ -182,16 +219,15 @@ class ScraperTool(BaseTool):
             
             # Browser lock must cover the entire job lifecycle per GOLDEN RULE 2.
             # Do not release the browser lock early; it will be released in the outer run() finally block.
-            pass
+            results = _merge_completed_articles(results, job_id)
 
             # Persist raw results to artifacts directory
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             raw_filepath = None
             try:
                 raw_filepath = write_artifact(
                     tool_name="scraper",
                     job_id=job_id or batch_id,
-                    artifact_type=f"scraper_output_{ts}",
+                    artifact_type="scraper_output",
                     ext="json",
                     content=json.dumps(results, indent=2, ensure_ascii=False)
                 )
@@ -345,8 +381,9 @@ class ScraperTool(BaseTool):
                     "target_curated_count": target_curated_count,
                     "fallback_used": fallback_used if 'fallback_used' in locals() else False,
                     "artifacts_written": artifacts_written,
+                    "artifacts_directory": str(Path("artifacts") / "scraper"),
                 },
-                "artifacts": [str(a["filename"]) for a in artifacts_written],
+                "artifacts": artifacts_written,
                 "backup_status": bak_res.dict() if bak_res else {"success": True, "message": "Disabled or skipped"}
             }
             if job_id: update_item_status(job_id, final_meta, "COMPLETED", json.dumps(result_payload))

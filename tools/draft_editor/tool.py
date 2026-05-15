@@ -117,9 +117,10 @@ class DraftEditorTool(BaseTool):
                     # Construct a slim version like the Scraper does
                     slim_replacement = {
                         "ulid": replacement.get("ulid"),
-                        "normalized_url": replacement.get("normalized_url"),
+                        "url": replacement.get("url", ""),
                         "title": replacement.get("title", ""),
-                        "conclusion": replacement.get("conclusion", "")
+                        "conclusion": replacement.get("conclusion", ""),
+                        "summary": replacement.get("summary", "")
                     }
                     top_10[idx] = slim_replacement
 

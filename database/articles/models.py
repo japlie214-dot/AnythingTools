@@ -5,7 +5,6 @@ from typing import Optional, Any
 @dataclass
 class ArticleWriteTask:
     article_id: str
-    normalized_url: str
     url: str
     title: str
     conclusion: str
@@ -25,12 +24,11 @@ class ArticleWriteTask:
         statements = []
         insert_sql = """
             INSERT INTO scraped_articles (
-                id, vec_rowid, normalized_url, url, title, conclusion, summary,
+                id, vec_rowid, url, title, conclusion, summary,
                 metadata_json, embedding_status, scraped_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ON CONFLICT(normalized_url) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(url) DO UPDATE SET
                 vec_rowid = excluded.vec_rowid,
-                url = excluded.url,
                 title = excluded.title,
                 conclusion = excluded.conclusion,
                 summary = excluded.summary,
@@ -41,7 +39,7 @@ class ArticleWriteTask:
         statements.append((
             insert_sql,
             (
-                self.article_id, self.vec_rowid, self.normalized_url, self.url,
+                self.article_id, self.vec_rowid, self.url,
                 self.title, self.conclusion, self.summary, self.metadata_json,
                 self.embedding_status,
             )
@@ -65,7 +63,6 @@ class ArticleWriteTask:
         from datetime import datetime, timezone
         return {
             "id": self.article_id,
-            "normalized_url": self.normalized_url,
             "url": self.url,
             "title": self.title,
             "conclusion": self.conclusion,

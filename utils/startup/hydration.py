@@ -29,8 +29,13 @@ async def hydrate_from_backup() -> None:
         
     try:
         from database.backup.restore import restore_master_tables_direct
-        conn = DatabaseManager.get_read_connection()
-        result = await asyncio.to_thread(restore_master_tables_direct, conn)
+        
+        def _do_restore():
+            # Acquire connection INSIDE the background thread to satisfy SQLite thread-locality
+            conn = DatabaseManager.get_read_connection()
+            return restore_master_tables_direct(conn)
+            
+        result = await asyncio.to_thread(_do_restore)
         if result.success:
             log.dual_log(tag="Startup:Hydration:MasterTables", message="Master table hydration complete", level="INFO", payload={"phase": "master_tables", "status": "success", "restored_counts": result.restored_counts, "duration_s": result.duration_seconds})
         else:

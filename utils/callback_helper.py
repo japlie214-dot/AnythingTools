@@ -83,7 +83,15 @@ def format_artifacts_list(artifacts: List[Dict[str, Any]], artifacts_subdir: Opt
         lines.append(f"> **Artifacts Directory:** `{full_path}`\n")
     lines.extend(["| # | Filename | Type | Description |", "|---|---|----------|------|-------------|"])
     for i, art in enumerate(artifacts, 1):
-        lines.append(f"| {i} | `{art.get('filename', 'unknown')}` | {art.get('type', 'file')} | {art.get('description', '')} |")
+        if isinstance(art, dict):
+            filename = art.get('filename', 'unknown')
+            art_type = art.get('type', 'file')
+            description = art.get('description', '')
+        else:
+            filename = str(art)
+            art_type = 'file'
+            description = ''
+        lines.append(f"| {i} | `{filename}` | {art_type} | {description} |")
     return "\n".join(lines) + "\n\n---\n"
 
 def _fetch_recent_errors(job_id: str, limit: int = 10) -> str:

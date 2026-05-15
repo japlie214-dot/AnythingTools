@@ -7,7 +7,6 @@ FLOAT32_COUNT = 1024
 SCRAPED_ARTICLES_SCHEMA = pa.schema([
     pa.field("id", pa.string(), nullable=False),
     pa.field("vec_rowid", pa.int64(), nullable=False),
-    pa.field("normalized_url", pa.string(), nullable=False),
     pa.field("url", pa.string(), nullable=False),
     pa.field("title", pa.string(), nullable=True),
     pa.field("conclusion", pa.string(), nullable=True),

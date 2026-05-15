@@ -97,6 +97,20 @@ def process_article(
                 pass
             else:
                 action, val_data = validate_article(raw_html, b64_image, url, sync_llm_chat)
+                
+                log.dual_log(
+                    tag="Scraper:Validation:Verdict",
+                    message=f"Validation verdict: {action.value}",
+                    level="INFO" if action == ValidationAction.PROCEED else "WARNING",
+                    payload={
+                        "url": url,
+                        "action": action.value,
+                        "reason": val_data.get("reason", "") if val_data else "",
+                        "valid": val_data.get("valid", None) if val_data else None,
+                        "job_id": job_id,
+                    }
+                )
+                
                 if action == ValidationAction.AUTO_SKIP:
                     reason = val_data.get("reason", "unknown") if val_data else "unknown"
                     local_meta["retryable"] = False

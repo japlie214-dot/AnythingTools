@@ -210,12 +210,11 @@ class ArticleStore:
         
         upsert_sql = """
             INSERT INTO scraped_articles (
-                id, vec_rowid, normalized_url, url, title, conclusion, summary,
+                id, vec_rowid, url, title, conclusion, summary,
                 metadata_json, embedding_status, scraped_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-            ON CONFLICT(normalized_url) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(url) DO UPDATE SET
                 vec_rowid = excluded.vec_rowid,
-                url = excluded.url,
                 title = excluded.title,
                 conclusion = excluded.conclusion,
                 summary = excluded.summary,
@@ -228,7 +227,6 @@ class ArticleStore:
             (
                 article_id,
                 vec_rowid,
-                meta.get("normalized_url", ""),
                 meta.get("url", ""),
                 meta.get("title"),
                 meta.get("conclusion"),

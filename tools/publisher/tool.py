@@ -114,7 +114,7 @@ class PublisherTool(BaseTool):
                 and bool(entry.get("ulid"))
                 and bool(entry.get("title"))
                 and bool(entry.get("conclusion"))
-                and (bool(entry.get("url")) or bool(entry.get("normalized_url")))
+                and bool(entry.get("url"))
             )
 
         top_10_ulids = {item.get("ulid") for item in top_10 if item.get("ulid")}

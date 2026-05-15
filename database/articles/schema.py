@@ -10,7 +10,6 @@ def get_article_row_as_dict(task) -> dict:
     return {
         "id": task.article_id,
         "vec_rowid": task.vec_rowid,
-        "normalized_url": task.normalized_url,
         "url": task.url,
         "title": task.title,
         "conclusion": task.conclusion,

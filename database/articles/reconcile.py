@@ -58,15 +58,15 @@ def reconcile_delta(store: ArticleStore) -> dict:
 
         insert_sql = """
             INSERT OR REPLACE INTO scraped_articles (
-                id, vec_rowid, normalized_url, url, title, conclusion, summary,
+                id, vec_rowid, url, title, conclusion, summary,
                 metadata_json, embedding_status, scraped_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         safe_updated_at = meta.get("updated_at", datetime.now(timezone.utc).isoformat())
         ops.append((
             insert_sql,
             (
-                aid, vec_rowid, meta.get("normalized_url", ""), meta.get("url", ""),
+                aid, vec_rowid, meta.get("url", ""),
                 meta.get("title"), meta.get("conclusion"), meta.get("summary"),
                 meta.get("metadata_json", "{}"), embedding_status,
                 safe_updated_at,

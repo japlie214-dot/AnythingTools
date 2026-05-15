@@ -78,16 +78,21 @@ class AzureProvider(LLMProvider):
         import time
         _start = time.monotonic()
         _resolved_model = request.model or self.default_model
-        _msg_preview = [
-            {"role": m.get("role"), "content_preview": str(m.get("content", ""))[:500] + ("..." if len(str(m.get("content", ""))) > 500 else "")}
-            for m in request.messages
-        ]
+        _msg_log = []
+        for m in request.messages:
+            raw_content = m.get("content", "")
+            if isinstance(raw_content, list):
+                text_parts = [p.get("text", "") for p in raw_content if isinstance(p, dict) and p.get("type") == "text"]
+                other_parts = [{"type": p.get("type"), **({"image_url_length": len(str(p.get("image_url", "")))} if p.get("type") == "image_url" else {})} for p in raw_content if isinstance(p, dict) and p.get("type") != "text"]
+                _msg_log.append({"role": m.get("role"), "content_text": " ".join(text_parts), "multimodal_parts": other_parts})
+            else:
+                _msg_log.append({"role": m.get("role"), "content": raw_content})
         log.dual_log(
             tag="LLM:Azure:Request",
             message=f"Sending request to {_resolved_model}",
             payload={
                 "model":            _resolved_model,
-                "messages":         _msg_preview,
+                "messages":         _msg_log,
                 "tools":            request.tools,
                 "response_format":  request.response_format,
                 "temperature":      request.temperature,
@@ -121,7 +126,7 @@ class AzureProvider(LLMProvider):
                 "model": _final_model,
                 "finish_reason": getattr(response, "status", None),
                 "usage": _extract_responses_usage(response),
-                "content_preview": (_content or "")[:500],
+                "content": _content or "",
                 "content_length": len(_content or ""),
                 "latency_ms": round(_latency_ms, 1),
                 "request_id": getattr(response, "_request_id", None),

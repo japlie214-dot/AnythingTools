@@ -6,7 +6,6 @@ import json
 import struct
 import config
 from utils.id_generator import ULID
-from utils.text_processing import normalize_url
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
@@ -41,7 +40,6 @@ def _parse_article_result(raw_result: dict, url: str) -> dict:
     return {
         "status":         "SUCCESS",
         "url":            url,
-        "normalized_url": normalize_url(url),
         "id":             _id,
         "ulid":           ulid_str,
         "title":          title,
@@ -94,7 +92,6 @@ def _sync_scraped_article_atomic(parsed_result: dict, job_id: str | None, meta_s
 
         article_data = {
             "id": parsed_result["ulid"],
-            "normalized_url": parsed_result["normalized_url"],
             "url": parsed_result["url"],
             "title": parsed_result["title"],
             "conclusion": parsed_result["conclusion"],

@@ -17,7 +17,6 @@ def enqueue_article_write(
     """Legacy create-only API seamlessly backed by ArticleStore."""
     task = ArticleWriteTask(
         article_id=article_data["id"],
-        normalized_url=article_data["normalized_url"],
         url=article_data["url"],
         title=article_data["title"],
         conclusion=article_data["conclusion"],

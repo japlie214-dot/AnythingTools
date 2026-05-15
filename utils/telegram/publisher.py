@@ -34,7 +34,7 @@ class ChannelPublisher:
             title = trans_data.get("translated_title", article.get("title", ""))
             summary = trans_data.get("translated_summary", article.get("summary", ""))
             conclusion = trans_data.get("translated_conclusion", article.get("conclusion", ""))
-            link = article.get("normalized_url", article.get("url", ""))
+            link = article.get("url", "")
             if not link:
                 link = "URL Unavailable"
             
@@ -79,7 +79,7 @@ class ChannelPublisher:
             title = trans_data.get("translated_title", article.get("title", ""))
             summary = trans_data.get("translated_summary", article.get("summary", ""))
             conclusion = trans_data.get("translated_conclusion", article.get("conclusion", ""))
-            link = article.get("normalized_url", article.get("url", ""))
+            link = article.get("url", "")
             if not link:
                 link = "URL Unavailable"
 
