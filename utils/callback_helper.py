@@ -72,14 +72,15 @@ def format_artifacts_list(artifacts: List[Dict[str, Any]], artifacts_subdir: Opt
         return "### Artifacts\n\n_No artifacts produced for this job._\n\n---\n\n"
     lines = ["### Artifacts\n"]
     if artifacts_subdir:
-        # Render absolute artifact directory path for AnythingLLM consumers
-        subdir_path = Path(str(artifacts_subdir))
+        # ARTIFACT-AS-RECEIPT: The artifacts directory contains audit receipts only.
+        # Operational data is in broadcast_batches + broadcast_details tables.
         base_dir = getattr(config, "ANYTHINGLLM_ARTIFACTS_DIR", None)
-        if base_dir and not subdir_path.is_absolute():
-            full_path = Path(base_dir) / str(artifacts_subdir).strip("/")
-            full_path = full_path.as_posix()
+        if base_dir:
+            artifacts_root = Path(base_dir)
+            tool_dir = artifacts_root / str(artifacts_subdir).strip("/")
+            full_path = tool_dir.as_posix()
         else:
-            full_path = subdir_path.as_posix()
+            full_path = str(artifacts_subdir)
         lines.append(f"> **Artifacts Directory:** `{full_path}`\n")
     lines.extend(["| # | Filename | Type | Description |", "|---|---|----------|------|-------------|"])
     for i, art in enumerate(artifacts, 1):

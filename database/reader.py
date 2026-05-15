@@ -155,7 +155,9 @@ def get_all_translated_items(job_id: str) -> List[Dict[str, Any]]:
 
 
 def get_batch_phase_state(batch_id: str) -> Dict[str, Any]:
-    """Retrieve the granular phase_state mapping for a broadcast batch."""
+    """DEPRECATED: Retrieve the granular phase_state mapping for a broadcast batch.
+    Use database.broadcast.queries instead.
+    """
     cur = _get_cursor()
     cur.execute(
         "SELECT phase_state FROM broadcast_batches WHERE batch_id = ?",

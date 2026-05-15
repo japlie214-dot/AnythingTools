@@ -13,6 +13,8 @@ MASTER_TABLES: list[str] = [
     "scraped_articles_vec",
     "long_term_memories",
     "long_term_memories_vec",
+    "broadcast_batches",
+    "broadcast_details",
 ]
 
 ALL_FTS_TABLES: Dict[str, str] = {

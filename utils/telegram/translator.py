@@ -17,8 +17,9 @@ MAX_TRANSLATION_RETRIES = 3
 BATCH_SIZE = 10
 
 class BatchTranslator:
-    def __init__(self, job_id: str | None):
+    def __init__(self, job_id: str | None, batch_id: str):
         self.job_id = job_id
+        self.batch_id = batch_id
         self.translated_map: Dict[str, Dict] = {}
         self.failed_ulids: Set[str] = set()
 
@@ -83,13 +84,22 @@ class BatchTranslator:
                 continue
 
             translations = await self._call_llm(current_batch)
+            from database.broadcast.writer import update_detail_publish_status
             for article in current_batch:
                 ulid = article.get("ulid")
                 trans_data = translations.get(ulid)
                 if trans_data and trans_data.get("translated_title"):
                     self.translated_map[ulid] = trans_data
+                    update_detail_publish_status(
+                        batch_id=self.batch_id,
+                        article_id=ulid,
+                        publish_status="TRANSLATING",
+                        translated_title=trans_data.get("translated_title", ""),
+                        translated_summary=trans_data.get("translated_summary", ""),
+                        translated_conclusion=trans_data.get("translated_conclusion", ""),
+                    )
                     if self.job_id:
-                        meta = make_metadata(STEP_TRANSLATE, ulid, retry=retry_count.get(ulid, 0), model=getattr(config, 'AZURE_DEPLOYMENT', 'gpt-4o-mini'), is_top10=article.get("_is_top10", False))
+                        meta = make_metadata(STEP_TRANSLATE, ulid, retry=retry_count.get(ulid, 0), model=getattr(config, 'AZURE_DEPLOYMENT', 'gpt-4o-mini'), is_top10=article.get("is_top10", False))
                         add_job_item(self.job_id, meta, json.dumps(article, ensure_ascii=False))
                         update_item_status(self.job_id, meta, "COMPLETED", json.dumps(trans_data, ensure_ascii=False))
                 else:

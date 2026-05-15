@@ -14,6 +14,7 @@ from utils.browser_lock import browser_lock
 from utils.metadata_helpers import make_metadata
 from database.writer import enqueue_write
 from database.job_queue import add_job_item, update_item_status
+from utils.artifact_manager import write_artifact
 
 from tools.base import BaseTool
 from tools.scraper.prompts import SCRAPER_SYS_PROMPT, CURATION_SYS_PROMPT
@@ -56,6 +57,11 @@ class ScraperTool(BaseTool):
         """Internal implementation with full pipeline."""
         from utils.logger.structured import granular_log
         
+        # ── ARCHITECTURE RULE: ARTIFACT-AS-RECEIPT ──────────────────────────
+        # Artifact files written below are RECEIPTS for audit/debug only.
+        # Operational data lives in broadcast_batches + broadcast_details + scraped_articles.
+        # ─────────────────────────────────────────────────────────────────────
+
         session_id = str(session_id or kwargs.get("chat_id", "0"))
         target_site = args.get("target_site")
         
@@ -365,13 +371,54 @@ class ScraperTool(BaseTool):
             # Finalization
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before finalization.", "Job canceled.")
 
+            # ── Persist to broadcast tables ─────────────────────────────────────
+            try:
+                from database.broadcast.writer import create_broadcast_batch, add_broadcast_details_bulk
+                top10_ids = {item.get("ulid") for item in top_10_list if item.get("ulid")}
+                all_success_articles = [_res for _url, _res in valid_results.items() if _res.get("status") == "SUCCESS" and _res.get("ulid")]
+
+                create_broadcast_batch(
+                    batch_id=batch_id,
+                    target_site=target_site,
+                    article_count=len(all_success_articles),
+                    top10_count=len(top10_ids),
+                    source_job_id=job_id,
+                )
+                add_broadcast_details_bulk(
+                    batch_id=batch_id,
+                    articles=all_success_articles,
+                    top10_list=top_10_list,
+                )
+            except Exception as e:
+                log.dual_log(tag="Scraper:Broadcast:WriteError", message=f"Failed to write broadcast tables: {e}", level="ERROR", exc_info=e, payload={"batch_id": batch_id, "error": str(e)})
+
+            # ── Build enriched summary ──────────────────────────────────────────
+            summary_parts = [f"Scraped and curated top {len(top_10_list)} articles from {target_site} (Batch ID: {batch_id}).\nSorted based on potential global impact."]
+            
+            if top_10_list:
+                summary_parts.append("\n\n### Top 10 Curated Articles")
+                for idx, article in enumerate(top_10_list, 1):
+                    title = article.get("title", "Untitled")
+                    conclusion = article.get("conclusion", "")
+                    summary_text = article.get("summary", "")
+                    summary_parts.append(f"\n**{idx}. {title}**\nConclusion: {conclusion}\nSummary: {summary_text}")
+                    
+            top10_ulid_set = {item.get("ulid") for item in top_10_list}
+            rest_articles = [res for res in valid_results.values() if res.get("status") == "SUCCESS" and res.get("ulid") and res.get("ulid") not in top10_ulid_set]
+            if rest_articles:
+                summary_parts.append("\n\n### Other Articles")
+                for idx, article in enumerate(rest_articles, 1):
+                    summary_parts.append(f"{idx}. {article.get('title', 'Untitled')}")
+                    
+            enriched_summary = "\n".join(summary_parts)
+
             final_meta = make_metadata("finalize", batch_id)
             if job_id: add_job_item(job_id, final_meta, "{}")
             result_payload = {
                 "_callback_format": "structured",
                 "tool_name": self.name,
                 "status": "COMPLETED",
-                "summary": f"Scraped and curated top {len(top_10_list)} articles from {target_site}",
+                "summary": enriched_summary,
                 "details": {
                     "target_site": target_site,
                     "batch_id": batch_id,
@@ -381,7 +428,7 @@ class ScraperTool(BaseTool):
                     "target_curated_count": target_curated_count,
                     "fallback_used": fallback_used if 'fallback_used' in locals() else False,
                     "artifacts_written": artifacts_written,
-                    "artifacts_directory": str(Path("artifacts") / "scraper"),
+                    "artifacts_directory": "scraper",
                 },
                 "artifacts": artifacts_written,
                 "backup_status": bak_res.dict() if bak_res else {"success": True, "message": "Disabled or skipped"}
@@ -406,27 +453,3 @@ class ScraperTool(BaseTool):
 
 
 
-def write_artifact(tool_name: str, job_id: str, artifact_type: str, ext: str, content: str) -> Path:
-    """Write artifact to disk and return Path using atomic replacement.
-
-    Raises an exception on failure so caller can surface fatal errors.
-    """
-    from pathlib import Path
-    import os
-    import tempfile
-
-    # Create artifacts directory
-    artifacts_dir = Path("artifacts") / tool_name
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-
-    # Generate filename
-    filename = f"{job_id}_{artifact_type}.{ext}"
-    filepath = artifacts_dir / filename
-
-    # Atomic write
-    with tempfile.NamedTemporaryFile("w", dir=artifacts_dir, delete=False, suffix=".tmp", encoding="utf-8") as tf:
-        tf.write(content)
-        temp_name = tf.name
-    os.replace(temp_name, filepath)
-
-    return filepath

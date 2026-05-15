@@ -53,85 +53,52 @@ class PublisherTool(BaseTool):
         finalize = args.get("finalize", False)
 
         from database.writer import enqueue_write
+        from database.broadcast.queries import get_batch_info, get_batch_articles
+        from database.broadcast.writer import reset_batch_publish_status
 
         job_id = kwargs.get("job_id")
-        conn = DatabaseManager.get_read_connection()
-        conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT raw_json_path, curated_json_path, status FROM broadcast_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+        batch_info = get_batch_info(batch_id)
         
-        if not row or not row["curated_json_path"] or not row["raw_json_path"]:
-            return _fail("Batch not found or missing data.", "Verify the batch_id is valid. If lost, use the `scraper` tool to generate a new batch.")
+        if not batch_info:
+            return _fail("Batch not found.", "Verify the batch_id is valid. If lost, use the `scraper` tool to generate a new batch.")
 
-        batch_status = row["status"]
+        batch_status = batch_info["status"]
         if batch_status == "COMPLETED" and not reset and not finalize:
             payload = {
-                "_callback_format": "structured",
-                "tool_name": self.name,
-                "status": "COMPLETED",
+                "_callback_format": "structured", "tool_name": self.name, "status": "COMPLETED",
                 "summary": f"Batch {batch_id} is already fully published.",
-                "status_overrides": {
-                    "COMPLETED": {
-                        "description": "Batch is already published.",
-                        "next_steps": "No further actions required. The batch is live.",
-                        "rerunnable": False
-                    }
-                }
+                "status_overrides": {"COMPLETED": {"description": "Batch is already published.", "next_steps": "No further actions required.", "rerunnable": False}}
             }
             return json.dumps(payload, ensure_ascii=False)
 
-        if finalize and batch_status == "PARTIAL":
-            enqueue_write(
-                "UPDATE broadcast_batches SET status = 'COMPLETED', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
-                (batch_id,)
-            )
+        if finalize and batch_status in ("PARTIAL", "PUBLISHING"):
+            enqueue_write("UPDATE broadcast_details SET publish_status = 'SKIPPED', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ? AND publish_status NOT IN ('PUBLISHED_ARCHIVE')", (batch_id,))
+            enqueue_write("UPDATE broadcast_batches SET status = 'COMPLETED', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?", (batch_id,))
             payload = {
-                "_callback_format": "structured",
-                "tool_name": self.name,
-                "status": "COMPLETED",
+                "_callback_format": "structured", "tool_name": self.name, "status": "COMPLETED",
                 "summary": f"Batch {batch_id} finalized to COMPLETED.",
-                "status_overrides": {
-                    "COMPLETED": {
-                        "description": "Batch was manually finalized to COMPLETED.",
-                        "next_steps": "No further actions required for this batch.",
-                        "rerunnable": False
-                    }
-                }
+                "status_overrides": {"COMPLETED": {"description": "Batch was manually finalized.", "next_steps": "No further actions required.", "rerunnable": False}}
             }
             return json.dumps(payload, ensure_ascii=False)
             
-        try:
-            with open(row["curated_json_path"], "r", encoding="utf-8") as f:
-                top_10 = json.load(f)
-            with open(row["raw_json_path"], "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
-        except Exception as e:
-            return _fail(f"File read error: {e}", "Data may have been purged. Use the `scraper` tool to generate a new batch.")
+        if reset:
+            reset_batch_publish_status(batch_id)
 
-        def _is_article(entry: Any) -> bool:
-            return (
-                isinstance(entry, dict)
-                and entry.get("status") == "SUCCESS"
-                and bool(entry.get("ulid"))
-                and bool(entry.get("title"))
-                and bool(entry.get("conclusion"))
-                and bool(entry.get("url"))
-            )
+        all_articles = get_batch_articles(batch_id)
+        top_10 = [a for a in all_articles if a.get("is_top10")]
+        inventory = [a for a in all_articles if not a.get("is_top10")]
 
-        top_10_ulids = {item.get("ulid") for item in top_10 if item.get("ulid")}
-        inventory = [
-            v for v in (raw_data.values() if isinstance(raw_data, dict) else raw_data)
-            if _is_article(v) and v.get("ulid") not in top_10_ulids
-        ]
-
-        raw_count = len(raw_data) if isinstance(raw_data, dict) else len(raw_data)
-        valid_raw_count = sum(1 for v in (raw_data.values() if isinstance(raw_data, dict) else raw_data) if _is_article(v))
-        
         from utils.logger import get_dual_logger
         log = get_dual_logger(__name__)
+
+        if not top_10:
+            enqueue_write("UPDATE broadcast_batches SET status = 'FAILED', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?", (batch_id,))
+            return _fail("Batch aborted: Top-10 is completely depleted.", "Generate a new batch using the Scraper tool.")
+
         log.dual_log(
             tag="Publisher:Inventory:Check",
-            message=f"Sanitized raw data: {valid_raw_count}/{raw_count} valid articles, {len(inventory)} inventory items.",
-            payload={"batch_id": batch_id, "valid_articles": valid_raw_count, "inventory": len(inventory)}
+            message=f"Loaded {len(all_articles)} articles from DB for batch {batch_id}",
+            payload={"batch_id": batch_id, "total": len(all_articles), "top10": len(top_10), "inventory": len(inventory)}
         )
 
         # Atomic check-and-set to establish strict publishing lock

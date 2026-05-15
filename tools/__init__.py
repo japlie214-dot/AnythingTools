@@ -17,6 +17,11 @@ ARCHITECTURE DEFINITION:
 3. The Execution Ledger is the Single Source of Truth. Agents and Tools must
    never maintain isolated LLM histories. Mode transitions and results MUST
    be appended to the execution_ledger.
+4. ARTIFACT-AS-RECEIPT: Artifact files (JSON, Parquet, etc.) written by
+   tools are RECEIPTS for auditing and debugging purposes ONLY. They are
+   NOT operational data sources. All tool-to-tool communication must go
+   through the database. Artifacts may be deleted or corrupted without
+   affecting system correctness.
 
 Public tool: library_query
 - A public tool available to the API.

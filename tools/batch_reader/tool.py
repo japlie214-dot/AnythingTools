@@ -45,26 +45,13 @@ class BatchReaderTool(BaseTool):
         if not batch_id or not query:
             return _fail("batch_id and query are required.", "Provide both 'batch_id' and 'query' parameters.")
             
-        conn = DatabaseManager.get_read_connection()
-        conn.row_factory = sqlite3.Row
+        from database.broadcast.queries import get_batch_info, get_batch_article_ids
         
-        # 1. Get batch raw JSON path
-        row = conn.execute("SELECT raw_json_path FROM broadcast_batches WHERE batch_id = ?", (batch_id,)).fetchone()
-        if not row or not row["raw_json_path"]:
-            return _fail("Batch not found or missing raw data.", "Verify the batch_id is valid. If lost, use the `scraper` tool to generate a new batch.")
+        batch_info = get_batch_info(batch_id)
+        if not batch_info:
+            return _fail("Batch not found.", "Verify the batch_id is valid. If lost, use the `scraper` tool to generate a new batch.")
             
-        try:
-            with open(row["raw_json_path"], "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
-        except Exception as e:
-            return _fail(f"Failed to read batch data: {str(e)}", "Data may have been purged. Use the `scraper` tool to generate a new batch.")
-            
-        # 2. Extract valid ULIDs for this batch
-        valid_ulids = []
-        for item in raw_data.values() if isinstance(raw_data, dict) else raw_data:
-            if isinstance(item, dict) and item.get("ulid"):
-                valid_ulids.append(item["ulid"])
-                
+        valid_ulids = get_batch_article_ids(batch_id)
         if not valid_ulids:
             return _fail("No valid articles found in batch.", "The batch is empty or corrupted. Scrape a new batch.")
 

@@ -36,15 +36,36 @@ CREATE INDEX idx_job_items_metadata ON job_items(
     "broadcast_batches": """CREATE TABLE broadcast_batches (
             batch_id TEXT PRIMARY KEY,
             target_site TEXT NOT NULL,
-            raw_json_path TEXT NOT NULL,
-            curated_json_path TEXT NOT NULL,
+            article_count INTEGER NOT NULL DEFAULT 0,
+            top10_count INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'PENDING'
                 CHECK(status IN ('PENDING','PUBLISHING','PARTIAL','COMPLETED','FAILED')),
-            phase_state TEXT NOT NULL DEFAULT '{}',
+            source_job_id TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 CREATE INDEX idx_broadcast_batches_status ON broadcast_batches(status);
+""",
+    "broadcast_details": """CREATE TABLE broadcast_details (
+            detail_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            article_id TEXT NOT NULL,
+            is_top10 INTEGER NOT NULL DEFAULT 0,
+            top10_rank INTEGER,
+            publish_status TEXT NOT NULL DEFAULT 'PENDING'
+                CHECK(publish_status IN ('PENDING','TRANSLATING','PUBLISHED_BRIEFING','PUBLISHED_ARCHIVE','FAILED','SKIPPED')),
+            translated_title TEXT,
+            translated_summary TEXT,
+            translated_conclusion TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(batch_id) REFERENCES broadcast_batches(batch_id) ON DELETE CASCADE,
+            FOREIGN KEY(article_id) REFERENCES scraped_articles(id) ON DELETE CASCADE,
+            UNIQUE(batch_id, article_id)
+        );
+CREATE INDEX idx_broadcast_details_batch ON broadcast_details(batch_id, publish_status);
+CREATE INDEX idx_broadcast_details_article ON broadcast_details(article_id);
+CREATE INDEX idx_broadcast_details_top10 ON broadcast_details(batch_id, is_top10);
 """,
 }
 
