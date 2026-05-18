@@ -152,9 +152,12 @@ class ToolRegistry:
         input_schema: Optional[Dict[str, Any]] = None
         try:
             InputModel = getattr(module, "INPUT_MODEL", None)
-            if InputModel is not None and hasattr(InputModel, "schema"):
+            if InputModel is not None:
                 try:
-                    input_schema = InputModel.schema()
+                    if hasattr(InputModel, "model_json_schema"):
+                        input_schema = InputModel.model_json_schema()
+                    elif hasattr(InputModel, "schema"):
+                        input_schema = InputModel.schema()
                 except Exception as e:
                     log.dual_log(tag="Registry:Tool:SchemaError", message=f"Failed to serialize INPUT_MODEL for {module_name}: {e}", level="WARNING", payload={"module": module_name})
         except Exception:

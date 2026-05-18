@@ -132,11 +132,22 @@ class PublisherTool(BaseTool):
         try:
             result = await pipeline.run_pipeline()
             batch_status = result["batch_status"]
+            
+            summary_parts = [f"Publisher finished: {result['archive_posted']}/{result['total_items']} published, {result['translation_failed']} failed."]
+            if top_10:
+                summary_parts.append("\n### Published Top 10 Articles")
+                for i, art in enumerate(top_10, 1):
+                    ulid = art.get("ulid", art.get("id", "unknown"))
+                    title = art.get("title", "Untitled")
+                    if len(title) > 120: title = title[:117] + "..."
+                    pub_status = art.get("publish_status", "UNKNOWN")
+                    summary_parts.append(f"**{i}.** [{ulid}] {title} — {pub_status}")
+
             payload = {
                 "_callback_format": "structured",
                 "tool_name": self.name,
                 "status": batch_status,
-                "summary": f"Publisher finished: {result['archive_posted']}/{result['total_items']} published, {result['translation_failed']} failed.",
+                "summary": "\n".join(summary_parts),
                 "details": result,
                 "status_overrides": {
                     "PARTIAL": {

@@ -92,11 +92,37 @@ class BatchReaderTool(BaseTool):
             }
         }
             
+        summary_parts = [f"Found {len(results)} relevant article(s) for query: '{query}' (batch: {batch_id})"]
+        
+        if results:
+            summary_parts.append("\n### Search Results")
+            for idx, article in enumerate(results, 1):
+                ulid = article.get("ulid", article.get("id", "unknown"))
+                title = article.get("title", "Untitled")
+                if len(title) > 120: title = title[:117] + "..."
+                
+                score = article.get("fusion_score")
+                score_str = f" (score: {score})" if score is not None else ""
+                summary_parts.append(f"\n**{idx}. [{ulid}] {title}**{score_str}")
+                
+                conclusion = article.get("conclusion", "")
+                if conclusion:
+                    if len(conclusion) > 5000: conclusion = conclusion[:4997] + "..."
+                    summary_parts.append(f"  Conclusion: {conclusion}")
+                
+                art_summary = article.get("summary", "")
+                if art_summary:
+                    if len(art_summary) > 9000: art_summary = art_summary[:8997] + "..."
+                    art_summary = art_summary.replace('\n', ' ')
+                    summary_parts.append(f"  Summary: {art_summary}")
+        else:
+            summary_parts.append("\n_No articles matched the query. Try rephrasing or using different keywords._")
+
         payload = {
             "_callback_format": "structured",
             "tool_name": self.name,
             "status": "COMPLETED",
-            "summary": f"Found {len(results)} relevant articles for query: '{query}'",
+            "summary": "\n".join(summary_parts),
             "details": {
                 "batch_id": batch_id,
                 "query": query,

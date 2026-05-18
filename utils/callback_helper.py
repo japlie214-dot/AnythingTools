@@ -155,6 +155,13 @@ def format_callback_message(
     if summary:
         sections.append(f"### Summary\n\n{summary}\n\n---\n")
 
+    if details and isinstance(details, dict):
+        safe_details = {k: v for k, v in details.items()
+                       if not isinstance(v, (list, dict)) or (isinstance(v, list) and len(v) <= 3)}
+        if safe_details:
+            details_json = json.dumps(safe_details, indent=2, default=str, ensure_ascii=False)[:2000]
+            sections.append(f"<details><summary>Details</summary>\n\n```json\n{details_json}\n```\n</details>\n\n---\n")
+
     sections.append(format_artifacts_list(artifacts or [], artifacts_subdir))
     sections.append(inject_status_definitions(status, status_overrides))
     return "".join(sections)

@@ -396,19 +396,23 @@ class ScraperTool(BaseTool):
             summary_parts = [f"Scraped and curated top {len(top_10_list)} articles from {target_site} (Batch ID: {batch_id}).\nSorted based on potential global impact."]
             
             if top_10_list:
-                summary_parts.append("\n\n### Top 10 Curated Articles")
+                summary_parts.append("\n### Top 10 Curated Articles")
                 for idx, article in enumerate(top_10_list, 1):
+                    ulid = article.get("ulid", "unknown")
                     title = article.get("title", "Untitled")
                     conclusion = article.get("conclusion", "")
                     summary_text = article.get("summary", "")
-                    summary_parts.append(f"\n**{idx}. {title}**\nConclusion: {conclusion}\nSummary: {summary_text}")
+                    summary_parts.append(f"\n**{idx}. [{ulid}] {title}**\nConclusion: {conclusion}\nSummary: {summary_text}")
                     
             top10_ulid_set = {item.get("ulid") for item in top_10_list}
             rest_articles = [res for res in valid_results.values() if res.get("status") == "SUCCESS" and res.get("ulid") and res.get("ulid") not in top10_ulid_set]
             if rest_articles:
                 summary_parts.append("\n\n### Other Articles")
                 for idx, article in enumerate(rest_articles, 1):
-                    summary_parts.append(f"{idx}. {article.get('title', 'Untitled')}")
+                    ulid = article.get("ulid", "unknown")
+                    title = article.get("title", "Untitled")
+                    if len(title) > 120: title = title[:117] + "..."
+                    summary_parts.append(f"{idx}. [{ulid}] {title}")
                     
             enriched_summary = "\n".join(summary_parts)
 
@@ -431,7 +435,7 @@ class ScraperTool(BaseTool):
                     "artifacts_directory": "scraper",
                 },
                 "artifacts": artifacts_written,
-                "backup_status": bak_res.dict() if bak_res else {"success": True, "message": "Disabled or skipped"}
+                "backup_status": (bak_res.model_dump() if hasattr(bak_res, "model_dump") else bak_res.dict()) if bak_res else {"success": True, "message": "Disabled or skipped"}
             }
             if job_id: update_item_status(job_id, final_meta, "COMPLETED", json.dumps(result_payload))
             await telemetry(self.status("Completed", "COMPLETED", payload=result_payload))

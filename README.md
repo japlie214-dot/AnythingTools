@@ -38,12 +38,18 @@ The system follows a **Producer-Consumer** architecture with a **Durable Ledger*
     - `writer.py`: A dedicated background thread for all writes to prevent database locks.
     - `articles/`: Mutable storage engine (`store.py`), reconciliation logic (`reconcile.py`), and data models.
     - `backup/`: Configuration and tools for system-wide backups.
+    - `broadcast/`: Logic for managing curated article batches (`broadcast_batches` and `broadcast_details`).
+    - `management/`: Health checks and schema introspection.
 - `tools/`: The tool library.
     - `registry.py`: Dynamic discovery and instantiation of `BaseTool` subclasses.
     - `scraper/`: Complex pipeline for extracting and curating web content.
+    - `batch_reader/`: Semantic search over curated batches.
+    - `draft_editor/`: Deterministic SWAP list manager for Top 10 curation.
+    - `publisher/`: Translation and delivery pipeline.
 - `utils/`: Shared utilities.
     - `logger/`: A "dual-logger" system that writes to both standard logs and a durable SQLite `logs.db`.
     - `browser_daemon.py`: Manages a persistent headless Chrome instance.
+    - `callback_helper.py`: Formats structured reports for LLM consumption.
 - `deprecated/`: Historical versions of agents and tools, serving as evidence of architectural evolution.
 
 ## 4. Core Concepts & Domain Model
@@ -62,7 +68,7 @@ The article pipeline uses a mutable JSON/BIN manifest system. `manifest.json` tr
 
 ## 5. Detailed Behavior
 ### Normal Execution
-1. API receives `/tools/scraper` $\rightarrow$ Job created in DB.
+1. API receives `/api/tools/scraper` $\rightarrow$ Job created in DB.
 2. Worker picks up job $\rightarrow$ Spawns thread $\rightarrow$ Instantiates `ScraperTool`.
 3. `ScraperTool` runs a pipeline: Extraction $\rightarrow$ Slimming $\rightarrow$ Curation $\rightarrow$ Artifact Generation.
 4. Curation uses a 3-retry loop with a "Budget" (knapsack-style) to fit as many candidates as possible into the LLM context.
@@ -83,7 +89,7 @@ The article pipeline uses a mutable JSON/BIN manifest system. `manifest.json` tr
 - `GET /api/manifest`: Returns the list of registered tools and their JSON schemas.
 
 ### Tool Registry
-Tools must subclass `BaseTool` and be located in `tools/`. They can optionally define an `INPUT_MODEL` (Pydantic) for automatic API validation.
+Tools must subclass `BaseTool` and be located in `tools/`. They can optionally define an `INPUT_MODEL` (Pydantic) for automatic API validation. The registry supports Pydantic V2 `model_json_schema()` with fallback to V1 `schema()`.
 
 ## 7. State, Persistence, and Data
 - **Primary DB (`sumanal.db`)**: Stores jobs, job items, and scraped articles.

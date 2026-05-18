@@ -67,7 +67,8 @@ class DraftEditorTool(BaseTool):
         inventory_dict = {a["ulid"]: a for a in articles if not a.get("is_top10")}
 
         for op in operations:
-            if hasattr(op, "dict"): op = op.dict()
+            if hasattr(op, "model_dump"): op = op.model_dump()
+            elif hasattr(op, "dict"): op = op.dict()
             idx = op.get("index_top10")
             target = op.get("target_identifier")
             
@@ -105,9 +106,12 @@ class DraftEditorTool(BaseTool):
         except Exception as e:
             return _fail(f"Save failed: {e}", "Database write error. Check system logs.")
 
-        summary_lines = [f"Successfully applied SWAP operations to batch {batch_id}.\n\n### New Top 10:"]
+        summary_lines = [f"Successfully applied {len(operations)} SWAP operation(s) on batch {batch_id}.\n\n### New Top 10:"]
         for i, art in enumerate(top_10, 1):
-            summary_lines.append(f"{i}. {art.get('title', 'Untitled')}")
+            ulid = art.get("ulid", "unknown")
+            title = art.get("title", "Untitled")
+            if len(title) > 120: title = title[:117] + "..."
+            summary_lines.append(f"**{i}.** [{ulid}] {title}")
 
         payload = {
             "_callback_format": "structured",
