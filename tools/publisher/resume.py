@@ -18,11 +18,9 @@ class ResumeHandler(BaseResumeHandler):
         published_archive = progress.get("PUBLISHED_ARCHIVE", 0)
         published_briefing = progress.get("PUBLISHED_BRIEFING", 0)
         
-        pending = progress.get("PENDING", 0)
-        failed = progress.get("FAILED", 0)
-        translating = progress.get("TRANSLATING", 0)
-        items_pending = pending + failed + translating
         total = sum(progress.values())
+        skipped = progress.get("SKIPPED", 0)
+        items_pending = total - published_archive - skipped
 
         return ResumeReport(
             tool_name="publisher",

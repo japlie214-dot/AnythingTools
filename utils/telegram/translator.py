@@ -141,8 +141,10 @@ class BatchTranslator:
         return translations
 
     def _record_failure(self, article: Dict, retry: int) -> None:
-        if not self.job_id: return
         ulid = article.get("ulid", "UNKNOWN")
-        meta = make_metadata(STEP_TRANSLATE, ulid, retry=retry, model=getattr(config, 'AZURE_DEPLOYMENT', 'gpt-4o-mini'), error="Max retries reached", is_top10=article.get("_is_top10", False))
+        from database.broadcast.writer import update_detail_publish_status
+        update_detail_publish_status(self.batch_id, ulid, "FAILED")
+        if not self.job_id: return
+        meta = make_metadata(STEP_TRANSLATE, ulid, retry=retry, model=getattr(config, 'AZURE_DEPLOYMENT', 'gpt-4o-mini'), error="Max retries reached", is_top10=article.get("is_top10", False))
         add_job_item(self.job_id, meta, json.dumps(article, ensure_ascii=False))
         update_item_status(self.job_id, meta, "FAILED", "{}")

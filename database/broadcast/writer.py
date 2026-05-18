@@ -146,12 +146,13 @@ def update_batch_status_from_details(batch_id: str) -> None:
     published = row["published"] or 0
     failed = row["failed"] or 0
     skipped = row["skipped"] or 0
+    pending = total - (published + failed + skipped)
 
-    if published == total:
+    if (published + skipped) == total and published > 0:
         new_status = "COMPLETED"
     elif failed == total or (failed + skipped) == total:
         new_status = "FAILED"
-    elif published > 0:
+    elif published > 0 or failed > 0:
         new_status = "PARTIAL"
     else:
         new_status = "PENDING"
