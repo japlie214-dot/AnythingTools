@@ -133,7 +133,7 @@ def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: l
             logs_enqueue_write(
                 "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ULID.generate(), job_id, "Worker:Callback:Success", "INFO", None, "Callback delivered", json.dumps({"attempt": attempt}), ULID.generate(), None, now_iso())
+                (ULID.generate(), job_id, "Worker:Callback:Success", "INFO", None, "Callback delivered", json.dumps({"attempt": attempt, "tool": tool_name, "status": status, "summary_len": len(summary)}), ULID.generate(), None, now_iso())
             )
             return True
 
@@ -212,10 +212,11 @@ class UnifiedWorkerManager:
                 # Also poll PENDING_CALLBACK jobs that are ready for retry
                 delay = config.ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS
                 rows = conn.execute(
-                    f"SELECT job_id, session_id, tool_name, args_json, status, result_json, retry_count FROM jobs "
-                    f"WHERE status IN ('QUEUED', 'INTERRUPTED') "
-                    f"   OR (status = 'PENDING_CALLBACK' AND updated_at < datetime('now', '-{delay} seconds')) "
-                    f"ORDER BY status ASC, created_at ASC LIMIT 5"
+                    "SELECT job_id, session_id, tool_name, args_json, status, result_json, retry_count FROM jobs "
+                    "WHERE status IN ('QUEUED', 'INTERRUPTED') "
+                    "   OR (status = 'PENDING_CALLBACK' AND updated_at < datetime('now', '-' || ? || ' seconds')) "
+                    "ORDER BY status ASC, created_at ASC LIMIT 5",
+                    (delay,)
                 ).fetchall()
                 
             except Exception as e:

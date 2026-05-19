@@ -42,7 +42,12 @@ class PublisherPipeline:
             raise RuntimeError(f"Publisher validation crashed: {e}") from e
 
         translator = BatchTranslator(self.job_id, self.batch_id)
-        translated_map = await translator.translate_all(valid_articles)
+        try:
+            translated_map = await translator.translate_all(valid_articles)
+        except Exception as e:
+            import traceback
+            log.dual_log(tag="Publisher:Pipeline:Crash", message=f"Translation phase crashed: {e}\n{traceback.format_exc()}", level="ERROR", exc_info=e, payload={"batch_id": self.batch_id, "job_id": self.job_id, "error": str(e)})
+            raise RuntimeError(f"Publisher translation crashed: {e}") from e
 
         if self.client:
             publisher = ChannelPublisher(self.client, self.batch_id, self.job_id)

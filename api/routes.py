@@ -216,7 +216,7 @@ async def get_job_status(job_id: str, request: Request):
     try:
         conn = DatabaseManager.get_read_connection()
         row = conn.execute(
-            "SELECT job_id, tool_name, status, args_json, created_at, updated_at FROM jobs WHERE job_id = ?", (job_id,)
+            "SELECT job_id, tool_name, status, args_json, result_json, created_at, updated_at FROM jobs WHERE job_id = ?", (job_id,)
         ).fetchone()
     except Exception:
         row = None
@@ -239,31 +239,29 @@ async def get_job_status(job_id: str, request: Request):
     except Exception:
         pass
 
-    # Attempt to read latest payload row from logs.db (payload_json) for final_payload
+    # Attempt to read final payload directly from the operational jobs table
     final_payload = None
     try:
-        conn = LogsDatabaseManager.get_read_connection()
-        p = conn.execute("SELECT payload_json FROM logs WHERE job_id = ? AND payload_json IS NOT NULL ORDER BY timestamp DESC LIMIT 1", (job_id,)).fetchone()
-        if p and p["payload_json"]:
-            try:
-                final_payload = json.loads(p["payload_json"])
-                # If artifacts are present, add artifact_url entries
-                if isinstance(final_payload, dict):
-                    arts = final_payload.get("artifacts") or final_payload.get("attachment_paths")
-                    if arts:
-                        urls = []
-                        for a in arts:
-                            try:
-                                # Normalize relative path and build absolute URL
-                                url = artifact_url_from_request(request, a)
-                                urls.append(url)
-                            except Exception:
-                                pass
-                        final_payload["artifact_urls"] = urls
-            except Exception:
-                final_payload = {"raw": p["payload_json"]}
+        if row and row["result_json"]:
+            parsed_result = json.loads(row["result_json"])
+            # The worker wraps output in {"status": ..., "result": ...}
+            final_payload = parsed_result.get("result", parsed_result)
+            
+            # If artifacts are present, add artifact_url entries
+            if isinstance(final_payload, dict):
+                arts = final_payload.get("artifacts") or final_payload.get("attachment_paths")
+                if arts:
+                    urls = []
+                    for a in arts:
+                        try:
+                            # Normalize relative path and build absolute URL
+                            url = artifact_url_from_request(request, a)
+                            urls.append(url)
+                        except Exception:
+                            pass
+                    final_payload["artifact_urls"] = urls
     except Exception:
-        pass
+        final_payload = {"raw": row["result_json"] if row else None}
 
     return JobStatusResponse(job_id=job_id, status=status_val, job_logs=job_logs, final_payload=final_payload)
 

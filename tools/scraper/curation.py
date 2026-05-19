@@ -73,11 +73,14 @@ class Top10Curator:
             return CurationResult([], 0, log_ctx, fallback_used=False)
 
         # Phase 0: Assembly
+        # Filter out articles with extremely short summaries to save LLM context
+        MIN_SUMMARY_CHARS = 600
         valid_candidates = [
             CurationCandidate(
                 ulid=c.get("ulid"), title=c.get("title", ""),
                 conclusion=c.get("conclusion", ""), url=c.get("normalized_url", c.get("url", ""))
-            ) for c in candidates if c.get("ulid")
+            ) for c in candidates
+            if c.get("ulid") and len(str(c.get("summary", "")).strip()) >= MIN_SUMMARY_CHARS
         ]
         
         log.dual_log(
@@ -113,7 +116,8 @@ class Top10Curator:
 
             prompt = f"Candidates:\n{json.dumps([{'ulid': c.ulid, 'title': c.title, 'conclusion': c.conclusion} for c in packed_candidates], ensure_ascii=False)}"
             if previous_errors:
-                prompt = f"WARNINGS from past attempts:\n" + "\n".join(f"- {err}" for err in previous_errors) + "\nDo NOT repeat these mistakes.\n\n" + prompt
+                # Keep only the last error to prevent context blowout doom-loop
+                prompt = f"WARNING from past attempt:\n- {previous_errors[-1]}\nDo NOT repeat this mistake.\n\n" + prompt
 
             call_ctx = {**log_ctx, "phase": "curation", "attempt": attempt, "target_count": target_count}
             

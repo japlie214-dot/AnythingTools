@@ -41,7 +41,7 @@ class ChannelPublisher:
             meta = make_metadata(STEP_PUBLISH_BRIEFING, ulid, is_top10=True)
             if self.job_id: add_job_item(self.job_id, meta, "")
 
-            raw_text = f"*{title}*\n\n{summary}\n\n*Kesimpulan:* {conclusion}"
+            raw_text = f"{title}\n\n{summary}\n\nKesimpulan: {conclusion}"
             body_text = escape_markdown_v2(raw_text)
 
             err1 = await self.client.send_message(self.briefing_chat, link, parse_mode=None, disable_link_preview=True)
@@ -84,7 +84,7 @@ class ChannelPublisher:
             meta = make_metadata(STEP_PUBLISH_ARCHIVE, ulid, is_top10=article.get("is_top10", False))
             if self.job_id: add_job_item(self.job_id, meta, "")
 
-            raw_text = f"*{title}*\n\n*Kesimpulan:* {conclusion}\n\n*Ringkasan:*\n{summary}"
+            raw_text = f"{title}\n\nKesimpulan: {conclusion}\n\nRingkasan:\n{summary}"
             body_text = escape_markdown_v2(raw_text)
 
             err1 = await self.client.send_message(self.archive_chat, link, parse_mode=None, disable_link_preview=True)

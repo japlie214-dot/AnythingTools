@@ -54,10 +54,10 @@ class DraftEditorTool(BaseTool):
         if not batch_info:
             return _fail("Batch not found.", "Verify the batch_id is valid.")
 
-        if batch_info["status"] != "PENDING":
+        if batch_info["status"] not in ("PENDING", "PARTIAL", "FAILED"):
             return _fail(
                 f"CRITICAL LOCK: Cannot execute SWAP. Status is '{batch_info['status']}'.",
-                "Draft Editor modifications are locked to 'PENDING' batches to prevent state corruption."
+                "Draft Editor modifications are locked to PENDING, PARTIAL, or FAILED batches to prevent state corruption."
             )
 
         articles = get_batch_articles(batch_id)
