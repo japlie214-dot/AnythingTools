@@ -121,6 +121,33 @@ def sanitize_for_xml(text: str) -> str:
     return text.strip()
 
 
+def clean_summary_bullets(bullets: list[str]) -> list[str]:
+    """Remove common attribution prefixes that the LLM might still produce.
+    Only strips prefixes that appear at the START of a bullet.
+    """
+    prefixes = [
+        "The article says ", "The article states ", "The article notes ",
+        "The article reports ", "The article mentions ", "The writer argues ",
+        "The author argues ", "The author notes ", "The author states ",
+        "According to the article, ", "According to the piece, ",
+        "According to the report, ", "It reports that ", "It notes that ",
+        "It states that ", "The report says ", "The report notes ",
+        "The piece argues ", "The piece notes ",
+    ]
+    cleaned = []
+    for b in bullets:
+        if not b:
+            continue
+        for p in prefixes:
+            if b.lower().startswith(p.lower()):
+                b = b[len(p):].lstrip()
+                break
+        if b and b[0].islower():
+            b = b[0].upper() + b[1:]
+        cleaned.append(b)
+    return cleaned
+
+
 # Stateful Markdown/HTML-aware splitter to avoid breaking code fences and links
 SAFE_MAX_LENGTH = 4000
 

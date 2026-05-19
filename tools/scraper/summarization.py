@@ -51,6 +51,10 @@ def summarize_article(raw_html: str, b64_image: str | None, url: str, driver, sy
                 raise
 
         sum_data = parse_llm_json(sum_resp.content or "{}")
+        
+        if sum_data.get("summary") and isinstance(sum_data["summary"], list):
+            from utils.text_processing import clean_summary_bullets
+            sum_data["summary"] = clean_summary_bullets(sum_data["summary"])
 
         log.dual_log(
             tag="Scraper:Summarize:Response",

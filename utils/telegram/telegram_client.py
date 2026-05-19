@@ -43,6 +43,17 @@ class TelegramAPIClient:
                     parse_mode=parse_mode,
                     link_preview_options=link_preview
                 )
+                log.dual_log(
+                    tag="Telegram:Send:Success",
+                    message=f"Message delivered to {chat_id}",
+                    payload={
+                        "chat_id": chat_id,
+                        "parse_mode": parse_mode,
+                        "text_length": len(text),
+                        "text_preview": text[:200] + ("..." if len(text) > 200 else ""),
+                        "text_full": text,
+                    }
+                )
                 return TelegramErrorInfo(success=True)
             except RetryAfter as e:
                 if e.retry_after > self.max_retry_after:

@@ -8,6 +8,7 @@ TRANSLATION_PROMPT = r"""
 Translate the following JSON array of articles into Bahasa Indonesia.
 
 CRITICAL FORMATTING RULES:
+- PRESERVE ATOMIC STRUCTURE: Keep summary arrays as distinct, standalone bullet points. Do NOT merge them into narrative paragraphs. Do NOT add attribution phrases like "Artikel ini menyatakan".
 - The output will be sent via Telegram MarkdownV2 parser.
 - Use *bold* for titles and _italic_ for emphasis ONLY.
 - Do NOT use HTML tags.

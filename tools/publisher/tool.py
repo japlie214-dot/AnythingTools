@@ -143,6 +143,24 @@ class PublisherTool(BaseTool):
                     pub_status = art.get("publish_status", "UNKNOWN")
                     summary_parts.append(f"**{i}.** [{ulid}] {title} — {pub_status}")
 
+            log.dual_log(
+                tag="Publisher:Tool:Complete",
+                message=f"Publisher tool completed for batch {batch_id}",
+                payload={
+                    "batch_id": batch_id,
+                    "batch_status": batch_status,
+                    "total_items": result["total_items"],
+                    "archive_posted": result["archive_posted"],
+                    "briefing_posted": result.get("briefing_posted", 0),
+                    "translation_failed": result["translation_failed"],
+                    "skipped_items": result.get("skipped_items", 0),
+                    "failed_ulids": result.get("failed_ulids", []),
+                    "job_id": job_id,
+                    "reset": reset,
+                    "finalize": finalize,
+                }
+            )
+
             payload = {
                 "_callback_format": "structured",
                 "tool_name": self.name,
@@ -174,6 +192,20 @@ class PublisherTool(BaseTool):
             summary = f"Publisher pipeline crashed: {str(e)[:200]}\n\nTraceback:\n{tb}"
             # Drop lock and revert to PARTIAL if an extreme rate limit or crash aborts the job
             enqueue_write("UPDATE broadcast_batches SET status = 'PARTIAL', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?", (batch_id,))
+            
+            log.dual_log(
+                tag="Publisher:Tool:Crashed",
+                message=f"Publisher tool crashed for batch {batch_id}",
+                level="ERROR",
+                exc_info=e,
+                payload={
+                    "batch_id": batch_id,
+                    "error": str(e)[:500],
+                    "job_id": job_id,
+                    "reset": reset,
+                }
+            )
+
             payload = {
                 "_callback_format": "structured",
                 "tool_name": self.name,
