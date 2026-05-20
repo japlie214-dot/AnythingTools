@@ -3,23 +3,34 @@ import json
 import config
 from typing import List, Dict
 from utils.logger import get_dual_logger
+from utils.logger.tags import (
+    TELEGRAM_DELIVER_BRIEFING, TELEGRAM_DELIVER_BRIEFING_SUCCESS, TELEGRAM_DELIVER_BRIEFING_FAILED,
+    TELEGRAM_DELIVER_ARCHIVE, TELEGRAM_DELIVER_ARCHIVE_SUCCESS, TELEGRAM_DELIVER_ARCHIVE_FAILED,
+    TELEGRAM_PUBLISH_PROGRESS
+)
 from utils.text_processing import escape_markdown_v2, smart_split_message
 from utils.metadata_helpers import make_metadata, STEP_PUBLISH_BRIEFING, STEP_PUBLISH_ARCHIVE
 from database.job_queue import add_job_item, update_item_status
 from utils.telegram.telegram_client import TelegramAPIClient
+from utils.telegram.types import PublishCounter
 from database.broadcast.writer import mark_detail_published, update_detail_publish_status
 from telegram.constants import ParseMode
 
 log = get_dual_logger(__name__)
 
 class ChannelPublisher:
-    def __init__(self, client: TelegramAPIClient, batch_id: str, job_id: str | None):
+    def __init__(self, client: TelegramAPIClient, batch_id: str, job_id: str | None, counter: PublishCounter | None = None):
         self.client = client
         self.batch_id = batch_id
         self.job_id = job_id
+        self.counter = counter
         self.briefing_chat = getattr(config, 'TELEGRAM_BRIEFING_CHAT_ID', None)
         self.archive_chat = getattr(config, 'TELEGRAM_ARCHIVE_CHAT_ID', None)
         self.max_message_length = getattr(config, 'TELEGRAM_MAX_MESSAGE_LENGTH', 4000)
+
+    def _log_progress(self, phase: str, ulid: str) -> None:
+        if self.counter and self.counter.total_processed % 5 == 0:
+            log.dual_log(tag=TELEGRAM_PUBLISH_PROGRESS, message=f"Publish progress: {self.counter.total_processed}/{self.counter.total_articles}", payload={**self.counter.snapshot(), "phase": phase, "ulid": ulid})
 
     async def publish_briefing(self, articles: List[Dict], translated_map: Dict[str, Dict]) -> None:
         if not self.briefing_chat: return
@@ -54,7 +65,7 @@ class ChannelPublisher:
             body_text = escape_markdown_v2(raw_text)
 
             log.dual_log(
-                tag="Telegram:Delivery:Briefing",
+                tag=TELEGRAM_DELIVER_BRIEFING,
                 message=f"Delivering briefing for {ulid} (resuming from chunk {chunks_sent})",
                 payload={
                     "batch_id": self.batch_id,
@@ -66,10 +77,12 @@ class ChannelPublisher:
                     "body_text_length": len(body_text),
                     "chunks_sent_prior": chunks_sent,
                     "job_id": self.job_id,
+                    **(self.counter.snapshot() if self.counter else {})
                 }
             )
 
             link_success = True
+            msg_count = 0
             if chunks_sent == 0:
                 err1 = await self.client.send_message(self.briefing_chat, link, parse_mode=None, disable_link_preview=True)
                 if not err1.success:
@@ -78,6 +91,7 @@ class ChannelPublisher:
                         raise Exception(f"Transient limit hit: {err1.description}")
                 else:
                     chunks_sent = 1
+                    msg_count += 1
                     if self.job_id: update_item_status(self.job_id, meta, "RUNNING", json.dumps({"chunks_sent": chunks_sent}))
             
             chunks = smart_split_message(body_text, self.max_message_length, ParseMode.MARKDOWN_V2)
@@ -94,16 +108,21 @@ class ChannelPublisher:
                             raise Exception(f"Transient limit hit: {err2.description}")
                         break
                     chunks_sent += 1
+                    msg_count += 1
                     if self.job_id: update_item_status(self.job_id, meta, "RUNNING", json.dumps({"chunks_sent": chunks_sent}))
 
             if link_success and all_chunks_success:
                 mark_detail_published(self.batch_id, ulid, "briefing")
                 if self.job_id: update_item_status(self.job_id, meta, "COMPLETED", json.dumps({"chunks_sent": chunks_sent}))
-                log.dual_log(tag="Telegram:Delivery:Briefing:Success", message=f"Briefing delivered for {ulid}", payload={"batch_id": self.batch_id, "ulid": ulid, "total_chunks_sent": chunks_sent})
+                log.dual_log(tag=TELEGRAM_DELIVER_BRIEFING_SUCCESS, message=f"Briefing delivered for {ulid}", payload={"batch_id": self.batch_id, "ulid": ulid, "total_chunks_sent": chunks_sent})
+                if self.counter: self.counter.increment("briefing", True, msg_count)
             else:
                 update_detail_publish_status(self.batch_id, ulid, "FAILED")
                 if self.job_id: update_item_status(self.job_id, meta, "FAILED", json.dumps({"chunks_sent": chunks_sent}))
-                log.dual_log(tag="Telegram:Delivery:Briefing:Failed", message=f"Briefing delivery failed for {ulid}", level="WARNING", payload={"batch_id": self.batch_id, "ulid": ulid, "chunks_sent": chunks_sent})
+                log.dual_log(tag=TELEGRAM_DELIVER_BRIEFING_FAILED, message=f"Briefing delivery failed for {ulid}", level="WARNING", payload={"batch_id": self.batch_id, "ulid": ulid, "chunks_sent": chunks_sent})
+                if self.counter: self.counter.increment("briefing", False, msg_count)
+            
+            self._log_progress("briefing", ulid)
 
     async def publish_archive(self, articles: List[Dict], translated_map: Dict[str, Dict]) -> None:
         if not self.archive_chat: return
@@ -138,7 +157,7 @@ class ChannelPublisher:
             body_text = escape_markdown_v2(raw_text)
 
             log.dual_log(
-                tag="Telegram:Delivery:Archive",
+                tag=TELEGRAM_DELIVER_ARCHIVE,
                 message=f"Delivering archive for {ulid} (resuming from chunk {chunks_sent})",
                 payload={
                     "batch_id": self.batch_id,
@@ -151,10 +170,12 @@ class ChannelPublisher:
                     "is_top10": article.get("is_top10", False),
                     "chunks_sent_prior": chunks_sent,
                     "job_id": self.job_id,
+                    **(self.counter.snapshot() if self.counter else {})
                 }
             )
 
             link_success = True
+            msg_count = 0
             if chunks_sent == 0:
                 err1 = await self.client.send_message(self.archive_chat, link, parse_mode=None, disable_link_preview=True)
                 if not err1.success:
@@ -163,6 +184,7 @@ class ChannelPublisher:
                         raise Exception(f"Transient limit hit: {err1.description}")
                 else:
                     chunks_sent = 1
+                    msg_count += 1
                     if self.job_id: update_item_status(self.job_id, meta, "RUNNING", json.dumps({"chunks_sent": chunks_sent}))
             
             chunks = smart_split_message(body_text, self.max_message_length, ParseMode.MARKDOWN_V2)
@@ -179,13 +201,18 @@ class ChannelPublisher:
                             raise Exception(f"Transient limit hit: {err2.description}")
                         break
                     chunks_sent += 1
+                    msg_count += 1
                     if self.job_id: update_item_status(self.job_id, meta, "RUNNING", json.dumps({"chunks_sent": chunks_sent}))
 
             if link_success and all_chunks_success:
                 mark_detail_published(self.batch_id, ulid, "archive")
                 if self.job_id: update_item_status(self.job_id, meta, "COMPLETED", json.dumps({"chunks_sent": chunks_sent}))
-                log.dual_log(tag="Telegram:Delivery:Archive:Success", message=f"Archive delivered for {ulid}", payload={"batch_id": self.batch_id, "ulid": ulid, "total_chunks_sent": chunks_sent})
+                log.dual_log(tag=TELEGRAM_DELIVER_ARCHIVE_SUCCESS, message=f"Archive delivered for {ulid}", payload={"batch_id": self.batch_id, "ulid": ulid, "total_chunks_sent": chunks_sent})
+                if self.counter: self.counter.increment("archive", True, msg_count)
             else:
                 update_detail_publish_status(self.batch_id, ulid, "FAILED")
                 if self.job_id: update_item_status(self.job_id, meta, "FAILED", json.dumps({"chunks_sent": chunks_sent}))
-                log.dual_log(tag="Telegram:Delivery:Archive:Failed", message=f"Archive delivery failed for {ulid}", level="WARNING", payload={"batch_id": self.batch_id, "ulid": ulid, "chunks_sent": chunks_sent})
+                log.dual_log(tag=TELEGRAM_DELIVER_ARCHIVE_FAILED, message=f"Archive delivery failed for {ulid}", level="WARNING", payload={"batch_id": self.batch_id, "ulid": ulid, "chunks_sent": chunks_sent})
+                if self.counter: self.counter.increment("archive", False, msg_count)
+
+            self._log_progress("archive", ulid)

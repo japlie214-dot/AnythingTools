@@ -53,6 +53,14 @@ SNOWFLAKE_EMBED_RAW = "Embed:Snowflake:Raw"
 
 # ── Telegram ───────────────────────────────────────────────
 TELEGRAM_RATELIMIT_THROTTLE = "Telegram:RateLimiter:Throttle"
+TELEGRAM_RATELIMIT_RETRY_AFTER = "Telegram:RateLimiter:RetryAfter"
+TELEGRAM_DELIVER_BRIEFING = "Telegram:Deliver:Briefing"
+TELEGRAM_DELIVER_BRIEFING_SUCCESS = "Telegram:Deliver:BriefingSuccess"
+TELEGRAM_DELIVER_BRIEFING_FAILED = "Telegram:Deliver:BriefingFailed"
+TELEGRAM_DELIVER_ARCHIVE = "Telegram:Deliver:Archive"
+TELEGRAM_DELIVER_ARCHIVE_SUCCESS = "Telegram:Deliver:ArchiveSuccess"
+TELEGRAM_DELIVER_ARCHIVE_FAILED = "Telegram:Deliver:ArchiveFailed"
+TELEGRAM_PUBLISH_PROGRESS = "Telegram:Publish:Progress"
 
 # ── DB Normalized (ALL_CAPS -> PascalCase) ──────────────────
 SYS_BLACKBOARD_INIT = "Sys:Blackboard:Init"

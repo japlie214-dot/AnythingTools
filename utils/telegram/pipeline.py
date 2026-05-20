@@ -6,9 +6,11 @@ from utils.telegram.validator import ArticleValidator
 from utils.telegram.translator import BatchTranslator
 from utils.telegram.publisher import ChannelPublisher
 from utils.telegram.telegram_client import TelegramAPIClient
+from utils.telegram.types import PublishCounter
 from database.broadcast.queries import get_details_for_publish, get_batch_articles, get_batch_publish_progress, get_batch_info
 from database.broadcast.writer import update_batch_status_from_details, update_detail_publish_status
 from utils.logger import get_dual_logger
+from utils.logger.tags import TELEGRAM_PUBLISH_PROGRESS
 
 log = get_dual_logger(__name__)
 
@@ -24,6 +26,16 @@ class PublisherPipeline:
         bot_token = getattr(config, 'TELEGRAM_BOT_TOKEN', None)
         self.client = TelegramAPIClient(bot_token=bot_token) if bot_token else None
         self.all_articles = get_batch_articles(batch_id)
+        
+        progress = get_batch_publish_progress(batch_id)
+        self.counter = PublishCounter(
+            batch_id=batch_id,
+            total_articles=len(self.all_articles),
+            total_briefing=len(self.top_10),
+            total_archive=len(self.all_articles),
+            briefing_sent=progress.get("PUBLISHED_BRIEFING", 0),
+            archive_sent=progress.get("PUBLISHED_ARCHIVE", 0),
+        )
 
     async def run_pipeline(self) -> Dict[str, Any]:
         pending_articles = get_details_for_publish(self.batch_id) if (self.resume and not self.reset) else self.all_articles
@@ -50,10 +62,11 @@ class PublisherPipeline:
             raise RuntimeError(f"Publisher translation crashed: {e}") from e
 
         if self.client:
-            publisher = ChannelPublisher(self.client, self.batch_id, self.job_id)
+            publisher = ChannelPublisher(self.client, self.batch_id, self.job_id, counter=self.counter)
+            log.dual_log(tag=TELEGRAM_PUBLISH_PROGRESS, message=f"Starting Telegram delivery for batch {self.batch_id}", payload=self.counter.snapshot())
             await publisher.publish_briefing(valid_articles, translated_map)
             await publisher.publish_archive(valid_articles, translated_map)
-            await self.client.close()
+            await self.client.shutdown()
 
         update_batch_status_from_details(self.batch_id)
         progress = get_batch_publish_progress(self.batch_id)
@@ -65,6 +78,9 @@ class PublisherPipeline:
 
         batch_info = get_batch_info(self.batch_id)
         batch_status = batch_info["status"] if batch_info else "FAILED"
+        
+        c_snap = self.counter.snapshot()
+        log.dual_log(tag=TELEGRAM_PUBLISH_PROGRESS, message=f"Publishing complete for batch {self.batch_id}", payload=c_snap)
 
         return {
             "batch_status": batch_status,
@@ -75,4 +91,6 @@ class PublisherPipeline:
             "briefing_posted": published_briefing,
             "archive_posted": published_archive,
             "failed_ulids": list(translator.failed_ulids),
+            "messages_sent": c_snap["messages_sent"],
+            "counter_summary": c_snap,
         }

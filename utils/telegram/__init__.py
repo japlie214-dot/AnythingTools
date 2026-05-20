@@ -6,8 +6,8 @@ handshakes, or notifications may be sent proactively by the system. Telegram mes
 is EXCLUSIVELY permitted when explicitly requested by a user-initiated job
 (e.g., via the `publisher` tool).
 """
-from utils.telegram.types import TelegramErrorInfo, PhaseState
-from utils.telegram.rate_limiter import GlobalRateLimiter
+from utils.telegram.types import TelegramErrorInfo, PhaseState, PublishCounter
+from utils.telegram.rate_limiter import SlidingWindowRateLimiter, GlobalRateLimiter
 from utils.telegram.telegram_client import TelegramAPIClient
 from utils.telegram.state_manager import PhaseStateManager
 from utils.telegram.validator import ArticleValidator
@@ -18,6 +18,8 @@ from utils.telegram.pipeline import PublisherPipeline
 __all__ = [
     "TelegramErrorInfo",
     "PhaseState",
+    "PublishCounter",
+    "SlidingWindowRateLimiter",
     "GlobalRateLimiter",
     "TelegramAPIClient",
     "PhaseStateManager",

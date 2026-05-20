@@ -18,6 +18,17 @@ class TelegramAPIClient:
         self.max_retry_after = max_retry_after
         self.message_delay = message_delay
         self.rate_limiter = GlobalRateLimiter()
+        
+        if self.message_delay != 3.1:
+            log.dual_log(
+                tag="Telegram:Client:Config",
+                message="message_delay is deprecated. SlidingWindowRateLimiter uses PTB defaults.",
+                level="WARNING",
+                payload={"provided_delay": self.message_delay}
+            )
+
+    def _is_group_chat(self, chat_id: str) -> bool:
+        return str(chat_id).startswith("-") or str(chat_id).startswith("@")
 
     async def send_message(
         self,
@@ -34,8 +45,10 @@ class TelegramAPIClient:
         retries = 0
         max_retries = 3
 
+        is_group = self._is_group_chat(chat_id)
+        
         while retries < max_retries:
-            await self.rate_limiter.wait_and_block(chat_id, self.message_delay)
+            await self.rate_limiter.wait_and_block(chat_id, is_group=is_group)
             try:
                 await self._bot.send_message(
                     chat_id=chat_id,
@@ -51,11 +64,12 @@ class TelegramAPIClient:
                         "parse_mode": parse_mode,
                         "text_length": len(text),
                         "text_preview": text[:200] + ("..." if len(text) > 200 else ""),
-                        "text_full": text,
+                        "rate_limiter_stats": self.rate_limiter.get_stats(),
                     }
                 )
                 return TelegramErrorInfo(success=True)
             except RetryAfter as e:
+                self.rate_limiter.record_retry_after(e.retry_after)
                 if e.retry_after > self.max_retry_after:
                     return TelegramErrorInfo(success=False, is_transient=True, retry_after=e.retry_after, description="Extreme rate limit")
                 log.dual_log(
@@ -64,7 +78,7 @@ class TelegramAPIClient:
                     level="WARNING",
                     payload={"chat_id": chat_id, "retry_after": e.retry_after, "attempt": retries + 1, "max_retries": max_retries}
                 )
-                await asyncio.sleep(e.retry_after)
+                await asyncio.sleep(e.retry_after + 0.1)
                 retries += 1
             except TelegramError as e:
                 error_msg = str(e).lower()
@@ -74,6 +88,14 @@ class TelegramAPIClient:
                 
         return TelegramErrorInfo(success=False, is_transient=True, description="Max retries exhausted")
 
-    async def close(self):
+    async def shutdown(self) -> None:
         if self._bot:
-            await self._bot.close()
+            try:
+                await self._bot.shutdown()
+                log.dual_log(tag="Telegram:Client:Shutdown", message="Bot shut down locally", payload={})
+            except Exception as e:
+                log.dual_log(tag="Telegram:Client:Shutdown", message=f"Shutdown non-fatal error: {e}", level="WARNING", payload={"error": str(e)})
+
+    async def close(self) -> None:
+        log.dual_log(tag="Telegram:Client:Deprecated", message="close() is deprecated, mapping to shutdown()", level="WARNING", payload={})
+        await self.shutdown()

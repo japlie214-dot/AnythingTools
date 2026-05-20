@@ -38,7 +38,7 @@ The system follows a **Producer-Consumer** pattern with a shared database for st
     - `connection.py`: Manages read-only and write connections.
     - `writer.py`: The single-threaded write queue implementation.
     - `schemas/`: SQL definitions for jobs, logs, and articles.
-    - `broadcast/`: Specialized logic for Telegram batch publishing.
+    - `broadcast/`: Specialized logic for Telegram batch publishing, including state-seeded progress tracking and rate-limited delivery.
 - `deprecated/`: Contains legacy versions of the agent, tools, and modes (e.g., `bot/core/agent.py`), serving as evidence of architectural evolution.
 - `tools/`:
     - `base.py`: Abstract base class for all tools.
@@ -53,6 +53,7 @@ The system follows a **Producer-Consumer** pattern with a shared database for st
 - **BaseTool**: All tools must inherit from this, implementing `execute()`.
 - **SoM (Semantic Object Model)**: A technique of injecting `data-ai-id` attributes into the DOM to allow the LLM to reference specific elements deterministically.
 - **WriteReceipt**: A synchronization primitive allowing asynchronous writes to be awaited.
+- **Sliding Window Rate Limiter**: A proactive traffic control mechanism that reserves future timestamps to ensure strict pacing of API requests and prevent 429 flood limits.
 
 ### Invariants
 - **Single Writer**: Only one thread may write to the primary database to prevent `database is locked` errors.
@@ -114,6 +115,7 @@ The system follows a **Producer-Consumer** pattern with a shared database for st
 - **SQLite Locking**: Despite the single-writer thread, high-concurrency reads during heavy writes can still encounter timeouts.
 - **Browser Stability**: Browser-based tools are susceptible to DOM changes, mitigated partially by SoM.
 - **Memory**: The `UnifiedWorkerManager` keeps active job threads in memory; extremely large batches may increase memory pressure.
+- **Telegram API Constraints**: Delivery is subject to strict rate limits (overall and per-group), managed via a sliding window reservation system.
 
 ## 12. Change Sensitivity
 - **Fragile Areas**: `database/writer.py` is the most critical point; any change to the queue logic can corrupt the entire state.
