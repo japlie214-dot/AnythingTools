@@ -77,6 +77,7 @@ def process_article(
                 skip_result = check_video_audio_skip(raw_html, url)
                 if skip_result:
                     local_meta["retryable"] = False
+                    local_meta["auto_skipped"] = True
                     _sync_meta("SKIPPED")
                     return skip_result
 
@@ -89,14 +90,16 @@ def process_article(
                     local_meta["validation_passed"] = True
                     _sync_meta("RUNNING")
                 elif pw_decision == "skip":
+                    local_meta["hitl_reason"] = "Paywall detected"
                     return {"status": "SKIPPED", "reason": "User skipped after HITL: Paywall detected"}
                 elif pw_decision == "cancel":
+                    local_meta["hitl_reason"] = "Paywall detected"
                     return {"status": "CANCELED", "reason": "User requested stop via HITL."}
 
             if local_meta.get("validation_passed"):
                 pass
             else:
-                action, val_data = validate_article(raw_html, b64_image, url, sync_llm_chat)
+                action, val_data, hitl_reason = validate_article(raw_html, b64_image, url, sync_llm_chat)
                 
                 log.dual_log(
                     tag="Scraper:Validation:Verdict",
@@ -114,13 +117,15 @@ def process_article(
                 if action == ValidationAction.AUTO_SKIP:
                     reason = val_data.get("reason", "unknown") if val_data else "unknown"
                     local_meta["retryable"] = False
+                    local_meta["auto_skipped"] = True
                     _sync_meta("SKIPPED")
                     return {"status": "SKIPPED", "reason": f"Auto-skipped: {reason}"}
                 elif action == ValidationAction.HUMAN_HELP:
                     reason = val_data.get("reason", "unknown") if val_data else "unknown"
+                    hitl_display = hitl_reason if hitl_reason else reason
                     if cancellation_flag is not None and cancellation_flag.is_set():
                         return {"status": "CANCELED", "reason": "User requested stop via Human Help mode."}
-                    decision = _hitl_state.request_decision(job_id, url, f"BLOCKED PAGE - Action Required: {reason}")
+                    decision = _hitl_state.request_decision(job_id, url, f"BLOCKED PAGE - Action Required: {hitl_display}")
                     if decision == "proceed":
                         wait_for_dom_stability(driver)
                         raw_html, _ = extract_hybrid_html(driver)
@@ -128,8 +133,10 @@ def process_article(
                         local_meta["validation_passed"] = True
                         _sync_meta("RUNNING")
                     elif decision == "skip":
-                        return {"status": "SKIPPED", "reason": f"User skipped after HITL: {reason}"}
+                        local_meta["hitl_reason"] = hitl_display
+                        return {"status": "SKIPPED", "reason": f"User skipped after HITL: {hitl_display}"}
                     elif decision == "cancel":
+                        local_meta["hitl_reason"] = hitl_display
                         if cancellation_flag is not None:
                             cancellation_flag.set()
                         return {"status": "CANCELED", "reason": "User requested stop via HITL."}

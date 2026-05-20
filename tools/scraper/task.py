@@ -164,6 +164,7 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
 
     # ── Article processing loop ────────────────────────────────────────────
     results: dict[str, dict] = {}
+    _job_final_status: str = "COMPLETED"
 
     from database.job_queue import update_item_status as _upd
     _stats = {
@@ -345,8 +346,8 @@ def _run_botasaurus_scraper_inner(driver: Driver, data: dict) -> dict:
     # Job finalized status
     total_successful_outcomes = _stats["success"] + _stats["skipped_auto_current"]
     all_embedded = (total_successful_outcomes == total_attempted) and (total_attempted > 0)
-    job_final_status = "COMPLETED"
-    if _stats["fail"] > 0 or (total_attempted > 0 and not all_embedded) or _job_final_status == "PARTIAL":
+    job_final_status = _job_final_status
+    if _stats["fail"] > 0 or (total_attempted > 0 and not all_embedded):
         job_final_status = "PARTIAL"
 
     log.dual_log(

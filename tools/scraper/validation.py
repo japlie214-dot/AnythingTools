@@ -37,7 +37,7 @@ def check_paywall(raw_html: str, url: str, job_id: str | None, cancellation_flag
         return decision
     return None
 
-def validate_article(raw_html: str, b64_image: str | None, url: str, sync_llm_chat) -> tuple[ValidationAction, dict | None]:
+def validate_article(raw_html: str, b64_image: str | None, url: str, sync_llm_chat) -> tuple[ValidationAction, dict | None, str | None]:
     slim_val  = raw_html[:15000]
     val_msgs  = _build_multimodal_messages(
         VALIDATION_PROMPT,
@@ -69,6 +69,11 @@ def validate_article(raw_html: str, b64_image: str | None, url: str, sync_llm_ch
         except ValueError:
             log.dual_log(tag="Scraper:Validation:Error", message=f"Unknown action '{action_str}', defaulting to human_help", level="WARNING", payload={"url": url})
             action = ValidationAction.HUMAN_HELP
-        return action, val_data
+            
+        hitl_reason = val_data.get("hitl_reason")
+        if hitl_reason:
+            hitl_reason = str(hitl_reason)[:100]
+            
+        return action, val_data, hitl_reason
 
-    return ValidationAction.PROCEED, None
+    return ValidationAction.PROCEED, None, None

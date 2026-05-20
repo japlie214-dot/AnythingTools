@@ -18,11 +18,16 @@ TASK: Determine whether the page displays genuine, readable article content or i
 5. Navigation pages, tag listings, search results with no article
 
 ## HUMAN_HELP TRIGGERS (operator must intervene):
-1. Cookie/consent banners blocking the entire page
-2. CAPTCHA challenges (reCAPTCHA, hCaptcha, etc.)
-3. Newsletter/subscription popups covering article content
-4. Age gates or region locks
-5. Paywalls where content exists but requires login/subscription
+1. CAPTCHA challenges (reCAPTCHA, hCaptcha, etc.) that prevent page interaction
+2. Full-page consent overlays that cannot be dismissed and completely hide article content
+3. Paywalls that block ALL article text (not just "read more" truncation)
+4. Age gates or region locks that prevent page access entirely
+
+## DO NOT TRIGGER HUMAN_HELP FOR:
+1. Small cookie banners that only cover part of the viewport.
+2. Newsletter popups that can be dismissed or ignored.
+3. Pages that have article text AND embedded audio/video — supplemental media is NOT a blocker.
+4. Partial paywalls ("Read more" truncation after several paragraphs).
 
 ## PROCEED TRIGGERS:
 - News articles with substantial text
@@ -34,11 +39,13 @@ TASK: Determine whether the page displays genuine, readable article content or i
 {
   "valid": true/false,
   "action": "proceed"/"auto_skip"/"human_help",
-  "reason": "One sentence explaining the classification"
+  "reason": "One sentence explaining the classification",
+  "hitl_reason": "Specific human-readable blocker description (max 100 chars) OR null if not human_help"
 }
 
 When valid=true, action MUST be "proceed".
 When valid=false, action MUST be either "auto_skip" or "human_help".
+When action="human_help", hitl_reason MUST be a string describing the blocker.
 
 ### PAGE CONTENT
 """
@@ -58,9 +65,13 @@ VALIDATION_SCHEMA = {
         "reason": {
             "type": "string",
             "description": "One sentence explaining the classification decision"
+        },
+        "hitl_reason": {
+            "type": ["string", "null"],
+            "description": "Specific human-readable blocker description (max 100 chars) if action is human_help, otherwise null"
         }
     },
-    "required": ["valid", "action", "reason"],
+    "required": ["valid", "action", "reason", "hitl_reason"],
     "additionalProperties": False
 }
 

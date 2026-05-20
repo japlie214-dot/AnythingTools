@@ -134,7 +134,7 @@ class ChannelPublisher:
                         chunks_sent = json.loads(row["output_data"]).get("chunks_sent", 0)
                     except: pass
 
-            raw_text = f"{title}\n\nKesimpulan: {conclusion}\n\nRingkasan:\n{summary}"
+            raw_text = f"{title}\n\n{conclusion}\n\n{summary}"
             body_text = escape_markdown_v2(raw_text)
 
             log.dual_log(
