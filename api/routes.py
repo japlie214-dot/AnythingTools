@@ -336,7 +336,7 @@ async def diagnostics():
 async def resume_job(job_id: str):
     """Resume an INTERRUPTED, FAILED, or PARTIAL job safely."""
     conn = DatabaseManager.get_read_connection()
-    row = conn.execute("SELECT tool_name, status, args_json FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    row = conn.execute("SELECT tool_name, status, args_json, resume_count FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -366,8 +366,13 @@ async def resume_job(job_id: str):
     if not report.resumable:
         raise HTTPException(status_code=400, detail=report.message)
 
+    resume_count = row["resume_count"] if row["resume_count"] is not None else 0
+    if resume_count >= getattr(config, "MAX_RESUME_ATTEMPTS", 3):
+        enqueue_write("UPDATE jobs SET status = 'FAILED', updated_at = ? WHERE job_id = ?", (now_iso(), job_id))
+        raise HTTPException(status_code=400, detail="Maximum resume attempts exceeded (Poison pill protection).")
+
     enqueue_write(
-        "UPDATE jobs SET status = 'QUEUED', updated_at = ? WHERE job_id = ?",
+        "UPDATE jobs SET status = 'QUEUED', resume_count = resume_count + 1, updated_at = ? WHERE job_id = ?",
         (now_iso(), job_id),
     )
 

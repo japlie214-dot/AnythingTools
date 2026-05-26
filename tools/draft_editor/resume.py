@@ -8,6 +8,9 @@ class ResumeHandler(BaseResumeHandler):
             resumable=False,
             items_completed=0,
             items_pending=0,
-            message="Draft Editor does not support resumption.",
-            details=None,
+            message="Draft Editor does not support resumption. Transactions are atomic.",
+            details={
+                "tool": "draft_editor",
+                "suggestion": "Re-run draft_editor with corrected operations. Changes are only committed on success."
+            },
         )

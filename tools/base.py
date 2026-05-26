@@ -8,7 +8,51 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
+from enum import Enum
+from dataclasses import dataclass, field
+
+class FailureSeverity(str, Enum):
+    TRANSIENT = "transient"
+    PERMANENT = "permanent"
+    CONFIGURATION = "configuration"
+    DATA = "data"
+
+@dataclass
+class StatusOverride:
+    description: str
+    severity: FailureSeverity = FailureSeverity.TRANSIENT
+    next_steps: str = "No action required."
+    rerunnable: bool = False
+    diagnostics: Optional[list[str]] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "description": self.description,
+            "severity": self.severity.value,
+            "next_steps": self.next_steps,
+            "rerunnable": self.rerunnable,
+            "diagnostics": self.diagnostics or []
+        }
+
+@dataclass
+class JobStatusReport:
+    status: str
+    summary: str
+    status_overrides: dict[str, StatusOverride] = field(default_factory=dict)
+    details: Optional[dict[str, Any]] = None
+    attachment_paths: Optional[list[str]] = None
+
+    def to_callback_dict(self, tool_name: str) -> dict:
+        overrides_dict = {k: v.to_dict() for k, v in self.status_overrides.items()}
+        return {
+            "_callback_format": "structured",
+            "tool_name": tool_name,
+            "status": self.status,
+            "summary": self.summary,
+            "status_overrides": overrides_dict,
+            "details": self.details or {},
+        }
 
 
 @dataclass

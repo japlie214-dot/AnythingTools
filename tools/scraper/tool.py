@@ -198,7 +198,11 @@ class ScraperTool(BaseTool):
                 ))
             return asyncio.run_coroutine_threadsafe(_call(), loop).result(timeout=300)
 
-        is_resume = kwargs.get("is_resume", False)
+        from database.connection import DatabaseManager
+        conn = DatabaseManager.get_read_connection()
+        items_exist = conn.execute("SELECT 1 FROM job_items WHERE job_id = ? LIMIT 1", (job_id,)).fetchone() if job_id else None
+        is_resume = items_exist is not None
+
         if is_resume:
             await telemetry(self.status(f"Resuming headful scraper for {target_site}..."))
         else:

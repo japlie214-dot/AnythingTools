@@ -1,8 +1,13 @@
 """database/backup/__init__.py
-Parquet Backup & Restore module for scraped articles.
+Backup & Restore module for scraped articles.
 
-Provides watermark-based delta export, immutable Parquet file storage,
+Provides watermark-based delta export, immutable file storage,
 and full restore capability with deduplication.
+
+DEVELOPER NOTICE:
+Dropping and recreating the database is the acceptable workflow for this environment.
+Always use the established backup and hydrate mechanism for state transitions.
+Do NOT write or add custom SQLite migration scripts.
 """
 
 from database.backup.runner import BackupRunner

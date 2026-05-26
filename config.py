@@ -31,6 +31,7 @@ TELEMETRY_DRY_RUN: bool = os.getenv("TELEMETRY_DRY_RUN", "false").lower() in ("t
 # --- Job Watchdog Settings ---
 JOB_WATCH_INTERVAL_SECONDS: int = int(os.getenv("JOB_WATCH_INTERVAL_SECONDS", "300"))
 JOB_STALE_THRESHOLD_SECONDS: int = int(os.getenv("JOB_STALE_THRESHOLD_SECONDS", str(8 * 3600)))
+MAX_RESUME_ATTEMPTS: int = int(os.getenv("MAX_RESUME_ATTEMPTS", "3"))
 
 # --- Artifacts Root ---
 ANYTHINGLLM_ARTIFACTS_DIR: str | None = os.getenv("ANYTHINGLLM_ARTIFACTS_DIR")
