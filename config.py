@@ -56,6 +56,9 @@ SNOWFLAKE_DATABASE: str | None = os.getenv("SNOWFLAKE_DATABASE")
 SNOWFLAKE_SCHEMA: str | None = os.getenv("SNOWFLAKE_SCHEMA")
 SNOWFLAKE_PRIVATE_KEY_PATH: str = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH", "snowflake_private_key.p8")
 
+# --- EDGAR Configuration ---
+EDGAR_IDENTITY: str | None = os.getenv("EDGAR_IDENTITY")
+
 # --- Google ---
 GOOGLE_API_KEY: str | None = os.getenv("GOOGLE_API_KEY")
 
@@ -90,7 +93,7 @@ BATCH_READER_KEYWORD_WEIGHT: float = float(os.getenv("BATCH_READER_KEYWORD_WEIGH
 LLM_CONTEXT_CHAR_LIMIT: int = int(os.getenv("LLM_CONTEXT_CHAR_LIMIT", "800000"))
 CALLBACK_TRUNCATION_MULTIPLIER: float = float(os.getenv("CALLBACK_TRUNCATION_MULTIPLIER", "0.5"))
 
-# --- Parquet Backup Configuration ---
+# --- Backup Configuration ---
 BACKUP_ONEDRIVE_DIR: str = os.getenv("BACKUP_ONEDRIVE_DIR", "")
 BACKUP_BATCH_SIZE: int = int(os.getenv("BACKUP_BATCH_SIZE", "1000"))
 BACKUP_COMPRESSION: str = os.getenv("BACKUP_COMPRESSION", "zstd")

@@ -15,6 +15,11 @@ log = get_dual_logger(__name__)
 
 async def init_database_layer() -> None:
     """Initialize database layer with explicit file probing and fresh logs.db policy."""
+    import config
+    if not getattr(config, "EDGAR_IDENTITY", None):
+        sys.stderr.write("[FATAL] EDGAR_IDENTITY environment variable is missing. Aborting startup.\n")
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
     # Fresh Start Policy: Wipe ephemeral logs.db
     try:
         if LOGS_DB_PATH.exists():

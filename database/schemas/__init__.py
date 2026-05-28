@@ -3,7 +3,7 @@
 import re
 from typing import Dict, Optional
 from database.connection import SQLITE_VEC_AVAILABLE
-from database.schemas import jobs, finance, vector, pdf, token, logs
+from database.schemas import jobs, finance, vector, pdf, token, logs, stock_notes
 
 # RULE: MASTER_TABLES must be an ordered list (parents before children) for FK-safe restores.
 # RULE: Derived/External FTS tables (e.g., scraped_articles_fts) must NEVER be included here.
@@ -22,7 +22,7 @@ ALL_FTS_TABLES: Dict[str, str] = {
 }
 
 ALL_TABLES: Dict[str, str] = {
-    **jobs.TABLES, **finance.TABLES, **vector.TABLES, **pdf.TABLES, **token.TABLES
+    **jobs.TABLES, **finance.TABLES, **vector.TABLES, **pdf.TABLES, **token.TABLES, **stock_notes.TABLES
 }
 
 ALL_VEC_TABLES: Dict[str, str] = {

@@ -107,6 +107,10 @@ class SchemaReconciler:
                 log.dual_log(tag="Database:Schema:PreserveShadow", message=f"[{self.label}] Preserving shadow: {table}", payload={"label": self.label, "table": table, "action": "preserve_shadow"})
                 continue
             
+            if table.startswith("sn_dt_"):
+                log.dual_log(tag="Database:Schema:PreserveDynamic", message=f"[{self.label}] Preserving dynamic table: {table}", payload={"label": self.label, "table": table, "action": "preserve_dynamic"})
+                continue
+            
             if table not in expected:
                 log.dual_log(tag="Database:Schema:DropUnexpected", level="WARNING", message=f"[{self.label}] Dropping unexpected table: {table}", payload={"label": self.label, "table": table, "action": "drop_unexpected"})
                 self.conn.execute(f"DROP TABLE IF EXISTS {table}")
