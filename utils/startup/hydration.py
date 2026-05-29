@@ -7,41 +7,32 @@ from utils.logger import get_dual_logger
 log = get_dual_logger(__name__)
 
 async def hydrate_from_backup() -> None:
-    """Startup phase: hydrate database from Parquet backup files."""
     config = BackupConfig.from_global_config()
-    if not config.enabled:
-        log.dual_log(tag="Startup:Hydration:Disabled", message="Backup disabled, skipping hydration", level="INFO", payload={"action": "skip", "reason": "backup_disabled"})
+    if not config.enabled or not config.backup_dir.exists():
+        log.dual_log(tag="Startup:Hydration:Skip", message="Backup disabled or missing", level="INFO", payload={"action": "skip"})
         return
         
-    if not config.backup_dir.exists():
-        log.dual_log(tag="Startup:Hydration:NoBackup", message="No backup directory found, skipping hydration", level="INFO", payload={"action": "skip", "reason": "no_backup_dir", "path": str(config.backup_dir)})
-        return
-        
-    log.dual_log(tag="Startup:Hydration:Started", message="Starting Parquet backup hydration", level="INFO", payload={"backup_dir": str(config.backup_dir)})
+    log.dual_log(tag="Startup:Hydration:Started", message="Starting unified JSON backup hydration", level="INFO", payload={"backup_dir": str(config.backup_dir)})
     
-    try:
-        from database.articles.bootstrap import reconcile_article_store
-        await asyncio.to_thread(reconcile_article_store)
-        log.dual_log(tag="Startup:Hydration:Articles", message="Article reconciliation complete", level="INFO", payload={"phase": "articles", "status": "success"})
-    except Exception as e:
-        log.dual_log(tag="Startup:Hydration:ArticleError", message=f"Article reconciliation failed: {e}", level="CRITICAL", exc_info=e, payload={"phase": "articles", "error": str(e)})
-        raise RuntimeError(f"Article reconciliation failed: {e}") from e
-        
-    try:
-        from database.backup.restore import restore_master_tables_direct
-        
-        def _do_restore():
-            # Acquire connection INSIDE the background thread to satisfy SQLite thread-locality
-            conn = DatabaseManager.get_read_connection()
-            return restore_master_tables_direct(conn)
-            
-        result = await asyncio.to_thread(_do_restore)
-        if result.success:
-            log.dual_log(tag="Startup:Hydration:MasterTables", message="Master table hydration complete", level="INFO", payload={"phase": "master_tables", "status": "success", "restored_counts": result.restored_counts, "duration_s": result.duration_seconds})
-        else:
-            log.dual_log(tag="Startup:Hydration:MasterTableWarning", message=f"Master table hydration partial: {result.error}", level="WARNING", payload={"phase": "master_tables", "error": result.error})
-    except Exception as e:
-        log.dual_log(tag="Startup:Hydration:MasterTableError", message=f"Master table hydration failed: {e}", level="CRITICAL", exc_info=e, payload={"phase": "master_tables", "error": str(e)})
-        raise RuntimeError(f"Master table hydration failed: {e}") from e
+    def _do_reconcile():
+        from database.backup.store_registry import StoreRegistry
+        from database.connection import DatabaseManager
+        conn = DatabaseManager.get_read_connection()
+        stores = StoreRegistry.get_all_stores()
+        results = {}
+        for name, store in stores.items():
+            try:
+                if hasattr(store, "reconcile"):
+                    summary = store.reconcile(conn)
+                    results[name] = summary
+                    log.dual_log(tag="Startup:Hydration:Store", message=f"Reconciled {name}", level="INFO", payload={"table": name, **summary})
+            except Exception as e:
+                log.dual_log(tag="Startup:Hydration:StoreError", message=f"Failed to reconcile {name}: {e}", level="ERROR", payload={"table": name, "error": str(e)})
+        return results
 
-    log.dual_log(tag="Startup:Hydration:Complete", message="Backup hydration completed successfully", level="INFO", payload={"status": "success"})
+    try:
+        result = await asyncio.to_thread(_do_reconcile)
+        log.dual_log(tag="Startup:Hydration:Complete", message="Backup hydration completed successfully", level="INFO", payload={"status": "success", "results": result})
+    except Exception as e:
+        log.dual_log(tag="Startup:Hydration:Error", message=f"Hydration failed: {e}", level="CRITICAL", exc_info=e, payload={"error": str(e)})
+        raise RuntimeError(f"Hydration failed: {e}") from e

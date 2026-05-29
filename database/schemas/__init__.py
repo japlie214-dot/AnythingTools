@@ -10,11 +10,11 @@ from database.schemas import jobs, finance, vector, pdf, token, logs, stock_note
 # They cannot be restored directly and must be rebuilt post-restoration.
 MASTER_TABLES: list[str] = [
     "scraped_articles",
-    "scraped_articles_vec",
-    "long_term_memories",
-    "long_term_memories_vec",
     "broadcast_batches",
     "broadcast_details",
+    "sn_filings",
+    "sn_notes",
+    "sn_detail_registry",
 ]
 
 ALL_FTS_TABLES: Dict[str, str] = {
@@ -22,11 +22,11 @@ ALL_FTS_TABLES: Dict[str, str] = {
 }
 
 ALL_TABLES: Dict[str, str] = {
-    **jobs.TABLES, **finance.TABLES, **vector.TABLES, **pdf.TABLES, **token.TABLES, **stock_notes.TABLES
+    **jobs.TABLES, **vector.TABLES, **stock_notes.TABLES
 }
 
 ALL_VEC_TABLES: Dict[str, str] = {
-    **jobs.VEC_TABLES, **finance.VEC_TABLES, **vector.VEC_TABLES, **pdf.VEC_TABLES, **token.VEC_TABLES
+    **jobs.VEC_TABLES, **vector.VEC_TABLES
 }
 
 ALL_TRIGGERS: Dict[str, str] = {

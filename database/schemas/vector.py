@@ -17,20 +17,6 @@ CREATE INDEX idx_scraped_articles_url ON scraped_articles(url);
 CREATE INDEX idx_scraped_articles_status ON scraped_articles(embedding_status);
 CREATE INDEX idx_scraped_articles_vec_rowid ON scraped_articles(vec_rowid);
 """,
-    "long_term_memories": """CREATE TABLE long_term_memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            agent_domain TEXT,
-            topic TEXT NOT NULL,
-            memory TEXT NOT NULL,
-            embedding BLOB,
-            type TEXT NOT NULL DEFAULT 'Knowledge',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-CREATE INDEX idx_memories_agent_domain ON long_term_memories(agent_domain, type, created_at DESC);
-CREATE INDEX idx_memories_session_type ON long_term_memories(session_id, type, created_at DESC);
-""",
 }
 
 FTS_TABLES = {
@@ -41,8 +27,6 @@ FTS_TABLES = {
 
 VEC_TABLES = {
     "scraped_articles_vec": """CREATE VIRTUAL TABLE IF NOT EXISTS scraped_articles_vec USING vec0(embedding float[1024]);
-""",
-    "long_term_memories_vec": """CREATE VIRTUAL TABLE IF NOT EXISTS long_term_memories_vec USING vec0(embedding float[1024]);
 """,
 }
 

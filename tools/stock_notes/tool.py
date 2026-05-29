@@ -42,10 +42,15 @@ class StockNotesTool(BaseTool):
             
             if not filings: return _fail(f"No filings found for {ticker}", "Verify the ticker.")
             
-            lines = [f"Found {len(filings)} filings for {ticker}. Newest first:"]
+            form_counts = {}
+            for f in filings:
+                form_counts[f['form']] = form_counts.get(f['form'], 0) + 1
+            count_detail = ', '.join(f"{k}: {v}" for k, v in sorted(form_counts.items()))
+            
+            lines = [f"Found {len(filings)} filings for {ticker} ({count_detail}). Newest first:"]
             for f in filings[:10]:
                 lines.append(f"- {f['form']} | {f['filing_date']} | Accession: {f['accession_no']}")
-            lines.append("Use `note <accession_no>` to explore notes.")
+            lines.append('To explore notes, use command "note" with instructions {"accession_no": "<accession_no>"}')
             
             return _success("\n".join(lines), {"filings": filings})
             

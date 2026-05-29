@@ -89,7 +89,6 @@ class ArticleDeleteResult:
 class ArticleWriteResult:
     success: bool
     article_id: str
-    parquet_path: Optional[str] = None
     receipt: Optional[Any] = None
     error: Optional[str] = None
     embedding_success: bool = False

@@ -159,6 +159,11 @@ class BaseTool(abc.ABC):
                 payload={"args": args, "kwargs": kwargs},
             )
             result = await self.run(args, telemetry, **kwargs)
+            _base_log.dual_log(
+                tag=f"Tool:{self.name}:Complete",
+                message=f"Execution of {self.name} completed",
+                payload={"job_id": job_id, "success": True, "output_len": len(result) if result else 0}
+            )
             return ToolResult(output=result or "", success=True)
         finally:
             try:

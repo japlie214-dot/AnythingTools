@@ -2,14 +2,14 @@
 import json
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict, Tuple
+from pathlib import Path
 
 from database.connection import DatabaseManager
 from database.writer import enqueue_write
 from database.backup.config import BackupConfig
 from database.backup.models import ExportResult, RestoreResult
-from database.backup.storage import export_all_tables, read_watermark, list_backup_files
-from database.backup.restore import restore_master_tables_direct
+from database.backup.store_registry import StoreRegistry
 from utils.browser_lock import browser_lock
 from utils.logger import get_dual_logger
 from utils.id_generator import ULID
@@ -18,6 +18,57 @@ log = get_dual_logger(__name__)
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def read_watermark(config: BackupConfig) -> dict:
+    if not config.watermark_path().exists():
+        return {}
+    try:
+        with open(config.watermark_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def list_backup_files(config: BackupConfig) -> Tuple[int, Dict[str, int]]:
+    counts = {}
+    total_size = 0
+    stores = StoreRegistry.get_all_stores()
+    for name, store in stores.items():
+        files = list(store.backup_dir.glob("*.json"))
+        counts[name] = len(files)
+        total_size += sum(f.stat().st_size for f in files)
+        bin_files = list(store.backup_dir.glob("*.bin"))
+        total_size += sum(f.stat().st_size for f in bin_files)
+    return total_size, counts
+
+def export_all_tables(conn, config: Optional[BackupConfig] = None, mode: str = "full") -> ExportResult:
+    start = time.monotonic()
+    total_counts = {}
+    try:
+        stores = StoreRegistry.get_all_stores()
+        for name, store in stores.items():
+            if hasattr(store, "export_from_sqlite"):
+                res = store.export_from_sqlite(conn)
+                total_counts[name] = res.get("exported", 0)
+            if mode == "full" and hasattr(store, "cleanup_orphaned_files"):
+                store.cleanup_orphaned_files(conn)
+        return ExportResult(success=True, exported_counts=total_counts, duration_seconds=time.monotonic() - start)
+    except Exception as e:
+        log.dual_log(tag="Backup:Export:Error", message=f"Failed: {e}", level="ERROR", exc_info=e, payload={"error": str(e)})
+        return ExportResult(success=False, error=str(e), duration_seconds=time.monotonic() - start)
+
+def restore_master_tables_direct(conn) -> RestoreResult:
+    start = time.monotonic()
+    restored_counts = {}
+    try:
+        stores = StoreRegistry.get_all_stores()
+        for name, store in stores.items():
+            if hasattr(store, "reconcile"):
+                summary = store.reconcile(conn)
+                restored_counts[name] = summary.get("inserts", 0) + summary.get("updates", 0)
+        return RestoreResult(success=True, restored_counts=restored_counts, duration_seconds=time.monotonic() - start)
+    except Exception as e:
+        log.dual_log(tag="Backup:Restore:Error", message=f"Restore failed: {e}", level="ERROR", exc_info=e, payload={"error": str(e)})
+        return RestoreResult(success=False, error=str(e), duration_seconds=time.monotonic() - start)
 
 class BackupRunner:
     """Orchestrates backup operations with job tracking and concurrency safety."""
@@ -41,19 +92,14 @@ class BackupRunner:
                     (backup_job_id, "0", "backup", json.dumps({"mode": mode, "trigger": "manual"}), "RUNNING", created, created)
                 )
         elif trigger_type == "auto":
-            # For auto triggers, the parent tool (e.g., scraper) manages its own job_items tracking.
             pass
         else:
             return ExportResult(success=False, error="Invalid trigger_type")
 
         start = time.monotonic()
         try:
-            # Exports only require read access. Do not close the thread-local read connection.
             conn = DatabaseManager.get_read_connection()
-            try:
-                result = export_all_tables(conn, config, mode=mode)
-            finally:
-                pass
+            result = export_all_tables(conn, config, mode=mode)
 
             if trigger_type == "manual" and backup_job_id:
                 status = "COMPLETED" if result.success else "FAILED"
@@ -76,16 +122,11 @@ class BackupRunner:
 
         start = time.monotonic()
 
-        # Block in background queue until scraper finishes
         log.dual_log(tag="Backup:Restore:Lock", level="INFO", message="Waiting for browser_lock...", payload={"action": "wait_lock"})
         browser_lock.acquire()
         try:
-            # Restore only requires read access to schema info; writes are routed via enqueue_transaction.
             conn = DatabaseManager.get_read_connection()
-            try:
-                result = restore_master_tables_direct(conn)
-            finally:
-                pass
+            result = restore_master_tables_direct(conn)
 
             if manual_job_id:
                 status = "COMPLETED" if result.success else "FAILED"
@@ -108,7 +149,7 @@ class BackupRunner:
         return {
             "enabled": config.enabled,
             "backup_dir": str(config.backup_dir),
-            "watermark": wm.model_dump_compat(),
+            "watermark": wm,
             "file_counts": counts,
             "total_size_bytes": total_size,
         }
