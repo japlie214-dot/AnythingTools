@@ -8,7 +8,7 @@ import json
 from datetime import datetime, timezone
 
 import config
-from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry, ExportQueuedResponse, RestoreQueuedResponse, ResumeResponse
+from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry, ResumeResponse, BackupMetricsResponse
 from tools.registry import REGISTRY
 from utils.logger.core import get_dual_logger
 from utils.id_generator import ULID
@@ -20,21 +20,12 @@ from utils.artifact_manager import artifact_url_from_request
 from bot.engine.worker import get_manager
 from pydantic import ValidationError
 
-# Backup imports
-from database.backup.config import BackupConfig
-from database.backup.runner import BackupRunner
-from utils.browser_lock import browser_lock
-
-# Security imports
-from utils.security import scan_args_for_urls
-
 log = get_dual_logger(__name__)
 router = APIRouter()
 
-# Durable state exclusively in the database; in-memory mirrors removed.
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def _ensure_writer_running() -> None:
     try:
@@ -42,167 +33,9 @@ def _ensure_writer_running() -> None:
     except Exception:
         log.dual_log(tag="API:Writer:Start", message="start_writer() failed (non-fatal)", payload={"action": "writer_start_failed"})
 
+
 def get_session_id(request: Request) -> str:
     return "0"  # Hardcoded fallback for legacy DB constraints, or read form input
-
-@router.post("/tools/{tool_name}", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
-async def enqueue_tool(tool_name: str, req: JobCreateRequest):
-    session_id = "0"  # Hardcoded fallback for legacy DB constraints
-    meta = REGISTRY._tools.get(tool_name)
-    if not meta:
-        diagnostics = REGISTRY.diagnostic_list()
-        diag_info = diagnostics.get(tool_name)
-        
-        if diag_info and diag_info.get("status") in ("FAILED", "REJECTED"):
-            reason = diag_info.get("error", "Unknown error")
-            raise HTTPException(status_code=503, detail=f"Tool failed to load: {reason}")
-        
-        raise HTTPException(status_code=404, detail="Tool not found")
-    
-    # Circuit breaker for browser-bound tools
-    if tool_name in ["skill", "browser_task", "scraper"]:
-        from utils.browser_daemon import daemon_manager, BrowserStatus
-        if daemon_manager.status != BrowserStatus.READY:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Browser environment is currently {daemon_manager.status.value}. Tool unavailable."
-            )
-
-    # Input validation using optional INPUT_MODEL
-    InputModel = None
-    try:
-        module = importlib.import_module(meta.get("module"))
-        InputModel = getattr(module, "INPUT_MODEL", None)
-    except Exception:
-        InputModel = None
-
-    try:
-        if InputModel is not None:
-            validated_args = InputModel.model_validate(req.args)
-            args = validated_args.model_dump()
-        else:
-            args = req.args
-        
-        if req.client_metadata:
-            args["_client_metadata"] = req.client_metadata
-    except ValidationError as e:
-        # Return 422 with structured validation errors
-        error_details = []
-        for error in e.errors():
-            error_details.append({
-                "field": " -> ".join(str(loc) for loc in error.get("loc", [])),
-                "message": error.get("msg", ""),
-                "type": error.get("type", ""),
-                "input": str(error.get("input", "N/A"))[:100]
-            })
-            
-        expected_schema = None
-        if InputModel is not None:
-            if hasattr(InputModel, "model_json_schema"):
-                expected_schema = InputModel.model_json_schema()
-            elif hasattr(InputModel, "schema"):
-                expected_schema = InputModel.schema()
-
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={ "message": f"Validation failed for tool '{tool_name}'",
-                "errors": error_details,
-                "expected_schema": expected_schema
-            }
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Input validation failed: {e}")
-
-    # SSRF / URL validation for any URL-like arguments
-    try:
-        scan_args_for_urls(args)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Unsafe URL in arguments: {e}")
-
-    job_id = ULID.generate()
-    created = now_iso()
-
-    # Log system: intent and pre-execution state
-    log.dual_log(
-        tag="API:Job:Create",
-        message=f"Enqueueing job for tool '{tool_name}'",
-        payload={"tool": tool_name, "args": args, "job_id": job_id, "session_id": session_id, "status": "QUEUED"}
-    )
-    enqueue_write(
-        "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (job_id, session_id, tool_name, json.dumps(args), "QUEUED", created, created),
-    )
-    log.dual_log(tag="API:Job:Persist", message=f"Job {job_id} persisted", payload={"job_id": job_id, "tool": tool_name, "session": session_id})
-
-    # Ensure background writer is running
-    _ensure_writer_running()
-
-    # Start the persistent manager so it will claim and run queued jobs
-    try:
-        mgr = get_manager()
-        mgr.start()
-    except Exception as e:
-        log.dual_log(tag="API:Worker:Start", message=f"Failed to start worker manager: {e}", level="WARNING", exc_info=e, payload={"error": str(e)})
-
-    return {"job_id": job_id, "status": "QUEUED"}
-
-
-# --- Backup Administration Routes ---
-
-@router.post("/backup/export")
-async def trigger_export(
-    background_tasks: BackgroundTasks,
-    mode: str = Query("full", description="Backup mode: 'full' or 'delta'")
-):
-    config = BackupConfig.from_global_config()
-    if not config.enabled:
-        raise HTTPException(status_code=503, detail="Backup disabled")
-
-    if mode not in ("full", "delta"):
-        raise HTTPException(status_code=400, detail="mode must be 'full' or 'delta'")
-
-    job_id = ULID.generate()
-    enqueue_write(
-        "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (job_id, "0", "backup", json.dumps({"mode": mode}), "QUEUED", now_iso(), now_iso())
-    )
-
-    _ensure_writer_running()
-    background_tasks.add_task(BackupRunner.run, mode=mode, trigger_type="manual", manual_job_id=job_id)
-    return {"status": "EXPORT_QUEUED", "message": f"{mode.capitalize()} export started in background", "job_id": job_id}
-
-
-@router.get("/backup/status")
-async def backup_status():
-    status = BackupRunner.get_status()
-    return {
-        "enabled": status["enabled"],
-        "backup_dir": status["backup_dir"],
-        "watermark": status["watermark"],
-        "file_counts": status["file_counts"],
-        "total_size_bytes": status["total_size_bytes"]
-    }
-
-
-@router.post("/backup/restore")
-async def trigger_restore(background_tasks: BackgroundTasks):
-    config = BackupConfig.from_global_config()
-    if not config.enabled:
-        raise HTTPException(status_code=503, detail="Backup disabled")
-    if browser_lock.locked():
-        raise HTTPException(status_code=409, detail="System busy: active scraping job.")
-
-    job_id = ULID.generate()
-    enqueue_write(
-        "INSERT INTO jobs (job_id, session_id, tool_name, status, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (job_id, "0", "backup_restore", "QUEUED", now_iso(), now_iso())
-    )
-    _ensure_writer_running()
-
-    background_tasks.add_task(BackupRunner.restore, manual_job_id=job_id)
-    return {"status": "RESTORE_QUEUED", "message": "Restore started in background under browser_lock", "job_id": job_id}
 
 
 @router.get("/manifest")

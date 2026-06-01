@@ -1,10 +1,10 @@
 # AnythingTools
 
 ## 1. Project Overview
-AnythingTools is a durable, tool-augmented background service designed for high-reliability web scraping, financial data extraction, and automated publishing to Telegram. It solves the "fragility" problem of LLM-driven browser automation by decoupling request submission from execution, implementing state persistence, and providing a robust crash-recovery framework.
+AnythingTools is a durable, tool-augmented background service designed for high-reliability web scraping, financial data extraction, and automated publishing to Telegram. It solves the fragility of LLM-driven browser automation by decoupling request submission from execution, implementing strict state persistence, utilizing Semantic Object Models (SoM) for DOM interaction, and providing a robust crash-recovery framework.
 
 ### Operational Purpose
-The system provides a managed execution environment for long-running browser tasks. It ensures that progress is not lost during network failures, DOM changes, or process crashes by tracking granular job items and providing a Human-in-the-Loop (HITL) mechanism to pause and resume tasks.
+The system provides a managed, asynchronous execution environment for long-running browser tasks. It ensures progress is never lost during network failures, DOM changes, or process crashes by tracking granular job items in a SQLite database. It provides a Human-in-the-Loop (HITL) mechanism to pause and resume tasks, and a robust dual-mode (Local SQLite + Cloud Snowflake) backup engine for disaster recovery and analytical syncing.
 
 ### Explicit Non-Goals
 - **Not a Chatbot**: It is an asynchronous job processor, not a real-time interactive chat interface.
@@ -12,118 +12,134 @@ The system provides a managed execution environment for long-running browser tas
 - **No Internal LLM**: It integrates with external providers (Azure OpenAI, Chutes) via a client abstraction layer.
 
 ## 2. High-Level Architecture
-The system implements a **Producer-Consumer** pattern centered around a SQLite-backed job queue.
+The system implements a **Producer-Consumer** pattern centered around a SQLite-backed job queue with strict single-writer database constraints.
 
 ### Major Components
-- **API (`api/`)**: FastAPI interface for job enqueueing, status polling, and resumption.
+- **API (`api/`)**: FastAPI interface for job enqueueing, status polling, resumption, and system observability.
 - **Unified Worker Manager (`bot/engine/worker.py`)**: A singleton daemon that polls the `jobs` table and spawns isolated threads for tool execution.
 - **Tool Registry (`tools/registry.py`)**: A dynamic discovery system that instantiates `BaseTool` subclasses.
-- **Orchestrator (`bot/orchestrator_core/`)**: A middleware layer that enhances browser interaction by injecting a Semantic Object Model (SoM) into the DOM.
-- **Database Layer (`database/`)**: A dual-database architecture (`sumanal.db` and `logs.db`) utilizing a single-writer thread model to prevent SQLite locking contention.
+- **Orchestrator (`bot/orchestrator_core/`)**: Middleware that enhances browser interaction by injecting a Semantic Object Model (SoM) into the DOM before LLM evaluation.
+- **Database Layer (`database/`)**: A multi-database architecture (`sumanal.db`, `logs.db`, `backup.db`) utilizing dedicated single-writer threads to completely eliminate SQLite locking contention (`database is locked`).
+- **Sync Subsystem (`database/backup/`)**: A bidirectional delta-sync engine maintaining parity between a local SQLite backup and a cloud Snowflake warehouse.
 
 ### Data Flow
-1. **Submission**: `POST /tools/{tool_name}` $\rightarrow$ API validates input $\rightarrow$ Job inserted into `jobs` table as `QUEUED`.
+1. **Submission**: `POST /api/tools/{tool_name}` $\rightarrow$ API validates input via Pydantic $\rightarrow$ Job inserted into `jobs` table as `QUEUED`.
 2. **Dispatch**: `UnifiedWorkerManager` polls `jobs` $\rightarrow$ Spawns execution thread $\rightarrow$ Sets status to `RUNNING`.
-3. **Execution**: `Worker` $\rightarrow$ `ToolRegistry` (instantiation) $\rightarrow$ `Tool.run()` (may involve SoM injection via Orchestrator).
-4. **Persistence**: Tool results are written to `jobs.result_json` and detailed progress is tracked in `job_items`.
-5. **Completion**: `_do_callback_with_logging` sends the final result to the calling system via HTTP POST.
+3. **Execution**: `Worker` $\rightarrow$ `ToolRegistry` (instantiation) $\rightarrow$ `Tool.run()` (invokes LLMs, bots, and SoM injection).
+4. **Persistence**: Tool results are written to `jobs.result_json` and detailed progress is tracked in `job_items`. All writes queue through `database.writer`.
+5. **Completion**: `_do_callback_with_logging` sends the final result to the calling system (e.g., AnythingLLM) via HTTP POST.
+6. **Backup/Sync**: On startup and shutdown, `DualEngine` calculates checksum deltas and syncs operational master tables to `backup.db` and Snowflake.
 
 ## 3. Repository Structure
-- `api/`: REST endpoints. Handles job lifecycle and backup triggers.
+- `api/`: REST endpoints (`routes.py`) and Pydantic validation schemas (`schemas.py`).
 - `bot/`:
     - `engine/`: The core polling loop (`worker.py`) and safety wrappers (`tool_runner.py`).
-    - `orchestrator_core/`: Logic for SoM (Semantic Object Model) markers and browser context.
-- `clients/`: LLM provider implementations (Azure, Chutes).
+    - `orchestrator_core/`: Logic for SoM markers and context budget eviction.
+- `clients/`: External integrations (LLM clients for Azure/Chutes, Snowflake client for native embedding generation).
 - `database/`: 
-    - `connection.py` & `writer.py`: Implements the single-writer queue to avoid `database is locked` errors.
-    - `schemas/`: SQL definitions for core tables.
-    - `broadcast/`: Domain-specific logic for Telegram publishing.
-    - `backup/`: Parquet-based export/restore mechanism for master tables.
-    - `management/`: Schema reconciliation and health checks.
-    - `stock_notes/`: JSON-based store for raw SEC filing payloads.
-- `deprecated/`: Historical artifacts showing the shift from autonomous agents to programmatic tools.
+    - `connection.py`, `writer.py`, `logs_writer.py`: Thread-safe database managers.
+    - `schemas/`: Canonical SQL definitions.
+    - `backup/`: The DualEngine backup system. Contains `engine/`, `sync/` (SyncLedger, ConflictResolver, DiffEngine), and `resilience/` (CircuitBreaker, DeadLetterQueue).
+    - `broadcast/`: Domain logic for Telegram publishing state.
+    - `management/`: Schema reconciliation and database health checks.
 - `tools/`:
     - `base.py`: Abstract base class and `ResumeReport` contracts.
-    - `registry.py`: Whitelist-based tool discovery.
-    - `scraper/`: Browser-based extraction and curation.
-    - `publisher/`: Telegram delivery pipeline.
+    - `registry.py`: Whitelist-based dynamic tool discovery.
+    - `scraper/`: Browser-based extraction, hitl escalation, and LLM curation.
+    - `publisher/`: Telegram delivery pipeline with sliding-window rate limiting.
     - `draft_editor/`: Atomic manipulation of curated lists.
     - `stock_notes/`: SEC EDGAR footnote extraction and dynamic table management.
-- `utils/`: Cross-cutting utilities (logging, artifact management, browser daemon, SoM utilities, rate limiters).
+    - `batch_reader/`: Hybrid semantic + keyword search across batches.
+- `utils/`: Cross-cutting utilities (logging, artifact management, browser daemon, SoM Javascript injection, rate limiters, text sanitization).
 
 ## 4. Core Concepts & Domain Model
 ### Key Abstractions
-- **Job**: The primary unit of work (ULID). States: `QUEUED`, `RUNNING`, `PAUSED_FOR_HITL`, `COMPLETED`, `FAILED`, `INTERRUPTED`.
-- **BaseTool**: The interface for all system capabilities.
-- **SoM (Semantic Object Model)**: Injection of `data-ai-id` attributes into the DOM to provide the LLM with deterministic element references.
-- **Resume Mechanism**: A tool-specific logic (`ResumeHandler`) that queries domain tables (e.g., `job_items`) to determine the exact point of resumption.
-- **WriteReceipt**: A synchronization primitive used to block synchronous code until an asynchronous database write is committed.
+- **Job**: The primary unit of work tracked by a ULID. States: `QUEUED`, `RUNNING`, `PAUSED_FOR_HITL`, `COMPLETED`, `FAILED`, `INTERRUPTED`, `CANCELLING`.
+- **SoM (Semantic Object Model)**: Injection of `data-ai-id` attributes into the DOM (via JS) to provide the LLM with deterministic element references, bypassing fragile CSS selectors.
+- **Resume Mechanism**: Tool-specific logic (`ResumeHandler`) that queries domain tables (e.g., `job_items`) to determine the exact point of resumption after a crash or HITL pause.
+- **WriteReceipt**: A synchronization primitive that blocks synchronous code until an asynchronous database write is committed by the writer thread.
+- **DualEngine Backup**: A non-destructive synchronization system tracking `updated_at` and data checksums in a `sync_ledger` to manage split-brain scenarios between local storage and Snowflake.
 
 ### Invariants
-- **Single Writer**: All writes to the operational DB must pass through the `database.writer` queue.
-- **Browser Lock**: Only one browser-based tool can execute at a time, enforced by `utils/browser_lock.py`.
-- **EDGAR Identity**: The `stock_notes` tool requires `EDGAR_IDENTITY` at startup or it will trigger a fatal process exit.
+- **Single Writer**: All writes to operational databases MUST pass through the `database.writer` or `database.logs_writer` queues.
+- **Read-Only Connections**: Direct queries (`DatabaseManager.get_read_connection()`) enforce `PRAGMA query_only = ON`.
+- **Browser Lock**: Only one browser-based tool can execute at a time, enforced by `utils/browser_lock.py` (`BrowserLockProxy`).
+- **Artifacts as Receipts**: Files in the `artifacts/` directory are for audit/debug only. Operational state is strictly derived from the SQLite database.
+- **Single Process**: The application enforces `WEB_CONCURRENCY=1` at startup to prevent state corruption.
 
 ## 5. Detailed Behavior
 ### Normal Execution
 1. API enqueues a job.
 2. Worker picks up the job, marks it `RUNNING`, and instantiates the tool.
-3. Tool executes. If browser-based, the Orchestrator injects SoM markers.
-4. Tool returns a result; Worker updates the DB and triggers the HTTP callback.
+3. Tool executes. If browser-based, the Botasaurus driver navigates, and the Orchestrator injects SoM markers via `run_js`.
+4. The tool streams progress into `job_items`.
+5. The tool returns a result; Worker updates the DB and triggers the HTTP callback.
 
 ### Failure Modes & Error Handling
-- **Crash Recovery**: If a thread crashes, the job is marked `INTERRUPTED`. The `UnifiedWorkerManager` automatically retries these.
-- **HITL Pause**: Tools can return a `PAUSED_FOR_HITL:` signal, stopping execution until a `/resume` API call is received.
-- **Doom Loop Prevention**: The `/resume` endpoint increments `resume_count` and rejects the job if it exceeds the configured threshold.
-- **Schema Drift**: The `SchemaReconciler` detects missing columns or tables at startup and applies repairs.
+- **Crash Recovery**: If the application crashes, the startup sequence (`utils/startup/recovery.py`) downgrades `RUNNING` jobs to `INTERRUPTED`. The `UnifiedWorkerManager` automatically retries these.
+- **HITL Pause**: Tools can raise a `PAUSED_FOR_HITL` signal (e.g., encountering a paywall). Execution halts until a POST to `/resume` is received.
+- **Doom Loop Prevention**: The `/resume` endpoint increments `resume_count`. If it exceeds `MAX_RESUME_ATTEMPTS`, the job is poisoned and marked `FAILED`.
+- **Sync Conflicts (Split-Brain)**: If both Snowflake and Local SQLite have modified a row since the last sync, `ConflictResolver` flags it. Headless resolution rules or `UserConfirmationHandler` dictate the overwrite direction.
+- **Circuit Breaking**: If Snowflake is unreachable, `CircuitBreaker` opens, and CloudEngine operations fail fast. The system operates locally and sets a `sync_pending` flag for future reconciliation.
 
 ## 6. Public Interfaces
 ### REST API
-- `POST /tools/{tool_name}`: Enqueues a tool execution.
-- `GET /jobs/{job_id}`: Returns status, logs, and final payload.
-- `POST /jobs/{job_id}/resume`: Resumes a paused or interrupted job.
-- `GET /manifest`: Returns available tools and their JSON schemas.
+- `POST /api/tools/{tool_name}`: Enqueues a tool execution. Requires valid payload matching the tool's `INPUT_MODEL`.
+- `GET /api/jobs/{job_id}`: Returns status, logs, and final payload.
+- `DELETE /api/jobs/{job_id}`: Marks a job as `CANCELLING` to trigger graceful termination.
+- `POST /api/jobs/{job_id}/resume`: Resumes a paused or interrupted job.
+- `GET /api/backup/status`: Returns `BackupMetricsResponse` containing health, sync state, and circuit breaker status for the DualEngine.
+- `GET /api/manifest`: Returns available tools and their JSON schemas for LLM orchestration.
 
-### Tool Registry
-- `REGISTRY.create_tool_instance(name)`: Returns a tool instance.
+### Internal Tool Registry
+- `REGISTRY.create_tool_instance(name)`: Returns a fresh tool instance.
 - `REGISTRY.schema_list()`: Returns MCP-compatible tool definitions.
 
 ## 7. State, Persistence, and Data
-### Storage
-- **Operational DB (`sumanal.db`)**: Stores `jobs`, `job_items`, `sn_filings`, `sn_notes`, etc.
-- **Telemetry DB (`logs.db`)**: High-throughput event store.
-- **Artifacts**: JSON/CSV/MD files stored on disk, served via the API.
-- **FilingStore**: JSON-based archive for raw SEC payloads in the backup directory.
+### Storage Locations
+- **Operational DB (`data/sumanal.db`)**: Source of truth for `jobs`, `job_items`, `scraped_articles`, `broadcast_batches`, `sn_filings`.
+- **Telemetry DB (`data/logs.db`)**: High-throughput event store. Recreated fresh on every application startup.
+- **Backup DB (`data/backup.db`)**: Local target for the DualEngine sync process. Contains the `sync_ledger` and `dead_letter_queue`.
+- **Snowflake**: Cloud target for analytical querying and remote backup.
+- **Artifacts (`data/temp/multimodal` / `artifacts/`)**: Ephemeral or receipt files (JSON, screenshots) served via the API.
 
-### Data Lifecycle
-- Jobs: `QUEUED` $\rightarrow$ `RUNNING` $\rightarrow$ `COMPLETED/FAILED`.
-- Broadcasts: `PENDING` $\rightarrow$ `PUBLISHING` $\rightarrow$ `COMPLETED`.
+### Data Management Rules
+- Schema management is performed at startup via `database.management.reconciler`.
+- Cloud schema management (`SnowflakeSchemaManager`) is strictly additive (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN`). It never drops data.
+- SQLite DDL is transpiled to Snowflake DDL at runtime using `sqlglot`. Embedding fields (`float[1024]`) are dynamically mapped to Snowflake native `VECTOR(FLOAT, 1024)`.
 
 ## 8. Dependencies & Integration
-- **SQLite**: Primary persistence.
-- **FastAPI**: API layer.
-- **Azure OpenAI / Chutes**: LLM providers.
-- **Botasaurus**: Browser automation.
-- **PyArrow**: Used for immutable Parquet backups of master tables.
-- **edgartools**: Used for SEC EDGAR data extraction.
+- **FastAPI**: REST API layer.
+- **SQLite (stdlib)**: Primary persistence mechanism.
+- **sqlite-vec**: C extension for vector similarity search (`MATCH`).
+- **Snowflake-SQLAlchemy & Cryptography**: Connection pooling, key-pair authentication, and `MERGE INTO` operations for cloud sync.
+- **sqlglot**: SQL dialect transpilation (SQLite -> Snowflake).
+- **Pydantic & Pydantic-Settings**: Data validation, input schema generation, and strict environment configuration (`BackupSettings`).
+- **Botasaurus**: Chrome automation (stealth, CDP interactions).
+- **python-telegram-bot**: Passive delivery of translated briefings.
+- **OpenAI SDK**: Interface to Azure OpenAI and Chutes (Llama 3) models.
 
 ## 9. Setup, Build, and Execution
-1. Install dependencies: `pip install -r requirements.txt`.
-2. Configure environment variables in `config.py` (API keys, DB paths, `EDGAR_IDENTITY`).
-3. Run the application: `python app.py`.
-4. The system initializes the SQLite schema and runs migrations on first run.
+1. Install dependencies: `pip install -r requirements.txt`. (Requires compiling `sqlite-vec` if not using pre-built wheels).
+2. Configure `.env` file (parsed by `pydantic-settings` for backup) and environment variables for legacy configs (`config.py`).
+   - Required: `API_KEY`, `AZURE_ENDPOINT`, `EDGAR_IDENTITY`.
+   - Optional Backup: `BACKUP_CLOUD__ACCOUNT`, `BACKUP_CLOUD__USER`, etc.
+3. Run the application: `python -m uvicorn app:app --reload --port 8000`.
+4. *Startup Sequence*: The app enforces `WEB_CONCURRENCY=1`, mounts static artifacts, drops and recreates `logs.db`, validates `sqlite-vec`, runs schema migrations, executes the `DualEngine` backup sync, and warms up the browser daemon.
 
 ## 10. Testing & Validation
-- **E2E Tests**: `tests/test_browser_e2e.py` validates the browser-tool-orchestrator loop.
-- **Backup Tests**: `tests/test_backup.py` verifies Parquet export/restore integrity.
-- **Gaps**: Lack of isolated unit tests for individual tools; reliance on E2E and manual validation.
+- **Health Checks**: Extensive runtime health checks during startup (e.g., PRAGMA `integrity_check`, CDP ping probes in `ChromeDaemonManager`).
+- **Diagnostics API**: `/api/diagnostics` and `/api/metrics` expose queue depths, dropped logs, and active job counts.
+- **Unit/Integration Testing**: Test suites exist for E2E browser flows and backup mechanics.
+- **Gaps**: Isolated unit test coverage is low for individual agent actions; heavily reliant on E2E flows and manual log reconstruction.
 
 ## 11. Known Limitations & Non-Goals
-- **SQLite Locking**: High-concurrency reads during heavy writes may still encounter timeouts despite the single-writer model.
-- **Browser Stability**: Susceptible to DOM changes; partially mitigated by SoM.
-- **Telegram Rate Limits**: Delivery is subject to strict pacing, managed via a sliding-window reservation system.
+- **Single-Node Limitation**: The architecture strictly relies on in-memory locks (`browser_lock.py`), in-memory context variables (`utils/logger/state.py`), and a local SQLite WAL. It cannot be horizontally scaled across multiple containers.
+- **Browser State Fragility**: Relying on headless/headful Chrome introduces inherent fragility regarding CDP timeouts, zombie processes, and changing target DOMs.
+- **Telegram Limits**: Global API rate limits are heavily constrained; `SlidingWindowRateLimiter` ensures compliance but forces slow, serialized delivery of large news batches.
+- **Memory Consumption**: `DiffEngine` uses SQLite temp tables to avoid Python OOMs, but massive `MERGE INTO` operations in Snowflake may still incur noticeable memory overhead in SQLAlchemy.
 
 ## 12. Change Sensitivity
-- **Fragile Areas**: `database/writer.py` is the critical bottleneck; errors here cause total state corruption.
-- **Tightly Coupled**: The `Orchestrator` depends heavily on `browser_daemon` and `som_utils.py`.
-- **Extensibility**: Adding new tools is trivial via `BaseTool` and `registry.py`.
+- **Extremely Fragile**: `database/writer.py` and `database/logs_writer.py`. Altering the queue logic, thread handling, or transaction boundaries here will cause immediate database locking or silent data loss.
+- **Tightly Coupled**: The `DualEngine` synchronization (`database/backup/engine/`) heavily relies on `database/backup/schema_registry.py` for precise type mapping. Changing SQLite schemas requires verifying the `sqlglot` output for Snowflake.
+- **Easily Extensible**: Adding a new tool is trivial. Create a subclass of `BaseTool` in `tools/`, define an `INPUT_MODEL`, and it will be automatically discovered by `registry.py` and exposed via the `/api/manifest` endpoint.

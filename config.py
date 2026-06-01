@@ -94,7 +94,4 @@ LLM_CONTEXT_CHAR_LIMIT: int = int(os.getenv("LLM_CONTEXT_CHAR_LIMIT", "800000"))
 CALLBACK_TRUNCATION_MULTIPLIER: float = float(os.getenv("CALLBACK_TRUNCATION_MULTIPLIER", "0.5"))
 
 # --- Backup Configuration ---
-BACKUP_ONEDRIVE_DIR: str = os.getenv("BACKUP_ONEDRIVE_DIR", "")
-BACKUP_BATCH_SIZE: int = int(os.getenv("BACKUP_BATCH_SIZE", "1000"))
-BACKUP_COMPRESSION: str = os.getenv("BACKUP_COMPRESSION", "zstd")
-BACKUP_ENABLED: bool = os.getenv("BACKUP_ENABLED", "true").lower() in ("true", "1", "yes")
+# Backup is now fully managed via pydantic-settings in database/backup/settings.py

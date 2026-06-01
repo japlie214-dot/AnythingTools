@@ -37,34 +37,17 @@ class ResumeResponse(BaseModel):
     items_pending: int
     message: str
     details: Optional[Dict[str, Any]] = None
-class WatermarkSchema(BaseModel):
-    last_article_id: str = ""
-    last_export_ts: Optional[str] = None
-    total_articles_exported: int = 0
-    total_vectors_exported: int = 0
-    table_watermarks: Dict[str, str] = Field(default_factory=dict)
+class EngineMetrics(BaseModel):
+    status: str
+    error: Optional[str] = None
 
+class SyncMetrics(BaseModel):
+    pending_conflicts: int = 0
+    dead_letter_count: int = 0
+    last_sync_time: Optional[str] = None
 
-class BackupMode(str, Enum):
-    FULL = "full"
-    DELTA = "delta"
-
-
-class BackupStatusResponse(BaseModel):
-    enabled: bool
-    backup_dir: str
-    watermark: WatermarkSchema
-    file_counts: Dict[str, int] = Field(default_factory=dict)
-    total_size_bytes: int
-
-
-class ExportQueuedResponse(BaseModel):
-    status: str = "EXPORT_QUEUED"
-    message: str
-    job_id: Optional[str] = None
-
-
-class RestoreQueuedResponse(BaseModel):
-    status: str = "RESTORE_QUEUED"
-    message: str
-    job_id: Optional[str] = None
+class BackupMetricsResponse(BaseModel):
+    local_engine: EngineMetrics
+    cloud_engine: EngineMetrics
+    sync_status: SyncMetrics
+    circuit_breaker_state: str
