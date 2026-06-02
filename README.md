@@ -51,6 +51,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
     - `stock_notes/`: SEC EDGAR footnote extraction and dynamic table management.
     - `batch_reader/`: Hybrid semantic + keyword search across batches.
 - `utils/`: Cross-cutting utilities (logging, artifact management, browser daemon, SoM Javascript injection, rate limiters, text sanitization).
+- `scripts/`: Standalone maintenance utilities (e.g., `migrate_artifacts.py` for legacy filesystem-to-DB migration).
 
 ## 4. Core Concepts & Domain Model
 ### Key Abstractions
@@ -107,6 +108,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - Schema management is performed at startup via `database.management.reconciler`.
 - Cloud schema management (`SnowflakeSchemaManager`) is strictly additive (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN`). It never drops data.
 - SQLite DDL is transpiled to Snowflake DDL at runtime using `sqlglot`. Embedding fields (`float[1024]`) are dynamically mapped to Snowflake native `VECTOR(FLOAT, 1024)`.
+- **Constraint Handling**: The system strips `DEFAULT CURRENT_TIMESTAMP` from Snowflake DDL to avoid type mismatches between `VARCHAR` and `TIMESTAMP_LTZ`.
 
 ## 8. Dependencies & Integration
 - **FastAPI**: REST API layer.
@@ -140,6 +142,6 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **Memory Consumption**: `DiffEngine` uses SQLite temp tables to avoid Python OOMs, but massive `MERGE INTO` operations in Snowflake may still incur noticeable memory overhead in SQLAlchemy.
 
 ## 12. Change Sensitivity
-- **Extremely Fragile**: `database/writer.py` and `database/logs_writer.py`. Altering the queue logic, thread handling, or transaction boundaries here will cause immediate database locking or silent data loss.
+- **Extremely Fragile**: `database/writer.py` and `database/logs_writer.py`. Altering the queue logic, thread handling, and transaction boundaries here will cause immediate database locking or silent data loss.
 - **Tightly Coupled**: The `DualEngine` synchronization (`database/backup/engine/`) heavily relies on `database/backup/schema_registry.py` for precise type mapping. Changing SQLite schemas requires verifying the `sqlglot` output for Snowflake.
 - **Easily Extensible**: Adding a new tool is trivial. Create a subclass of `BaseTool` in `tools/`, define an `INPUT_MODEL`, and it will be automatically discovered by `registry.py` and exposed via the `/api/manifest` endpoint.

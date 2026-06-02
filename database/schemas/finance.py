@@ -39,6 +39,7 @@ CREATE INDEX idx_formulas_ticker_stmt ON financial_formulas(ticker, statement_ty
             moving_avg_3y REAL,
             std_dev_3y REAL,
             pe_ratio REAL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (ticker, date)
         );
 """,
@@ -53,6 +54,7 @@ CREATE INDEX idx_formulas_ticker_stmt ON financial_formulas(ticker, statement_ty
             unit TEXT DEFAULT 'USD',
             source TEXT DEFAULT 'SEC_EDGAR',
             extracted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(ticker, statement_type, period_end_date, concept)
         );
 CREATE INDEX idx_raw_fundamentals_ticker_period ON raw_fundamentals(ticker, period_end_date);
@@ -68,6 +70,7 @@ CREATE INDEX idx_fundamentals_ticker_date ON raw_fundamentals(ticker, statement_
             low REAL,
             close REAL,
             volume INTEGER,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(ticker, date)
         );
 CREATE INDEX idx_prices_ticker_date ON stock_prices(ticker, date DESC);

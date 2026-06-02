@@ -124,6 +124,24 @@ async def _validate_single_db(
         )
         report = reconciler.reconcile()
         
+        # Bump write generations so thread-local read connections see the new schema
+        if label == "Logs DB":
+            try:
+                from database.logs_writer import _logs_writer_lock
+                import database.logs_writer as lw
+                with _logs_writer_lock:
+                    lw._logs_write_generation += 1
+            except Exception:
+                pass
+        else:
+            try:
+                from database.writer import _write_lock
+                import database.writer as dw
+                with _write_lock:
+                    dw._write_generation += 1
+            except Exception:
+                pass
+
         # Log all actions
         for action in report.actions:
             level = "WARNING" if action.action in ["recreated", "pruned"] else "INFO"
@@ -186,21 +204,18 @@ async def _initialize_database(db_manager, label: str, expected_tables: dict, ex
 
 
 async def _restore_master_tables(conn: sqlite3.Connection, label: str, expected_tables: dict, master_tables: list):
-    """Restore master tables from backup after recreation - agnostic."""
     log.dual_log(tag="Database:Lifecycle:RestoreRequired", level="WARNING",
                 message="Master tables need restoration", payload={"label": label, "master_tables": master_tables})
     
     try:
-        from database.backup.restore import restore_master_tables_direct
-        result = restore_master_tables_direct(conn, master_tables)
+        from database.backup.runner import BackupRunner
+        result = BackupRunner.restore()
         
         if result.success:
             log.dual_log(tag="Database:Lifecycle:Restored", level="INFO",
-                       message="Restored master tables", payload={"label": label, "restored_counts": result.restored_counts})
+                       message="Restored master tables", payload={"label": label})
             
-            # Agnostic FTS rebuild: Check if any expected FTS table targets the restored tables
             for table_name in master_tables:
-                # Look for FTS tables in expected_tables that match this master table
                 for fts_name in expected_tables.keys():
                     if fts_name.endswith("_fts") and fts_name.startswith(table_name.replace("_vec", "")):
                         try:
@@ -210,24 +225,22 @@ async def _restore_master_tables(conn: sqlite3.Connection, label: str, expected_
                         except sqlite3.OperationalError:
                             pass
             
-            # Post-restore cleanup backup
+            # Commit the FTS rebuilds to release the write lock before wal_checkpoint or backups
+            conn.commit()
+
             log.dual_log(tag="Database:Lifecycle:BackupStart", level="INFO",
                         message="Running post-restore backup", payload={"label": label})
-            from database.backup.storage import export_all_tables
-            result = export_all_tables(conn, mode="full")
             
+            result = BackupRunner.run(mode="full")
             if result.success:
                 log.dual_log(tag="Database:Lifecycle:BackupComplete", level="INFO",
-                           message=f"[{label}] Cleanup backup complete",
-                           payload={"label": label, "action": "post_restore_cleanup", "success": True})
+                           message=f"[{label}] Cleanup backup complete", payload={"label": label, "success": True})
             else:
                 log.dual_log(tag="Database:Lifecycle:BackupFailed", level="WARNING",
-                           message=f"[{label}] Cleanup backup failed: {result.error}",
-                           payload={"label": label, "action": "post_restore_cleanup", "success": False, "error": result.error})
+                           message=f"[{label}] Cleanup backup failed: {result.error}", payload={"label": label, "error": result.error})
         else:
             log.dual_log(tag="Database:Lifecycle:RestoreError", level="CRITICAL",
-                       message=f"[{label}] Restoration failed: {result.error}",
-                       payload={"label": label, "error": result.error, "master_tables": master_tables})
+                       message=f"[{label}] Restoration failed: {result.error}", payload={"label": label, "error": result.error})
     except Exception as e:
         log.dual_log(tag="Database:Lifecycle:CriticalRestoreError", level="CRITICAL",
                     message="Restoration error", exc_info=e, payload={"label": label, "error": str(e)})

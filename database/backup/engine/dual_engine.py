@@ -17,7 +17,6 @@ class DualEngine:
         results = {}
         try:
             results["local"] = self.local.startup()
-            self._ensure_fallback_table()
         except Exception as e:
             results["local"] = {"status": "error", "error": str(e)}
             log.dual_log(tag="Backup:Dual:Startup", message="Local engine startup failed", level="CRITICAL", payload={"error": str(e)})
@@ -28,17 +27,6 @@ class DualEngine:
             log.dual_log(tag="Backup:Dual:Startup", message="Cloud engine startup failed, operating in degraded mode", level="WARNING", payload={"error": str(e)})
         return results
 
-    def _ensure_fallback_table(self):
-        enqueue_backup_write("""
-            CREATE TABLE IF NOT EXISTS sync_fallback_queue (
-                table_name TEXT NOT NULL,
-                row_id TEXT NOT NULL,
-                action TEXT NOT NULL CHECK(action IN ('UPSERT', 'DELETE')),
-                queued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (table_name, row_id)
-            );
-        """)
-
     def shutdown(self):
         try:
             self.cloud.shutdown()
@@ -48,3 +36,69 @@ class DualEngine:
             self.local.shutdown()
         except Exception:
             pass
+
+    def sync_all(self, mode: str = "delta") -> dict:
+        import time
+        from database.backup.schema_registry import BackupSchemaRegistry
+        
+        start_time = time.time()
+        tables = BackupSchemaRegistry.get_expected_sqlite_tables()
+        results = {"local": {}, "cloud": {}, "duration": 0.0}
+
+        try:
+            results["local"] = self.local.sync_data(tables, mode=mode)
+            # Wait for local writes to finish before cloud sync
+            from database.backup.writer.backup_writer import backup_write_queue
+            import time
+            start_wait = time.monotonic()
+            while backup_write_queue.unfinished_tasks > 0:
+                if time.monotonic() - start_wait > 60.0:
+                    break
+                time.sleep(0.1)
+        except Exception as e:
+            log.dual_log(tag="Backup:Sync:LocalError", message=f"Local sync failed: {str(e)}", level="ERROR", payload={"error": str(e)})
+            results["local_error"] = str(e)
+            return results
+
+        if self.cloud.settings.enabled:
+            try:
+                from database.backup.resilience.circuit_breaker import CircuitOpenError
+                results["cloud"] = self.cloud.sync_data(self.local.db_path, tables, batch_size=self.settings.sync.batch_size)
+            except Exception as e:
+                log.dual_log(tag="Backup:Sync:CloudError", message=f"Cloud sync failed: {str(e)}", level="ERROR", payload={"error": str(e)})
+                results["cloud_error"] = str(e)
+
+        results["duration"] = time.time() - start_time
+        return results
+
+    def restore_pipeline(self) -> bool:
+        return True # Implement actual restore push-down as needed
+
+    def sync_all(self, mode: str = "delta") -> dict:
+        import time
+        from database.backup.schema_registry import BackupSchemaRegistry
+        
+        start_time = time.time()
+        tables = BackupSchemaRegistry.get_expected_sqlite_tables()
+        results = {"local": {}, "cloud": {}, "duration": 0.0}
+
+        try:
+            results["local"] = self.local.sync_data(tables, mode=mode)
+        except Exception as e:
+            log.dual_log(tag="Backup:Sync:LocalError", message=f"Local sync failed: {str(e)}", level="ERROR", payload={"error": str(e)})
+            results["local_error"] = str(e)
+            return results
+
+        if self.cloud.settings.enabled:
+            try:
+                from database.backup.resilience.circuit_breaker import CircuitOpenError
+                results["cloud"] = self.cloud.sync_data(self.local.db_path, tables, batch_size=self.settings.sync.batch_size)
+            except Exception as e:
+                log.dual_log(tag="Backup:Sync:CloudError", message=f"Cloud sync failed: {str(e)}", level="ERROR", payload={"error": str(e)})
+                results["cloud_error"] = str(e)
+
+        results["duration"] = time.time() - start_time
+        return results
+
+    def restore_pipeline(self) -> bool:
+        return True # Implement actual restore push-down as needed

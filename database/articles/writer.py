@@ -2,7 +2,7 @@
 from typing import Optional
 from database.writer import WriteReceipt, enqueue_transaction, start_writer
 from database.articles.models import ArticleWriteTask, ArticleWriteResult, ArticleDeleteTask, ArticleDeleteResult
-from database.backup.stores.article_store import get_article_store
+from database.articles.store import get_article_store
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
@@ -33,48 +33,30 @@ def enqueue_article_write(
     start_writer()
 
     try:
-        store_success = False
+        receipt = None
         try:
             store = get_article_store()
-            store.upsert_article(
+            # Ensure unique vec_rowid before building statements to prevent collisions
+            task.vec_rowid = store._ensure_unique_vec_rowid(task.vec_rowid, task.article_id)
+            db_statements = task.to_upsert_statements()
+            
+            if db_statements:
+                receipt = enqueue_transaction(db_statements, track=True)
+                
+            return ArticleWriteResult(
+                success=True,
                 article_id=task.article_id,
-                meta=task.to_store_meta(),
-                embedding_bytes=task.embedding_bytes,
+                receipt=receipt,
+                embedding_success=(task.embedding_status == "EMBEDDED"),
             )
-            store_success = True
-        except Exception as store_err:
+        except Exception as db_err:
             log.dual_log(
-                tag="Article:Write:StoreError",
+                tag="Article:Write:Error",
                 level="WARNING",
-                message=f"ArticleStore write failed: {store_err}",
-                payload={"article_id": task.article_id, "error": str(store_err)},
+                message=f"Article write failed: {db_err}",
+                payload={"article_id": task.article_id, "error": str(db_err)},
             )
-
-        # Enqueue only the job_items tracking SQL, Store handled the core article upsert.
-        db_statements = task.to_upsert_statements()
-        job_statements = [
-            (sql, params) for sql, params in db_statements if "job_items" in sql.lower()
-        ]
-
-        # Fallback to all statements if store failed
-        if store_success:
-            all_statements = job_statements
-        else:
-            all_statements = db_statements
-
-        receipt = None
-        if all_statements:
-            try:
-                receipt = enqueue_transaction(all_statements, track=True)
-            except Exception as db_err:
-                return ArticleWriteResult(success=False, article_id=task.article_id, error=str(db_err))
-
-        return ArticleWriteResult(
-            success=True,
-            article_id=task.article_id,
-            receipt=receipt,
-            embedding_success=(task.embedding_status == "EMBEDDED"),
-        )
+            return ArticleWriteResult(success=False, article_id=task.article_id, error=str(db_err))
     except Exception as e:
         return ArticleWriteResult(success=False, article_id=task.article_id, error=str(e))
 

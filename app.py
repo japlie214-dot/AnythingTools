@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI):
             try:
                 from utils.startup import _global_dual_engine
                 if _global_dual_engine:
-                    log.dual_log(tag="App:Lifecycle:ShutdownBackupV2", message="Shutting down Backup V2 engines", level="INFO", payload={})
+                    log.dual_log(tag="App:Lifecycle:ShutdownBackupV2", message="Shutting down Backup V2 engines", level="INFO", payload={"status": "initiating"})
                     _global_dual_engine.shutdown()
             except Exception as e:
                 log.dual_log(tag="App:Lifecycle:ShutdownBackupV2Error", message=f"Error closing Backup V2: {e}", level="WARNING", payload={"error": str(e)})

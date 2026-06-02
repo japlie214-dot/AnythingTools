@@ -269,23 +269,13 @@ class SchemaReconciler:
     def _snapshot_master(self, table_name: str):
         """Pre-drop snapshot for master tables. If corrupted, log CRITICAL and proceed with reset."""
         try:
-            from database.backup.exporter import export_table_chunks
-            from database.backup.config import BackupConfig
-            from database.backup.storage import write_table_batch
-            
-            cfg = BackupConfig.from_global_config()
-            # This may raise OperationalError if table is corrupted
-            chunks = export_table_chunks(self.conn, table_name, cfg, mode="full")
-            written = write_table_batch(table_name, chunks, cfg)
-            
-            log.dual_log(tag="Database:Schema:SnapshotComplete", level="INFO", message=f"[{self.label}] Pre-drop snapshot complete: {table_name} ({written} rows)", payload={"label": self.label, "table": table_name, "rows_written": written})
+            from database.backup.runner import BackupRunner
+            BackupRunner.run(mode="full")
+            log.dual_log(tag="Database:Schema:SnapshotComplete", level="INFO", message=f"[{self.label}] Pre-drop snapshot complete: {table_name}", payload={"label": self.label, "table": table_name})
         except Exception as e:
-            # FAIL-OPEN POLICY: Log CRITICAL, allow DROP/CREATE to proceed
             log.dual_log(
                 tag="Database:Schema:SnapshotFailed",
                 level="CRITICAL",
-                message=f"[{self.label}] {table_name} corrupted/unreadable. Snapshot failed. "
-                        f"Proceeding with destructive reset to restore availability. Error: {e}",
+                message=f"[{self.label}] {table_name} snapshot failed. Proceeding with reset. Error: {e}",
                 payload={"label": self.label, "table": table_name, "error": str(e)},
             )
-            # Do not re-raise; allow the system to drop and recreate the broken table

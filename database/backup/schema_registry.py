@@ -5,12 +5,28 @@ from typing import Dict, List
 from database.schemas import ALL_TABLES, ALL_VEC_TABLES, MASTER_TABLES
 from database.management.schema_introspector import _columns_from_ddl_in_memory
 
+import re
+import sqlglot
+from typing import Dict, List
+from database.schemas import ALL_TABLES, ALL_VEC_TABLES, MASTER_TABLES
+from database.connection import SQLITE_VEC_AVAILABLE
+from database.management.schema_introspector import _columns_from_ddl_in_memory
+
 class BackupSchemaRegistry:
     @classmethod
     def get_expected_sqlite_tables(cls) -> Dict[str, str]:
-        """Returns only target master tables and vector tables."""
-        tables = {k: v for k, v in ALL_TABLES.items() if k in MASTER_TABLES}
-        tables.update(ALL_VEC_TABLES)
+        """Returns target master and vector tables strictly ordered by MASTER_TABLES for FK safety."""
+        # Force dictionary sorting according to the parent-before-child rules of MASTER_TABLES
+        tables = {}
+        for t_name in MASTER_TABLES:
+            if t_name in ALL_TABLES:
+                tables[t_name] = ALL_TABLES[t_name]
+                
+        for name, ddl in ALL_VEC_TABLES.items():
+            if SQLITE_VEC_AVAILABLE:
+                tables[name] = ddl
+            else:
+                tables[name] = f"CREATE TABLE IF NOT EXISTS {name} (rowid INTEGER PRIMARY KEY AUTOINCREMENT, embedding BLOB);"
         return tables
 
     @classmethod
@@ -25,6 +41,13 @@ class BackupSchemaRegistry:
 
         # Transpile standard tables
         sf_ddl = sqlglot.transpile(sqlite_ddl, read='sqlite', write='snowflake')[0]
+        
+        # Snowflake strictly enforces data type matching for DEFAULT constraints.
+        # sqlglot maps SQLite TEXT to Snowflake VARCHAR, but CURRENT_TIMESTAMP() returns a TIMESTAMP.
+        # We strip the default timestamp constraint for the cloud backup since the local SQLite DB
+        # has already generated and populated the timestamp strings.
+        sf_ddl = re.sub(r"(?i)\s*DEFAULT\s+CURRENT_TIMESTAMP(?:\(\))?", "", sf_ddl)
+        
         return sf_ddl
 
     @classmethod

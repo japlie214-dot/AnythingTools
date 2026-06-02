@@ -2,7 +2,6 @@
 
 import os
 from utils.logger.core import get_dual_logger
-from database.backup.config import BackupConfig
 
 log = get_dual_logger(__name__)
 
@@ -33,15 +32,19 @@ async def cleanup_zombie_chrome() -> None:
 
 async def cleanup_temp_files() -> None:
     try:
-        bak_cfg = BackupConfig.from_global_config()
-        if bak_cfg.enabled and bak_cfg.backup_dir.exists():
-            removed_count = 0
-            for p in bak_cfg.backup_dir.rglob("*.tmp.parquet"):
-                try:
-                    p.unlink(missing_ok=True)
-                    removed_count += 1
-                except Exception:
-                    pass
-            log.dual_log(tag="Startup:Cleanup:TempFiles", message="Cleaned up temp Parquet files", level="INFO", payload={"files_removed": removed_count})
+        from database.backup.settings import BackupSettings
+        from pathlib import Path
+        settings = BackupSettings()
+        if settings.local.enabled:
+            backup_dir = Path(settings.local.db_path).parent
+            if backup_dir.exists():
+                removed_count = 0
+                for p in backup_dir.rglob("*.tmp.parquet"):
+                    try:
+                        p.unlink(missing_ok=True)
+                        removed_count += 1
+                    except Exception:
+                        pass
+                log.dual_log(tag="Startup:Cleanup:TempFiles", message="Cleaned up temp Parquet files", level="INFO", payload={"files_removed": removed_count})
     except Exception as e:
         log.dual_log(tag="Startup:Cleanup:TempError", message=f"Temp file cleanup warning: {e}", level="WARNING", payload={"error": str(e)})

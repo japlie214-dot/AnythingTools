@@ -8,7 +8,8 @@ TABLES = {
             page_number INTEGER NOT NULL,
             content TEXT,
             embedding_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(embedding_status IN ('PENDING','EMBEDDED','SKIPPED')),
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 CREATE INDEX idx_pdf_pages_file_page ON pdf_parsed_pages(pdf_name, page_number);
 """,

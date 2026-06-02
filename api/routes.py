@@ -227,3 +227,63 @@ async def resume_job(job_id: str):
         message=report.message,
         details=report.details
     )
+
+@router.post("/tools/{tool_name}", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
+async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
+    meta = REGISTRY._tools.get(tool_name)
+    if not meta:
+        diagnostics = REGISTRY.diagnostic_list()
+        diag_info = diagnostics.get(tool_name)
+        if diag_info and diag_info.get("status") in ("FAILED", "REJECTED"):
+            raise HTTPException(status_code=503, detail=f"Tool {tool_name} is currently degraded: {diag_info.get('error')}")
+        raise HTTPException(status_code=404, detail="Tool not found")
+        
+    tool_cls = meta.get("cls")
+    if tool_cls and hasattr(tool_cls, "INPUT_MODEL") and tool_cls.INPUT_MODEL:
+        try:
+            tool_cls.INPUT_MODEL.model_validate(req.args)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Validation failed: {str(e)}")
+
+    from utils.security import scan_args_for_urls
+    scan_args_for_urls(req.args)
+
+    job_id = ULID.generate()
+    session_id = get_session_id(request)
+    
+    enqueue_write(
+        "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (job_id, session_id, tool_name, json.dumps(req.args), "QUEUED", now_iso(), now_iso())
+    )
+    
+    _ensure_writer_running()
+    get_manager().start()
+    return {"job_id": job_id, "status": "QUEUED"}
+
+@router.get("/backup/status", response_model=BackupMetricsResponse)
+async def get_backup_status():
+    from utils.startup import _global_dual_engine
+    if not _global_dual_engine:
+        raise HTTPException(status_code=503, detail="Backup engine is not active")
+    from database.backup.observability.metrics import BackupMetricsCollector
+    metrics = BackupMetricsCollector.get_metrics(_global_dual_engine)
+    return BackupMetricsResponse(**metrics)
+
+@router.post("/backup/export")
+async def trigger_export(background_tasks: BackgroundTasks, mode: str = Query("delta")):
+    from database.backup.settings import BackupSettings
+    from database.backup.runner import BackupRunner
+    settings = BackupSettings()
+    if not settings.local.enabled and not settings.cloud.enabled:
+        raise HTTPException(status_code=400, detail="Backups are completely disabled")
+        
+    job_id = str(ULID.generate())
+    background_tasks.add_task(BackupRunner.run, mode=mode, trigger_type="manual", manual_job_id=job_id)
+    return {"status": "EXPORT_QUEUED", "job_id": job_id}
+
+@router.post("/backup/restore")
+async def trigger_restore(background_tasks: BackgroundTasks):
+    from database.backup.runner import BackupRunner
+    job_id = str(ULID.generate())
+    background_tasks.add_task(BackupRunner.restore, manual_job_id=job_id)
+    return {"status": "RESTORE_QUEUED", "job_id": job_id}

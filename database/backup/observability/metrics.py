@@ -16,13 +16,33 @@ class BackupMetricsCollector:
                 "circuit_breaker_state": "CLOSED"
             }
             
+        import sqlite3
+        local_db = dual_engine.local.db_path
+        pending_count = 0
+        dlq_count = 0
+        last_sync = None
+
+        try:
+            conn = sqlite3.connect(local_db, timeout=5.0)
+            cursor = conn.execute("SELECT count(*) FROM sync_ledger WHERE state = 'PENDING'")
+            pending_count = cursor.fetchone()[0]
+            
+            cursor = conn.execute("SELECT count(*) FROM dead_letter_queue")
+            dlq_count = cursor.fetchone()[0]
+            
+            cursor = conn.execute("SELECT max(completed_at) FROM sync_ledger WHERE state = 'COMPLETED'")
+            last_sync = cursor.fetchone()[0]
+            conn.close()
+        except Exception:
+            pass
+
         return {
             "local_engine": {"status": "ok" if dual_engine.local.settings.enabled else "disabled"},
             "cloud_engine": {"status": "ok" if dual_engine.cloud.settings.enabled else "disabled"},
             "sync_status": {
-                "pending_conflicts": 0,  # Query from sync_ledger where state = 'PENDING'
-                "dead_letter_count": 0,  # Query from dead_letter_queue count
-                "last_sync_time": None
+                "pending_conflicts": pending_count,
+                "dead_letter_count": dlq_count,
+                "last_sync_time": last_sync
             },
-            "circuit_breaker_state": getattr(dual_engine.cloud.circuit_breaker, 'state', 'CLOSED')
+            "circuit_breaker_state": getattr(dual_engine.cloud.circuit_breaker, "state", "CLOSED")
         }
