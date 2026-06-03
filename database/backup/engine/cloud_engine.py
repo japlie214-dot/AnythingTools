@@ -13,11 +13,11 @@ class SnowflakeSchemaManager:
     @staticmethod
     def reconcile_non_destructive(engine, schema_name: str):
         with engine.begin() as conn:
-            res = conn.execute(text(f"""
-                SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_SCHEMA = '{schema_name.upper()}'
-            """))
+            res = conn.execute(text("""
+                SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = :schema
+            """).bindparams(schema=schema_name.upper()))
             existing = {}
             for row in res:
                 t_name, c_name, d_type = row[0].lower(), row[1].lower(), row[2]
@@ -54,7 +54,9 @@ def unpack_vector(blob: bytes) -> List[float]:
         return []
     return list(struct.unpack('<1024f', blob))
 
-class CloudEngine:
+from database.backup.engine.base import BackupEngine
+
+class CloudEngine(BackupEngine):
     def __init__(self, settings: CloudBackupSettings, cb_settings):
         self.settings = settings
         if self.settings.enabled:
@@ -102,25 +104,90 @@ class CloudEngine:
 
         def _execute_cloud_sync():
             import sqlite3
-            local_conn = sqlite3.connect(local_db_path)
+            local_conn = sqlite3.connect(local_db_path, timeout=30.0)
             results = {}
             
-            with self.engine.begin() as cloud_conn:
-                for table_name in tables:
-                    if 'VIRTUAL' in tables[table_name].upper():
-                        continue
-                    
-                    cursor = local_conn.execute(f"SELECT * FROM {table_name}")
-                    rows = cursor.fetchall()
-                    if not rows:
-                        results[table_name] = 0
-                        continue
+            try:
+                with self.engine.begin() as cloud_conn:
+                    for table_name in tables:
+                        if 'VIRTUAL' in tables[table_name].upper():
+                            continue
+                        
+                        cursor = local_conn.execute(f"SELECT * FROM {table_name}")
+                        rows = cursor.fetchall()
+                        if not rows:
+                            results[table_name] = 0
+                            continue
 
-                    results[table_name] = len(rows) # Snowflake MERGE implemented in actual deployment
-            local_conn.close()
-            return results
+                        columns = [desc[0] for desc in cursor.description]
+                        placeholders = ",".join([f":{c}" for c in columns])
+                        dict_rows = [dict(zip(columns, r)) for r in rows]
+
+                        try:
+                            cloud_conn.execute(text(f"DELETE FROM {self.settings.schema_name}.{table_name}"))
+                            cloud_conn.execute(
+                                text(f"INSERT INTO {self.settings.schema_name}.{table_name} ({','.join(columns)}) VALUES ({placeholders})"),
+                                dict_rows
+                            )
+                            results[table_name] = len(dict_rows)
+                        except Exception as inner_e:
+                            log.dual_log(tag="Backup:Cloud:PushTableError", message=f"Failed pushing table {table_name}", level="ERROR", payload={"error": str(inner_e)})
+                            raise
+                return results
+            finally:
+                local_conn.close()
 
         try:
             return self.circuit_breaker.call(_execute_cloud_sync)
         except Exception as e:
             raise e
+
+    def pull_to_local(self, local_db_path: str, tables: dict) -> dict:
+        if not self.settings.enabled or not self.engine:
+            return {"status": "disabled"}
+            
+        import sqlite3
+        import datetime
+        from decimal import Decimal
+        local_conn = sqlite3.connect(local_db_path, timeout=30.0)
+        results = {}
+        
+        try:
+            with self.engine.begin() as cloud_conn:
+                for table_name in tables:
+                    if 'VIRTUAL' in tables[table_name].upper():
+                        continue
+                        
+                    cloud_rows = cloud_conn.execute(
+                        text(f"SELECT * FROM {self.settings.schema_name}.{table_name}")
+                    ).fetchall()
+                    
+                    if not cloud_rows:
+                        results[table_name] = 0
+                        continue
+                        
+                    columns = list(cloud_rows[0]._mapping.keys())
+                    col_names = ",".join(columns)
+                    placeholders = ",".join(["?"] * len(columns))
+                    
+                    normalized_rows = []
+                    for row in cloud_rows:
+                        norm_row = []
+                        for val in row:
+                            if isinstance(val, (datetime.datetime, datetime.date)):
+                                norm_row.append(val.isoformat())
+                            elif isinstance(val, Decimal):
+                                norm_row.append(float(val))
+                            else:
+                                norm_row.append(val)
+                        normalized_rows.append(tuple(norm_row))
+                        
+                    local_conn.executemany(
+                        f"INSERT OR REPLACE INTO {table_name} ({col_names}) VALUES ({placeholders})",
+                        normalized_rows
+                    )
+                    results[table_name] = len(normalized_rows)
+            local_conn.commit()
+        finally:
+            local_conn.close()
+        return results

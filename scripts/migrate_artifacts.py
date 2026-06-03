@@ -3,11 +3,12 @@
 import os
 import json
 import sqlite3
+import sqlite_vec  # 1. Import the sqlite-vec module
 from pathlib import Path
 
 def migrate():
     db_path = Path("data/sumanal.db")
-    legacy_dir = Path("backups/articles")
+    legacy_dir = Path(r"C:\Users\10102721\OneDrive - JAPFA\AnythingTools\articles")
 
     if not db_path.exists():
         print(f"[ERROR] Database {db_path} not found. Ensure you run this from the project root.")
@@ -20,6 +21,12 @@ def migrate():
     print(f"[INFO] Starting migration from {legacy_dir} into {db_path}...")
     
     conn = sqlite3.connect(db_path)
+    
+    # 2. Enable and load the sqlite-vec extension
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    
     cursor = conn.cursor()
 
     success_count = 0
@@ -70,7 +77,23 @@ def migrate():
     print("\n========================================")
     print(f"Migration Complete. Success: {success_count}, Failed: {fail_count}")
     print("========================================")
-    print("You may now safely delete the legacy 'backups/articles/' directory.")
+
+    # 3. Trigger DualEngine Backup Sync
+    if success_count > 0:
+        print("\n[INFO] Triggering DualEngine sync to backup.db and Snowflake...")
+        try:
+            from database.backup.runner import BackupRunner
+            result = BackupRunner.run(mode="delta", trigger_type="manual")
+            if result.success:
+                print(f"[SUCCESS] DualEngine sync completed. Exported: {result.exported_counts}")
+            else:
+                print(f"[ERROR] DualEngine sync failed: {result.error}")
+        except ImportError:
+            print("[WARN] Could not import BackupRunner. DualEngine sync skipped. Ensure you run this from the project root.")
+        except Exception as e:
+            print(f"[ERROR] Could not trigger DualEngine sync: {e}")
+
+    print("\nYou may now safely delete the legacy 'backups/articles/' directory.")
 
 if __name__ == "__main__":
     migrate()

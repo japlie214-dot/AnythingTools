@@ -3,11 +3,19 @@ from typing import Dict, Literal
 
 class ConflictResolver:
     @staticmethod
-    def resolve(conflict_row: Dict[str, str], last_sync_ts: str) -> Literal['local', 'cloud', 'manual']:
-        local_ts = conflict_row.get("local_ts", "")
-        cloud_ts = conflict_row.get("cloud_ts", "")
-        if local_ts > last_sync_ts and cloud_ts <= last_sync_ts:
-            return 'local'
-        if cloud_ts > last_sync_ts and local_ts <= last_sync_ts:
-            return 'cloud'
-        return 'manual'
+    def resolve_triad(conflict_row: Dict[str, str], strategy: str = "newest_overall_wins") -> str:
+        op_ts = conflict_row.get("operational_ts", "")
+        bk_ts = conflict_row.get("backup_ts", "")
+        
+        if strategy == "operational_wins":
+            return "operational"
+        elif strategy in ("local_backup_wins", "cloud_backup_wins"):
+            return "backup"
+        elif strategy == "newest_overall_wins":
+            if op_ts > bk_ts:
+                return "operational"
+            elif bk_ts > op_ts:
+                return "backup"
+            else:
+                return "manual"
+        return "manual"

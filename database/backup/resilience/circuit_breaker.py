@@ -24,7 +24,7 @@ class CircuitBreaker:
         if self.state == self.OPEN:
             if time.monotonic() - self.last_failure_time > self.reset_timeout:
                 self.state = self.HALF_OPEN
-                log.dual_log(tag="Resilience:CircuitBreaker:HalfOpen", message="Circuit breaker transitioning to HALF_OPEN", level="INFO", payload={})
+                log.dual_log(tag="Resilience:CircuitBreaker:HalfOpen", message="Circuit breaker transitioning to HALF_OPEN", level="INFO", payload={"state": "HALF_OPEN", "failure_count": self.failure_count})
             else:
                 raise CircuitOpenError("Circuit breaker is OPEN")
         try:
@@ -32,7 +32,7 @@ class CircuitBreaker:
             if self.state == self.HALF_OPEN:
                 self.state = self.CLOSED
                 self.failure_count = 0
-                log.dual_log(tag="Resilience:CircuitBreaker:Closed", message="Circuit breaker recovered and CLOSED", level="INFO", payload={})
+                log.dual_log(tag="Resilience:CircuitBreaker:Closed", message="Circuit breaker recovered and CLOSED", level="INFO", payload={"state": "CLOSED", "recovered": True})
             return result
         except Exception as e:
             self.failure_count += 1

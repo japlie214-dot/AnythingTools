@@ -97,6 +97,16 @@ async def lifespan(app: FastAPI):
             try:
                 from utils.startup import _global_dual_engine
                 if _global_dual_engine:
+                    log.dual_log(tag="App:Lifecycle:ShutdownSync", message="Running shutdown sync", level="INFO", payload={"phase": "shutdown_sync"})
+                    try:
+                        sync_result = await asyncio.wait_for(
+                            asyncio.to_thread(_global_dual_engine.sync_all, "delta"),
+                            timeout=30.0
+                        )
+                        log.dual_log(tag="App:Lifecycle:ShutdownSyncComplete", message="Shutdown sync completed", level="INFO", payload=sync_result)
+                    except asyncio.TimeoutError:
+                        log.dual_log(tag="App:Lifecycle:ShutdownSyncTimeout", message="Shutdown sync timed out after 30s", level="WARNING", payload={"timeout_s": 30})
+                    
                     log.dual_log(tag="App:Lifecycle:ShutdownBackupV2", message="Shutting down Backup V2 engines", level="INFO", payload={"status": "initiating"})
                     _global_dual_engine.shutdown()
             except Exception as e:

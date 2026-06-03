@@ -4,7 +4,7 @@
 AnythingTools is a durable, tool-augmented background service designed for high-reliability web scraping, financial data extraction, and automated publishing to Telegram. It solves the fragility of LLM-driven browser automation by decoupling request submission from execution, implementing strict state persistence, utilizing Semantic Object Models (SoM) for DOM interaction, and providing a robust crash-recovery framework.
 
 ### Operational Purpose
-The system provides a managed, asynchronous execution environment for long-running browser tasks. It ensures progress is never lost during network failures, DOM changes, or process crashes by tracking granular job items in a SQLite database. It provides a Human-in-the-Loop (HITL) mechanism to pause and resume tasks, and a robust dual-mode (Local SQLite + Cloud Snowflake) backup engine for disaster recovery and analytical syncing.
+The system provides a managed, asynchronous execution environment for long-running browser tasks. It ensures progress is never lost during network failures, DOM changes, or process crashes by tracking granular job items in a SQLite database. It provides a Human-in-the-Loop (HITL) mechanism to pause and resume tasks, and a robust dual-mode (Local SQLite + Cloud Snowflake) bidirectional synchronization engine for disaster recovery and analytical syncing.
 
 ### Explicit Non-Goals
 - **Not a Chatbot**: It is an asynchronous job processor, not a real-time interactive chat interface.
@@ -20,7 +20,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **Tool Registry (`tools/registry.py`)**: A dynamic discovery system that instantiates `BaseTool` subclasses.
 - **Orchestrator (`bot/orchestrator_core/`)**: Middleware that enhances browser interaction by injecting a Semantic Object Model (SoM) into the DOM before LLM evaluation.
 - **Database Layer (`database/`)**: A multi-database architecture (`sumanal.db`, `logs.db`, `backup.db`) utilizing dedicated single-writer threads to completely eliminate SQLite locking contention (`database is locked`).
-- **Sync Subsystem (`database/backup/`)**: A bidirectional delta-sync engine maintaining parity between a local SQLite backup and a cloud Snowflake warehouse.
+- **Sync Subsystem (`database/backup/`)**: A bidirectional delta-sync engine maintaining parity between an Operational DB, a Local SQLite backup, and a cloud Snowflake warehouse.
 
 ### Data Flow
 1. **Submission**: `POST /api/tools/{tool_name}` $\rightarrow$ API validates input via Pydantic $\rightarrow$ Job inserted into `jobs` table as `QUEUED`.
@@ -28,7 +28,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 3. **Execution**: `Worker` $\rightarrow$ `ToolRegistry` (instantiation) $\rightarrow$ `Tool.run()` (invokes LLMs, bots, and SoM injection).
 4. **Persistence**: Tool results are written to `jobs.result_json` and detailed progress is tracked in `job_items`. All writes queue through `database.writer`.
 5. **Completion**: `_do_callback_with_logging` sends the final result to the calling system (e.g., AnythingLLM) via HTTP POST.
-6. **Backup/Sync**: On startup and shutdown, `DualEngine` calculates checksum deltas and syncs operational master tables to `backup.db` and Snowflake.
+6. **Backup/Sync**: On startup and shutdown, `DualEngine` executes a bidirectional sync. It pulls from Snowflake, computes a 3-way delta (Operational vs. Local vs. Cloud), resolves conflicts via automated strategies or HITL, persists the merged state locally, drains the write queue, and finally pushes the synchronized state back to Snowflake.
 
 ## 3. Repository Structure
 - `api/`: REST endpoints (`routes.py`) and Pydantic validation schemas (`schemas.py`).
@@ -39,7 +39,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - `database/`: 
     - `connection.py`, `writer.py`, `logs_writer.py`: Thread-safe database managers.
     - `schemas/`: Canonical SQL definitions.
-    - `backup/`: The DualEngine backup system. Contains `engine/`, `sync/` (SyncLedger, ConflictResolver, DiffEngine), and `resilience/` (CircuitBreaker, DeadLetterQueue).
+    - `backup/`: The DualEngine backup system. Contains `engine/`, `sync/` (SyncLedger, ConflictResolver, DiffEngine, UserConfirmationHandler), and `resilience/` (CircuitBreaker, DeadLetterQueue).
     - `broadcast/`: Domain logic for Telegram publishing state.
     - `management/`: Schema reconciliation and database health checks.
 - `tools/`:
@@ -59,7 +59,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **SoM (Semantic Object Model)**: Injection of `data-ai-id` attributes into the DOM (via JS) to provide the LLM with deterministic element references, bypassing fragile CSS selectors.
 - **Resume Mechanism**: Tool-specific logic (`ResumeHandler`) that queries domain tables (e.g., `job_items`) to determine the exact point of resumption after a crash or HITL pause.
 - **WriteReceipt**: A synchronization primitive that blocks synchronous code until an asynchronous database write is committed by the writer thread.
-- **DualEngine Backup**: A non-destructive synchronization system tracking `updated_at` and data checksums in a `sync_ledger` to manage split-brain scenarios between local storage and Snowflake.
+- **DualEngine 3-Way Sync**: A non-destructive synchronization system that computes deltas across the Operational DB, Local Backup, and Cloud Snowflake. It utilizes a `sync_ledger` and a `dead_letter_queue` for conflict auditing and error isolation.
 
 ### Invariants
 - **Single Writer**: All writes to operational databases MUST pass through the `database.writer` or `database.logs_writer` queues.
@@ -80,7 +80,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **Crash Recovery**: If the application crashes, the startup sequence (`utils/startup/recovery.py`) downgrades `RUNNING` jobs to `INTERRUPTED`. The `UnifiedWorkerManager` automatically retries these.
 - **HITL Pause**: Tools can raise a `PAUSED_FOR_HITL` signal (e.g., encountering a paywall). Execution halts until a POST to `/resume` is received.
 - **Doom Loop Prevention**: The `/resume` endpoint increments `resume_count`. If it exceeds `MAX_RESUME_ATTEMPTS`, the job is poisoned and marked `FAILED`.
-- **Sync Conflicts (Split-Brain)**: If both Snowflake and Local SQLite have modified a row since the last sync, `ConflictResolver` flags it. Headless resolution rules or `UserConfirmationHandler` dictate the overwrite direction.
+- **Sync Conflicts (Split-Brain)**: If multiple versions of a row exist across Operational, Local, and Cloud states, `ConflictResolver` flags it. The system employs automated strategies (`newest_overall_wins`, etc.) or escalates to the `UserConfirmationHandler` for a manual terminal-based decision.
 - **Circuit Breaking**: If Snowflake is unreachable, `CircuitBreaker` opens, and CloudEngine operations fail fast. The system operates locally and sets a `sync_pending` flag for future reconciliation.
 
 ## 6. Public Interfaces
@@ -114,7 +114,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **FastAPI**: REST API layer.
 - **SQLite (stdlib)**: Primary persistence mechanism.
 - **sqlite-vec**: C extension for vector similarity search (`MATCH`).
-- **Snowflake-SQLAlchemy & Cryptography**: Connection pooling, key-pair authentication, and `MERGE INTO` operations for cloud sync.
+- **Snowflake-SQLAlchemy & Cryptography**: Connection pooling, key-pair authentication, and `INSERT` operations for cloud sync.
 - **sqlglot**: SQL dialect transpilation (SQLite -> Snowflake).
 - **Pydantic & Pydantic-Settings**: Data validation, input schema generation, and strict environment configuration (`BackupSettings`).
 - **Botasaurus**: Chrome automation (stealth, CDP interactions).
@@ -127,7 +127,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
    - Required: `API_KEY`, `AZURE_ENDPOINT`, `EDGAR_IDENTITY`.
    - Optional Backup: `BACKUP_CLOUD__ACCOUNT`, `BACKUP_CLOUD__USER`, etc.
 3. Run the application: `python -m uvicorn app:app --reload --port 8000`.
-4. *Startup Sequence*: The app enforces `WEB_CONCURRENCY=1`, mounts static artifacts, drops and recreates `logs.db`, validates `sqlite-vec`, runs schema migrations, executes the `DualEngine` backup sync, and warms up the browser daemon.
+4. *Startup Sequence*: The app enforces `WEB_CONCURRENCY=1`, mounts static artifacts, drops and recreates `logs.db`, validates `sqlite-vec`, runs schema migrations, executes the `DualEngine` bidirectional backup sync (including HITL strategy selection), and warms up the browser daemon.
 
 ## 10. Testing & Validation
 - **Health Checks**: Extensive runtime health checks during startup (e.g., PRAGMA `integrity_check`, CDP ping probes in `ChromeDaemonManager`).
@@ -139,7 +139,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **Single-Node Limitation**: The architecture strictly relies on in-memory locks (`browser_lock.py`), in-memory context variables (`utils/logger/state.py`), and a local SQLite WAL. It cannot be horizontally scaled across multiple containers.
 - **Browser State Fragility**: Relying on headless/headful Chrome introduces inherent fragility regarding CDP timeouts, zombie processes, and changing target DOMs.
 - **Telegram Limits**: Global API rate limits are heavily constrained; `SlidingWindowRateLimiter` ensures compliance but forces slow, serialized delivery of large news batches.
-- **Memory Consumption**: `DiffEngine` uses SQLite temp tables to avoid Python OOMs, but massive `MERGE INTO` operations in Snowflake may still incur noticeable memory overhead in SQLAlchemy.
+- **Memory Consumption**: `DiffEngine` uses SQLite temp tables to avoid Python OOMs, but massive data transfers in Snowflake may still incur noticeable memory overhead in SQLAlchemy.
 
 ## 12. Change Sensitivity
 - **Extremely Fragile**: `database/writer.py` and `database/logs_writer.py`. Altering the queue logic, thread handling, and transaction boundaries here will cause immediate database locking or silent data loss.

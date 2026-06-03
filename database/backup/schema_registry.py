@@ -3,12 +3,6 @@ import re
 import sqlglot
 from typing import Dict, List
 from database.schemas import ALL_TABLES, ALL_VEC_TABLES, MASTER_TABLES
-from database.management.schema_introspector import _columns_from_ddl_in_memory
-
-import re
-import sqlglot
-from typing import Dict, List
-from database.schemas import ALL_TABLES, ALL_VEC_TABLES, MASTER_TABLES
 from database.connection import SQLITE_VEC_AVAILABLE
 from database.management.schema_introspector import _columns_from_ddl_in_memory
 

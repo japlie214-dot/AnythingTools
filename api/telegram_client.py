@@ -41,7 +41,7 @@ class TelegramBot:
     @staticmethod
     async def send_chat_message(text: str, parse_mode: str = "HTML") -> bool:
         try:
-            log.dual_log(tag="Telegram:Bot:Deprecated", message="Deprecated send_chat_message called; no-op", payload={"length": len(text) if text else 0})
+            log.dual_log(tag="Telegram:Bot:Deprecated", message="Deprecated send_chat_message called; no-op", payload={"method": "send_chat_message", "length": len(text) if text else 0, "active": False})
         except Exception:
             pass
         return False
@@ -49,7 +49,7 @@ class TelegramBot:
     @staticmethod
     async def send_poll(*args, **kwargs):
         try:
-            log.dual_log(tag="Telegram:Bot:Deprecated", message="Deprecated send_poll called; no-op", payload={})
+            log.dual_log(tag="Telegram:Bot:Deprecated", message="Deprecated send_poll called; no-op", payload={"method": "send_poll", "active": False})
         except Exception:
             pass
         return None

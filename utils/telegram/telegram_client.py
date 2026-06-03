@@ -92,10 +92,10 @@ class TelegramAPIClient:
         if self._bot:
             try:
                 await self._bot.shutdown()
-                log.dual_log(tag="Telegram:Client:Shutdown", message="Bot shut down locally", payload={})
+                log.dual_log(tag="Telegram:Client:Shutdown", message="Bot shut down locally", payload={"action": "shutdown", "bot_initialized": True})
             except Exception as e:
                 log.dual_log(tag="Telegram:Client:Shutdown", message=f"Shutdown non-fatal error: {e}", level="WARNING", payload={"error": str(e)})
 
     async def close(self) -> None:
-        log.dual_log(tag="Telegram:Client:Deprecated", message="close() is deprecated, mapping to shutdown()", level="WARNING", payload={})
+        log.dual_log(tag="Telegram:Client:Deprecated", message="close() is deprecated, mapping to shutdown()", level="WARNING", payload={"deprecated_method": "close", "replacement": "shutdown"})
         await self.shutdown()
