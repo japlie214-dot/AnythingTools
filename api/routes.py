@@ -131,24 +131,6 @@ async def delete_job(job_id: str, request: Request):
         # Job not actively running yet; we marked it in DB and manager will honor it.
         return {"job_id": job_id, "status": "CANCELLING"}
 
-
-@router.get("/metrics")
-async def metrics():
-    # Legacy route
-    try:
-        from database.writer import write_queue
-        qsize = write_queue.qsize()
-    except Exception:
-        qsize = 0
-    active_jobs = 0
-    try:
-        mgr = get_manager()
-        active_jobs = len(mgr.cancellation_flags)
-    except Exception:
-        pass
-    return {"write_queue_size": qsize, "active_jobs": active_jobs, "registered_tools": len(REGISTRY._tools)}
-
-
 @router.get("/diagnostics")
 async def diagnostics():
     """Return internal metrics for observability."""

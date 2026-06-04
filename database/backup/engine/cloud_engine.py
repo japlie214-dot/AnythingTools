@@ -70,10 +70,21 @@ class CloudEngine(BackupEngine):
             )
         else:
             self.engine = None
-        self.circuit_breaker = CircuitBreaker(
+        
+        # Isolate circuit breakers into discrete instances
+        self.circuit_breaker_push = CircuitBreaker(
             failure_threshold=cb_settings.circuit_breaker_threshold,
             reset_timeout=cb_settings.circuit_breaker_reset_seconds
         )
+        self.circuit_breaker_pull = CircuitBreaker(
+            failure_threshold=cb_settings.circuit_breaker_threshold,
+            reset_timeout=cb_settings.circuit_breaker_reset_seconds
+        )
+        self.circuit_breaker_vec = CircuitBreaker(
+            failure_threshold=cb_settings.circuit_breaker_threshold,
+            reset_timeout=cb_settings.circuit_breaker_reset_seconds
+        )
+        self.circuit_breaker = self.circuit_breaker_push # Backward compatibility
 
     def _load_private_key(self):
         from cryptography.hazmat.backends import default_backend
@@ -90,9 +101,11 @@ class CloudEngine(BackupEngine):
         if not self.settings.enabled:
             return {"status": "disabled"}
         def _do_startup():
+            with self.engine.begin() as conn:
+                conn.execute(text("SELECT CURRENT_VERSION()"))
             SnowflakeSchemaManager.reconcile_non_destructive(self.engine, self.settings.schema_name)
             return {"status": "ok"}
-        return self.circuit_breaker.call(_do_startup)
+        return self.circuit_breaker_push.call(_do_startup)
 
     def shutdown(self):
         if self.engine:
@@ -124,12 +137,35 @@ class CloudEngine(BackupEngine):
                         dict_rows = [dict(zip(columns, r)) for r in rows]
 
                         try:
-                            cloud_conn.execute(text(f"DELETE FROM {self.settings.schema_name}.{table_name}"))
+                            stage_table = f"{table_name}_stage"
+                            col_defs = ",".join([f"{c} VARCHAR" for c in columns])
+                            cloud_conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {self.settings.schema_name}.{stage_table} ({col_defs})"))
+                            
                             cloud_conn.execute(
-                                text(f"INSERT INTO {self.settings.schema_name}.{table_name} ({','.join(columns)}) VALUES ({placeholders})"),
+                                text(f"INSERT INTO {self.settings.schema_name}.{stage_table} VALUES ({placeholders})"),
                                 dict_rows
                             )
-                            results[table_name] = len(dict_rows)
+                            
+                            pk_col = "id"
+                            try:
+                                for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
+                                    if col_info[5] > 0:  # The 5th index represents the PK flag
+                                        pk_col = col_info[1]
+                                        break
+                            except Exception:
+                                pass
+
+                            merge_sql = f"""
+                            MERGE INTO {self.settings.schema_name}.{table_name} t
+                            USING {self.settings.schema_name}.{stage_table} s
+                            ON t.{pk_col} = s.{pk_col}
+                            WHEN MATCHED THEN UPDATE SET
+                                {", ".join([f"t.{c} = s.{c}" for c in columns if c != pk_col])}
+                            WHEN NOT MATCHED THEN INSERT ({",".join(columns)})
+                                VALUES ({",".join([f"s.{c}" for c in columns])})
+                            """
+                            result = cloud_conn.execute(text(merge_sql))
+                            results[table_name] = result.rowcount if hasattr(result, "rowcount") else len(dict_rows)
                         except Exception as inner_e:
                             log.dual_log(tag="Backup:Cloud:PushTableError", message=f"Failed pushing table {table_name}", level="ERROR", payload={"error": str(inner_e)})
                             raise
@@ -138,7 +174,7 @@ class CloudEngine(BackupEngine):
                 local_conn.close()
 
         try:
-            return self.circuit_breaker.call(_execute_cloud_sync)
+            return self.circuit_breaker_push.call(_execute_cloud_sync)
         except Exception as e:
             raise e
 
@@ -166,7 +202,7 @@ class CloudEngine(BackupEngine):
                         results[table_name] = 0
                         continue
                         
-                    columns = list(cloud_rows[0]._mapping.keys())
+                    columns = [k.lower() for k in cloud_rows[0]._mapping.keys()]
                     col_names = ",".join(columns)
                     placeholders = ",".join(["?"] * len(columns))
                     

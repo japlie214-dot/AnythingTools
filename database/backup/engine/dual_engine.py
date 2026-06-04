@@ -130,7 +130,7 @@ class DualEngine:
                     bk_latest = bk_conn.execute(f"SELECT MAX(updated_at) FROM {table_name}").fetchone()[0]
                 except Exception: bk_count, bk_latest = 0, "N/A"
 
-                deltas = DiffEngine.compute_triad_deltas(op_conn, bk_conn, table_name)
+                deltas = DiffEngine.compute_triad_deltas(op_conn, bk_conn, None, table_name)
                 triad_deltas[table_name] = deltas
                 
                 metrics["tables"][table_name] = {

@@ -31,17 +31,19 @@ class LocalEngine(BackupEngine):
 
             expected_tables = BackupSchemaRegistry.get_expected_sqlite_tables()
             from database.backup.sync.ledger import SyncLedger
+            from database.schemas.sync_audit import TABLES as AUDIT_TABLES
             
             # Register infrastructure tables so the Reconciler manages and protects them
+            expected_tables.update(AUDIT_TABLES)
             expected_tables["sync_ledger"] = SyncLedger.SCHEMA
             expected_tables["dead_letter_queue"] = """
                 CREATE TABLE IF NOT EXISTS dead_letter_queue (
-                    dlq_id TEXT PRIMARY KEY,
                     table_name TEXT NOT NULL,
                     row_id TEXT NOT NULL,
                     row_data TEXT NOT NULL,
                     error_message TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (table_name, row_id)
                 );
             """
             expected_tables["sync_fallback_queue"] = """
@@ -79,6 +81,32 @@ class LocalEngine(BackupEngine):
             backup_write_queue.put(None, timeout=2.0)
         except Exception:
             pass
+
+    def _snapshot_via_attach(self, run_id: str | None) -> dict:
+        import time
+        import sqlite3
+        from database.connection import DB_PATH
+        t0 = time.monotonic()
+        target_conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
+            target_conn.execute(f"ATTACH DATABASE '{DB_PATH.as_posix()}' AS op")
+            tables = BackupSchemaRegistry.get_expected_sqlite_tables()
+            for table_name, ddl in tables.items():
+                if 'VIRTUAL' in ddl.upper():
+                    continue
+                target_conn.execute(f"INSERT OR REPLACE INTO main.{table_name} SELECT * FROM op.{table_name}")
+            target_conn.commit()
+        except Exception as e:
+            target_conn.rollback()
+            raise e
+        finally:
+            try: target_conn.execute("DETACH DATABASE op")
+            except: pass
+            target_conn.close()
+            
+        dur = time.monotonic() - t0
+        log.dual_log(tag="Backup:Local:Snapshot", message="Local snapshot via ATTACH complete", payload={"duration_s": dur, "run_id": run_id})
+        return {"snapshot": True, "duration_s": dur}
 
     def sync_data(self, tables: dict, mode: str = "delta") -> dict:
         from database.connection import DatabaseManager

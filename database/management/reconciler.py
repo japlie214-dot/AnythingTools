@@ -267,15 +267,22 @@ class SchemaReconciler:
                 report.add(ReconciliationAction(name, "recreated", is_master=is_master, reason=f"vec0 read probe failed: {e}"))
 
     def _snapshot_master(self, table_name: str):
-        """Pre-drop snapshot for master tables. If corrupted, log CRITICAL and proceed with reset."""
+        """Pre-drop snapshot for master tables by locally renaming them to prevent loss and avoid circular runner loops."""
         try:
-            from database.backup.runner import BackupRunner
-            BackupRunner.run(mode="full")
-            log.dual_log(tag="Database:Schema:SnapshotComplete", level="INFO", message=f"[{self.label}] Pre-drop snapshot complete: {table_name}", payload={"label": self.label, "table": table_name})
+            import time
+            timestamp = int(time.time())
+            backup_name = f"_old_{table_name}_{timestamp}"
+            self.conn.execute(f"ALTER TABLE {table_name} RENAME TO {backup_name}")
+            log.dual_log(
+                tag="Database:Schema:LocalSnapshot",
+                level="INFO",
+                message=f"[{self.label}] Locally renamed master table {table_name} to {backup_name} before recreation",
+                payload={"label": self.label, "table": table_name, "backup_table": backup_name}
+            )
         except Exception as e:
             log.dual_log(
                 tag="Database:Schema:SnapshotFailed",
                 level="CRITICAL",
-                message=f"[{self.label}] {table_name} snapshot failed. Proceeding with reset. Error: {e}",
+                message=f"[{self.label}] Local snapshot of master table {table_name} failed. Error: {e}",
                 payload={"label": self.label, "table": table_name, "error": str(e)},
             )

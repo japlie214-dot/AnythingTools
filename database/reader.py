@@ -154,30 +154,3 @@ def get_all_translated_items(job_id: str) -> List[Dict[str, Any]]:
     return results
 
 
-def get_batch_phase_state(batch_id: str) -> Dict[str, Any]:
-    """DEPRECATED: Retrieve the granular phase_state mapping for a broadcast batch.
-    Use database.broadcast.queries instead.
-    """
-    cur = _get_cursor()
-    cur.execute(
-        "SELECT phase_state FROM broadcast_batches WHERE batch_id = ?",
-        (batch_id,)
-    )
-    row = cur.fetchone()
-    
-    default_state = {
-        "validate": {},
-        "translate": {},
-        "publish_briefing": {},
-        "publish_archive": {}
-    }
-    
-    if not row or not row["phase_state"]:
-        return default_state
-
-    try:
-        loaded = json.loads(row["phase_state"])
-        default_state.update(loaded)
-        return default_state
-    except json.JSONDecodeError:
-        return default_state
