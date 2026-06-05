@@ -19,7 +19,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **Unified Worker Manager (`bot/engine/worker.py`)**: A singleton daemon that polls the `jobs` table and spawns isolated threads for tool execution.
 - **Tool Registry (`tools/registry.py`)**: A dynamic discovery system that instantiates `BaseTool` subclasses.
 - **Orchestrator (`bot/orchestrator_core/`)**: Middleware that enhances browser interaction by injecting a Semantic Object Model (SoM) into the DOM before LLM evaluation.
-- **Database Layer (`database/`)**: A multi-database architecture (`sumanal.db`, `logs.db`, `backup.db`) utilizing dedicated single-writer threads to completely eliminate SQLite locking contention (`database is locked`).
+- **Database Layer (`database/`)**: A multi-database architecture (`sumanal.db`, `logs.db`, `backup.db`) utilizing dedicated single-writer threads to completely eliminate SQLite locking contention.
 - **Sync Subsystem (`database/backup/`)**: A bidirectional delta-sync engine maintaining parity between an Operational DB, a Local SQLite backup, and a cloud Snowflake warehouse.
 
 ### Data Flow
@@ -27,7 +27,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 2. **Dispatch**: `UnifiedWorkerManager` polls `jobs` $\rightarrow$ Spawns execution thread $\rightarrow$ Sets status to `RUNNING`.
 3. **Execution**: `Worker` $\rightarrow$ `ToolRegistry` (instantiation) $\rightarrow$ `Tool.run()` (invokes LLMs, bots, and SoM injection).
 4. **Persistence**: Tool results are written to `jobs.result_json` and detailed progress is tracked in `job_items`. All writes queue through `database.writer`.
-5. **Completion**: `_do_callback_with_logging` sends the final result to the calling system (e.g., AnythingLLM) via HTTP POST.
+5. **Completion**: `_do_callback_with_logging` sends the final result to the calling system via HTTP POST.
 6. **Backup/Sync**: On startup and shutdown, `DualEngine` executes a bidirectional sync. It pulls from Snowflake, computes a 3-way delta (Operational vs. Local vs. Cloud), resolves conflicts via automated strategies or HITL, persists the merged state locally, drains the write queue, and finally pushes the synchronized state back to Snowflake.
 
 ## 3. Repository Structure
@@ -39,7 +39,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - `database/`: 
     - `connection.py`, `writer.py`, `logs_writer.py`: Thread-safe database managers.
     - `schemas/`: Canonical SQL definitions.
-    - `backup/`: The DualEngine backup system. Contains `engine/`, `sync/` (SyncLedger, ConflictResolver, DiffEngine, UserConfirmationHandler), and `resilience/` (CircuitBreaker, DeadLetterQueue).
+    - `backup/`: The DualEngine backup system. Contains `engine/` (Local, Cloud, Dual), `sync/` (DiffEngine, resolution, foundation), and `writer/` (BackupWriteTask, enqueue_backup_write).
     - `broadcast/`: Domain logic for Telegram publishing state.
     - `management/`: Schema reconciliation and database health checks.
 - `tools/`:
@@ -51,7 +51,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
     - `stock_notes/`: SEC EDGAR footnote extraction and dynamic table management.
     - `batch_reader/`: Hybrid semantic + keyword search across batches.
 - `utils/`: Cross-cutting utilities (logging, artifact management, browser daemon, SoM Javascript injection, rate limiters, text sanitization).
-- `scripts/`: Standalone maintenance utilities (e.g., `migrate_artifacts.py` for legacy filesystem-to-DB migration).
+- `scripts/`: Standalone maintenance utilities (e.g., `migrate_artifacts.py`).
 
 ## 4. Core Concepts & Domain Model
 ### Key Abstractions

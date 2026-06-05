@@ -30,7 +30,7 @@ class LocalEngine(BackupEngine):
             _attempt_vec_load(conn)
 
             expected_tables = BackupSchemaRegistry.get_expected_sqlite_tables()
-            from database.backup.sync.ledger import SyncLedger
+            from database.backup.sync.foundation import SyncLedger
             from database.schemas.sync_audit import TABLES as AUDIT_TABLES
             
             # Register infrastructure tables so the Reconciler manages and protects them
@@ -43,15 +43,6 @@ class LocalEngine(BackupEngine):
                     row_data TEXT NOT NULL,
                     error_message TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (table_name, row_id)
-                );
-            """
-            expected_tables["sync_fallback_queue"] = """
-                CREATE TABLE IF NOT EXISTS sync_fallback_queue (
-                    table_name TEXT NOT NULL,
-                    row_id TEXT NOT NULL,
-                    action TEXT NOT NULL CHECK(action IN ('UPSERT', 'DELETE')),
-                    queued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (table_name, row_id)
                 );
             """
@@ -82,36 +73,11 @@ class LocalEngine(BackupEngine):
         except Exception:
             pass
 
-    def _snapshot_via_attach(self, run_id: str | None) -> dict:
-        import time
-        import sqlite3
-        from database.connection import DB_PATH
-        t0 = time.monotonic()
-        target_conn = sqlite3.connect(self.db_path, timeout=30.0)
-        try:
-            target_conn.execute(f"ATTACH DATABASE '{DB_PATH.as_posix()}' AS op")
-            tables = BackupSchemaRegistry.get_expected_sqlite_tables()
-            for table_name, ddl in tables.items():
-                if 'VIRTUAL' in ddl.upper():
-                    continue
-                target_conn.execute(f"INSERT OR REPLACE INTO main.{table_name} SELECT * FROM op.{table_name}")
-            target_conn.commit()
-        except Exception as e:
-            target_conn.rollback()
-            raise e
-        finally:
-            try: target_conn.execute("DETACH DATABASE op")
-            except: pass
-            target_conn.close()
-            
-        dur = time.monotonic() - t0
-        log.dual_log(tag="Backup:Local:Snapshot", message="Local snapshot via ATTACH complete", payload={"duration_s": dur, "run_id": run_id})
-        return {"snapshot": True, "duration_s": dur}
 
     def sync_data(self, tables: dict, mode: str = "delta") -> dict:
         from database.connection import DatabaseManager
         from database.backup.writer.backup_writer import enqueue_backup_write
-        from database.backup.sync.ledger import SyncLedger
+        from database.backup.sync.foundation import SyncLedger
         
         op_conn = DatabaseManager.get_read_connection()
         results = {}
@@ -138,19 +104,26 @@ class LocalEngine(BackupEngine):
             column_names = ",".join(columns)
             
             batch_size = 1000
+            from database.backup.writer.backup_writer import BackupWriteTask
             for i in range(0, len(rows), batch_size):
-                batch = [tuple(r) for r in rows[i:i + batch_size]]
-                enqueue_backup_write(
-                    f"INSERT OR REPLACE INTO {table_name} ({column_names}) VALUES ({placeholders})",
-                    batch
-                )
+                batch = rows[i:i + batch_size]
+                records = [dict(zip(columns, r)) for r in batch]
+                pk_col = "id"  # Implicit default standard
+                enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", records, pk_col))
             results[table_name] = len(rows)
 
         if sum(results.values()) > 0:
-            enqueue_backup_write(
-                "INSERT INTO sync_ledger (operation_id, table_name, direction, row_count, state, completed_at) VALUES (?, ?, 'BIDIRECTIONAL', ?, 'COMPLETED', ?)",
-                (SyncLedger.now_iso(), "ALL", sum(results.values()), SyncLedger.now_iso())
-            )
+            from database.backup.writer.backup_writer import BackupWriteTask
+            from database.backup.sync.foundation import SyncLedger
+            ledger_records = [{
+                "operation_id": SyncLedger.now_iso(),
+                "table_name": "ALL",
+                "direction": "BIDIRECTIONAL",
+                "row_count": sum(results.values()),
+                "state": "COMPLETED",
+                "completed_at": SyncLedger.now_iso()
+            }]
+            enqueue_backup_write(BackupWriteTask("sync_ledger", "UPSERT", ledger_records, "operation_id"))
         return results
 
     def _get_table_watermark(self, table_name: str) -> str:

@@ -133,7 +133,13 @@ class CloudEngine(BackupEngine):
                             continue
 
                         columns = [desc[0] for desc in cursor.description]
-                        placeholders = ",".join([f":{c}" for c in columns])
+                        placeholders_list = []
+                        for c in columns:
+                            if c == "embedding":
+                                placeholders_list.append(f"PARSE_JSON(:{c})::VECTOR(FLOAT, 1024)")
+                            else:
+                                placeholders_list.append(f":{c}")
+                        placeholders = ",".join(placeholders_list)
                         dict_rows = [dict(zip(columns, r)) for r in rows]
                         
                         pk_col = "id"
@@ -145,22 +151,21 @@ class CloudEngine(BackupEngine):
                         except Exception:
                             pass
 
-                        # Process vectors to lists of floats for Snowflake compatibility
+                        # Process vectors to JSON strings for Snowflake compatibility
                         if "embedding" in columns:
+                            import json
                             valid_rows = []
                             for row in dict_rows:
                                 if row.get("embedding"):
                                     unpacked = unpack_vector(row["embedding"])
                                     if len(unpacked) != 1024:
                                         import time
-                                        dlq_sql = "INSERT OR REPLACE INTO dead_letter_queue (dlq_id, table_name, row_id, row_data, error_message) VALUES (?, ?, ?, ?, ?)"
-                                        try:
-                                            local_conn.execute(dlq_sql, (str(time.time()), table_name, str(row.get(pk_col, "")), str(row), "Invalid vector dimensions"))
-                                            local_conn.commit()
-                                        except Exception:
-                                            log.dual_log(tag="Backup:Cloud:DLQ:WriteFailed", message="Failed writing DLQ entry", level="WARNING", payload={"table": table_name, "row": str(row)})
+                                        from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
+                                        row["_error_msg"] = "Invalid vector dimensions"
+                                        enqueue_backup_write(BackupWriteTask("dead_letter_queue", "DLQ", [row], pk_col))
                                         continue
-                                    row["embedding"] = unpacked
+                                    # Keep as JSON string to prevent Python connector array-expansion
+                                    row["embedding"] = json.dumps(unpacked)
                                 valid_rows.append(row)
                             dict_rows = valid_rows
                             if not dict_rows:
@@ -191,12 +196,10 @@ class CloudEngine(BackupEngine):
                             if "VECTOR" in str(inner_e).upper() or "FLOAT" in str(inner_e).upper() or "DIMENSION" in str(inner_e).upper():
                                 log.dual_log(tag="Backup:Cloud:PushTableDLQ", message=f"Vector validation failed for {table_name}, routing to DLQ", level="WARNING", payload={"error": str(inner_e)})
                                 import time
-                                dlq_inserts = [
-                                    (str(time.time() + i), table_name, str(r.get(pk_col, "")), str(r), str(inner_e))
-                                    for i, r in enumerate(dict_rows)
-                                ]
-                                local_conn.executemany("INSERT OR REPLACE INTO dead_letter_queue (dlq_id, table_name, row_id, row_data, error_message) VALUES (?, ?, ?, ?, ?)", dlq_inserts)
-                                local_conn.commit()
+                                from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
+                                for r in dict_rows:
+                                    r["_error_msg"] = str(inner_e)
+                                enqueue_backup_write(BackupWriteTask("dead_letter_queue", "DLQ", dict_rows, pk_col))
                             else:
                                 log.dual_log(tag="Backup:Cloud:PushTableError", message=f"Failed pushing table {table_name}", level="ERROR", payload={"error": str(inner_e)})
                                 raise
@@ -213,10 +216,8 @@ class CloudEngine(BackupEngine):
         if not self.settings.enabled or not self.engine:
             return {"status": "disabled"}
             
-        import sqlite3
         import datetime
         from decimal import Decimal
-        local_conn = sqlite3.connect(local_db_path, timeout=30.0)
         results = {}
         
         try:
@@ -237,7 +238,7 @@ class CloudEngine(BackupEngine):
                     col_names = ",".join(columns)
                     placeholders = ",".join(["?"] * len(columns))
                     
-                    from database.backup.sync.content_hasher import ContentHasher
+                    from database.backup.sync.foundation import ContentHasher
                     normalized_rows = []
                     for row in cloud_rows:
                         norm_row = []
@@ -262,12 +263,11 @@ class CloudEngine(BackupEngine):
                                 new_r[hash_idx] = new_hash
                                 normalized_rows[i] = tuple(new_r)
 
-                    local_conn.executemany(
-                        f"INSERT OR REPLACE INTO {table_name} ({col_names}) VALUES ({placeholders})",
-                        normalized_rows
-                    )
+                    pk_col = "id"
+                    records = [dict(zip(columns, r)) for r in normalized_rows]
+                    from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
+                    enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", records, pk_col))
                     results[table_name] = len(normalized_rows)
-            local_conn.commit()
         finally:
-            local_conn.close()
+            pass
         return results

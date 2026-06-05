@@ -1,6 +1,6 @@
-# database/backup/vec/vector_backup_adapter.py
+# database/backup/vec/adapter.py
 import sqlite3
-from typing import List, Optional
+from typing import List
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
@@ -12,8 +12,11 @@ class VectorBackupAdapter:
             rows = op_conn.execute("SELECT v.rowid, a.id, v.embedding FROM scraped_articles_vec v JOIN scraped_articles a ON a.vec_rowid = v.rowid").fetchall()
             if not rows:
                 return 0
-            backup_conn.execute("DELETE FROM scraped_articles_vec_backup")
-            backup_conn.executemany("INSERT OR REPLACE INTO scraped_articles_vec_backup (rowid, article_id, embedding) VALUES (?, ?, ?)", [(r[0], r[1], bytes(r[2])) for r in rows])
+            try:
+                backup_conn.execute("DELETE FROM scraped_articles_vec_backup")
+            except Exception:
+                pass
+            backup_conn.executemany("INSERT OR REPLACE INTO scraped_articles_vec_backup (rowid, article_id, embedding) VALUES (?, ?, ?)", [(r[0], r[1], bytes(r[2]) if r[2] is not None else None) for r in rows])
             backup_conn.commit()
             return len(rows)
         except Exception as e:
@@ -26,10 +29,17 @@ class VectorBackupAdapter:
             rows = backup_conn.execute("SELECT rowid, embedding FROM scraped_articles_vec_backup").fetchall()
             if not rows:
                 return 0
-            op_conn.execute("DELETE FROM scraped_articles_vec")
-            op_conn.executemany("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", [(r[0], bytes(r[1])) for r in rows])
+            try:
+                op_conn.execute("DELETE FROM scraped_articles_vec")
+            except Exception:
+                pass
+            op_conn.executemany("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", [(r[0], bytes(r[1]) if r[1] is not None else None) for r in rows])
             return len(rows)
         except Exception as e:
             log.dual_log(tag="Restore:Vec:Error", message=f"Vector restore failed: {e}", level="ERROR", payload={"error": str(e)})
-            op_conn.rollback()
+            try:
+                op_conn.rollback()
+            except Exception:
+                pass
             return 0
+        

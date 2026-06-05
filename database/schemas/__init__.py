@@ -8,6 +8,9 @@ from database.schemas import jobs, finance, vector, pdf, token, logs, stock_note
 # RULE: PERSISTED_TABLES must be an ordered list (parents before children) for FK-safe restores.
 # RULE: Derived/External FTS tables (e.g., scraped_articles_fts) must NEVER be included here.
 # They cannot be restored directly and must be rebuilt post-restoration.
+# CRITICAL: ONLY tables explicitly listed in PERSISTED_TABLES are backed up.
+# Ephemeral tables (like `jobs`, `job_items`) and physical artifacts (JSON, Markdown in `artifacts/`)
+# are STRICTLY EXCLUDED and will not survive a cloud restore.
 PERSISTED_TABLES: list[str] = [
     "scraped_articles",
     "scraped_articles_vec_backup",

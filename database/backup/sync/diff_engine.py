@@ -14,7 +14,7 @@ class DiffEngine:
           content_identical, timestamp_drift and genuine_conflicts.
         - When content_hash is missing for either side, fall back to timestamp comparison.
         """
-        from database.backup.sync.content_hasher import ContentHasher
+        from database.backup.sync.foundation import ContentHasher
 
         mem_db = sqlite3.connect(":memory:")
         mem_db.executescript("""
@@ -35,15 +35,20 @@ class DiffEngine:
         # Backfill missing content_hash in operational DB if column exists
         if has_content_hash_op:
             try:
-                count = op_conn.execute(f"SELECT COUNT(*) FROM {table_name} WHERE content_hash = '' OR content_hash IS NULL").fetchone()[0]
-                if count > 0:
-                    op_rows = op_conn.execute(f"SELECT * FROM {table_name} WHERE content_hash = '' OR content_hash IS NULL").fetchall()
-                    col_names = [d[0] for d in op_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
-                    for r in op_rows:
-                        row_dict = dict(zip(col_names, r))
-                        new_hash = ContentHasher.compute_row_hash(table_name, row_dict)
-                        op_conn.execute(f"UPDATE {table_name} SET content_hash = ? WHERE {pk_col} = ?", (new_hash, row_dict[pk_col]))
-                    op_conn.commit()
+                from database.connection import DatabaseManager
+                write_conn = DatabaseManager.create_write_connection()
+                try:
+                    count = write_conn.execute(f"SELECT COUNT(*) FROM {table_name} WHERE content_hash = '' OR content_hash IS NULL").fetchone()[0]
+                    if count > 0:
+                        op_rows = write_conn.execute(f"SELECT * FROM {table_name} WHERE content_hash = '' OR content_hash IS NULL").fetchall()
+                        col_names = [d[0] for d in write_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
+                        for r in op_rows:
+                            row_dict = dict(zip(col_names, r))
+                            new_hash = ContentHasher.compute_row_hash(table_name, row_dict)
+                            write_conn.execute(f"UPDATE {table_name} SET content_hash = ? WHERE {pk_col} = ?", (new_hash, row_dict[pk_col]))
+                        write_conn.commit()
+                finally:
+                    write_conn.close()
             except Exception:
                 pass
 

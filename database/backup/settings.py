@@ -30,18 +30,12 @@ from enum import Enum
 
 class StrategyMode(str, Enum):
     AUTO_RECOMMEND = "auto_recommend"
-    THREE_WAY_MERGE = "three_way_merge"
     NEWEST_WINS = "newest_wins"
     LOCAL_BACKUP_WINS = "local_backup_wins"
     CLOUD_BACKUP_WINS = "cloud_backup_wins"
     OPERATIONAL_WINS = "operational_wins"
     ABORT = "abort"
 
-class DecisionSource(str, Enum):
-    ENV = "env"
-    API = "api"
-    TERMINAL = "terminal"
-    AUTO_ACCEPT = "auto"
 
 class HITLConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix='BACKUP_SYNC_', extra='ignore')
@@ -52,7 +46,7 @@ class HITLConfig(BaseSettings):
 
 class Vec0BackupSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix='BACKUP_VEC0_', extra='ignore')
-    enabled: bool = False
+    enabled: bool = True
     dim: int = 1024
     chunk_size: int = 1024
     push_batch_size: int = 256
