@@ -175,6 +175,12 @@ class SchemaReconciler:
             
             has_drift = any([missing, type_mismatches, constraint_mismatches, extra])
             
+            if has_drift and missing == ["content_hash"] and not type_mismatches and not constraint_mismatches and not extra:
+                log.dual_log(tag="Database:Schema:AddColumn", level="INFO", message=f"[{self.label}] Adding content_hash to {name}", payload={"table": name})
+                self.conn.execute(f"ALTER TABLE {name} ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+                report.add(ReconciliationAction(name, "altered"))
+                continue
+
             if has_drift:
                 is_master = name in self.master_tables
                 if is_master:

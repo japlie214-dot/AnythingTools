@@ -20,32 +20,39 @@ class UserConfirmationHandler:
 
     @staticmethod
     def hitl_prompt_sync_strategy(metrics: dict) -> str:
-        print("\n" + "="*80)
-        print("=== HITL PRE-SYNC VALIDATION & SOURCE OF TRUTH SELECTION ===")
-        print("="*80)
-        print(f"Operational DB : {metrics['op_db_path']}")
-        print(f"Local Backup   : {metrics['bk_db_path']} (Enabled: {metrics['local_enabled']})")
-        print(f"Cloud Backup   : {metrics['cloud_account']} (Enabled: {metrics['cloud_enabled']})")
-        print("-" * 80)
-        print(f"{'TABLE':<22} | {'OP ROWS':<8} | {'BK ROWS':<8} | {'OP_ONLY':<8} | {'BK_ONLY':<8} | {'CONFLICTS':<9}")
-        for t, m in metrics['tables'].items():
-            print(f"{t:<22} | {m['op_rows']:<8} | {m['bk_rows']:<8} | {m['op_only']:<8} | {m['bk_only']:<8} | {m['conflicts']:<9}")
-            op_latest = str(m.get('op_latest', 'N/A'))[:19]
-            bk_latest = str(m.get('bk_latest', 'N/A'))[:19]
-            if op_latest != 'N/A' or bk_latest != 'N/A':
-                print(f"  └─ Latest Update -> Op: {op_latest} | Bk: {bk_latest}")
-        print("="*80)
-        print("Select the Source of Truth Strategy for this sync session:")
-        print("  [N] Newest Overall Wins (Merge delta, resolve conflicts by latest updated_at)")
-        print("  [O] Operational Wins (Force Op state, overwrite backups)")
-        print("  [B] Backup Wins (Force Local/Cloud state, overwrite Op)")
-        print("  [A] Abort Sync")
-        while True:
-            try:
-                choice = input("Strategy [N/O/B/A]: ").strip().upper()
-            except EOFError:
-                choice = "A"
-            if choice == 'N': return 'newest_overall_wins'
-            if choice == 'O': return 'operational_wins'
-            if choice == 'B': return 'backup_wins'
-            if choice == 'A': return 'abort'
+        from database.backup.sync.strategy_recommender import StrategyRecommender
+        rec = StrategyRecommender.recommend(metrics['tables'], metrics['local_enabled'], metrics['cloud_enabled'])
+        print(f"\n>>> RECOMMENDED: {rec.overall_strategy.value} (confidence: {rec.overall_confidence:.0%})")
+        print(f">>> Reasoning: {rec.reasoning}")
+        
+        from utils.logger.state import hitl_buffer_lock
+        import utils.logger.state as log_state
+        with hitl_buffer_lock:
+            log_state.hitl_buffering_active = True
+
+        try:
+            choice = input(f"Strategy [N/O/L/C/A] (recommended: {rec.overall_strategy.value}): ").strip().upper()
+        except EOFError:
+            choice = "A"
+            if rec.safe_to_auto_accept:
+                choice_map = {
+                    "newest_wins": "N",
+                    "operational_wins": "O",
+                    "local_backup_wins": "L",
+                    "cloud_backup_wins": "C",
+                }
+                choice = choice_map.get(rec.overall_strategy.value, "A")
+
+        with hitl_buffer_lock:
+            log_state.hitl_buffering_active = False
+            to_flush = list(log_state.hitl_buffer)
+            log_state.hitl_buffer.clear()
+        
+        for logger_inst, t, m, lvl, p, exc, st in to_flush:
+            logger_inst.dual_log(tag=t, message=m, level=lvl, payload=p, exc_info=exc, status_state=st)
+
+        if choice == 'N': return 'newest_overall_wins'
+        if choice == 'O': return 'operational_wins'
+        if choice == 'L' or choice == 'B': return 'backup_wins'
+        if choice == 'C': return 'cloud_backup_wins'
+        if choice == 'A': return 'abort'

@@ -135,10 +135,40 @@ class CloudEngine(BackupEngine):
                         columns = [desc[0] for desc in cursor.description]
                         placeholders = ",".join([f":{c}" for c in columns])
                         dict_rows = [dict(zip(columns, r)) for r in rows]
+                        
+                        pk_col = "id"
+                        try:
+                            for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
+                                if col_info[5] > 0:
+                                    pk_col = col_info[1]
+                                    break
+                        except Exception:
+                            pass
 
+                        # Process vectors to lists of floats for Snowflake compatibility
+                        if "embedding" in columns:
+                            valid_rows = []
+                            for row in dict_rows:
+                                if row.get("embedding"):
+                                    unpacked = unpack_vector(row["embedding"])
+                                    if len(unpacked) != 1024:
+                                        import time
+                                        dlq_sql = "INSERT OR REPLACE INTO dead_letter_queue (dlq_id, table_name, row_id, row_data, error_message) VALUES (?, ?, ?, ?, ?)"
+                                        try:
+                                            local_conn.execute(dlq_sql, (str(time.time()), table_name, str(row.get(pk_col, "")), str(row), "Invalid vector dimensions"))
+                                            local_conn.commit()
+                                        except Exception:
+                                            log.dual_log(tag="Backup:Cloud:DLQ:WriteFailed", message="Failed writing DLQ entry", level="WARNING", payload={"table": table_name, "row": str(row)})
+                                        continue
+                                    row["embedding"] = unpacked
+                                valid_rows.append(row)
+                            dict_rows = valid_rows
+                            if not dict_rows:
+                                results[table_name] = 0
+                                continue
                         try:
                             stage_table = f"{table_name}_stage"
-                            col_defs = ",".join([f"{c} VARCHAR" for c in columns])
+                            col_defs = ",".join([f"{c} VECTOR(FLOAT, 1024)" if c == "embedding" else f"{c} VARCHAR" for c in columns])
                             cloud_conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {self.settings.schema_name}.{stage_table} ({col_defs})"))
                             
                             cloud_conn.execute(
@@ -146,15 +176,6 @@ class CloudEngine(BackupEngine):
                                 dict_rows
                             )
                             
-                            pk_col = "id"
-                            try:
-                                for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
-                                    if col_info[5] > 0:  # The 5th index represents the PK flag
-                                        pk_col = col_info[1]
-                                        break
-                            except Exception:
-                                pass
-
                             merge_sql = f"""
                             MERGE INTO {self.settings.schema_name}.{table_name} t
                             USING {self.settings.schema_name}.{stage_table} s
@@ -167,8 +188,18 @@ class CloudEngine(BackupEngine):
                             result = cloud_conn.execute(text(merge_sql))
                             results[table_name] = result.rowcount if hasattr(result, "rowcount") else len(dict_rows)
                         except Exception as inner_e:
-                            log.dual_log(tag="Backup:Cloud:PushTableError", message=f"Failed pushing table {table_name}", level="ERROR", payload={"error": str(inner_e)})
-                            raise
+                            if "VECTOR" in str(inner_e).upper() or "FLOAT" in str(inner_e).upper() or "DIMENSION" in str(inner_e).upper():
+                                log.dual_log(tag="Backup:Cloud:PushTableDLQ", message=f"Vector validation failed for {table_name}, routing to DLQ", level="WARNING", payload={"error": str(inner_e)})
+                                import time
+                                dlq_inserts = [
+                                    (str(time.time() + i), table_name, str(r.get(pk_col, "")), str(r), str(inner_e))
+                                    for i, r in enumerate(dict_rows)
+                                ]
+                                local_conn.executemany("INSERT OR REPLACE INTO dead_letter_queue (dlq_id, table_name, row_id, row_data, error_message) VALUES (?, ?, ?, ?, ?)", dlq_inserts)
+                                local_conn.commit()
+                            else:
+                                log.dual_log(tag="Backup:Cloud:PushTableError", message=f"Failed pushing table {table_name}", level="ERROR", payload={"error": str(inner_e)})
+                                raise
                 return results
             finally:
                 local_conn.close()
@@ -206,6 +237,7 @@ class CloudEngine(BackupEngine):
                     col_names = ",".join(columns)
                     placeholders = ",".join(["?"] * len(columns))
                     
+                    from database.backup.sync.content_hasher import ContentHasher
                     normalized_rows = []
                     for row in cloud_rows:
                         norm_row = []
@@ -214,10 +246,22 @@ class CloudEngine(BackupEngine):
                                 norm_row.append(val.isoformat())
                             elif isinstance(val, Decimal):
                                 norm_row.append(float(val))
+                            elif isinstance(val, list) and len(val) > 0 and isinstance(val[0], float):
+                                norm_row.append(struct.pack(f'<{len(val)}f', *val))
                             else:
                                 norm_row.append(val)
                         normalized_rows.append(tuple(norm_row))
                         
+                    if "content_hash" in columns:
+                        hash_idx = columns.index("content_hash")
+                        for i, r in enumerate(normalized_rows):
+                            if not r[hash_idx]:
+                                row_dict = dict(zip(columns, r))
+                                new_hash = ContentHasher.compute_row_hash(table_name, row_dict)
+                                new_r = list(r)
+                                new_r[hash_idx] = new_hash
+                                normalized_rows[i] = tuple(new_r)
+
                     local_conn.executemany(
                         f"INSERT OR REPLACE INTO {table_name} ({col_names}) VALUES ({placeholders})",
                         normalized_rows

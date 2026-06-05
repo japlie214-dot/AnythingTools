@@ -30,6 +30,11 @@ _current_job_id: contextvars.ContextVar[str | None] = (
     contextvars.ContextVar("_current_job_id", default=None)
 )
 
+# HITL console buffering primitives
+import threading
+hitl_buffer_lock = threading.Lock()
+hitl_buffering_active = False
+hitl_buffer: list = []
 
 def get_current_job_id() -> str | None:
     """Return the current job id stored in the ContextVar (may be None)."""

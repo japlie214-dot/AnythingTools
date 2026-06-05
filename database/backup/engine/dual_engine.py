@@ -70,7 +70,48 @@ class DualEngine:
         return results
 
     def restore_pipeline(self) -> bool:
-        return True # Implement actual restore push-down as needed
+        import sqlite3
+        from database.backup.schema_registry import BackupSchemaRegistry
+        from database.connection import DatabaseManager
+        from database.backup.vec.vector_backup_adapter import VectorBackupAdapter
+        from database.schemas import PERSISTED_TABLES
+        
+        op_conn = DatabaseManager.create_write_connection()
+        bk_conn = sqlite3.connect(self.local.db_path)
+        tables = BackupSchemaRegistry.get_expected_sqlite_tables()
+        
+        try:
+            op_conn.execute("PRAGMA foreign_keys = OFF")
+            
+            # Order 1: PERSISTED_TABLES (scalar data)
+            for t in PERSISTED_TABLES:
+                if t in tables:
+                    rows = bk_conn.execute(f"SELECT * FROM {t}").fetchall()
+                    if rows:
+                        cols = [desc[0] for desc in bk_conn.execute(f"SELECT * FROM {t} LIMIT 1").description]
+                        placeholders = ",".join(["?"] * len(cols))
+                        op_conn.execute(f"DELETE FROM {t}")
+                        op_conn.executemany(f"INSERT INTO {t} ({','.join(cols)}) VALUES ({placeholders})", rows)
+            
+            # Order 2: FTS5 Triggers automatically fired during scalar insert.
+            try:
+                op_conn.execute("INSERT INTO scraped_articles_fts(scraped_articles_fts) VALUES('rebuild')")
+            except Exception:
+                pass
+                
+            # Order 3: Vector companion table to vec0
+            VectorBackupAdapter.restore_vectors(bk_conn, op_conn)
+            
+            op_conn.commit()
+            return True
+        except Exception as e:
+            log.dual_log(tag="Backup:Restore:Error", message=f"Restore pipeline failed: {e}", level="CRITICAL", payload={"error": str(e)})
+            op_conn.rollback()
+            return False
+        finally:
+            op_conn.execute("PRAGMA foreign_keys = ON")
+            op_conn.close()
+            bk_conn.close()
 
     def sync_bidirectional(self, mode: str = "delta", default_strategy: str = "newest_overall_wins") -> dict:
         import time
@@ -135,7 +176,12 @@ class DualEngine:
                 
                 metrics["tables"][table_name] = {
                     "op_rows": op_count, "bk_rows": bk_count, "op_latest": op_latest, "bk_latest": bk_latest,
-                    "op_only": len(deltas["op_only"]), "bk_only": len(deltas["bk_only"]), "conflicts": len(deltas["conflicts"])
+                    "op_only": len(deltas["op_only"]), "bk_only": len(deltas["bk_only"]),
+                    "conflicts": len(deltas.get("genuine_conflicts", [])),
+                    "genuine_conflicts": deltas.get("genuine_conflicts", []),
+                    "content_identical": deltas.get("content_identical", []),
+                    "timestamp_drift": deltas.get("timestamp_drift", []),
+                    "total_rows": deltas.get("total_rows", 0)
                 }
             
             # HITL CONFIRMATION
@@ -189,11 +235,11 @@ class DualEngine:
                         results["bk_persisted"] += 1
                         log.dual_log(tag="Backup:Sync:Verdict", message="Persisted row to backup", payload={"table": table_name, "id": op_id, "action": "PERSIST_TO_BK", "reason": "merge_op_only"})
 
-                for conflict in deltas["conflicts"]:
+                for conflict in deltas.get("genuine_conflicts", []):
                     verdict = ConflictResolver.resolve_triad(conflict, strategy=selected_strategy)
                     if verdict == "manual":
                         verdict = UserConfirmationHandler.hitl_wait_for_sync_operator(
-                            table_name, conflict["id"], conflict["operational_ts"], conflict["backup_ts"], conflict["cloud_ts"]
+                            table_name, conflict.get("id"), conflict.get("op_ts", ""), conflict.get("bk_ts", ""), conflict.get("cloud_ts", "")
                         )
                     
                     log.dual_log(tag="Backup:Sync:Verdict", message="Conflict resolved", payload={"table": table_name, "id": conflict["id"], "verdict": verdict, "conflict_data": conflict})

@@ -2,7 +2,7 @@
 import re
 import sqlglot
 from typing import Dict, List
-from database.schemas import ALL_TABLES, ALL_VEC_TABLES, MASTER_TABLES
+from database.schemas import ALL_TABLES, ALL_VEC_TABLES, PERSISTED_TABLES
 from database.connection import SQLITE_VEC_AVAILABLE
 from database.management.schema_introspector import _columns_from_ddl_in_memory
 
@@ -12,7 +12,7 @@ class BackupSchemaRegistry:
         """Returns target master and vector tables strictly ordered by MASTER_TABLES for FK safety."""
         # Force dictionary sorting according to the parent-before-child rules of MASTER_TABLES
         tables = {}
-        for t_name in MASTER_TABLES:
+        for t_name in PERSISTED_TABLES:
             if t_name in ALL_TABLES:
                 tables[t_name] = ALL_TABLES[t_name]
                 

@@ -42,6 +42,7 @@ CREATE INDEX idx_job_items_metadata ON job_items(
             status TEXT NOT NULL DEFAULT 'PENDING'
                 CHECK(status IN ('PENDING','PUBLISHING','PARTIAL','COMPLETED','FAILED')),
             source_job_id TEXT,
+            content_hash TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -58,6 +59,7 @@ CREATE INDEX idx_broadcast_batches_status ON broadcast_batches(status);
             translated_title TEXT,
             translated_summary TEXT,
             translated_conclusion TEXT,
+            content_hash TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(batch_id) REFERENCES broadcast_batches(batch_id) ON DELETE CASCADE,

@@ -1,7 +1,7 @@
 # database/schemas/vector.py
 
 TABLES = {
-    "scraped_articles": """CREATE TABLE scraped_articles (
+    "scraped_articles": """CREATE TABLE IF NOT EXISTS scraped_articles (
             id TEXT NOT NULL PRIMARY KEY,
             vec_rowid INTEGER NOT NULL,
             url TEXT NOT NULL UNIQUE,
@@ -10,12 +10,23 @@ TABLES = {
             summary TEXT,
             metadata_json TEXT NOT NULL DEFAULT '{}',
             embedding_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(embedding_status IN ('PENDING','EMBEDDED','SKIPPED')),
+            content_hash TEXT NOT NULL DEFAULT '',
             scraped_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-CREATE INDEX idx_scraped_articles_url ON scraped_articles(url);
-CREATE INDEX idx_scraped_articles_status ON scraped_articles(embedding_status);
-CREATE INDEX idx_scraped_articles_vec_rowid ON scraped_articles(vec_rowid);
+CREATE INDEX IF NOT EXISTS idx_scraped_articles_url ON scraped_articles(url);
+CREATE INDEX IF NOT EXISTS idx_scraped_articles_status ON scraped_articles(embedding_status);
+CREATE INDEX IF NOT EXISTS idx_scraped_articles_vec_rowid ON scraped_articles(vec_rowid);
+""",
+
+    "scraped_articles_vec_backup": """CREATE TABLE IF NOT EXISTS scraped_articles_vec_backup (
+            rowid INTEGER PRIMARY KEY,
+            article_id TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            hashed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (article_id) REFERENCES scraped_articles(id) ON DELETE CASCADE
+        );
+CREATE INDEX IF NOT EXISTS idx_vec_backup_article ON scraped_articles_vec_backup(article_id);
 """,
 }
 

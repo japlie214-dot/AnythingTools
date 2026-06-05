@@ -15,6 +15,7 @@ TABLES = {
         fiscal_year_end_month INTEGER NOT NULL DEFAULT 12,
         quarter INTEGER NOT NULL DEFAULT 0,
         year INTEGER NOT NULL DEFAULT 0,
+        content_hash TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -40,6 +41,7 @@ TABLES = {
         year INTEGER NOT NULL DEFAULT 0,
         quarterly_status TEXT NOT NULL DEFAULT '',
         version INTEGER NOT NULL DEFAULT 1,
+        content_hash TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(filing_id) REFERENCES sn_filings(filing_id) ON DELETE CASCADE
@@ -60,6 +62,7 @@ TABLES = {
         quarter INTEGER NOT NULL DEFAULT 0,
         year INTEGER NOT NULL DEFAULT 0,
         quarterly_status TEXT NOT NULL DEFAULT '',
+        content_hash TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(ticker, detail_table_name, source_accession_no, source_note_number)

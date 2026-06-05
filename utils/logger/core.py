@@ -58,6 +58,12 @@ class SumAnalLogger:
         event_id = ULID.generate()
         extra = {"tag": tag, "payload": payload, "event_id": event_id}
 
+        from utils.logger.state import hitl_buffer_lock, hitl_buffering_active, hitl_buffer
+        with hitl_buffer_lock:
+            if hitl_buffering_active:
+                hitl_buffer.append((self, tag, message, level, payload, exc_info, status_state))
+                return
+
         # 1. Console + master file via composed logger.
         self._logger.log(level_int, message, extra=extra, exc_info=exc_info)
 

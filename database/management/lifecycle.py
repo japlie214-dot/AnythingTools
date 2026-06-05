@@ -38,7 +38,7 @@ async def run_database_lifecycle() -> None:
     # 1. Import schemas (orchestration layer is allowed to know about domains)
     from database.schemas import (
         ALL_TABLES, ALL_VEC_TABLES, ALL_FTS_TABLES, ALL_TRIGGERS,
-        MASTER_TABLES, LOGS_TABLES
+        PERSISTED_TABLES, LOGS_TABLES
     )
     
     # 2. Context 1: Main Operational Database
@@ -52,7 +52,7 @@ async def run_database_lifecycle() -> None:
         db_path=DB_PATH,
         expected_tables=main_tables,
         expected_triggers=ALL_TRIGGERS,
-        master_tables=MASTER_TABLES
+        master_tables=PERSISTED_TABLES
     )
     
     # 3. Context 2: Logs Database (with clean separation)
