@@ -78,7 +78,9 @@ class DualEngine:
 
         if self.cloud.settings.enabled:
             try:
-                results["cloud"] = self.cloud.sync_data(self.local.db_path, tables, batch_size=self.settings.sync.batch_size)
+                # DELTA PRINCIPLE: Shutdown sync forces an operational_wins strategy
+                # (via local SQLite sync) and then performs a delta-only cloud push to Snowflake.
+                results["cloud"] = self.cloud.sync_data(self.local.db_path, tables, batch_size=self.settings.sync.batch_size, delta_only=True)
             except Exception as e:
                 log.dual_log(tag="Backup:Sync:CloudError", message=f"Cloud sync failed: {str(e)}", level="ERROR", payload={"error": str(e)})
                 results["cloud_error"] = str(e)
@@ -224,12 +226,12 @@ class DualEngine:
                     results["bk_deleted"] += len(deltas["bk_only"])
                     for bk_id in deltas["bk_only"]:
                         log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{bk_id}] action=DELETE_FROM_BK reason=operational_wins", payload={"table": table_name, "id": bk_id})
-                elif selected_strategy == "backup_wins" and deltas["op_only"]:
+                elif selected_strategy in ("local_backup_wins", "backup_wins") and deltas["op_only"]:
                     for op_id in deltas["op_only"]:
                         op_transactions.append((f"DELETE FROM {table_name} WHERE {pk_col} = ?", (op_id,)))
                     results["op_deleted"] += len(deltas["op_only"])
                     for op_id in deltas["op_only"]:
-                        log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{op_id}] action=DELETE_FROM_OP reason=backup_wins", payload={"table": table_name, "id": op_id})
+                        log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{op_id}] action=DELETE_FROM_OP reason=local_backup_wins", payload={"table": table_name, "id": op_id})
             
             # Phase 2: UPSERT operations (Forward order)
             for table_name in ordered_tables:
@@ -245,7 +247,7 @@ class DualEngine:
                         results["bk_persisted"] += len(rows)
                         for op_id in deltas["op_only"]:
                             log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{op_id}] action=PERSIST_TO_BK reason=operational_wins", payload={"table": table_name, "id": op_id})
-                elif selected_strategy == "backup_wins" and deltas["bk_only"]:
+                elif selected_strategy in ("local_backup_wins", "backup_wins") and deltas["bk_only"]:
                     rows = bk_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({','.join(['?']*len(deltas['bk_only']))})", deltas["bk_only"]).fetchall()
                     if rows:
                         cols = [desc[0] for desc in bk_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
@@ -253,7 +255,7 @@ class DualEngine:
                             op_transactions.append((f"INSERT OR REPLACE INTO {table_name} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", tuple(r)))
                         results["op_restored"] += len(rows)
                         for bk_id in deltas["bk_only"]:
-                            log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{bk_id}] action=RESTORE_TO_OP reason=backup_wins", payload={"table": table_name, "id": bk_id})
+                            log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{bk_id}] action=RESTORE_TO_OP reason=local_backup_wins", payload={"table": table_name, "id": bk_id})
                 elif selected_strategy == "newest_overall_wins":
                     if deltas["bk_only"]:
                         rows = bk_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({','.join(['?']*len(deltas['bk_only']))})", deltas["bk_only"]).fetchall()
@@ -333,9 +335,10 @@ class DualEngine:
         log.dual_log(tag="Backup:Sync:Summary", message="Bidirectional sync pipeline complete", payload={"summary_text": "\n".join(summary_lines), "results": results})
 
         if self.cloud.settings.enabled:
-            log.dual_log(tag="Backup:Sync:CloudPushRequest", message="Pushing synchronized local data to cloud", payload={"tables": list(tables.keys())})
+            log.dual_log(tag="Backup:Sync:CloudPushRequest", message="Pushing synchronized local data to cloud (delta mode)", payload={"tables": list(tables.keys()), "mode": "delta"})
             try:
-                results["cloud_push"] = self.cloud.sync_data(self.local.db_path, tables, batch_size=self.settings.sync.batch_size)
+                # DELTA PRINCIPLE: Only push rows that differ between local backup and cloud via manifest diffing.
+                results["cloud_push"] = self.cloud.sync_data(self.local.db_path, tables, batch_size=self.settings.sync.batch_size, delta_only=True)
                 log.dual_log(tag="Backup:Sync:CloudPushResponse", message="Cloud push complete", payload={"results": results["cloud_push"]})
             except Exception as e:
                 log.dual_log(tag="Backup:Sync:CloudPushError", message=f"Cloud push failed: {e}", level="ERROR", payload={"error": str(e)})

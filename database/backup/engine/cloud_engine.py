@@ -111,7 +111,25 @@ class CloudEngine(BackupEngine):
         if self.engine:
             self.engine.dispose()
 
-    def sync_data(self, local_db_path: str, tables: dict, batch_size: int = 500) -> dict:
+    def _upload_local_manifest(self, local_conn, cloud_conn, table_name: str, pk_col: str, hash_col: str) -> str:
+        """Uploads local IDs and content hashes to a Snowflake temporary table for manifest diffing."""
+        manifest_table = f"{table_name}_manifest_tmp"
+        cloud_conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {self.settings.schema_name}.{manifest_table} (id VARCHAR, content_hash VARCHAR)"))
+        
+        try:
+            cursor = local_conn.execute(f"SELECT {pk_col}, {hash_col} FROM {table_name}")
+            manifest_rows = [{"id": str(row[0]), "content_hash": str(row[1])} for row in cursor.fetchall()]
+        except Exception:
+            manifest_rows = []
+            
+        if manifest_rows:
+            batch_size = 10000
+            for i in range(0, len(manifest_rows), batch_size):
+                batch = manifest_rows[i:i + batch_size]
+                cloud_conn.execute(text(f"INSERT INTO {self.settings.schema_name}.{manifest_table} (id, content_hash) VALUES (:id, :content_hash)"), batch)
+        return manifest_table
+
+    def sync_data(self, local_db_path: str, tables: dict, batch_size: int = 500, delta_only: bool = True) -> dict:
         if not self.settings.enabled or not self.engine:
             return {"status": "disabled"}
 
@@ -126,117 +144,129 @@ class CloudEngine(BackupEngine):
                         if 'VIRTUAL' in tables[table_name].upper():
                             continue
                         
-                        cursor = local_conn.execute(f"SELECT * FROM {table_name}")
-                        rows = cursor.fetchall()
-                        if not rows:
+                        pk_col = "id"
+                        hash_col = "content_hash"
+                        try:
+                            for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
+                                if col_info[5] > 0: pk_col = col_info[1]
+                        except Exception: pass
+
+                        try:
+                            has_hash = False
+                            for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
+                                if col_info[1] == "content_hash": has_hash = True
+                            if not has_hash: hash_col = "''"
+                        except Exception: pass
+
+                        manifest_table = self._upload_local_manifest(local_conn, cloud_conn, table_name, pk_col, hash_col)
+
+                        try:
+                            diff_query = f"""
+                            SELECT m.id FROM {self.settings.schema_name}.{manifest_table} m
+                            LEFT JOIN {self.settings.schema_name}.{table_name} c ON m.id = c.{pk_col}
+                            WHERE c.{pk_col} IS NULL OR COALESCE(m.content_hash, '') != COALESCE(c.content_hash, '')
+                            """
+                            cloud_needs = cloud_conn.execute(text(diff_query)).fetchall()
+                            ids_to_push = [r[0] for r in cloud_needs]
+                        except Exception:
+                            # Fallback to full table extraction if diff fails
+                            cursor = local_conn.execute(f"SELECT {pk_col} FROM {table_name}")
+                            ids_to_push = [r[0] for r in cursor.fetchall()]
+
+                        if not ids_to_push:
                             results[table_name] = 0
                             continue
 
-                        columns = [desc[0] for desc in cursor.description]
-                        placeholders_list = []
-                        for c in columns:
-                            if c == "embedding":
-                                placeholders_list.append(f"PARSE_JSON(:{c})::VECTOR(FLOAT, 1024)")
-                            else:
-                                placeholders_list.append(f":{c}")
-                        placeholders = ",".join(placeholders_list)
-                        dict_rows = [dict(zip(columns, r)) for r in rows]
-                        
-                        pk_col = "id"
-                        try:
-                            for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
-                                if col_info[5] > 0:
-                                    pk_col = col_info[1]
-                                    break
-                        except Exception:
-                            pass
+                        # Chunk reading from SQLite to avoid parameter limits
+                        chunk_size = 900
+                        dict_rows = []
+                        columns = []
+                        for i in range(0, len(ids_to_push), chunk_size):
+                            chunk = ids_to_push[i:i + chunk_size]
+                            placeholders = ",".join("?" for _ in chunk)
+                            cursor = local_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({placeholders})", chunk)
+                            if not columns and cursor.description:
+                                columns = [desc[0] for desc in cursor.description]
+                            dict_rows.extend([dict(zip(columns, r)) for r in cursor.fetchall()])
 
-                        # Process vectors to JSON strings for Snowflake compatibility
+                        if not dict_rows or not columns:
+                            results[table_name] = 0
+                            continue
+
                         if "embedding" in columns:
-                            import json
-                            valid_rows = []
-                            for row in dict_rows:
-                                if row.get("embedding"):
-                                    unpacked = unpack_vector(row["embedding"])
-                                    if len(unpacked) != 1024:
-                                        import time
-                                        from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
-                                        row["_error_msg"] = "Invalid vector dimensions"
-                                        enqueue_backup_write(BackupWriteTask("dead_letter_queue", "DLQ", [row], pk_col))
-                                        continue
-                                    # Keep as JSON string to prevent Python connector array-expansion
-                                    row["embedding"] = json.dumps(unpacked)
-                                valid_rows.append(row)
-                            dict_rows = valid_rows
-                            if not dict_rows:
-                                results[table_name] = 0
-                                continue
-                        try:
+                            from database.backup.vec.cloud_vector_pusher import CloudVectorPusher
+                            pusher = CloudVectorPusher(circuit_breaker=self.circuit_breaker_vec)
+                            push_result = pusher.push_vectors(cloud_conn, self.settings.schema_name, table_name, columns, dict_rows, pk_col, batch_size=batch_size)
+                            results[table_name] = push_result["pushed"]
+                        else:
                             stage_table = f"{table_name}_stage"
-                            col_defs = ",".join([f"{c} VECTOR(FLOAT, 1024)" if c == "embedding" else f"{c} VARCHAR" for c in columns])
+                            col_defs = ",".join([f"{c} VARCHAR" for c in columns])
                             cloud_conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {self.settings.schema_name}.{stage_table} ({col_defs})"))
                             
-                            cloud_conn.execute(
-                                text(f"INSERT INTO {self.settings.schema_name}.{stage_table} VALUES ({placeholders})"),
-                                dict_rows
-                            )
+                            insert_placeholders = ",".join([f":{c}" for c in columns])
+                            cloud_conn.execute(text(f"INSERT INTO {self.settings.schema_name}.{stage_table} VALUES ({insert_placeholders})"), dict_rows)
                             
                             merge_sql = f"""
                             MERGE INTO {self.settings.schema_name}.{table_name} t
                             USING {self.settings.schema_name}.{stage_table} s
                             ON t.{pk_col} = s.{pk_col}
-                            WHEN MATCHED THEN UPDATE SET
-                                {", ".join([f"t.{c} = s.{c}" for c in columns if c != pk_col])}
-                            WHEN NOT MATCHED THEN INSERT ({",".join(columns)})
-                                VALUES ({",".join([f"s.{c}" for c in columns])})
+                            WHEN MATCHED THEN UPDATE SET {", ".join([f"t.{c} = s.{c}" for c in columns if c != pk_col])}
+                            WHEN NOT MATCHED THEN INSERT ({",".join(columns)}) VALUES ({",".join([f"s.{c}" for c in columns])})
                             """
                             result = cloud_conn.execute(text(merge_sql))
                             results[table_name] = result.rowcount if hasattr(result, "rowcount") else len(dict_rows)
-                        except Exception as inner_e:
-                            if "VECTOR" in str(inner_e).upper() or "FLOAT" in str(inner_e).upper() or "DIMENSION" in str(inner_e).upper():
-                                log.dual_log(tag="Backup:Cloud:PushTableDLQ", message=f"Vector validation failed for {table_name}, routing to DLQ", level="WARNING", payload={"error": str(inner_e)})
-                                import time
-                                from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
-                                for r in dict_rows:
-                                    r["_error_msg"] = str(inner_e)
-                                enqueue_backup_write(BackupWriteTask("dead_letter_queue", "DLQ", dict_rows, pk_col))
-                            else:
-                                log.dual_log(tag="Backup:Cloud:PushTableError", message=f"Failed pushing table {table_name}", level="ERROR", payload={"error": str(inner_e)})
-                                raise
+
                 return results
             finally:
                 local_conn.close()
 
-        try:
-            return self.circuit_breaker_push.call(_execute_cloud_sync)
-        except Exception as e:
-            raise e
+        return self.circuit_breaker_push.call(_execute_cloud_sync)
 
     def pull_to_local(self, local_db_path: str, tables: dict) -> dict:
         if not self.settings.enabled or not self.engine:
             return {"status": "disabled"}
             
         import datetime
+        import struct
         from decimal import Decimal
         results = {}
         
         try:
+            import sqlite3
+            local_conn = sqlite3.connect(local_db_path, timeout=30.0)
             with self.engine.begin() as cloud_conn:
                 for table_name in tables:
                     if 'VIRTUAL' in tables[table_name].upper():
                         continue
-                        
-                    cloud_rows = cloud_conn.execute(
-                        text(f"SELECT * FROM {self.settings.schema_name}.{table_name}")
-                    ).fetchall()
+                    
+                    pk_col = "id"
+                    hash_col = "content_hash"
+                    try:
+                        for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
+                            if col_info[5] > 0: pk_col = col_info[1]
+                    except Exception: pass
+
+                    try:
+                        has_hash = False
+                        for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
+                            if col_info[1] == "content_hash": has_hash = True
+                        if not has_hash: hash_col = "''"
+                    except Exception: pass
+
+                    manifest_table = self._upload_local_manifest(local_conn, cloud_conn, table_name, pk_col, hash_col)
+
+                    diff_query = f"""
+                        SELECT c.* FROM {self.settings.schema_name}.{table_name} c
+                        LEFT JOIN {self.settings.schema_name}.{manifest_table} m ON c.{pk_col} = m.id
+                        WHERE m.id IS NULL OR COALESCE(c.content_hash, '') != COALESCE(m.content_hash, '')
+                    """
+                    cloud_rows = cloud_conn.execute(text(diff_query)).fetchall()
                     
                     if not cloud_rows:
                         results[table_name] = 0
                         continue
                         
                     columns = [k.lower() for k in cloud_rows[0]._mapping.keys()]
-                    col_names = ",".join(columns)
-                    placeholders = ",".join(["?"] * len(columns))
                     
                     from database.backup.sync.foundation import ContentHasher
                     normalized_rows = []
@@ -263,11 +293,11 @@ class CloudEngine(BackupEngine):
                                 new_r[hash_idx] = new_hash
                                 normalized_rows[i] = tuple(new_r)
 
-                    pk_col = "id"
                     records = [dict(zip(columns, r)) for r in normalized_rows]
                     from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
                     enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", records, pk_col))
                     results[table_name] = len(normalized_rows)
         finally:
-            pass
+            local_conn.close()
+            
         return results

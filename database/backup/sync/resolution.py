@@ -42,29 +42,31 @@ class UserConfirmationHandler:
 
     @staticmethod
     def hitl_prompt_sync_strategy(metrics: dict) -> str:
+        from database.backup.sync.smart_recommender import SmartRecommender
+        recommender = SmartRecommender()
+        rec = recommender.recommend(metrics)
+
         print("\n=== BIDIRECTIONAL SYNC METRICS ===")
-        tables = metrics.get('tables', {})
-        for tbl, m in tables.items():
-            print(f"  {tbl}: op={m.get('op_rows')} bk={m.get('bk_rows')} op_only={m.get('op_only')} bk_only={m.get('bk_only')} conflicts={m.get('conflicts')} identical={len(m.get('content_identical', []))}")
-            
+        print(recommender.format_outcomes_display(rec))
+
         print("\n=== STRATEGY DICTIONARY ===")
-        print("  N = newest_overall_wins (merge bidirectionally)")
-        print("  O = operational_wins (op overrides backup)")
-        print("  L = backup_wins (backup overrides op)")
-        print("  C = cloud_backup_wins (cloud overrides both)")
-        print("  A = abort")
+        print("  N = newest_overall_wins (Merge bidirectionally. Conflicts resolved by newest timestamp.)")
+        print("  O = operational_wins (Operational DB overrides local backup)")
+        print("  L = local_backup_wins (Local backup overrides operational)")
+        print("  C = cloud_backup_wins (Cloud backup overrides both operational and local)")
+        print("  A = abort (Cancel sync)")
         
-        total_conflicts = sum(len(t.get('genuine_conflicts', [])) for t in tables.values())
-        recommended = "N" if total_conflicts == 0 else "A"
-        
+        rec_key = {"operational_wins": "O", "local_backup_wins": "L", "cloud_backup_wins": "C", "newest_overall_wins": "N", "abort": "A"}.get(rec.strategy, "A")
+        print(f"\n  RECOMMENDED: {rec_key} ({rec.strategy}) — {int(rec.confidence * 100)}% confidence")
+        print(f"  Reason: {rec.reasoning}")
+
         from utils.logger.state import hitl_buffer_lock
         import utils.logger.state as log_state
-        
         with hitl_buffer_lock:
             log_state.hitl_buffering_active = True
 
         try:
-            choice = input(f"\n>>> Strategy [N/O/L/C/A] (recommended: {recommended}): ").strip().upper()
+            choice = input(f"\n>>> Strategy [N/O/L/C/A] (recommended: {rec_key}): ").strip().upper()
         except EOFError:
             choice = "A"
 
@@ -78,6 +80,6 @@ class UserConfirmationHandler:
 
         if choice == 'N': return 'newest_overall_wins'
         if choice == 'O': return 'operational_wins'
-        if choice in ('L', 'B'): return 'backup_wins'
+        if choice in ('L', 'B'): return 'local_backup_wins'
         if choice == 'C': return 'cloud_backup_wins'
         return 'abort'

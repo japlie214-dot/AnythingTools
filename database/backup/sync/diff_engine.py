@@ -2,6 +2,26 @@
 import sqlite3
 from typing import Dict, Any
 
+def _safe_ts_compare(ts1: str, ts2: str) -> int:
+    """Returns 1 if ts1 > ts2, -1 if ts1 < ts2, 0 if equal. Safely parses ISO8601 strings."""
+    from datetime import datetime
+    def parse_ts(t: str) -> float:
+        if not t: return 0.0
+        t_clean = t.replace("Z", "+00:00").replace(" ", "T")
+        try:
+            return datetime.fromisoformat(t_clean).timestamp()
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(t, fmt).timestamp()
+                except ValueError:
+                    continue
+            return 0.0
+    val1, val2 = parse_ts(ts1), parse_ts(ts2)
+    if val1 > val2: return 1
+    if val1 < val2: return -1
+    return 0
+
 class DiffEngine:
     @staticmethod
     def compute_triad_deltas(op_conn: sqlite3.Connection, backup_conn: sqlite3.Connection, cloud_iter: Any, table_name: str) -> Dict[str, Any]:
@@ -100,13 +120,13 @@ class DiffEngine:
                 if has_content_hash_op and has_content_hash_bk and op_hash and bk_hash:
                     if op_hash == bk_hash:
                         content_identical.append(pk)
-                        if op_ts != bk_ts:
+                        if _safe_ts_compare(op_ts, bk_ts) != 0:
                             timestamp_drift.append({"id": pk, "op_ts": op_ts, "bk_ts": bk_ts, "classification": "timestamp_drift"})
                     else:
                         genuine_conflicts.append({"id": pk, "op_ts": op_ts, "bk_ts": bk_ts, "op_hash": op_hash, "bk_hash": bk_hash, "classification": "genuine_conflict"})
                 else:
                     # Fallback: timestamp comparison
-                    if op_ts != bk_ts:
+                    if _safe_ts_compare(op_ts, bk_ts) != 0:
                         genuine_conflicts.append({"id": pk, "op_ts": op_ts, "bk_ts": bk_ts, "classification": "legacy_timestamp_conflict"})
                     else:
                         content_identical.append(pk)
@@ -123,6 +143,6 @@ class DiffEngine:
             "total_rows": total_rows,
             "op_rows": len(op_rows),
             "bk_rows": len(bk_rows),
-            "op_newer": sum(1 for d in timestamp_drift if d["op_ts"] > d["bk_ts"]),
-            "bk_newer": sum(1 for d in timestamp_drift if d["bk_ts"] > d["op_ts"]) 
+            "op_newer": sum(1 for d in timestamp_drift if _safe_ts_compare(d["op_ts"], d["bk_ts"]) > 0),
+            "bk_newer": sum(1 for d in timestamp_drift if _safe_ts_compare(d["bk_ts"], d["op_ts"]) > 0)
         }

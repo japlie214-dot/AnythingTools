@@ -7,16 +7,36 @@ log = get_dual_logger(__name__)
 
 class VectorBackupAdapter:
     @classmethod
-    def backup_vectors(cls, op_conn: sqlite3.Connection, backup_conn: sqlite3.Connection) -> int:
+    def backup_vectors(cls, op_conn: sqlite3.Connection, backup_conn: sqlite3.Connection, delta_only: bool = True) -> int:
         try:
             rows = op_conn.execute("SELECT v.rowid, a.id, v.embedding FROM scraped_articles_vec v JOIN scraped_articles a ON a.vec_rowid = v.rowid").fetchall()
             if not rows:
                 return 0
-            try:
-                backup_conn.execute("DELETE FROM scraped_articles_vec_backup")
-            except Exception:
-                pass
-            backup_conn.executemany("INSERT OR REPLACE INTO scraped_articles_vec_backup (rowid, article_id, embedding) VALUES (?, ?, ?)", [(r[0], r[1], bytes(r[2]) if r[2] is not None else None) for r in rows])
+
+            if not delta_only:
+                try:
+                    backup_conn.execute("DELETE FROM scraped_articles_vec_backup")
+                except Exception:
+                    pass
+                backup_conn.executemany("INSERT OR REPLACE INTO scraped_articles_vec_backup (rowid, article_id, embedding) VALUES (?, ?, ?)", [(r[0], r[1], bytes(r[2]) if r[2] is not None else None) for r in rows])
+            else:
+                existing_rowids = {r[0] for r in backup_conn.execute("SELECT rowid FROM scraped_articles_vec_backup").fetchall()}
+                op_rowids = {r[0] for r in rows}
+
+                new_rows = [(r[0], r[1], bytes(r[2]) if r[2] is not None else None) for r in rows if r[0] not in existing_rowids]
+                deleted_rowids = existing_rowids - op_rowids
+
+                if new_rows:
+                    backup_conn.executemany("INSERT OR REPLACE INTO scraped_articles_vec_backup (rowid, article_id, embedding) VALUES (?, ?, ?)", new_rows)
+                if deleted_rowids:
+                    backup_conn.executemany("DELETE FROM scraped_articles_vec_backup WHERE rowid = ?", [(rid,) for rid in deleted_rowids])
+
+                log.dual_log(
+                    tag="Backup:Vec:Delta",
+                    message=f"Vector delta: {len(new_rows)} new, {len(deleted_rowids)} deleted",
+                    payload={"new": len(new_rows), "deleted": len(deleted_rowids)}
+                )
+
             backup_conn.commit()
             return len(rows)
         except Exception as e:

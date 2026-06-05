@@ -30,7 +30,7 @@ from enum import Enum
 
 class StrategyMode(str, Enum):
     AUTO_RECOMMEND = "auto_recommend"
-    NEWEST_WINS = "newest_wins"
+    NEWEST_WINS = "newest_overall_wins"
     LOCAL_BACKUP_WINS = "local_backup_wins"
     CLOUD_BACKUP_WINS = "cloud_backup_wins"
     OPERATIONAL_WINS = "operational_wins"
