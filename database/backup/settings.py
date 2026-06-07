@@ -47,6 +47,7 @@ class HITLConfig(BaseSettings):
 class Vec0BackupSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix='BACKUP_VEC0_', extra='ignore')
     enabled: bool = True
+    use_native_vector_type: bool = True
     dim: int = 1024
     chunk_size: int = 1024
     push_batch_size: int = 256

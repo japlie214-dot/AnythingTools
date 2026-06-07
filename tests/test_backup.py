@@ -1,71 +1,80 @@
-"""tests/test_backup.py
-Unit tests for the backup subsystem.
-Run with: python -m pytest tests/test_backup.py -v
-"""
+# tests/test_backup.py
 import pytest
-import pyarrow as pa
-import pandas as pd
 from pathlib import Path
 import sys
+import struct
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from database.backup.schema import (
-    TABLE_SCHEMAS,
-    VECTOR_BYTE_LENGTH,
-    FLOAT32_COUNT,
-    validate_embedding_bytes,
-    SCRAPED_ARTICLES_VEC_SCHEMA,
-    LONG_TERM_MEMORIES_VEC_SCHEMA,
-)
+# ─── Constants ─────────────────────────────────────────────────────────
+VECTOR_DIM = 1024
+VECTOR_BYTES = VECTOR_DIM * 4
+
+def make_valid_embedding_blob(seed: float = 0.1) -> bytes:
+    return struct.pack(f'<{VECTOR_DIM}f', *[seed + i * 0.001 for i in range(VECTOR_DIM)])
+
+def make_valid_float_list(seed: float = 0.1) -> list:
+    return [seed + i * 0.001 for i in range(VECTOR_DIM)]
+
+class TestVectorSyncValidation:
+    def test_validate_valid_vector(self):
+        from database.backup.vec.cloud_vector_pusher import VectorSync
+        VectorSync.validate_vector(make_valid_float_list())
+
+    def test_validate_wrong_dimensions(self):
+        from database.backup.vec.cloud_vector_pusher import VectorSync, VectorValidationError
+        with pytest.raises(VectorValidationError):
+            VectorSync.validate_vector([0.1] * 512)
+
+    def test_validate_nan_in_vector(self):
+        from database.backup.vec.cloud_vector_pusher import VectorSync, VectorValidationError
+        values = make_valid_float_list()
+        values[0] = float('nan')
+        with pytest.raises(VectorValidationError):
+            VectorSync.validate_vector(values)
+
+class TestBlobConversion:
+    def test_blob_to_float_list_roundtrip(self):
+        from database.backup.vec.cloud_vector_pusher import VectorSync
+        original = make_valid_float_list()
+        blob = VectorSync.float_list_to_blob(original)
+        recovered = VectorSync.blob_to_float_list(blob)
+        assert len(recovered) == VECTOR_DIM
+
+class TestValidateAndNormalize:
+    def test_normalize_wrong_dimensions_routes_to_dlq(self):
+        from database.backup.vec.cloud_vector_pusher import VectorSync
+        sync = VectorSync()
+        rows = [{"id": "1", "embedding": [0.1] * 512}]
+        valid, dlq = sync._validate_and_normalize(rows)
+        assert len(valid) == 0
+        assert len(dlq) == 1
+        assert isinstance(dlq[0]["embedding"], list)
 
 class TestSchemaDefinitions:
-    def test_vector_schema_uses_binary(self):
-        for schema_name in ["scraped_articles_vec", "long_term_memories_vec"]:
-            schema = TABLE_SCHEMAS[schema_name]
-            emb_field = schema.field("embedding")
-            assert pa.types.is_binary(emb_field.type)
-
-    def test_all_schemas_are_valid_pyarrow(self):
-        for name, schema in TABLE_SCHEMAS.items():
-            assert isinstance(schema, pa.Schema)
-            assert len(schema.names) > 0
-
-    def test_vector_byte_length_matches_float32_count(self):
-        assert VECTOR_BYTE_LENGTH == FLOAT32_COUNT * 4
+    def test_schema_registry_snowflake_mappings(self):
+        from database.backup.schema_registry import BackupSchemaRegistry
+        vec0_ddl = BackupSchemaRegistry.get_snowflake_ddl("scraped_articles_vec")
+        backup_ddl = BackupSchemaRegistry.get_snowflake_ddl("scraped_articles_vec_backup")
+        assert "VECTOR(FLOAT, 1024)" in vec0_ddl
+        assert "VECTOR(FLOAT, 1024)" in backup_ddl
 
 class TestEmbeddingValidation:
     def test_valid_embedding_passes(self):
-        valid = b"\x00" * VECTOR_BYTE_LENGTH
-        validate_embedding_bytes(valid)
+        from database.backup.vec.adapter import _validate_embedding_blob
+        valid = b"\x00" * VECTOR_BYTES
+        _validate_embedding_blob(valid, 1)
 
-    def test_none_embedding_raises(self):
-        with pytest.raises(ValueError):
-            validate_embedding_bytes(None)  # type: ignore[arg-type]
+    def test_none_embedding_passes(self):
+        from database.backup.vec.adapter import _validate_embedding_blob
+        # None is bypassed silently in adapter
+        _validate_embedding_blob(None, 1)
 
     def test_wrong_size_embedding_raises(self):
-        wrong = b"\x00" * (VECTOR_BYTE_LENGTH - 4)
+        from database.backup.vec.adapter import _validate_embedding_blob
+        wrong = b"\x00" * (VECTOR_BYTES - 4)
         with pytest.raises(ValueError):
-            validate_embedding_bytes(wrong)
-
-class TestSchemaPandasRoundtrip:
-    def test_vector_table_from_pandas(self):
-        df = pd.DataFrame({
-            "rowid": [1, 2, 3],
-            "embedding": [b"\x00" * VECTOR_BYTE_LENGTH for _ in range(3)],
-        })
-        table = pa.Table.from_pandas(df, schema=SCRAPED_ARTICLES_VEC_SCHEMA, preserve_index=False)
-        assert table.schema.equals(SCRAPED_ARTICLES_VEC_SCHEMA)
-        assert table.num_rows == 3
-
-    def test_vector_table_wrong_size_fails_validation(self):
-        df = pd.DataFrame({
-            "rowid": [1],
-            "embedding": [b"\x00" * (VECTOR_BYTE_LENGTH - 1)],
-        })
-        # Validation helper should catch the wrong-sized embedding before conversion
-        with pytest.raises(ValueError):
-            validate_embedding_bytes(df.iloc[0]["embedding"])  # type: ignore[index]
+            _validate_embedding_blob(wrong, 1)
 
 class TestWatermarkCompatibility:
     def test_model_dump_compat(self):

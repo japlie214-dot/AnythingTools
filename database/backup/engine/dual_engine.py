@@ -3,8 +3,8 @@ from database.backup.settings import BackupSettings
 from database.backup.engine.local_engine import LocalEngine
 from database.backup.engine.cloud_engine import CloudEngine
 from database.backup.writer.backup_writer import enqueue_backup_write
-import json
 from utils.logger import get_dual_logger
+import json
 
 log = get_dual_logger(__name__)
 

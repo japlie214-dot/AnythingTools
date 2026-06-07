@@ -48,11 +48,16 @@ class SnowflakeSchemaManager:
                                 c_type = "VECTOR(FLOAT, 1024)"
                             conn.execute(text(f"ALTER TABLE {t_name} ADD COLUMN {c_name} {c_type}"))
                             log.dual_log(tag="Backup:Cloud:Schema", message=f"Added column {c_name} to {t_name}", level="INFO", payload={"table": t_name, "column": c_name})
+                        elif c_name == "embedding":
+                            existing_type = existing[t_name][c_name].upper()
+                            if "VECTOR" not in existing_type:
+                                log.dual_log(
+                                    tag="Backup:Cloud:Schema:Migration",
+                                    message=f"Column {c_name} in {t_name} is {existing_type}, expected VECTOR(FLOAT, 1024).",
+                                    level="WARNING",
+                                    payload={"table": t_name, "column": c_name}
+                                )
 
-def unpack_vector(blob: bytes) -> List[float]:
-    if not blob or len(blob) != 4096:
-        return []
-    return list(struct.unpack('<1024f', blob))
 
 from database.backup.engine.base import BackupEngine
 
@@ -194,10 +199,26 @@ class CloudEngine(BackupEngine):
                             continue
 
                         if "embedding" in columns:
-                            from database.backup.vec.cloud_vector_pusher import CloudVectorPusher
-                            pusher = CloudVectorPusher(circuit_breaker=self.circuit_breaker_vec)
-                            push_result = pusher.push_vectors(cloud_conn, self.settings.schema_name, table_name, columns, dict_rows, pk_col, batch_size=batch_size)
-                            results[table_name] = push_result["pushed"]
+                            if self.settings.vec0.use_native_vector_type:
+                                from database.backup.vec.cloud_vector_pusher import VectorSync
+                                pusher = VectorSync(circuit_breaker=self.circuit_breaker_vec)
+                                push_result = pusher.push_vectors(cloud_conn, self.settings.schema_name, table_name, columns, dict_rows, pk_col, batch_size=batch_size)
+                                results[table_name] = push_result["pushed"]
+                            else:
+                                stage_table = f"{table_name}_stage"
+                                col_defs = ",".join([f"{c} VARCHAR" for c in columns])
+                                cloud_conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {self.settings.schema_name}.{stage_table} ({col_defs})"))
+                                insert_placeholders = ",".join([f":{c}" for c in columns])
+                                cloud_conn.execute(text(f"INSERT INTO {self.settings.schema_name}.{stage_table} VALUES ({insert_placeholders})"), dict_rows)
+                                merge_sql = f"""
+                                MERGE INTO {self.settings.schema_name}.{table_name} t
+                                USING {self.settings.schema_name}.{stage_table} s
+                                ON t.{pk_col} = s.{pk_col}
+                                WHEN MATCHED THEN UPDATE SET {", ".join([f"t.{c} = s.{c}" for c in columns if c != pk_col])}
+                                WHEN NOT MATCHED THEN INSERT ({",".join(columns)}) VALUES ({",".join([f"s.{c}" for c in columns])})
+                                """
+                                result = cloud_conn.execute(text(merge_sql))
+                                results[table_name] = result.rowcount if hasattr(result, "rowcount") else len(dict_rows)
                         else:
                             stage_table = f"{table_name}_stage"
                             col_defs = ",".join([f"{c} VARCHAR" for c in columns])
@@ -268,35 +289,52 @@ class CloudEngine(BackupEngine):
                         
                     columns = [k.lower() for k in cloud_rows[0]._mapping.keys()]
                     
-                    from database.backup.sync.foundation import ContentHasher
-                    normalized_rows = []
-                    for row in cloud_rows:
-                        norm_row = []
-                        for val in row:
-                            if isinstance(val, (datetime.datetime, datetime.date)):
-                                norm_row.append(val.isoformat())
-                            elif isinstance(val, Decimal):
-                                norm_row.append(float(val))
-                            elif isinstance(val, list) and len(val) > 0 and isinstance(val[0], float):
-                                norm_row.append(struct.pack(f'<{len(val)}f', *val))
-                            else:
-                                norm_row.append(val)
-                        normalized_rows.append(tuple(norm_row))
-                        
-                    if "content_hash" in columns:
-                        hash_idx = columns.index("content_hash")
-                        for i, r in enumerate(normalized_rows):
-                            if not r[hash_idx]:
-                                row_dict = dict(zip(columns, r))
-                                new_hash = ContentHasher.compute_row_hash(table_name, row_dict)
-                                new_r = list(r)
-                                new_r[hash_idx] = new_hash
-                                normalized_rows[i] = tuple(new_r)
+                    has_embedding = "embedding" in columns
 
-                    records = [dict(zip(columns, r)) for r in normalized_rows]
+                    if has_embedding and self.settings.vec0.use_native_vector_type:
+                        from database.backup.vec.cloud_vector_pusher import VectorSync
+                        vector_sync = VectorSync()
+                        records, dlq_rows = vector_sync.pull_vectors_from_cloud(cloud_rows, columns)
+
+                        if dlq_rows:
+                            from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
+                            import json
+                            for dlq_row in dlq_rows:
+                                safe_dlq_row = {k: v for k, v in dlq_row.items() if k != "_error_msg" and not isinstance(v, bytes)}
+                                enqueue_backup_write(BackupWriteTask(
+                                    "dead_letter_queue", "DLQ",
+                                    [{
+                                        pk_col: dlq_row.get(pk_col, ""),
+                                        "table_name": table_name,
+                                        "row_data": json.dumps(safe_dlq_row, default=str),
+                                        "_error_msg": dlq_row.get("_error_msg", "Unknown error")
+                                    }],
+                                    pk_col
+                                ))
+                    else:
+                        records = []
+                        for row in cloud_rows:
+                            norm_row = []
+                            for val in row:
+                                if isinstance(val, (datetime.datetime, datetime.date)):
+                                    norm_row.append(val.isoformat())
+                                elif isinstance(val, Decimal):
+                                    norm_row.append(float(val))
+                                elif isinstance(val, list) and len(val) > 0 and isinstance(val[0], float):
+                                    norm_row.append(struct.pack(f'<{len(val)}f', *val))
+                                else:
+                                    norm_row.append(val)
+                            records.append(dict(zip(columns, norm_row)))
+
+                    if "content_hash" in columns:
+                        for r in records:
+                            if isinstance(r, dict) and not r.get("content_hash"):
+                                from database.backup.sync.foundation import ContentHasher
+                                new_hash = ContentHasher.compute_row_hash(table_name, r)
+                                r["content_hash"] = new_hash
                     from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
                     enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", records, pk_col))
-                    results[table_name] = len(normalized_rows)
+                    results[table_name] = len(records)
         finally:
             local_conn.close()
             

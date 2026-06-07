@@ -52,6 +52,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
     - `batch_reader/`: Hybrid semantic + keyword search across batches.
 - `utils/`: Cross-cutting utilities (logging, artifact management, browser daemon, SoM Javascript injection, rate limiters, text sanitization).
 - `scripts/`: Standalone maintenance utilities (e.g., `migrate_artifacts.py`).
+- `deprecated/`: Legacy logic (e.g., `bot/core/agent.py`, `tools/finance/`) that has been superseded by the current modular tool architecture.
 
 ## 4. Core Concepts & Domain Model
 ### Key Abstractions

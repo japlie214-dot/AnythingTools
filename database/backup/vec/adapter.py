@@ -1,6 +1,12 @@
 # database/backup/vec/adapter.py
 import sqlite3
-from typing import List
+from typing import List, Any
+
+VECTOR_BYTES = 4096
+
+def _validate_embedding_blob(blob: bytes, rowid: Any):
+    if blob is not None and len(blob) != VECTOR_BYTES:
+        raise ValueError(f"Invalid embedding BLOB for rowid={rowid}: expected {VECTOR_BYTES} bytes, got {len(blob)}")
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
@@ -18,12 +24,32 @@ class VectorBackupAdapter:
                     backup_conn.execute("DELETE FROM scraped_articles_vec_backup")
                 except Exception:
                     pass
-                backup_conn.executemany("INSERT OR REPLACE INTO scraped_articles_vec_backup (rowid, article_id, embedding) VALUES (?, ?, ?)", [(r[0], r[1], bytes(r[2]) if r[2] is not None else None) for r in rows])
+                validated_rows = []
+                for r in rows:
+                    blob = bytes(r[2]) if r[2] is not None else None
+                    if blob is not None:
+                        try:
+                            _validate_embedding_blob(blob, r[0])
+                        except ValueError as e:
+                            log.dual_log(tag="Backup:Vec:Validation", message=f"Skipping invalid vector backup: {e}", level="WARNING", payload={"rowid": r[0], "error": str(e)})
+                            continue
+                    validated_rows.append((r[0], r[1], blob))
+                backup_conn.executemany("INSERT OR REPLACE INTO scraped_articles_vec_backup (rowid, article_id, embedding) VALUES (?, ?, ?)", validated_rows)
             else:
                 existing_rowids = {r[0] for r in backup_conn.execute("SELECT rowid FROM scraped_articles_vec_backup").fetchall()}
                 op_rowids = {r[0] for r in rows}
 
-                new_rows = [(r[0], r[1], bytes(r[2]) if r[2] is not None else None) for r in rows if r[0] not in existing_rowids]
+                new_rows = []
+                for r in rows:
+                    if r[0] not in existing_rowids:
+                        blob = bytes(r[2]) if r[2] is not None else None
+                        if blob is not None:
+                            try:
+                                _validate_embedding_blob(blob, r[0])
+                            except ValueError as e:
+                                log.dual_log(tag="Backup:Vec:Validation", message=f"Skipping invalid vector backup: {e}", level="WARNING", payload={"rowid": r[0], "error": str(e)})
+                                continue
+                        new_rows.append((r[0], r[1], blob))
                 deleted_rowids = existing_rowids - op_rowids
 
                 if new_rows:
@@ -53,7 +79,18 @@ class VectorBackupAdapter:
                 op_conn.execute("DELETE FROM scraped_articles_vec")
             except Exception:
                 pass
-            op_conn.executemany("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", [(r[0], bytes(r[1]) if r[1] is not None else None) for r in rows])
+            validated_rows = []
+            for r in rows:
+                blob = bytes(r[1]) if r[1] is not None else None
+                if blob is not None:
+                    try:
+                        _validate_embedding_blob(blob, r[0])
+                        validated_rows.append((r[0], blob))
+                    except ValueError as e:
+                        log.dual_log(tag="Restore:Vec:Validation", message=f"Skipping invalid vector restore: {e}", level="WARNING", payload={"rowid": r[0], "error": str(e)})
+                else:
+                    validated_rows.append((r[0], None))
+            op_conn.executemany("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", validated_rows)
             return len(rows)
         except Exception as e:
             log.dual_log(tag="Restore:Vec:Error", message=f"Vector restore failed: {e}", level="ERROR", payload={"error": str(e)})

@@ -33,6 +33,17 @@ class BackupSchemaRegistry:
         if "VIRTUAL TABLE" in sqlite_ddl.upper() and "vec0" in sqlite_ddl.lower():
             return f"CREATE TABLE IF NOT EXISTS {table_name} (rowid NUMBER, embedding VECTOR(FLOAT, 1024));"
 
+        # Intercept vec_backup table which has BLOB embedding → use VECTOR
+        if table_name == "scraped_articles_vec_backup":
+            return (
+                f"CREATE TABLE IF NOT EXISTS {table_name} ("
+                f"rowid NUMBER, "
+                f"article_id VARCHAR, "
+                f"embedding VECTOR(FLOAT, 1024), "
+                f"hashed_at VARCHAR"
+                f");"
+            )
+
         # Transpile standard tables
         sf_ddl = sqlglot.transpile(sqlite_ddl, read='sqlite', write='snowflake')[0]
         
