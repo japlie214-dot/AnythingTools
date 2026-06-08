@@ -57,8 +57,8 @@ class SmartRecommender:
             drift = data.get('timestamp_drift', [])
             breakdowns[table_name] = TableBreakdown(
                 table_name=table_name,
-                op_only=len(data.get('op_only', [])),
-                bk_only=len(data.get('bk_only', [])),
+                op_only=data.get('op_only', 0),
+                bk_only=data.get('bk_only', 0),
                 identical=len(data.get('content_identical', [])),
                 conflicts=len(conflicts),
                 op_newer=sum(1 for d in drift if d.get('op_ts', '') > d.get('bk_ts', '')),

@@ -102,7 +102,7 @@ class VectorSync:
         stage_col_defs = []
         for col in columns:
             if col == "embedding":
-                stage_col_defs.append(f"{col} ARRAY")
+                stage_col_defs.append(f"{col} VARCHAR")
             elif col in ("rowid", pk_col):
                 stage_col_defs.append(f"{col} NUMBER")
             else:
@@ -114,7 +114,7 @@ class VectorSync:
         placeholders = []
         for col in columns:
             if col == "embedding":
-                placeholders.append(f"CASE WHEN :{col} IS NULL THEN NULL ELSE PARSE_JSON(:{col}) END")
+                placeholders.append(f":{col}")
             else:
                 placeholders.append(f":{col}")
 
@@ -123,10 +123,11 @@ class VectorSync:
 
         non_pk_cols = [c for c in columns if c != pk_col]
         update_sets = ", ".join([
-            f"t.{c} = CASE WHEN s.{c} IS NOT NULL THEN s.{c}{'::' + VECTOR_TYPE if c == 'embedding' else ''} END" 
+            f"t.{c} = CASE WHEN s.{c} IS NOT NULL THEN PARSE_JSON(s.{c})::{VECTOR_TYPE} END" if c == 'embedding'
+            else f"t.{c} = s.{c}"
             for c in non_pk_cols
         ])
-        insert_select = ", ".join([f"s.{c}::{VECTOR_TYPE}" if c == "embedding" else f"s.{c}" for c in columns])
+        insert_select = ", ".join([f"PARSE_JSON(s.{c})::{VECTOR_TYPE}" if c == "embedding" else f"s.{c}" for c in columns])
 
         merge_sql = f"""
         MERGE INTO {schema}.{table_name} t

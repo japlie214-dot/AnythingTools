@@ -78,8 +78,6 @@ class DualEngine:
 
         if self.cloud.settings.enabled:
             try:
-                # DELTA PRINCIPLE: Shutdown sync forces an operational_wins strategy
-                # (via local SQLite sync) and then performs a delta-only cloud push to Snowflake.
                 results["cloud"] = self.cloud.sync_data(self.local.db_path, tables, batch_size=self.settings.sync.batch_size, delta_only=True)
             except Exception as e:
                 log.dual_log(tag="Backup:Sync:CloudError", message=f"Cloud sync failed: {str(e)}", level="ERROR", payload={"error": str(e)})
@@ -102,7 +100,6 @@ class DualEngine:
         try:
             op_conn.execute("PRAGMA foreign_keys = OFF")
             
-            # Order 1: PERSISTED_TABLES (scalar data)
             for t in PERSISTED_TABLES:
                 if t in tables:
                     rows = bk_conn.execute(f"SELECT * FROM {t}").fetchall()
@@ -112,13 +109,11 @@ class DualEngine:
                         op_conn.execute(f"DELETE FROM {t}")
                         op_conn.executemany(f"INSERT INTO {t} ({','.join(cols)}) VALUES ({placeholders})", rows)
             
-            # Order 2: FTS5 Triggers automatically fired during scalar insert.
             try:
                 op_conn.execute("INSERT INTO scraped_articles_fts(scraped_articles_fts) VALUES('rebuild')")
             except Exception:
                 pass
                 
-            # Order 3: Vector companion table to vec0
             VectorBackupAdapter.restore_vectors(bk_conn, op_conn)
             
             op_conn.commit()
@@ -222,10 +217,12 @@ class DualEngine:
                 pk_col = deltas["pk_col"]
                 
                 if selected_strategy == "operational_wins" and deltas["bk_only"]:
-                    enqueue_backup_write(BackupWriteTask(table_name, "DELETE", [{pk_col: bk_id} for bk_id in deltas["bk_only"]], pk_col))
-                    results["bk_deleted"] += len(deltas["bk_only"])
-                    for bk_id in deltas["bk_only"]:
-                        log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{bk_id}] action=DELETE_FROM_BK reason=operational_wins", payload={"table": table_name, "id": bk_id})
+                    for chunk_idx in range(0, len(deltas["bk_only"]), 900):
+                        chunk = deltas["bk_only"][chunk_idx:chunk_idx+900]
+                        enqueue_backup_write(BackupWriteTask(table_name, "DELETE", [{pk_col: bk_id} for bk_id in chunk], pk_col))
+                        results["bk_deleted"] += len(chunk)
+                        for bk_id in chunk:
+                            log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{bk_id}] action=DELETE_FROM_BK reason=operational_wins", payload={"table": table_name, "id": bk_id})
                 elif selected_strategy in ("local_backup_wins", "backup_wins") and deltas["op_only"]:
                     for op_id in deltas["op_only"]:
                         op_transactions.append((f"DELETE FROM {table_name} WHERE {pk_col} = ?", (op_id,)))
@@ -233,47 +230,57 @@ class DualEngine:
                     for op_id in deltas["op_only"]:
                         log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{op_id}] action=DELETE_FROM_OP reason=local_backup_wins", payload={"table": table_name, "id": op_id})
             
-            # Phase 2: UPSERT operations (Forward order)
+            # Phase 2: UPSERT operations (Forward order; safe chunking applied)
             for table_name in ordered_tables:
                 if table_name not in triad_deltas: continue
                 deltas = triad_deltas[table_name]
                 pk_col = deltas["pk_col"]
                 
                 if selected_strategy == "operational_wins" and deltas["op_only"]:
-                    rows = op_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({','.join(['?']*len(deltas['op_only']))})", deltas["op_only"]).fetchall()
-                    if rows:
-                        cols = [desc[0] for desc in op_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
-                        enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", [dict(zip(cols, r)) for r in rows], pk_col))
-                        results["bk_persisted"] += len(rows)
-                        for op_id in deltas["op_only"]:
-                            log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{op_id}] action=PERSIST_TO_BK reason=operational_wins", payload={"table": table_name, "id": op_id})
+                    for chunk_idx in range(0, len(deltas["op_only"]), 900):
+                        chunk = deltas["op_only"][chunk_idx:chunk_idx+900]
+                        rows = op_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({','.join(['?']*len(chunk))})", chunk).fetchall()
+                        if rows:
+                            cols = [desc[0] for desc in op_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
+                            enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", [dict(zip(cols, r)) for r in rows], pk_col))
+                            results["bk_persisted"] += len(rows)
+                            for op_id in chunk:
+                                log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{op_id}] action=PERSIST_TO_BK reason=operational_wins", payload={"table": table_name, "id": op_id})
+
                 elif selected_strategy in ("local_backup_wins", "backup_wins") and deltas["bk_only"]:
-                    rows = bk_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({','.join(['?']*len(deltas['bk_only']))})", deltas["bk_only"]).fetchall()
-                    if rows:
-                        cols = [desc[0] for desc in bk_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
-                        for r in rows:
-                            op_transactions.append((f"INSERT OR REPLACE INTO {table_name} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", tuple(r)))
-                        results["op_restored"] += len(rows)
-                        for bk_id in deltas["bk_only"]:
-                            log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{bk_id}] action=RESTORE_TO_OP reason=local_backup_wins", payload={"table": table_name, "id": bk_id})
-                elif selected_strategy == "newest_overall_wins":
-                    if deltas["bk_only"]:
-                        rows = bk_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({','.join(['?']*len(deltas['bk_only']))})", deltas["bk_only"]).fetchall()
+                    for chunk_idx in range(0, len(deltas["bk_only"]), 900):
+                        chunk = deltas["bk_only"][chunk_idx:chunk_idx+900]
+                        rows = bk_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({','.join(['?']*len(chunk))})", chunk).fetchall()
                         if rows:
                             cols = [desc[0] for desc in bk_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
                             for r in rows:
                                 op_transactions.append((f"INSERT OR REPLACE INTO {table_name} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", tuple(r)))
                             results["op_restored"] += len(rows)
-                            for bk_id in deltas["bk_only"]:
-                                log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{bk_id}] action=RESTORE_TO_OP reason=merge_bk_only", payload={"table": table_name, "id": bk_id})
+                            for bk_id in chunk:
+                                log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{bk_id}] action=RESTORE_TO_OP reason=local_backup_wins", payload={"table": table_name, "id": bk_id})
+
+                elif selected_strategy == "newest_overall_wins":
+                    if deltas["bk_only"]:
+                        for chunk_idx in range(0, len(deltas["bk_only"]), 900):
+                            chunk = deltas["bk_only"][chunk_idx:chunk_idx+900]
+                            rows = bk_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({','.join(['?']*len(chunk))})", chunk).fetchall()
+                            if rows:
+                                cols = [desc[0] for desc in bk_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
+                                for r in rows:
+                                    op_transactions.append((f"INSERT OR REPLACE INTO {table_name} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", tuple(r)))
+                                results["op_restored"] += len(rows)
+                                for bk_id in chunk:
+                                    log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{bk_id}] action=RESTORE_TO_OP reason=merge_bk_only", payload={"table": table_name, "id": bk_id})
                     if deltas["op_only"]:
-                        rows = op_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({','.join(['?']*len(deltas['op_only']))})", deltas["op_only"]).fetchall()
-                        if rows:
-                            cols = [desc[0] for desc in op_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
-                            enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", [dict(zip(cols, r)) for r in rows], pk_col))
-                            results["bk_persisted"] += len(rows)
-                            for op_id in deltas["op_only"]:
-                                log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{op_id}] action=PERSIST_TO_BK reason=merge_op_only", payload={"table": table_name, "id": op_id})
+                        for chunk_idx in range(0, len(deltas["op_only"]), 900):
+                            chunk = deltas["op_only"][chunk_idx:chunk_idx+900]
+                            rows = op_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({','.join(['?']*len(chunk))})", chunk).fetchall()
+                            if rows:
+                                cols = [desc[0] for desc in op_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
+                                enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", [dict(zip(cols, r)) for r in rows], pk_col))
+                                results["bk_persisted"] += len(rows)
+                                for op_id in chunk:
+                                    log.dual_log(tag="Backup:Sync:Verdict", message=f"[{table_name}:{op_id}] action=PERSIST_TO_BK reason=merge_op_only", payload={"table": table_name, "id": op_id})
 
                 for conflict in deltas.get("genuine_conflicts", []):
                     verdict = ConflictResolver.resolve_triad(conflict, strategy=selected_strategy)
@@ -337,7 +344,6 @@ class DualEngine:
         if self.cloud.settings.enabled:
             log.dual_log(tag="Backup:Sync:CloudPushRequest", message="Pushing synchronized local data to cloud (delta mode)", payload={"tables": list(tables.keys()), "mode": "delta"})
             try:
-                # DELTA PRINCIPLE: Only push rows that differ between local backup and cloud via manifest diffing.
                 results["cloud_push"] = self.cloud.sync_data(self.local.db_path, tables, batch_size=self.settings.sync.batch_size, delta_only=True)
                 log.dual_log(tag="Backup:Sync:CloudPushResponse", message="Cloud push complete", payload={"results": results["cloud_push"]})
             except Exception as e:

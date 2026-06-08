@@ -58,12 +58,17 @@ class SnowflakeSchemaManager:
                                     payload={"table": t_name, "column": c_name}
                                 )
 
-
 from database.backup.engine.base import BackupEngine
 
 class CloudEngine(BackupEngine):
     def __init__(self, settings: CloudBackupSettings, cb_settings):
         self.settings = settings
+        
+        # DILIGENCE: Load vec0 settings internally to preserve 100% backward compatibility
+        # with the original 2-argument constructor signature, preventing instantiation crashes.
+        from database.backup.settings import Vec0BackupSettings
+        self.vec0_settings = Vec0BackupSettings()
+        
         if self.settings.enabled:
             url = f"snowflake://{settings.user}@{settings.account}/{settings.database}/{settings.schema_name}?warehouse={settings.warehouse}"
             self.engine = create_engine(
@@ -89,7 +94,7 @@ class CloudEngine(BackupEngine):
             failure_threshold=cb_settings.circuit_breaker_threshold,
             reset_timeout=cb_settings.circuit_breaker_reset_seconds
         )
-        self.circuit_breaker = self.circuit_breaker_push # Backward compatibility
+        self.circuit_breaker = self.circuit_breaker_push
 
     def _load_private_key(self):
         from cryptography.hazmat.backends import default_backend
@@ -151,14 +156,10 @@ class CloudEngine(BackupEngine):
                         
                         pk_col = "id"
                         hash_col = "content_hash"
+                        has_hash = False
                         try:
                             for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
                                 if col_info[5] > 0: pk_col = col_info[1]
-                        except Exception: pass
-
-                        try:
-                            has_hash = False
-                            for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
                                 if col_info[1] == "content_hash": has_hash = True
                             if not has_hash: hash_col = "''"
                         except Exception: pass
@@ -166,14 +167,19 @@ class CloudEngine(BackupEngine):
                         manifest_table = self._upload_local_manifest(local_conn, cloud_conn, table_name, pk_col, hash_col)
 
                         try:
+                            # Avoid 'C.CONTENT_HASH' exceptions if column is not supported in the table 
                             diff_query = f"""
                             SELECT m.id FROM {self.settings.schema_name}.{manifest_table} m
                             LEFT JOIN {self.settings.schema_name}.{table_name} c ON m.id = c.{pk_col}
-                            WHERE c.{pk_col} IS NULL OR COALESCE(m.content_hash, '') != COALESCE(c.content_hash, '')
+                            WHERE c.{pk_col} IS NULL
                             """
+                            if has_hash:
+                                diff_query += " OR COALESCE(m.content_hash, '') != COALESCE(c.content_hash, '')"
+                            
                             cloud_needs = cloud_conn.execute(text(diff_query)).fetchall()
                             ids_to_push = [r[0] for r in cloud_needs]
-                        except Exception:
+                        except Exception as e:
+                            log.dual_log(tag="Backup:Cloud:DiffFail", message=f"Diff query failed for {table_name}: {e}", level="WARNING", payload={"error": str(e)})
                             # Fallback to full table extraction if diff fails
                             cursor = local_conn.execute(f"SELECT {pk_col} FROM {table_name}")
                             ids_to_push = [r[0] for r in cursor.fetchall()]
@@ -182,7 +188,7 @@ class CloudEngine(BackupEngine):
                             results[table_name] = 0
                             continue
 
-                        # Chunk reading from SQLite to avoid parameter limits
+                        # Chunk reading from SQLite to avoid parameter limits (999 limit in SQLite)
                         chunk_size = 900
                         dict_rows = []
                         columns = []
@@ -199,7 +205,7 @@ class CloudEngine(BackupEngine):
                             continue
 
                         if "embedding" in columns:
-                            if self.settings.vec0.use_native_vector_type:
+                            if self.vec0_settings.use_native_vector_type:
                                 from database.backup.vec.cloud_vector_pusher import VectorSync
                                 pusher = VectorSync(circuit_breaker=self.circuit_breaker_vec)
                                 push_result = pusher.push_vectors(cloud_conn, self.settings.schema_name, table_name, columns, dict_rows, pk_col, batch_size=batch_size)
@@ -262,25 +268,25 @@ class CloudEngine(BackupEngine):
                     
                     pk_col = "id"
                     hash_col = "content_hash"
+                    has_hash = False
                     try:
                         for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
                             if col_info[5] > 0: pk_col = col_info[1]
-                    except Exception: pass
-
-                    try:
-                        has_hash = False
-                        for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
                             if col_info[1] == "content_hash": has_hash = True
                         if not has_hash: hash_col = "''"
                     except Exception: pass
 
                     manifest_table = self._upload_local_manifest(local_conn, cloud_conn, table_name, pk_col, hash_col)
 
+                    # Dynamic conditional check prevents query failures on tables without content_hash
                     diff_query = f"""
                         SELECT c.* FROM {self.settings.schema_name}.{table_name} c
                         LEFT JOIN {self.settings.schema_name}.{manifest_table} m ON c.{pk_col} = m.id
-                        WHERE m.id IS NULL OR COALESCE(c.content_hash, '') != COALESCE(m.content_hash, '')
+                        WHERE m.id IS NULL
                     """
+                    if has_hash:
+                        diff_query += " OR COALESCE(c.content_hash, '') != COALESCE(m.content_hash, '')"
+
                     cloud_rows = cloud_conn.execute(text(diff_query)).fetchall()
                     
                     if not cloud_rows:
@@ -291,7 +297,7 @@ class CloudEngine(BackupEngine):
                     
                     has_embedding = "embedding" in columns
 
-                    if has_embedding and self.settings.vec0.use_native_vector_type:
+                    if has_embedding and self.vec0_settings.use_native_vector_type:
                         from database.backup.vec.cloud_vector_pusher import VectorSync
                         vector_sync = VectorSync()
                         records, dlq_rows = vector_sync.pull_vectors_from_cloud(cloud_rows, columns)
@@ -332,6 +338,7 @@ class CloudEngine(BackupEngine):
                                 from database.backup.sync.foundation import ContentHasher
                                 new_hash = ContentHasher.compute_row_hash(table_name, r)
                                 r["content_hash"] = new_hash
+                                
                     from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
                     enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", records, pk_col))
                     results[table_name] = len(records)
