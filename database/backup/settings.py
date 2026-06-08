@@ -2,13 +2,6 @@
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-class LocalBackupSettings(BaseSettings):
-    enabled: bool = True
-    db_path: str = 'data/backup.db'
-    allow_drop_tables: bool = True
-    checkpoint_before_snapshot_seconds: int = Field(default=5, ge=0, le=60)
-    vec0_integrity_check: bool = True
-
 class CloudBackupSettings(BaseSettings):
     enabled: bool = False
     account: str = ''
@@ -65,7 +58,6 @@ class BackupSettings(BaseSettings):
         env_file='.env',
         extra='ignore'
     )
-    local: LocalBackupSettings = LocalBackupSettings()
     cloud: CloudBackupSettings = CloudBackupSettings()
     sync: SyncSettings = SyncSettings()
     hitl: HITLConfig = HITLConfig()
@@ -73,9 +65,7 @@ class BackupSettings(BaseSettings):
     content_hash: ContentHashConfig = ContentHashConfig()
 
     @model_validator(mode='after')
-    def validate_at_least_one_mode(self):
-        if not self.local.enabled and not self.cloud.enabled:
-            raise ValueError('At least one backup mode must be enabled')
+    def validate_cloud_config(self):
         if self.cloud.enabled and not self.cloud.account:
             raise ValueError('Cloud mode requires BACKUP_CLOUD__ACCOUNT')
         return self

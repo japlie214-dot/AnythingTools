@@ -31,20 +31,29 @@ async def cleanup_zombie_chrome() -> None:
         pass
 
 async def cleanup_temp_files() -> None:
+    """Clean up temporary files from the data directory."""
     try:
-        from database.backup.settings import BackupSettings
         from pathlib import Path
-        settings = BackupSettings()
-        if settings.local.enabled:
-            backup_dir = Path(settings.local.db_path).parent
-            if backup_dir.exists():
-                removed_count = 0
-                for p in backup_dir.rglob("*.tmp.parquet"):
-                    try:
-                        p.unlink(missing_ok=True)
-                        removed_count += 1
-                    except Exception:
-                        pass
-                log.dual_log(tag="Startup:Cleanup:TempFiles", message="Cleaned up temp Parquet files", level="INFO", payload={"files_removed": removed_count})
+        data_dir = Path("data")
+        if data_dir.exists():
+            removed_count = 0
+            for p in data_dir.rglob("*.tmp.parquet"):
+                try:
+                    p.unlink(missing_ok=True)
+                    removed_count += 1
+                except Exception:
+                    pass
+            if removed_count > 0:
+                log.dual_log(
+                    tag="Startup:Cleanup:TempFiles",
+                    message=f"Cleaned up {removed_count} temp files",
+                    level="INFO",
+                    payload={"files_removed": removed_count}
+                )
     except Exception as e:
-        log.dual_log(tag="Startup:Cleanup:TempError", message=f"Temp file cleanup warning: {e}", level="WARNING", payload={"error": str(e)})
+        log.dual_log(
+            tag="Startup:Cleanup:TempError",
+            message=f"Temp file cleanup warning: {e}",
+            level="WARNING",
+            payload={"error": str(e)}
+        )

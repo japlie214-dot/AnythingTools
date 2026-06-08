@@ -26,12 +26,22 @@ def create_broadcast_batch(
     top10_count: int = 0,
     source_job_id: Optional[str] = None,
 ) -> None:
+    now = _utcnow()
     enqueue_write(
         "INSERT INTO broadcast_batches "
         "(batch_id, target_site, article_count, top10_count, status, source_job_id, created_at, updated_at) "
         "VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?)",
-        (batch_id, target_site, article_count, top10_count, source_job_id, _utcnow(), _utcnow())
+        (batch_id, target_site, article_count, top10_count, source_job_id, now, now)
     )
+    try:
+        from database.backup.writer.cloud_writer import enqueue_cloud_write
+        enqueue_cloud_write("broadcast_batches", {
+            "batch_id": batch_id, "target_site": target_site, "article_count": article_count,
+            "top10_count": top10_count, "status": "PENDING", "source_job_id": source_job_id,
+            "created_at": now, "updated_at": now
+        }, pk_col="batch_id")
+    except Exception:
+        pass
 
 
 def add_broadcast_detail(
@@ -99,6 +109,15 @@ def update_detail_publish_status(
             "WHERE batch_id = ? AND article_id = ?",
             (publish_status, _utcnow(), batch_id, article_id)
         )
+    try:
+        from database.connection import DatabaseManager
+        from database.backup.writer.cloud_writer import enqueue_cloud_write
+        conn = DatabaseManager.get_read_connection()
+        row = conn.execute("SELECT * FROM broadcast_details WHERE batch_id = ? AND article_id = ?", (batch_id, article_id)).fetchone()
+        if row:
+            enqueue_cloud_write("broadcast_details", dict(row), pk_col="detail_id")
+    except Exception:
+        pass
 
 
 def mark_detail_published(
@@ -124,6 +143,15 @@ def mark_detail_published(
         "WHERE batch_id = ? AND article_id = ?",
         (new_status, _utcnow(), batch_id, article_id)
     )
+    try:
+        from database.connection import DatabaseManager
+        from database.backup.writer.cloud_writer import enqueue_cloud_write
+        conn = DatabaseManager.get_read_connection()
+        row = conn.execute("SELECT * FROM broadcast_details WHERE batch_id = ? AND article_id = ?", (batch_id, article_id)).fetchone()
+        if row:
+            enqueue_cloud_write("broadcast_details", dict(row), pk_col="detail_id")
+    except Exception:
+        pass
 
 
 def update_batch_status_from_details(batch_id: str) -> None:
@@ -161,6 +189,13 @@ def update_batch_status_from_details(batch_id: str) -> None:
         "UPDATE broadcast_batches SET status = ?, updated_at = ? WHERE batch_id = ?",
         (new_status, _utcnow(), batch_id)
     )
+    try:
+        from database.backup.writer.cloud_writer import enqueue_cloud_write
+        batch_row = conn.execute("SELECT * FROM broadcast_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+        if batch_row:
+            enqueue_cloud_write("broadcast_batches", dict(batch_row), pk_col="batch_id")
+    except Exception:
+        pass
 
 
 def reset_batch_publish_status(batch_id: str) -> None:

@@ -97,6 +97,15 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
         (filing_id, ticker, form, str(filing.filing_date), accession_no, period, str(getattr(filing, 'company', "Unknown")), cik, fy_month, quarter, year)
     )
+    try:
+        from database.backup.writer.cloud_writer import enqueue_cloud_write
+        enqueue_cloud_write("sn_filings", {
+            "filing_id": filing_id, "ticker": ticker, "form": form, "filing_date": str(filing.filing_date),
+            "accession_no": accession_no, "period_of_report": period, "company_name": str(getattr(filing, 'company', "Unknown")),
+            "cik": cik, "fiscal_year_end_month": fy_month, "quarter": quarter, "year": year
+        }, pk_col="filing_id")
+    except Exception:
+        pass
     
     if not hasattr(obj, "notes") or not obj.notes:
         return {"filing_id": filing_id, "ticker": ticker, "accession_no": accession_no, "note_count": 0, "detail_table_count": 0}
@@ -136,6 +145,15 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
                 (note_id, filing_id, ticker, form, accession_no, note.number, note.title, narrative, quarter, year, q_status)
             )
+            try:
+                from database.backup.writer.cloud_writer import enqueue_cloud_write
+                enqueue_cloud_write("sn_notes", {
+                    "note_id": note_id, "filing_id": filing_id, "ticker": ticker, "form": form, "accession_no": accession_no,
+                    "note_number": note.number, "title": note.title, "narrative_text": narrative, "quarter": quarter,
+                    "year": year, "quarterly_status": q_status
+                }, pk_col="note_id")
+            except Exception:
+                pass
             filing_payload["notes"].append(note_payload)
             if job_id: update_item_status(job_id, note_meta, "COMPLETED", json.dumps({"tables": len(note_payload["tables"])}))
         except Exception as e:

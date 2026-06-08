@@ -58,7 +58,7 @@ class ArticleStore:
         meta: dict,
         embedding_bytes: Optional[bytes] = None,
     ) -> None:
-        """Create or update an article with SQLite writes."""
+        """Create or update an article with SQLite writes and best-effort Cloud sync."""
         updated_at = meta.get("updated_at", datetime.now(timezone.utc).isoformat())
         meta["updated_at"] = updated_at
 
@@ -74,6 +74,24 @@ class ArticleStore:
             article_id, meta, embedding_bytes, embedding_status
         )
         self.enqueue_tx(db_statements)
+        
+        # Enqueue Inline Cloud Sync
+        try:
+            from database.backup.writer.cloud_writer import enqueue_cloud_write
+            row_data = {
+                "id": article_id,
+                "url": meta.get("url", ""),
+                "title": meta.get("title"),
+                "conclusion": meta.get("conclusion"),
+                "summary": meta.get("summary"),
+                "metadata_json": meta.get("metadata_json", "{}"),
+                "embedding_status": embedding_status,
+                "vec_rowid": vec_rowid,
+                "updated_at": updated_at
+            }
+            enqueue_cloud_write("scraped_articles", row_data, pk_col="id")
+        except Exception:
+            pass
 
         log.dual_log(
             tag="Article:Store:Upsert",
@@ -132,9 +150,16 @@ class ArticleStore:
     # ── Public API: Delete ───────────────────────────────────────────────
 
     def delete_article(self, article_id: str) -> None:
-        """Delete an article with SQLite deletion."""
+        """Delete an article with SQLite deletion and best-effort Cloud sync."""
         # Enqueue SQLite delete
         self.enqueue_tx([("DELETE FROM scraped_articles WHERE id = ?", (article_id,))])
+        
+        # Enqueue Inline Cloud Sync
+        try:
+            from database.backup.writer.cloud_writer import enqueue_cloud_delete
+            enqueue_cloud_delete("scraped_articles", article_id, pk_col="id")
+        except Exception:
+            pass
 
         log.dual_log(
             tag="Article:Store:Delete",

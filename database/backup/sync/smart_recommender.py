@@ -6,16 +6,16 @@ from typing import Dict
 class TableBreakdown:
     table_name: str
     op_only: int
-    bk_only: int
+    cloud_only: int
     identical: int
     conflicts: int
     op_newer: int
-    bk_newer: int
+    cloud_newer: int
     timestamp_drift: int
 
     @property
     def conflict_rate(self) -> float:
-        total = self.op_only + self.bk_only + self.identical + self.conflicts
+        total = self.op_only + self.cloud_only + self.identical + self.conflicts
         return (self.conflicts / total * 100) if total > 0 else 0.0
 
 @dataclass
@@ -33,12 +33,12 @@ class SmartRecommender:
         outcomes = self._compute_outcomes(per_table)
 
         total_conflicts = sum(t.conflicts for t in per_table.values())
-        total_bk_only = sum(t.bk_only for t in per_table.values())
-        total_rows = sum(t.op_only + t.bk_only + t.identical + t.conflicts for t in per_table.values())
+        total_cloud_only = sum(t.cloud_only for t in per_table.values())
+        total_rows = sum(t.op_only + t.cloud_only + t.identical + t.conflicts for t in per_table.values())
         overall_conflict_rate = (total_conflicts / total_rows * 100) if total_rows > 0 else 0.0
 
-        if total_conflicts == 0 and total_bk_only == 0:
-            strategy, confidence, reasoning = "operational_wins", 0.95, "No conflicts and no backup-only entries."
+        if total_conflicts == 0 and total_cloud_only == 0:
+            strategy, confidence, reasoning = "operational_wins", 0.95, "No conflicts and no cloud-only entries."
         elif total_conflicts == 0:
             strategy, confidence, reasoning = "newest_overall_wins", 0.90, "Safe bidirectional merge with zero conflict resolution needed."
         elif overall_conflict_rate < 5.0:
@@ -58,40 +58,40 @@ class SmartRecommender:
             breakdowns[table_name] = TableBreakdown(
                 table_name=table_name,
                 op_only=data.get('op_only', 0),
-                bk_only=data.get('bk_only', 0),
+                cloud_only=data.get('cloud_only', 0),
                 identical=len(data.get('content_identical', [])),
                 conflicts=len(conflicts),
-                op_newer=sum(1 for d in drift if d.get('op_ts', '') > d.get('bk_ts', '')),
-                bk_newer=sum(1 for d in drift if d.get('bk_ts', '') > d.get('op_ts', '')),
+                op_newer=sum(1 for d in drift if d.get('op_ts', '') > d.get('cloud_ts', '')),
+                cloud_newer=sum(1 for d in drift if d.get('cloud_ts', '') > d.get('op_ts', '')),
                 timestamp_drift=len(drift)
             )
         return breakdowns
 
     def _compute_outcomes(self, per_table: Dict[str, TableBreakdown]) -> Dict[str, Dict[str, int]]:
         outcomes = {}
-        for strategy in ["operational_wins", "local_backup_wins", "cloud_backup_wins", "newest_overall_wins"]:
-            total = {"op_to_bk": 0, "bk_to_op": 0, "op_deletes": 0, "bk_deletes": 0, "conflict_op_wins": 0, "conflict_bk_wins": 0}
+        for strategy in ["operational_wins", "cloud_wins", "newest_overall_wins"]:
+            total = {"op_to_cloud": 0, "cloud_to_op": 0, "op_deletes": 0, "cloud_deletes": 0, "conflict_op_wins": 0, "conflict_cloud_wins": 0}
             for tbl in per_table.values():
                 if strategy == "operational_wins":
-                    total["op_to_bk"] += tbl.op_only
-                    total["bk_deletes"] += tbl.bk_only
+                    total["op_to_cloud"] += tbl.op_only
+                    total["cloud_deletes"] += tbl.cloud_only
                     total["conflict_op_wins"] += tbl.conflicts
-                elif strategy in ("local_backup_wins", "cloud_backup_wins"):
-                    total["bk_to_op"] += tbl.bk_only
+                elif strategy == "cloud_wins":
+                    total["cloud_to_op"] += tbl.cloud_only
                     total["op_deletes"] += tbl.op_only
-                    total["conflict_bk_wins"] += tbl.conflicts
+                    total["conflict_cloud_wins"] += tbl.conflicts
                 elif strategy == "newest_overall_wins":
-                    total["op_to_bk"] += tbl.op_only
-                    total["bk_to_op"] += tbl.bk_only
-                    total["conflict_op_wins"] += tbl.op_newer + max(0, tbl.conflicts - tbl.op_newer - tbl.bk_newer)
-                    total["conflict_bk_wins"] += tbl.bk_newer
+                    total["op_to_cloud"] += tbl.op_only
+                    total["cloud_to_op"] += tbl.cloud_only
+                    total["conflict_op_wins"] += tbl.op_newer + max(0, tbl.conflicts - tbl.op_newer - tbl.cloud_newer)
+                    total["conflict_cloud_wins"] += tbl.cloud_newer
             outcomes[strategy] = total
         return outcomes
 
     def format_outcomes_display(self, rec: Recommendation) -> str:
         lines = ["=== PER-TABLE BREAKDOWN ==="]
         for tbl_name, tbl in sorted(rec.per_table.items()):
-            lines.append(f"  {tbl_name}: op_only={tbl.op_only} bk_only={tbl.bk_only} identical={tbl.identical} conflicts={tbl.conflicts}")
+            lines.append(f"  {tbl_name}: op_only={tbl.op_only} cloud_only={tbl.cloud_only} identical={tbl.identical} conflicts={tbl.conflicts}")
         
         lines.append("\n=== STRATEGY OUTCOMES PREVIEW ===")
         for strategy_key, outcome in rec.outcomes.items():

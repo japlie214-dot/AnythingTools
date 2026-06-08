@@ -95,22 +95,28 @@ async def lifespan(app: FastAPI):
 
             # Shutdown Backup V2
             try:
-                from utils.startup import _global_dual_engine
-                if _global_dual_engine:
-                    log.dual_log(tag="App:Lifecycle:ShutdownSync", message="Running shutdown sync", level="INFO", payload={"phase": "shutdown_sync"})
+                from utils.startup import _global_sync_engine
+                from database.backup.writer.cloud_writer import cloud_write_queue
+                
+                # Drain cloud writer queue
+                drain_start = time.time()
+                while cloud_write_queue.unfinished_tasks > 0 and (time.time() - drain_start < 10.0):
+                    await asyncio.sleep(0.5)
+
+                if _global_sync_engine:
+                    log.dual_log(tag="App:Lifecycle:ShutdownSync", message="Running shutdown sync", level="INFO")
                     try:
                         sync_result = await asyncio.wait_for(
-                            asyncio.to_thread(_global_dual_engine.sync_all, "delta"),
+                            asyncio.to_thread(_global_sync_engine.sync_all, "delta"),
                             timeout=30.0
                         )
                         log.dual_log(tag="App:Lifecycle:ShutdownSyncComplete", message="Shutdown sync completed", level="INFO", payload=sync_result)
                     except asyncio.TimeoutError:
-                        log.dual_log(tag="App:Lifecycle:ShutdownSyncTimeout", message="Shutdown sync timed out after 30s", level="WARNING", payload={"timeout_s": 30})
+                        log.dual_log(tag="App:Lifecycle:ShutdownSyncTimeout", message="Shutdown sync timed out", level="WARNING")
                     
-                    log.dual_log(tag="App:Lifecycle:ShutdownBackupV2", message="Shutting down Backup V2 engines", level="INFO", payload={"status": "initiating"})
-                    _global_dual_engine.shutdown()
+                    _global_sync_engine.shutdown()
             except Exception as e:
-                log.dual_log(tag="App:Lifecycle:ShutdownBackupV2Error", message=f"Error closing Backup V2: {e}", level="WARNING", payload={"error": str(e)})
+                log.dual_log(tag="App:Lifecycle:ShutdownSyncError", message=f"Error closing SyncEngine: {e}", level="WARNING")
             
             log.dual_log(tag="App:Lifecycle:ShutdownComplete", message="Clean shutdown complete", level="INFO", payload={"status": "clean", "startup_failed": startup_failed})
         except Exception as e:

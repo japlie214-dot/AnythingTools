@@ -176,3 +176,12 @@ def register_detail_table(
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
         (ticker, detail_table_name, source_title, source_note_number, source_accession_no, role_or_type, json.dumps(columns), row_count, quarter, year, quarterly_status)
     )
+    try:
+        from database.connection import DatabaseManager
+        from database.backup.writer.cloud_writer import enqueue_cloud_write
+        conn = DatabaseManager.get_read_connection()
+        row = conn.execute("SELECT * FROM sn_detail_registry WHERE ticker = ? AND detail_table_name = ?", (ticker, detail_table_name)).fetchone()
+        if row:
+            enqueue_cloud_write("sn_detail_registry", dict(row), pk_col="registry_id")
+    except Exception:
+        pass

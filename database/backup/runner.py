@@ -5,31 +5,31 @@ from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
 
-def _get_dual_engine():
-    from utils.startup import _global_dual_engine
-    if _global_dual_engine is None:
+def _get_sync_engine():
+    from utils.startup import _global_sync_engine
+    if _global_sync_engine is None:
         from database.backup.settings import BackupSettings
-        from database.backup.engine.dual_engine import DualEngine
-        engine = DualEngine(BackupSettings())
+        from database.backup.engine.sync_engine import SyncEngine
+        engine = SyncEngine(BackupSettings())
         engine.startup()
         return engine
-    return _global_dual_engine
+    return _global_sync_engine
 
 class BackupRunner:
     @staticmethod
     def run(mode: str = "delta", trigger_type: str = "manual", parent_job_id: Optional[str] = None, manual_job_id: Optional[str] = None) -> ExportResult:
-        engine = _get_dual_engine()
+        engine = _get_sync_engine()
         result = engine.sync_all(mode=mode)
         return ExportResult(
-            success=result.get("local_error") is None,
-            exported_counts=result.get("local", {}),
+            success=result.get("cloud_error") is None,
+            exported_counts=result.get("cloud", {}),
             duration_seconds=result.get("duration", 0.0),
-            error=result.get("local_error") or result.get("cloud_error")
+            error=result.get("cloud_error")
         )
 
     @staticmethod
     def restore(manual_job_id: Optional[str] = None) -> RestoreResult:
-        engine = _get_dual_engine()
+        engine = _get_sync_engine()
         start = time.monotonic()
         try:
             success = engine.restore_pipeline()

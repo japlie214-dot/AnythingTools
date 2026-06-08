@@ -9,6 +9,9 @@ load_dotenv()
 API_KEY: str = os.getenv("API_KEY", "dev_default_key_change_me_in_production")
 ANYTHINGTOOLS_PORT: int = int(os.getenv("ANYTHINGTOOLS_PORT", "8000"))
 
+# --- Operational Database Path ---
+OPERATIONAL_DB_PATH: str = os.getenv("OPERATIONAL_DB_PATH", "data/sumanal.db")
+
 # --- Schema Reset Control ---
 # Set SUMANAL_ALLOW_SCHEMA_RESET=1 to allow destructive schema reset on version mismatch.
 # WARNING: This drops ALL data on every restart if the schema version changes. Defaults to 0 (disabled).

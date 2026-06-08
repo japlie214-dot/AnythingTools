@@ -87,7 +87,16 @@ def _attempt_vec_load(conn: sqlite3.Connection) -> bool:
     return True
 
 # Path to the SQLite database files. Adjust as needed.
-DB_PATH = Path("data") / "sumanal.db"
+import os
+
+def _resolve_db_path() -> Path:
+    import config
+    path_str = getattr(config, "OPERATIONAL_DB_PATH", None) or os.getenv("OPERATIONAL_DB_PATH", "data/sumanal.db")
+    p = Path(path_str)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+DB_PATH = _resolve_db_path()
 LOGS_DB_PATH = Path("data") / "logs.db"
 
 # Connection configuration constants
