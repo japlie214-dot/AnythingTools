@@ -63,7 +63,7 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
     from edgar import Company, find as edgar_find
     from tools.stock_notes.fiscal import get_fiscal_year_end_month, fiscal_quarter_from_period_end
     from tools.stock_notes.detail_manager import upsert_detail_records, register_detail_table
-    from database.stock_notes.store import get_filing_store
+    from database.connection import DatabaseManager
     
     set_edgar_identity()
     edgar_limiter.wait()
@@ -162,7 +162,14 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
 
     # JSON Archive Integration
     try:
-        get_filing_store().upsert_filing_payload(accession_no, filing_payload)
+        # Filing store logic is currently handled via direct SQL writes to sn_filings/sn_notes.
+        # Payload archiving to a dedicated store is currently unimplemented.
+        pass
+    except Exception as e:
+        log.dual_log(tag="StockNotes:Store:Error", message=f"FilingStore failed for {accession_no}", level="ERROR", payload={"error": str(e)})
+        # Filing store logic is currently handled via direct SQL writes to sn_filings/sn_notes.
+        # Payload archiving to a dedicated store is currently unimplemented.
+        pass
     except Exception as e:
         log.dual_log(tag="StockNotes:Store:Error", message=f"FilingStore failed for {accession_no}", level="ERROR", payload={"error": str(e)})
 

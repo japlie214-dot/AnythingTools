@@ -94,6 +94,7 @@ def update_detail_publish_status(
     translated_summary: Optional[str] = None,
     translated_conclusion: Optional[str] = None,
 ) -> None:
+    now = _utcnow()
     if translated_title is not None:
         enqueue_write(
             "UPDATE broadcast_details SET publish_status = ?, "
@@ -101,13 +102,13 @@ def update_detail_publish_status(
             "updated_at = ? "
             "WHERE batch_id = ? AND article_id = ?",
             (publish_status, translated_title, translated_summary, translated_conclusion,
-             _utcnow(), batch_id, article_id)
+             now, batch_id, article_id)
         )
     else:
         enqueue_write(
             "UPDATE broadcast_details SET publish_status = ?, updated_at = ? "
             "WHERE batch_id = ? AND article_id = ?",
-            (publish_status, _utcnow(), batch_id, article_id)
+            (publish_status, now, batch_id, article_id)
         )
     try:
         from database.connection import DatabaseManager
@@ -115,7 +116,14 @@ def update_detail_publish_status(
         conn = DatabaseManager.get_read_connection()
         row = conn.execute("SELECT * FROM broadcast_details WHERE batch_id = ? AND article_id = ?", (batch_id, article_id)).fetchone()
         if row:
-            enqueue_cloud_write("broadcast_details", dict(row), pk_col="detail_id")
+            cloud_payload = dict(row)
+            cloud_payload["publish_status"] = publish_status
+            cloud_payload["updated_at"] = now
+            if translated_title is not None:
+                cloud_payload["translated_title"] = translated_title
+                cloud_payload["translated_summary"] = translated_summary
+                cloud_payload["translated_conclusion"] = translated_conclusion
+            enqueue_cloud_write("broadcast_details", cloud_payload, pk_col="detail_id")
     except Exception:
         pass
 
@@ -138,10 +146,11 @@ def mark_detail_published(
             payload={"batch_id": batch_id, "article_id": article_id, "phase": phase}
         )
         return
+    now = _utcnow()
     enqueue_write(
         "UPDATE broadcast_details SET publish_status = ?, updated_at = ? "
         "WHERE batch_id = ? AND article_id = ?",
-        (new_status, _utcnow(), batch_id, article_id)
+        (new_status, now, batch_id, article_id)
     )
     try:
         from database.connection import DatabaseManager
@@ -149,7 +158,10 @@ def mark_detail_published(
         conn = DatabaseManager.get_read_connection()
         row = conn.execute("SELECT * FROM broadcast_details WHERE batch_id = ? AND article_id = ?", (batch_id, article_id)).fetchone()
         if row:
-            enqueue_cloud_write("broadcast_details", dict(row), pk_col="detail_id")
+            cloud_payload = dict(row)
+            cloud_payload["publish_status"] = new_status
+            cloud_payload["updated_at"] = now
+            enqueue_cloud_write("broadcast_details", cloud_payload, pk_col="detail_id")
     except Exception:
         pass
 
@@ -185,15 +197,19 @@ def update_batch_status_from_details(batch_id: str) -> None:
     else:
         new_status = "PENDING"
 
+    now = _utcnow()
     enqueue_write(
         "UPDATE broadcast_batches SET status = ?, updated_at = ? WHERE batch_id = ?",
-        (new_status, _utcnow(), batch_id)
+        (new_status, now, batch_id)
     )
     try:
         from database.backup.writer.cloud_writer import enqueue_cloud_write
         batch_row = conn.execute("SELECT * FROM broadcast_batches WHERE batch_id = ?", (batch_id,)).fetchone()
         if batch_row:
-            enqueue_cloud_write("broadcast_batches", dict(batch_row), pk_col="batch_id")
+            cloud_payload = dict(batch_row)
+            cloud_payload["status"] = new_status
+            cloud_payload["updated_at"] = now
+            enqueue_cloud_write("broadcast_batches", cloud_payload, pk_col="batch_id")
     except Exception:
         pass
 

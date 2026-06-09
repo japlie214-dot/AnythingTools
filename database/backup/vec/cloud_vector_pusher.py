@@ -164,7 +164,7 @@ class VectorSync:
         return valid_rows, dlq_rows
 
     def _route_to_dlq(self, dlq_rows: List[Dict], table_name: str, pk_col: str):
-        from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
+        from database.backup.writer.cloud_writer import CloudWriteTask as BackupWriteTask, enqueue_cloud_write as enqueue_backup_write
         for row in dlq_rows:
             safe_row = {k: v for k, v in row.items() if k != "_error_msg" and not isinstance(v, bytes)}
             enqueue_backup_write(BackupWriteTask(

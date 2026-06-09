@@ -29,7 +29,7 @@ async def _init_backup_step() -> None:
         global _global_sync_engine
         _global_sync_engine = engine
     except Exception as e:
-        log.dual_log(tag="Startup:Backup:Error", message=f"Backup engine failed: {e}", level="WARNING")
+        log.dual_log(tag="Startup:Backup:Error", message=f"Backup engine failed: {e}", level="WARNING", payload={"error": str(e)})
 
 async def _sync_from_backup_step() -> None:
     from utils.logger import get_dual_logger
@@ -38,15 +38,15 @@ async def _sync_from_backup_step() -> None:
     
     global _global_sync_engine
     if _global_sync_engine is None:
-        log.dual_log(tag="Startup:Sync:Skip", message="SyncEngine offline", level="WARNING")
+        log.dual_log(tag="Startup:Sync:Skip", message="SyncEngine offline", level="WARNING", payload={"action": "skip_sync"})
         return
         
     try:
-        log.dual_log(tag="Startup:Sync:Start", message="Starting cloud pull sync", level="INFO")
+        log.dual_log(tag="Startup:Sync:Start", message="Starting cloud pull sync", level="INFO", payload={"action": "start_sync"})
         result = await asyncio.to_thread(_global_sync_engine.sync_all, "delta")
         log.dual_log(tag="Startup:Sync:Complete", message="Cloud sync completed", level="INFO", payload=result)
     except Exception as e:
-        log.dual_log(tag="Startup:Sync:Error", message=f"Startup sync failed: {e}", level="CRITICAL")
+        log.dual_log(tag="Startup:Sync:Error", message=f"Startup sync failed: {e}", level="CRITICAL", payload={"error": str(e)})
 
 async def run_startup(app_instance=None) -> StartupContext:
     ctx = StartupContext()

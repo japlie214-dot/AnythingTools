@@ -104,7 +104,7 @@ async def lifespan(app: FastAPI):
                     await asyncio.sleep(0.5)
 
                 if _global_sync_engine:
-                    log.dual_log(tag="App:Lifecycle:ShutdownSync", message="Running shutdown sync", level="INFO")
+                    log.dual_log(tag="App:Lifecycle:ShutdownSync", message="Running shutdown sync", level="INFO", payload={"phase": "shutdown_sync"})
                     try:
                         sync_result = await asyncio.wait_for(
                             asyncio.to_thread(_global_sync_engine.sync_all, "delta"),
@@ -112,11 +112,11 @@ async def lifespan(app: FastAPI):
                         )
                         log.dual_log(tag="App:Lifecycle:ShutdownSyncComplete", message="Shutdown sync completed", level="INFO", payload=sync_result)
                     except asyncio.TimeoutError:
-                        log.dual_log(tag="App:Lifecycle:ShutdownSyncTimeout", message="Shutdown sync timed out", level="WARNING")
+                        log.dual_log(tag="App:Lifecycle:ShutdownSyncTimeout", message="Shutdown sync timed out", level="WARNING", payload={"timeout_s": 30.0})
                     
                     _global_sync_engine.shutdown()
             except Exception as e:
-                log.dual_log(tag="App:Lifecycle:ShutdownSyncError", message=f"Error closing SyncEngine: {e}", level="WARNING")
+                log.dual_log(tag="App:Lifecycle:ShutdownSyncError", message=f"Error closing SyncEngine: {e}", level="WARNING", payload={"error": str(e)})
             
             log.dual_log(tag="App:Lifecycle:ShutdownComplete", message="Clean shutdown complete", level="INFO", payload={"status": "clean", "startup_failed": startup_failed})
         except Exception as e:

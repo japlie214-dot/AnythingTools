@@ -51,9 +51,10 @@ def start_cloud_writer():
     )
     _cloud_writer_thread.start()
     log.dual_log(
-        tag="CloudWriter:Started",
+        tag="Backup:CloudWriter:Start",
         message="Cloud writer thread started",
-        level="INFO"
+        level="INFO",
+        payload={"action": "start"}
     )
 
 
@@ -67,7 +68,7 @@ def enqueue_cloud_write(table_name: str, row_data: dict, pk_col: str = "id"):
         task = CloudWriteTask(table_name=table_name, operation="UPSERT", records=[row_data], pk_col=pk_col)
         cloud_write_queue.put_nowait(task)
     except queue.Full:
-        log.dual_log(tag="CloudWriter:QueueFull", level="DEBUG", message=f"Queue full, dropping write for {table_name}", payload={"table": table_name})
+        log.dual_log(tag="Backup:CloudWriter:QueueFull", level="DEBUG", message=f"Queue full, dropping write for {table_name}", payload={"table": table_name})
 
 
 def enqueue_cloud_write_batch(table_name: str, records: list, pk_col: str = "id"):
@@ -76,7 +77,7 @@ def enqueue_cloud_write_batch(table_name: str, records: list, pk_col: str = "id"
         task = CloudWriteTask(table_name=table_name, operation="UPSERT", records=records, pk_col=pk_col)
         cloud_write_queue.put_nowait(task)
     except queue.Full:
-        log.dual_log(tag="CloudWriter:QueueFullBatch", level="DEBUG", message=f"Queue full, dropping batch for {table_name}", payload={"table": table_name, "batch_size": len(records)})
+        log.dual_log(tag="Backup:CloudWriter:QueueFull", level="DEBUG", message=f"Queue full, dropping batch for {table_name}", payload={"table": table_name, "batch_size": len(records)})
 
 
 def enqueue_cloud_delete(table_name: str, pk_val: str, pk_col: str = "id"):
@@ -85,7 +86,7 @@ def enqueue_cloud_delete(table_name: str, pk_val: str, pk_col: str = "id"):
         task = CloudWriteTask(table_name=table_name, operation="DELETE", records=[{pk_col: pk_val}], pk_col=pk_col)
         cloud_write_queue.put_nowait(task)
     except queue.Full:
-        log.dual_log(tag="CloudWriter:QueueFullDelete", level="DEBUG", message=f"Queue full, dropping delete for {table_name}", payload={"table": table_name, "pk": pk_val})
+        log.dual_log(tag="Backup:CloudWriter:QueueFull", level="DEBUG", message=f"Queue full, dropping delete for {table_name}", payload={"table": table_name, "pk": pk_val})
 
 
 def _cloud_writer_loop():
@@ -94,19 +95,21 @@ def _cloud_writer_loop():
     
     try:
         settings = BackupSettings()
-    except Exception:
+    except Exception as e:
         log.dual_log(
-            tag="CloudWriter:ConfigError",
+            tag="Backup:CloudWriter:ConfigError",
             level="WARNING",
-            message="Backup settings not configured, cloud writer inactive"
+            message="Backup settings not configured, cloud writer inactive",
+            payload={"error": str(e)}
         )
         return
     
     if not settings.cloud.enabled:
         log.dual_log(
-            tag="CloudWriter:Disabled",
+            tag="Backup:CloudWriter:Disabled",
             level="INFO",
-            message="Cloud backup disabled, cloud writer thread idle"
+            message="Cloud backup disabled, cloud writer thread idle",
+            payload={"action": "check_enabled"}
         )
         return
     
@@ -125,9 +128,11 @@ def _cloud_writer_loop():
                 break
             
             # Accumulate into batch
-            if task.table_name not in batch_buffer:
-                batch_buffer[task.table_name] = []
-            batch_buffer[task.table_name].extend(task.records)
+            # Accumulate into batch grouped by table and operation
+            key = (task.table_name, task.operation, task.pk_col)
+            if key not in batch_buffer:
+                batch_buffer[key] = []
+            batch_buffer[key].extend(task.records)
             
         except queue.Empty:
             pass
@@ -149,16 +154,24 @@ def _cloud_writer_loop():
         _flush_batch(cloud_engine, batch_buffer)
     
     cloud_engine.shutdown()
-    log.dual_log(tag="CloudWriter:Shutdown", message="Cloud writer thread stopped")
+    log.dual_log(tag="Backup:CloudWriter:Shutdown", message="Cloud writer thread stopped", payload={"action": "shutdown"})
 
 
 def _flush_batch(cloud_engine, batch_buffer: dict):
     """Flush accumulated writes to Snowflake."""
-    for table_name, records in batch_buffer.items():
+    for (table_name, operation, pk_col), records in batch_buffer.items():
         try:
             with cloud_engine.engine.begin() as conn:
                 schema = cloud_engine.settings.schema_name
                 
+                if operation == "DELETE":
+                    pk_vals = [r[pk_col] for r in records if pk_col in r]
+                    if pk_vals:
+                        placeholders = ",".join([f":p{i}" for i in range(len(pk_vals))])
+                        params = {f"p{i}": val for i, val in enumerate(pk_vals)}
+                        conn.execute(text(f"DELETE FROM {schema}.{table_name} WHERE {pk_col} IN ({placeholders})"), params)
+                    continue
+
                 # Get columns from first record
                 if not records:
                     continue
@@ -172,17 +185,17 @@ def _flush_batch(cloud_engine, batch_buffer: dict):
                     pusher = VectorSync(circuit_breaker=cloud_engine.circuit_breaker_vec)
                     try:
                         push_result = pusher.push_vectors(
-                            conn, schema, table_name, columns, records, "id"
+                            conn, schema, table_name, columns, records, pk_col
                         )
                         log.dual_log(
-                            tag="CloudWriter:Flush",
+                            tag="Backup:CloudWriter:Flush",
                             message=f"Flushed {push_result.get('pushed', 0)} rows to {table_name}",
                             level="DEBUG",
                             payload={"table": table_name, "rows": push_result.get('pushed', 0)}
                         )
                     except Exception as e:
                         log.dual_log(
-                            tag="CloudWriter:FlushError",
+                            tag="Backup:CloudWriter:FlushError",
                             level="WARNING",
                             message=f"Failed to flush {table_name}: {e}",
                             payload={"table": table_name, "error": str(e)[:200]}
@@ -190,16 +203,6 @@ def _flush_batch(cloud_engine, batch_buffer: dict):
                 else:
                     # Standard MERGE for non-embedding tables
                     stage_table = f"{table_name}_stage"
-                    pk_col = "id"
-                    
-                    # Find PK column
-                    for rec in records:
-                        for k, v in rec.items():
-                            if k == "id" or k.endswith("_id"):
-                                pk_col = k
-                                break
-                        if pk_col != "id":
-                            break
                     
                     col_defs = ",".join([f"{c} VARCHAR" for c in columns])
                     conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {schema}.{stage_table} ({col_defs})"))
@@ -217,14 +220,14 @@ def _flush_batch(cloud_engine, batch_buffer: dict):
                     result = conn.execute(text(merge_sql))
                     
                     log.dual_log(
-                        tag="CloudWriter:Flush",
+                        tag="Backup:CloudWriter:Flush",
                         message=f"Flushed {len(records)} rows to Snowflake {table_name}",
                         level="DEBUG",
                         payload={"table": table_name, "rows": len(records)}
                     )
         except Exception as e:
             log.dual_log(
-                tag="CloudWriter:BatchError",
+                tag="Backup:CloudWriter:BatchError",
                 level="WARNING",
                 message=f"Batch flush failed for {table_name}: {e}",
                 payload={"table": table_name, "error": str(e)[:200]}

@@ -16,7 +16,7 @@ log = get_dual_logger(__name__)
 
 
 class ArticleStore:
-    def __init__(self, backup_dir: str | Path):
+    def __init__(self, backup_dir: Optional[str | Path] = None):
         pass
 
     def _ensure_unique_vec_rowid(self, vec_rowid: int, article_id: str) -> int:
@@ -185,9 +185,5 @@ def get_article_store() -> ArticleStore:
     global _global_store
     with _global_store_lock:
         if _global_store is None:
-            from database.backup.settings import BackupSettings
-            from pathlib import Path
-            settings = BackupSettings()
-            backup_dir = Path(settings.local.db_path).parent / "articles"
-            _global_store = ArticleStore(backup_dir)
+            _global_store = ArticleStore()
         return _global_store

@@ -4,7 +4,7 @@
 AnythingTools is a durable, tool-augmented background service designed for high-reliability web scraping, financial data extraction, and automated publishing to Telegram. It solves the fragility of LLM-driven browser automation by decoupling request submission from execution, implementing strict state persistence, utilizing Semantic Object Models (SoM) for DOM interaction, and providing a robust crash-recovery framework.
 
 ### Operational Purpose
-The system provides a managed, asynchronous execution environment for long-running browser tasks. It ensures progress is never lost during network failures, DOM changes, or process crashes by tracking granular job items in a SQLite database. It provides a Human-in-the-Loop (HITL) mechanism to pause and resume tasks, and a robust dual-mode (Local SQLite + Cloud Snowflake) bidirectional synchronization engine for disaster recovery and analytical syncing.
+The system provides a managed, asynchronous execution environment for long-running browser tasks. It ensures progress is never lost during network failures, DOM changes, or process crashes by tracking granular job items in a SQLite database. It provides a Human-in-the-Loop (HITL) mechanism to pause and resume tasks, and a robust 2-tier synchronization engine for disaster recovery and analytical syncing between the Operational DB and a cloud Snowflake warehouse.
 
 ### Explicit Non-Goals
 - **Not a Chatbot**: It is an asynchronous job processor, not a real-time interactive chat interface.
@@ -19,16 +19,17 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **Unified Worker Manager (`bot/engine/worker.py`)**: A singleton daemon that polls the `jobs` table and spawns isolated threads for tool execution.
 - **Tool Registry (`tools/registry.py`)**: A dynamic discovery system that instantiates `BaseTool` subclasses.
 - **Orchestrator (`bot/orchestrator_core/`)**: Middleware that enhances browser interaction by injecting a Semantic Object Model (SoM) into the DOM before LLM evaluation.
-- **Database Layer (`database/`)**: A multi-database architecture (`sumanal.db`, `logs.db`, `backup.db`) utilizing dedicated single-writer threads to completely eliminate SQLite locking contention.
-- **Sync Subsystem (`database/backup/`)**: A bidirectional delta-sync engine maintaining parity between an Operational DB, a Local SQLite backup, and a cloud Snowflake warehouse.
+- **Database Layer (`database/`)**: A multi-database architecture (`sumanal.db`, `logs.db`) utilizing dedicated single-writer threads to eliminate SQLite locking contention.
+- **Sync Subsystem (`database/backup/`)**: A 2-tier synchronization engine (`SyncEngine`) maintaining parity between the Operational DB and a cloud Snowflake warehouse. It utilizes an asynchronous `cloud_writer` for real-time, best-effort updates.
 
 ### Data Flow
 1. **Submission**: `POST /api/tools/{tool_name}` $\rightarrow$ API validates input via Pydantic $\rightarrow$ Job inserted into `jobs` table as `QUEUED`.
 2. **Dispatch**: `UnifiedWorkerManager` polls `jobs` $\rightarrow$ Spawns execution thread $\rightarrow$ Sets status to `RUNNING`.
 3. **Execution**: `Worker` $\rightarrow$ `ToolRegistry` (instantiation) $\rightarrow$ `Tool.run()` (invokes LLMs, bots, and SoM injection).
 4. **Persistence**: Tool results are written to `jobs.result_json` and detailed progress is tracked in `job_items`. All writes queue through `database.writer`.
-5. **Completion**: `_do_callback_with_logging` sends the final result to the calling system via HTTP POST.
-6. **Backup/Sync**: On startup and shutdown, `DualEngine` executes a bidirectional sync. It pulls from Snowflake, computes a 3-way delta (Operational vs. Local vs. Cloud), resolves conflicts via automated strategies or HITL, persists the merged state locally, drains the write queue, and finally pushes the synchronized state back to Snowflake.
+5. **Inline Cloud Sync**: Mutating operations in the application layer (e.g., `ArticleStore`, `BroadcastWriter`) trigger `enqueue_cloud_write`, which pushes data to Snowflake asynchronously via a background queue.
+6. **Completion**: `_do_callback_with_logging` sends the final result to the calling system via HTTP POST.
+7. **Lifecycle Sync**: On startup, `SyncEngine` pulls from Snowflake to synchronize the local operational state. On shutdown, the system drains the `cloud_write_queue` and performs a final delta sync to Snowflake.
 
 ## 3. Repository Structure
 - `api/`: REST endpoints (`routes.py`) and Pydantic validation schemas (`schemas.py`).
@@ -39,7 +40,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - `database/`: 
     - `connection.py`, `writer.py`, `logs_writer.py`: Thread-safe database managers.
     - `schemas/`: Canonical SQL definitions.
-    - `backup/`: The DualEngine backup system. Contains `engine/` (Local, Cloud, Dual), `sync/` (DiffEngine, resolution, foundation), and `writer/` (BackupWriteTask, enqueue_backup_write).
+    - `backup/`: The SyncEngine system. Contains `engine/` (`SyncEngine`, `CloudEngine`), `sync/` (`DiffEngine`, `resolution`, `smart_recommender`), and `writer/` (`cloud_writer.py` for async Snowflake writes).
     - `broadcast/`: Domain logic for Telegram publishing state.
     - `management/`: Schema reconciliation and database health checks.
 - `tools/`:
@@ -51,7 +52,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
     - `stock_notes/`: SEC EDGAR footnote extraction and dynamic table management.
     - `batch_reader/`: Hybrid semantic + keyword search across batches.
 - `utils/`: Cross-cutting utilities (logging, artifact management, browser daemon, SoM Javascript injection, rate limiters, text sanitization).
-- `scripts/`: Standalone maintenance utilities (e.g., `migrate_artifacts.py`).
+- `scripts/`: Maintenance utilities.
 - `deprecated/`: Legacy logic (e.g., `bot/core/agent.py`, `tools/finance/`) that has been superseded by the current modular tool architecture.
 
 ## 4. Core Concepts & Domain Model
@@ -60,7 +61,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **SoM (Semantic Object Model)**: Injection of `data-ai-id` attributes into the DOM (via JS) to provide the LLM with deterministic element references, bypassing fragile CSS selectors.
 - **Resume Mechanism**: Tool-specific logic (`ResumeHandler`) that queries domain tables (e.g., `job_items`) to determine the exact point of resumption after a crash or HITL pause.
 - **WriteReceipt**: A synchronization primitive that blocks synchronous code until an asynchronous database write is committed by the writer thread.
-- **DualEngine 3-Way Sync**: A non-destructive synchronization system that computes deltas across the Operational DB, Local Backup, and Cloud Snowflake. It utilizes a `sync_ledger` and a `dead_letter_queue` for conflict auditing and error isolation.
+- **2-Tier Sync**: A synchronization model that treats the Operational DB as the source of truth and Snowflake as the durable cloud mirror. It uses a `sync_ledger` for watermarking and a 2-way `DiffEngine` for conflict detection.
 
 ### Invariants
 - **Single Writer**: All writes to operational databases MUST pass through the `database.writer` or `database.logs_writer` queues.
@@ -81,7 +82,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **Crash Recovery**: If the application crashes, the startup sequence (`utils/startup/recovery.py`) downgrades `RUNNING` jobs to `INTERRUPTED`. The `UnifiedWorkerManager` automatically retries these.
 - **HITL Pause**: Tools can raise a `PAUSED_FOR_HITL` signal (e.g., encountering a paywall). Execution halts until a POST to `/resume` is received.
 - **Doom Loop Prevention**: The `/resume` endpoint increments `resume_count`. If it exceeds `MAX_RESUME_ATTEMPTS`, the job is poisoned and marked `FAILED`.
-- **Sync Conflicts (Split-Brain)**: If multiple versions of a row exist across Operational, Local, and Cloud states, `ConflictResolver` flags it. The system employs automated strategies (`newest_overall_wins`, etc.) or escalates to the `UserConfirmationHandler` for a manual terminal-based decision.
+- **Sync Conflicts (Split-Brain)**: If versions of a row differ between Operational and Cloud states, `ConflictResolver` flags it. The system employs automated strategies (`newest_overall_wins`, etc.) or escalates to the `UserConfirmationHandler` for manual terminal-based decision.
 - **Circuit Breaking**: If Snowflake is unreachable, `CircuitBreaker` opens, and CloudEngine operations fail fast. The system operates locally and sets a `sync_pending` flag for future reconciliation.
 
 ## 6. Public Interfaces
@@ -90,7 +91,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - `GET /api/jobs/{job_id}`: Returns status, logs, and final payload.
 - `DELETE /api/jobs/{job_id}`: Marks a job as `CANCELLING` to trigger graceful termination.
 - `POST /api/jobs/{job_id}/resume`: Resumes a paused or interrupted job.
-- `GET /api/backup/status`: Returns `BackupMetricsResponse` containing health, sync state, and circuit breaker status for the DualEngine.
+- `GET /api/backup/status`: Returns `BackupMetricsResponse` containing health, sync state, and circuit breaker status for the SyncEngine.
 - `GET /api/manifest`: Returns available tools and their JSON schemas for LLM orchestration.
 
 ### Internal Tool Registry
@@ -99,9 +100,8 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 
 ## 7. State, Persistence, and Data
 ### Storage Locations
-- **Operational DB (`data/sumanal.db`)**: Source of truth for `jobs`, `job_items`, `scraped_articles`, `broadcast_batches`, `sn_filings`.
+- **Operational DB (`data/sumanal.db`)**: Source of truth for `jobs`, `job_items`, `scraped_articles`, `broadcast_batches`, `sn_filings`, and the `sync_ledger`.
 - **Telemetry DB (`data/logs.db`)**: High-throughput event store. Recreated fresh on every application startup.
-- **Backup DB (`data/backup.db`)**: Local target for the DualEngine sync process. Contains the `sync_ledger` and `dead_letter_queue`.
 - **Snowflake**: Cloud target for analytical querying and remote backup.
 - **Artifacts (`data/temp/multimodal` / `artifacts/`)**: Ephemeral or receipt files (JSON, screenshots) served via the API.
 
@@ -125,10 +125,10 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 ## 9. Setup, Build, and Execution
 1. Install dependencies: `pip install -r requirements.txt`. (Requires compiling `sqlite-vec` if not using pre-built wheels).
 2. Configure `.env` file (parsed by `pydantic-settings` for backup) and environment variables for legacy configs (`config.py`).
-   - Required: `API_KEY`, `AZURE_ENDPOINT`, `EDGAR_IDENTITY`.
-   - Optional Backup: `BACKUP_CLOUD__ACCOUNT`, `BACKUP_CLOUD__USER`, etc.
+    - Required: `API_KEY`, `AZURE_ENDPOINT`, `EDGAR_IDENTITY`.
+    - Optional Backup: `BACKUP_CLOUD__ACCOUNT`, `BACKUP_CLOUD__USER`, etc.
 3. Run the application: `python -m uvicorn app:app --reload --port 8000`.
-4. *Startup Sequence*: The app enforces `WEB_CONCURRENCY=1`, mounts static artifacts, drops and recreates `logs.db`, validates `sqlite-vec`, runs schema migrations, executes the `DualEngine` bidirectional backup sync (including HITL strategy selection), and warms up the browser daemon.
+4. *Startup Sequence*: The app enforces `WEB_CONCURRENCY=1`, mounts static artifacts, drops and recreates `logs.db`, validates `sqlite-vec`, runs schema migrations, initializes the `SyncEngine` and `cloud_writer`, executes a cloud pull sync, and warms up the browser daemon.
 
 ## 10. Testing & Validation
 - **Health Checks**: Extensive runtime health checks during startup (e.g., PRAGMA `integrity_check`, CDP ping probes in `ChromeDaemonManager`).
@@ -144,5 +144,26 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 
 ## 12. Change Sensitivity
 - **Extremely Fragile**: `database/writer.py` and `database/logs_writer.py`. Altering the queue logic, thread handling, and transaction boundaries here will cause immediate database locking or silent data loss.
-- **Tightly Coupled**: The `DualEngine` synchronization (`database/backup/engine/`) heavily relies on `database/backup/schema_registry.py` for precise type mapping. Changing SQLite schemas requires verifying the `sqlglot` output for Snowflake.
+- **Tightly Coupled**: The `SyncEngine` synchronization (`database/backup/engine/`) heavily relies on `database/backup/schema_registry.py` for precise type mapping. Changing SQLite schemas requires verifying the `sqlglot` output for Snowflake.
 - **Easily Extensible**: Adding a new tool is trivial. Create a subclass of `BaseTool` in `tools/`, define an `INPUT_MODEL`, and it will be automatically discovered by `registry.py` and exposed via the `/api/manifest` endpoint.
+
+## 13. Changes (Evolutionary Analysis from Current Code)
+
+### Transition from 3-Tier to 2-Tier Backup Architecture
+- **Pain Point Addressed**: The prior system used a 3-tier model (Operational DB $\rightarrow$ local `backup.db` $\rightarrow$ Snowflake). This introduced significant redundancy, complex 3-way diffing logic, and a "local backup" layer that acted as a bottleneck and a point of failure. Evidence: The presence of `deprecated/` logic and the complete purge of `local_engine.py` and `backup_writer.py`.
+- **Solution Implemented**: Replaced the `DualEngine` with a `SyncEngine` (`database/backup/engine/sync_engine.py`) that synchronizes the Operational DB directly to Snowflake. Introduced an asynchronous `cloud_writer` (`database/backup/writer/cloud_writer.py`) using a `queue.Queue` to perform "best-effort" inline writes without blocking application logic.
+- **Impact & Evidence**: 
+    - *Architectural:* Removed the intermediate `backup.db` from the critical path. `database/connection.py` now resolves the operational path dynamically via `OPERATIONAL_DB_PATH`.
+    - *Behavioral:* Application stores (e.g., `ArticleStore`) now trigger asynchronous cloud writes immediately upon local commit, reducing the window of data loss.
+    - *Developer Experience:* Simplified the differential engine to a 2-way comparison (Operational vs. Cloud), as evidenced by the rewritten `DiffEngine.compute_deltas`.
+    - *New Risks/Trade-offs:* Introduced a potential for "best-effort" data loss if the application crashes before the async queue is drained, mitigated by a 10-second shutdown drain in `app.py`.
+- **Confidence Level**: High (Directly evidenced by the massive purge of legacy files and the structural shift in the `backup/` directory).
+
+### Observability and Logging Contract Hardening
+- **Pain Point Addressed**: Inconsistent logging and tag formats led to `Logger:Contract:TagViolation` warnings and runtime `TypeError` crashes due to missing required `payload` arguments in `dual_log`.
+- **Solution Implemented**: Standardized all tags to a 3-part hierarchy (`Category:Sub-Category:Action`) and enforced the inclusion of structured payloads in all `dual_log` calls across the startup and sync pipelines.
+- **Impact & Evidence**: 
+    - *Architectural:* The logging system now strictly enforces a contract that allows for reliable SQL-based filtering of logs.
+    - *Behavioral:* Eliminated runtime crashes during critical lifecycle events (startup/shutdown).
+    - *Developer Experience:* Increased transparency in autonomous decisions (e.g., HITL bypasses now log the exact Boolean reason and row metrics).
+- **Confidence Level**: High (Directly evidenced by the systematic updates to `dual_log` calls and the specific `Backup:CloudWriter` tag formatting).

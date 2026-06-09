@@ -1,5 +1,5 @@
-"""database/backup/engine/sync_engine.py
-Unified backup engine: Direct Operational DB ↔ Snowflake sync.
+# database/backup/engine/sync_engine.py
+"""Unified backup engine: Direct Operational DB ↔ Snowflake sync.
 
 Replaces the old DualEngine (Operational → backup.db → Snowflake).
 Now syncs directly from the operational SQLite database to Snowflake,
@@ -15,6 +15,8 @@ thread. This engine handles:
 
 import sqlite3
 import time
+import os
+import tempfile
 from database.backup.settings import BackupSettings
 from database.backup.engine.cloud_engine import CloudEngine
 from database.backup.schema_registry import BackupSchemaRegistry
@@ -57,29 +59,138 @@ class SyncEngine:
         except Exception:
             pass
 
+    def _get_table_watermark(self, op_conn: sqlite3.Connection, table_name: str) -> str:
+        """Query the operational DB's sync ledger to find the last successful completed timestamp."""
+        try:
+            cursor = op_conn.execute(
+                "SELECT max(completed_at) FROM sync_ledger WHERE state = 'COMPLETED' AND (table_name = ? OR table_name = 'ALL')",
+                (table_name,)
+            )
+            val = cursor.fetchone()[0]
+            return val if val else "1970-01-01T00:00:00"
+        except sqlite3.OperationalError:
+            return "1970-01-01T00:00:00"
+
     def sync_all(self, mode: str = "delta") -> dict:
         """Sync operational DB directly to Snowflake (no backup.db intermediary)."""
-        from database.connection import DB_PATH
+        from database.connection import DB_PATH, DatabaseManager
         
         start_time = time.time()
         tables = BackupSchemaRegistry.get_expected_sqlite_tables()
         results = {"cloud": {}, "duration": 0.0}
 
-        if self.cloud.settings.enabled:
+        # Proactive Analysis: Gather proof of what is available to sync
+        sync_proofs = {}
+        total_pending_rows = 0
+        
+        try:
+            op_conn = DatabaseManager.get_read_connection()
+            for table_name, ddl in tables.items():
+                if 'VIRTUAL' in ddl.upper():
+                    continue
+                
+                # Get local row count
+                try:
+                    row_count = op_conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                except Exception:
+                    row_count = 0
+                    
+                # Get watermark
+                watermark = "1970-01-01T00:00:00"
+                if mode == "delta":
+                    watermark = self._get_table_watermark(op_conn, table_name)
+                
+                # Get count of pending updates
+                ts_col = "updated_at" if "updated_at" in ddl.lower() else None
+                pending_count = 0
+                if ts_col:
+                    try:
+                        pending_count = op_conn.execute(
+                            f"SELECT COUNT(*) FROM {table_name} WHERE {ts_col} > ?",
+                            (watermark,)
+                        ).fetchone()[0]
+                    except Exception:
+                        pending_count = row_count
+                else:
+                    pending_count = row_count
+                    
+                sync_proofs[table_name] = {
+                    "total_local_rows": row_count,
+                    "watermark_evaluated": watermark,
+                    "pending_delta_rows": pending_count
+                }
+                total_pending_rows += pending_count
+        except Exception as e:
+            log.dual_log(
+                tag="Backup:SyncAll:AnalysisFailed",
+                message=f"Could not analyze operational state before sync: {e}",
+                level="WARNING",
+                payload={"error": str(e)}
+            )
+
+        if not self.cloud.settings.enabled:
+            log.dual_log(
+                tag="Backup:SyncAll:Skipped",
+                message="SyncAll skipped: Cloud backup is disabled",
+                level="INFO",
+                payload={"reason": "cloud_disabled", "proofs": sync_proofs}
+            )
+            return {"status": "disabled"}
+
+        # Log pre-sync state
+        log.dual_log(
+            tag="Backup:SyncAll:PreFlight",
+            message=f"Pre-flight analysis: {total_pending_rows} pending rows across {len(sync_proofs)} tables",
+            level="INFO",
+            payload={"mode": mode, "total_pending_rows": total_pending_rows, "proofs": sync_proofs}
+        )
+
+        if total_pending_rows == 0:
+            log.dual_log(
+                tag="Backup:SyncAll:Skipped",
+                message="SyncAll skipped: No new operational records found above watermarks",
+                level="INFO",
+                payload={"reason": "no_pending_changes", "proofs": sync_proofs}
+            )
+            results["duration"] = time.time() - start_time
+            return results
+
+        # Perform the actual push
+        try:
+            results["cloud"] = self.cloud.sync_data(
+                str(DB_PATH), tables,
+                batch_size=self.settings.sync.batch_size,
+                delta_only=(mode == "delta")
+            )
+            
+            pushed_total = sum(results["cloud"].values())
+            
+            # Post-sync ledger update to advance local watermarks
             try:
-                results["cloud"] = self.cloud.sync_data(
-                    str(DB_PATH), tables,
-                    batch_size=self.settings.sync.batch_size,
-                    delta_only=(mode == "delta")
+                from database.backup.sync.foundation import SyncLedger
+                from database.writer import enqueue_write
+                now_iso = SyncLedger.now_iso()
+                enqueue_write(
+                    "INSERT OR REPLACE INTO sync_ledger (operation_id, table_name, direction, row_count, state, completed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (now_iso, "ALL", "LOCAL_TO_CLOUD", pushed_total, "COMPLETED", now_iso)
                 )
-            except Exception as e:
-                log.dual_log(
-                    tag="Backup:Sync:CloudError",
-                    message=f"Cloud sync failed: {str(e)}",
-                    level="ERROR",
-                    payload={"error": str(e)}
-                )
-                results["cloud_error"] = str(e)
+            except Exception as e_ledger:
+                log.dual_log(tag="Backup:SyncAll:LedgerError", message=f"Failed to advance local sync ledger: {e_ledger}", level="WARNING", payload={"error": str(e_ledger)})
+
+            log.dual_log(
+                tag="Backup:SyncAll:Pushed",
+                message=f"SyncAll pushed {pushed_total} rows to Snowflake",
+                level="INFO",
+                payload={"pushed_details": results["cloud"], "proofs": sync_proofs}
+            )
+        except Exception as e:
+            log.dual_log(
+                tag="Backup:SyncAll:CloudError",
+                message=f"Cloud sync execution failed: {str(e)}",
+                level="ERROR",
+                payload={"error": str(e), "proofs": sync_proofs}
+            )
+            results["cloud_error"] = str(e)
 
         # Vec0 backup to Snowflake
         if self.settings.vec0.enabled and self.cloud.settings.enabled:
@@ -112,7 +223,8 @@ class SyncEngine:
             log.dual_log(
                 tag="Backup:Restore:Skip",
                 message="Cloud not configured, cannot restore",
-                level="WARNING"
+                level="WARNING",
+                payload={"reason": "cloud_not_configured"}
             )
             return False
             
@@ -212,7 +324,12 @@ class SyncEngine:
             "conflicts": 0, "duration": 0.0
         }
 
-        # Step 1: Pull cloud data to a temp staging area for diffing
+        import tempfile
+        import os
+        
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".db", prefix="sync_")
+        os.close(temp_fd)
+        temp_conn = sqlite3.connect(temp_path, timeout=30.0)
         op_conn = DatabaseManager.get_read_connection()
         
         metrics = {
@@ -224,6 +341,12 @@ class SyncEngine:
 
         triad_deltas = {}
         try:
+            for t_name, ddl in tables.items():
+                if 'VIRTUAL' not in ddl.upper():
+                    temp_conn.executescript(ddl)
+            if self.cloud.settings.enabled:
+                self.cloud.pull_to_local(temp_path, tables)
+
             for table_name, ddl in tables.items():
                 if 'VIRTUAL' in ddl.upper() or 'updated_at' not in ddl.lower():
                     continue
@@ -233,19 +356,32 @@ class SyncEngine:
                 except Exception:
                     op_count, op_latest = 0, "N/A"
 
-                # Use DiffEngine against operational DB + cloud
-                # We need a local staging for cloud data to compute triad
-                deltas = {"op_only": [], "bk_only": [], "genuine_conflicts": [], 
-                          "content_identical": [], "timestamp_drift": [], "pk_col": "id", "total_rows": 0}
+                deltas = DiffEngine.compute_deltas(op_conn, temp_conn, table_name)
                 triad_deltas[table_name] = deltas
                 
                 metrics["tables"][table_name] = {
                     "op_rows": op_count, "op_latest": op_latest,
-                    "op_only": 0, "bk_only": 0, "conflicts": 0,
+                    "op_only": len(deltas["op_only"]), "cloud_only": len(deltas["cloud_only"]),
+                    "conflicts": len(deltas.get("genuine_conflicts", [])),
                 }
             
             selected_strategy = default_strategy
-            if self.settings.hitl.interactive:
+            hitl_bypassed = False
+            hitl_bypass_reason = None
+            
+            # Evaluate auto-accept condition
+            total_conflicts = sum(m.get("conflicts", 0) for m in metrics["tables"].values())
+            total_cloud_only = sum(m.get("cloud_only", 0) for m in metrics["tables"].values())
+            
+            if not self.settings.hitl.interactive:
+                hitl_bypassed = True
+                hitl_bypass_reason = "hitl.interactive configuration is set to False"
+            elif self.settings.hitl.auto_accept_on_no_conflict and total_conflicts == 0 and total_cloud_only == 0:
+                hitl_bypassed = True
+                hitl_bypass_reason = "auto_accept_on_no_conflict is True and zero conflicts/cloud-only records exist"
+                selected_strategy = "operational_wins"
+            
+            if not hitl_bypassed:
                 selected_strategy = UserConfirmationHandler.hitl_prompt_sync_strategy(metrics)
             
             if selected_strategy == 'abort':
@@ -253,11 +389,55 @@ class SyncEngine:
 
             log.dual_log(
                 tag="Backup:Sync:Strategy",
-                message=f"Strategy: {selected_strategy}",
-                payload={"strategy": selected_strategy}
+                message=f"Strategy: {selected_strategy}" + (f" (HITL bypassed: {hitl_bypass_reason})" if hitl_bypassed else " (Selected via HITL)"),
+                payload={
+                    "strategy": selected_strategy,
+                    "hitl_interactive_flag": self.settings.hitl.interactive,
+                    "hitl_auto_accept_flag": self.settings.hitl.auto_accept_on_no_conflict,
+                    "total_conflicts": total_conflicts,
+                    "total_cloud_only": total_cloud_only,
+                    "hitl_bypassed": hitl_bypassed,
+                    "hitl_bypass_reason": hitl_bypass_reason
+                }
             )
 
-            # Step 2: Sync operational → Snowflake (push)
+            from database.writer import enqueue_transaction
+            op_transactions = []
+            
+            for table_name, deltas in triad_deltas.items():
+                pk_col = deltas["pk_col"]
+                
+                if selected_strategy in ("cloud_wins", "newest_overall_wins") and deltas["cloud_only"]:
+                    for chunk_idx in range(0, len(deltas["cloud_only"]), 900):
+                        chunk = deltas["cloud_only"][chunk_idx:chunk_idx+900]
+                        placeholders = ",".join(["?"] * len(chunk))
+                        rows = temp_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({placeholders})", chunk).fetchall()
+                        if rows:
+                            cols = [desc[0] for desc in temp_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
+                            for r in rows:
+                                op_transactions.append((f"INSERT OR REPLACE INTO {table_name} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", tuple(r)))
+                            results["op_restored"] += len(rows)
+
+                if selected_strategy == "cloud_wins" and deltas["op_only"]:
+                    for op_id in deltas["op_only"]:
+                        op_transactions.append((f"DELETE FROM {table_name} WHERE {pk_col} = ?", (op_id,)))
+                    results["op_deleted"] += len(deltas["op_only"])
+
+                for conflict in deltas.get("genuine_conflicts", []):
+                    verdict = ConflictResolver.resolve_conflict(conflict, strategy=selected_strategy)
+                    if verdict == "manual":
+                        verdict = UserConfirmationHandler.hitl_wait_for_sync_operator(table_name, conflict.get("id"), conflict.get("op_ts", ""), conflict.get("cloud_ts", ""))
+                    
+                    if verdict == "cloud":
+                        row = temp_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} = ?", (conflict["id"],)).fetchone()
+                        if row:
+                            cols = [desc[0] for desc in temp_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
+                            op_transactions.append((f"INSERT OR REPLACE INTO {table_name} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", tuple(row)))
+                            results["op_restored"] += 1
+
+            if op_transactions:
+                enqueue_transaction(op_transactions)
+
             if self.cloud.settings.enabled:
                 try:
                     results["cloud_push"] = self.cloud.sync_data(
@@ -274,7 +454,11 @@ class SyncEngine:
                     )
 
         finally:
-            pass  # op_conn is a read connection, no close needed
+            temp_conn.close()
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
 
         results["duration"] = time.time() - start_time
         return results

@@ -32,28 +32,5 @@ async def cleanup_zombie_chrome() -> None:
 
 async def cleanup_temp_files() -> None:
     """Clean up temporary files from the data directory."""
-    try:
-        from pathlib import Path
-        data_dir = Path("data")
-        if data_dir.exists():
-            removed_count = 0
-            for p in data_dir.rglob("*.tmp.parquet"):
-                try:
-                    p.unlink(missing_ok=True)
-                    removed_count += 1
-                except Exception:
-                    pass
-            if removed_count > 0:
-                log.dual_log(
-                    tag="Startup:Cleanup:TempFiles",
-                    message=f"Cleaned up {removed_count} temp files",
-                    level="INFO",
-                    payload={"files_removed": removed_count}
-                )
-    except Exception as e:
-        log.dual_log(
-            tag="Startup:Cleanup:TempError",
-            message=f"Temp file cleanup warning: {e}",
-            level="WARNING",
-            payload={"error": str(e)}
-        )
+    # Legacy .tmp.parquet cleanup removed as we no longer use local parquet staging
+    pass

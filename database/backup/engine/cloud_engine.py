@@ -303,7 +303,7 @@ class CloudEngine(BackupEngine):
                         records, dlq_rows = vector_sync.pull_vectors_from_cloud(cloud_rows, columns)
 
                         if dlq_rows:
-                            from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
+                            from database.backup.writer.cloud_writer import CloudWriteTask as BackupWriteTask, enqueue_cloud_write as enqueue_backup_write
                             import json
                             for dlq_row in dlq_rows:
                                 safe_dlq_row = {k: v for k, v in dlq_row.items() if k != "_error_msg" and not isinstance(v, bytes)}
@@ -339,7 +339,7 @@ class CloudEngine(BackupEngine):
                                 new_hash = ContentHasher.compute_row_hash(table_name, r)
                                 r["content_hash"] = new_hash
                                 
-                    from database.backup.writer.backup_writer import BackupWriteTask, enqueue_backup_write
+                    from database.backup.writer.cloud_writer import CloudWriteTask as BackupWriteTask, enqueue_cloud_write as enqueue_backup_write
                     enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", records, pk_col))
                     results[table_name] = len(records)
         finally:
