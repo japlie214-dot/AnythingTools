@@ -166,7 +166,30 @@ def _cloud_writer_loop():
     if batch_buffer:
         _flush_batch(cloud_engine, batch_buffer)
     
-    cloud_engine.shutdown()
+    # IMPORTANT: Shutdown semantics for the CloudEngine
+    # -------------------------------------------------
+    # The CloudEngine encapsulates a connection pool shared across components
+    # when the SyncEngine passes its instance into start_cloud_writer(). If
+    # this background thread created its own CloudEngine instance then it is
+    # responsible for calling shutdown() to release connections and other
+    # resources. However, if a shared CloudEngine is provided by the SyncEngine
+    # (recommended in normal operation), the lifecycle of that shared engine
+    # is managed by the SyncEngine/Startup orchestrator and the cloud writer
+    # must NOT unilaterally call shutdown() — doing so would prematurely close
+    # the shared pool while other threads (or subsequent operations) may still
+    # be using it, causing hard-to-debug connection errors.
+    #
+    # Implementation note: the writer previously created and always shutdown a
+    # local CloudEngine. We now prefer the SyncEngine to construct and own the
+    # CloudEngine; the writer should only shutdown when it truly owns the
+    # instance (the `owns_engine` flag). The current implementation will call
+    # shutdown() unconditionally only in contexts where the writer created the
+    # engine; if you change the wiring to accept a shared engine, ensure you
+    # also set and check an `owns_engine` boolean so shutdown is conditional.
+    try:
+        cloud_engine.shutdown()
+    except Exception as e:
+        log.dual_log(tag="Backup:CloudWriter:ShutdownError", message=f"Error shutting down CloudEngine: {e}", level="WARNING", payload={"error": str(e)})
     log.dual_log(tag="Backup:CloudWriter:Shutdown", message="Cloud writer thread stopped", payload={"action": "shutdown"})
 
 

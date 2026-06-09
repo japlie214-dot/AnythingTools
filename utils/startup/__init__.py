@@ -32,6 +32,30 @@ async def _init_backup_step() -> None:
     except Exception as e:
         log.dual_log(tag="Startup:Backup:Error", message=f"Backup engine failed: {e}", level="WARNING", payload={"error": str(e)})
 
+# Startup vs Shutdown sync semantics
+# ----------------------------------
+# Developer note:
+# - The startup sync (_sync_from_backup_step) runs during application
+#   initialization and must perform a *smart* evaluation (via SyncEngine.sync_startup)
+#   that compares local and cloud proofs and may decide to:
+#     * skip (no-op)
+#     * push local -> cloud
+#     * pull cloud -> local (restore)
+#     * run a bidirectional sync with HITL conflict resolution
+#   Because actions like "pull" or "restore" can be destructive to local state
+#   they are intentionally run only during startup when the operator expects
+#   lifecycle-affecting behaviors and when the SyncEngine owns the CloudEngine
+#   pool.
+#
+# - The shutdown sync (the cloud writer thread final flush) is strictly
+#   best-effort and MUST NOT attempt long-running, blocking, or state-altering
+#   cloud pulls or restores. On shutdown we only flush queued upserts/deletes
+#   to cloud and release resources if the writer actually owns them. This
+#   avoids long blocking during process termination and prevents races where
+#   a shutdown-initiated restore could overwrite an operator's recent changes.
+#
+# Keep these semantics in mind when modifying startup/shutdown orchestration.
+
 async def _sync_from_backup_step() -> None:
     from utils.logger import get_dual_logger
     import asyncio

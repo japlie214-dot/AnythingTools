@@ -193,58 +193,70 @@ class SyncEngine:
             hitl_required=True,
             recommended_strategy="newest_overall_wins"
         )
+def sync_startup(self) -> SyncDecision:
+    """Smart startup orchestration.
 
-    def sync_startup(self) -> SyncDecision:
-        start_time = time.time()
-        tables = BackupSchemaRegistry.get_expected_sqlite_tables()
-        local_proofs = self.compute_local_proofs(tables)
-        cloud_proofs = self.compute_cloud_proofs(tables)
-        decision = self.decide_startup_action(local_proofs, cloud_proofs)
-        
-        log.dual_log(
-            tag="Backup:Startup:Decision",
-            message=f"Startup sync decision: {decision.action} - {decision.reason}",
-            level="INFO" if not decision.divergence_detected else "WARNING",
-            payload={
-                "action": decision.action,
-                "reason": decision.reason,
-                "divergence_detected": decision.divergence_detected,
-                "hitl_required": decision.hitl_required,
-                "local_proofs": local_proofs,
-                "cloud_proofs": cloud_proofs
-            }
-        )
-        
-        if decision.action == "skip":
-            decision.duration_seconds = time.time() - start_time
-            return decision
-            
-        if decision.action == "push_only":
-            self.sync_all(mode="delta")
-            decision.duration_seconds = time.time() - start_time
-            return decision
-            
-        if decision.action == "pull_only":
-            if decision.hitl_required:
-                strategy = self._hitl_startup_prompt(decision)
-                decision.hitl_outcome = strategy
-                if strategy == "abort":
-                    decision.action = "abort"
-                elif strategy == "cloud_wins":
-                    self.restore_pipeline()
-            decision.duration_seconds = time.time() - start_time
-            return decision
-            
-        if decision.action == "bidirectional":
-            if decision.hitl_required:
-                strategy = self._hitl_startup_prompt(decision)
-                decision.hitl_outcome = strategy
-                if strategy == "abort":
-                    decision.action = "abort"
-                else:
-                    self.sync_bidirectional(mode="delta", default_strategy=strategy)
-            decision.duration_seconds = time.time() - start_time
-            return decision
+    This routine intentionally runs during process startup and may make
+    authoritative decisions that change local operational state (e.g.
+    restoring from cloud, or running bidirectional reconciliation with
+    HITL). These actions are gated by the decision engine and, when
+    required, operator confirmation via HITL prompts.
+
+    IMPORTANT: Do not reuse this routine for shutdown-time syncs. Shutdown
+    must remain best-effort and non-destructive — it only flushes queued
+    writes and must never trigger pulls/restores which can block the
+    shutdown path or mutate local state unexpectedly.
+    """
+    start_time = time.time()
+    tables = BackupSchemaRegistry.get_expected_sqlite_tables()
+    local_proofs = self.compute_local_proofs(tables)
+    cloud_proofs = self.compute_cloud_proofs(tables)
+    decision = self.decide_startup_action(local_proofs, cloud_proofs)
+
+    log.dual_log(
+        tag="Backup:Startup:Decision",
+        message=f"Startup sync decision: {decision.action} - {decision.reason}",
+        level="INFO" if not decision.divergence_detected else "WARNING",
+        payload={
+            "action": decision.action,
+            "reason": decision.reason,
+            "divergence_detected": decision.divergence_detected,
+            "hitl_required": decision.hitl_required,
+            "local_proofs": local_proofs,
+            "cloud_proofs": cloud_proofs,
+        }
+    )
+
+    if decision.action == "skip":
+        decision.duration_seconds = time.time() - start_time
+        return decision
+
+    if decision.action == "push_only":
+        self.sync_all(mode="delta")
+        decision.duration_seconds = time.time() - start_time
+        return decision
+
+    if decision.action == "pull_only":
+        if decision.hitl_required:
+            strategy = self._hitl_startup_prompt(decision)
+            decision.hitl_outcome = strategy
+            if strategy == "abort":
+                decision.action = "abort"
+            elif strategy == "cloud_wins":
+                self.restore_pipeline()
+        decision.duration_seconds = time.time() - start_time
+        return decision
+
+    if decision.action == "bidirectional":
+        if decision.hitl_required:
+            strategy = self._hitl_startup_prompt(decision)
+            decision.hitl_outcome = strategy
+            if strategy == "abort":
+                decision.action = "abort"
+            else:
+                self.sync_bidirectional(mode="delta", default_strategy=strategy)
+        decision.duration_seconds = time.time() - start_time
+        return decision
             
         decision.duration_seconds = time.time() - start_time
         return decision
