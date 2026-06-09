@@ -367,8 +367,8 @@ class ScraperTool(BaseTool):
             log.dual_log(
                 tag="Scraper:Backup:Inline",
                 level="INFO",
-                message="Article backup is handled inline by database/articles writer pipeline",
-                payload={"batch_id": batch_id, "article_count": len(top_10_list)}
+                message="Article + embedding cloud backup triggered inline via ArticleStore.upsert_article()",
+                payload={"batch_id": batch_id, "article_count": len(top_10_list), "cloud_sync": "enabled"}
             )
             bak_res = None
 

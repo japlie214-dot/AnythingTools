@@ -15,50 +15,57 @@ def enqueue_article_write(
     local_metadata: Optional[str] = None,
 ) -> ArticleWriteResult:
     """Legacy create-only API seamlessly backed by ArticleStore."""
-    task = ArticleWriteTask(
-        article_id=article_data["id"],
-        url=article_data["url"],
-        title=article_data["title"],
-        conclusion=article_data["conclusion"],
-        summary=article_data["summary"],
-        metadata_json=article_data["metadata_json"],
-        embedding_status=article_data["embedding_status"],
-        vec_rowid=int(article_data["vec_rowid"]),
-        embedding_bytes=embedding_bytes,
-        job_id=job_id,
-        item_metadata=item_metadata,
-        local_metadata=local_metadata,
-    )
-
+    from datetime import datetime, timezone
     start_writer()
 
     try:
-        receipt = None
-        try:
-            store = get_article_store()
-            # Ensure unique vec_rowid before building statements to prevent collisions
-            task.vec_rowid = store._ensure_unique_vec_rowid(task.vec_rowid, task.article_id)
-            db_statements = task.to_upsert_statements()
-            
-            if db_statements:
-                receipt = enqueue_transaction(db_statements, track=True)
-                
-            return ArticleWriteResult(
-                success=True,
-                article_id=task.article_id,
-                receipt=receipt,
-                embedding_success=(task.embedding_status == "EMBEDDED"),
-            )
-        except Exception as db_err:
-            log.dual_log(
-                tag="Article:Write:Error",
-                level="WARNING",
-                message=f"Article write failed: {db_err}",
-                payload={"article_id": task.article_id, "error": str(db_err)},
-            )
-            return ArticleWriteResult(success=False, article_id=task.article_id, error=str(db_err))
+        store = get_article_store()
+        article_id = article_data["id"]
+        vec_rowid = int(article_data.get("vec_rowid", 0))
+        vec_rowid = store._ensure_unique_vec_rowid(vec_rowid, article_id)
+        
+        meta = {
+            "id": article_id,
+            "url": article_data["url"],
+            "title": article_data["title"],
+            "conclusion": article_data["conclusion"],
+            "summary": article_data["summary"],
+            "metadata_json": article_data.get("metadata_json", "{}"),
+            "embedding_status": article_data.get("embedding_status", "PENDING"),
+            "vec_rowid": vec_rowid,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        extra_statements = []
+        if job_id and item_metadata and local_metadata:
+            extra_statements.append((
+                """UPDATE job_items SET status = ?, output_data = ?, item_metadata = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = ? AND json_extract(item_metadata, '$.step') = json_extract(?, '$.step')
+                AND json_extract(item_metadata, '$.ulid') = json_extract(?, '$.ulid')""",
+                ("COMPLETED", local_metadata, item_metadata, job_id, item_metadata, item_metadata)
+            ))
+
+        receipt = store.upsert_article(
+            article_id=article_id,
+            meta=meta,
+            embedding_bytes=embedding_bytes,
+            extra_statements=extra_statements
+        )
+        
+        return ArticleWriteResult(
+            success=True,
+            article_id=article_id,
+            receipt=receipt,
+            embedding_success=(meta["embedding_status"] == "EMBEDDED"),
+        )
     except Exception as e:
-        return ArticleWriteResult(success=False, article_id=task.article_id, error=str(e))
+        log.dual_log(
+            tag="Article:Write:Error",
+            level="WARNING",
+            message=f"Article write failed: {e}",
+            payload={"article_id": article_data.get("id"), "error": str(e)},
+        )
+        return ArticleWriteResult(success=False, article_id=article_data.get("id", ""), error=str(e))
 
 def upsert_article(article_id: str, meta: dict, embedding_bytes: Optional[bytes] = None) -> ArticleWriteResult:
     start_writer()

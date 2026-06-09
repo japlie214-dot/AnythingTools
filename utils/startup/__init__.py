@@ -24,7 +24,8 @@ async def _init_backup_step() -> None:
         result = await asyncio.to_thread(engine.startup)
         log.dual_log(tag="Startup:Backup:Init", message="SyncEngine initialized", level="INFO", payload=result)
         
-        start_cloud_writer()
+        # Start the cloud writer thread reusing the SyncEngine's CloudEngine
+        start_cloud_writer(cloud_engine=engine.cloud)
         
         global _global_sync_engine
         _global_sync_engine = engine
@@ -42,9 +43,23 @@ async def _sync_from_backup_step() -> None:
         return
         
     try:
-        log.dual_log(tag="Startup:Sync:Start", message="Starting cloud pull sync", level="INFO", payload={"action": "start_sync"})
-        result = await asyncio.to_thread(_global_sync_engine.sync_all, "delta")
-        log.dual_log(tag="Startup:Sync:Complete", message="Cloud sync completed", level="INFO", payload=result)
+        log.dual_log(tag="Startup:Sync:Start", message="Starting smart startup sync", level="INFO", payload={"action": "start_sync"})
+        decision = await asyncio.to_thread(_global_sync_engine.sync_startup)
+        log.dual_log(
+            tag="Startup:Sync:Complete",
+            message=f"Startup sync completed: {decision.action}",
+            level="INFO" if not decision.divergence_detected else "WARNING",
+            payload={
+                "action": decision.action,
+                "reason": decision.reason,
+                "divergence_detected": decision.divergence_detected,
+                "hitl_required": decision.hitl_required,
+                "hitl_outcome": decision.hitl_outcome,
+                "duration_seconds": decision.duration_seconds,
+                "local_proofs": decision.local_proofs,
+                "cloud_proofs": decision.cloud_proofs,
+            }
+        )
     except Exception as e:
         log.dual_log(tag="Startup:Sync:Error", message=f"Startup sync failed: {e}", level="CRITICAL", payload={"error": str(e)})
 

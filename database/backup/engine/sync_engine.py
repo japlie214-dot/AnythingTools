@@ -1,15 +1,15 @@
 # database/backup/engine/sync_engine.py
-"""Unified backup engine: Direct Operational DB ↔ Snowflake sync.
+"""Unified backup engine: Direct Operational DB  Snowflake sync.
 
-Replaces the old DualEngine (Operational → backup.db → Snowflake).
+Replaces the old DualEngine (Operational  backup.db  Snowflake).
 Now syncs directly from the operational SQLite database to Snowflake,
 eliminating the intermediate backup.db staging layer.
 
 Inline cloud writes (from enqueue_write) are handled by the CloudWriter
 thread. This engine handles:
-  1. Full/delta sync (operational → Snowflake)
+  1. Full/delta sync (operational  Snowflake)
   2. Bidirectional sync with HITL conflict resolution
-  3. Restore from Snowflake → operational DB
+  3. Restore from Snowflake  operational DB
   4. Periodic sync as safety net for missed inline writes
 """
 
@@ -26,13 +26,15 @@ from database.connection import DatabaseManager
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
+from database.backup.models import SyncDecision
+from sqlalchemy import text
 
 
 class SyncEngine:
-    """Direct Operational DB ↔ Snowflake sync engine.
+    """Direct Operational DB  Snowflake sync engine.
     
-    Replaces the three-tier (Operational → backup.db → Snowflake) with
-    a two-tier (Operational → Snowflake) architecture.
+    Replaces the three-tier (Operational  backup.db  Snowflake) with
+    a two-tier (Operational  Snowflake) architecture.
     """
     
     def __init__(self, settings: BackupSettings):
@@ -70,6 +72,199 @@ class SyncEngine:
             return val if val else "1970-01-01T00:00:00"
         except sqlite3.OperationalError:
             return "1970-01-01T00:00:00"
+
+    def compute_local_proofs(self, tables: dict) -> dict:
+        proofs = {}
+        try:
+            op_conn = DatabaseManager.get_read_connection()
+            for table_name, ddl in tables.items():
+                if 'VIRTUAL' in ddl.upper():
+                    continue
+                try:
+                    row_count = op_conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                except Exception:
+                    row_count = 0
+                watermark = self._get_table_watermark(op_conn, table_name)
+                proofs[table_name] = {
+                    "total_rows": row_count,
+                    "watermark": watermark,
+                    "has_updated_at": "updated_at" in ddl.lower()
+                }
+        except Exception as e:
+            log.dual_log(tag="Backup:Proofs:LocalError", message=f"Could not compute local proofs: {e}", level="WARNING", payload={"error": str(e)})
+        return proofs
+
+    def compute_cloud_proofs(self, tables: dict) -> dict:
+        if not self.cloud.settings.enabled:
+            return {}
+        proofs = {}
+        try:
+            def _count_cloud_rows():
+                nonlocal proofs
+                with self.cloud.engine.begin() as conn:
+                    for table_name in tables:
+                        if 'VIRTUAL' in tables[table_name].upper():
+                            continue
+                        try:
+                            result = conn.execute(text(f"SELECT COUNT(*) FROM {self.cloud.settings.schema_name}.{table_name}"))
+                            proofs[table_name] = {"total_rows": result.fetchone()[0]}
+                        except Exception:
+                            proofs[table_name] = {"total_rows": -1, "error": "table_not_found"}
+                return proofs
+            return self.cloud.circuit_breaker_pull.call(_count_cloud_rows)
+        except Exception as e:
+            log.dual_log(tag="Backup:Proofs:CloudError", message=f"Could not compute cloud proofs: {e}", level="WARNING", payload={"error": str(e)})
+            return {}
+
+    def decide_startup_action(self, local_proofs: dict, cloud_proofs: dict) -> SyncDecision:
+        if not cloud_proofs:
+            return SyncDecision(
+                action="skip",
+                reason="Cloud proofs unavailable - operating in degraded mode",
+                local_proofs=local_proofs,
+                cloud_proofs={},
+                divergence_detected=False,
+                hitl_required=False,
+                recommended_strategy="operational_wins"
+            )
+        
+        local_has_data = any(p.get("total_rows", 0) > 0 for p in local_proofs.values())
+        cloud_has_data = any(p.get("total_rows", 0) > 0 for p in cloud_proofs.values())
+        
+        if not local_has_data and not cloud_has_data:
+            return SyncDecision(
+                action="skip",
+                reason="Both local and cloud are empty - no data to sync",
+                local_proofs=local_proofs,
+                cloud_proofs=cloud_proofs,
+                divergence_detected=False,
+                hitl_required=False,
+                recommended_strategy="operational_wins"
+            )
+            
+        if not local_has_data and cloud_has_data:
+            cloud_total = sum(p.get("total_rows", 0) for p in cloud_proofs.values() if p.get("total_rows", 0) > 0)
+            return SyncDecision(
+                action="pull_only",
+                reason=f"Local DB is empty but cloud has {cloud_total} rows",
+                local_proofs=local_proofs,
+                cloud_proofs=cloud_proofs,
+                divergence_detected=True,
+                hitl_required=True,
+                recommended_strategy="cloud_wins"
+            )
+            
+        if local_has_data and not cloud_has_data:
+            local_total = sum(p.get("total_rows", 0) for p in local_proofs.values())
+            return SyncDecision(
+                action="push_only",
+                reason=f"Local has {local_total} rows but cloud is empty - populating fresh cloud",
+                local_proofs=local_proofs,
+                cloud_proofs=cloud_proofs,
+                divergence_detected=False,
+                hitl_required=False,
+                recommended_strategy="operational_wins"
+            )
+            
+        divergence_tables = []
+        for t in local_proofs:
+            l_rows = local_proofs[t].get("total_rows", 0)
+            c_rows = cloud_proofs.get(t, {}).get("total_rows", 0)
+            if l_rows != c_rows:
+                divergence_tables.append(t)
+                
+        if not divergence_tables:
+            return SyncDecision(
+                action="skip",
+                reason="Local and cloud row counts match - no divergence detected",
+                local_proofs=local_proofs,
+                cloud_proofs=cloud_proofs,
+                divergence_detected=False,
+                hitl_required=False,
+                recommended_strategy="operational_wins"
+            )
+            
+        return SyncDecision(
+            action="bidirectional",
+            reason=f"Row count divergence in tables: {', '.join(divergence_tables)}",
+            local_proofs=local_proofs,
+            cloud_proofs=cloud_proofs,
+            divergence_detected=True,
+            hitl_required=True,
+            recommended_strategy="newest_overall_wins"
+        )
+
+    def sync_startup(self) -> SyncDecision:
+        start_time = time.time()
+        tables = BackupSchemaRegistry.get_expected_sqlite_tables()
+        local_proofs = self.compute_local_proofs(tables)
+        cloud_proofs = self.compute_cloud_proofs(tables)
+        decision = self.decide_startup_action(local_proofs, cloud_proofs)
+        
+        log.dual_log(
+            tag="Backup:Startup:Decision",
+            message=f"Startup sync decision: {decision.action} - {decision.reason}",
+            level="INFO" if not decision.divergence_detected else "WARNING",
+            payload={
+                "action": decision.action,
+                "reason": decision.reason,
+                "divergence_detected": decision.divergence_detected,
+                "hitl_required": decision.hitl_required,
+                "local_proofs": local_proofs,
+                "cloud_proofs": cloud_proofs
+            }
+        )
+        
+        if decision.action == "skip":
+            decision.duration_seconds = time.time() - start_time
+            return decision
+            
+        if decision.action == "push_only":
+            self.sync_all(mode="delta")
+            decision.duration_seconds = time.time() - start_time
+            return decision
+            
+        if decision.action == "pull_only":
+            if decision.hitl_required:
+                strategy = self._hitl_startup_prompt(decision)
+                decision.hitl_outcome = strategy
+                if strategy == "abort":
+                    decision.action = "abort"
+                elif strategy == "cloud_wins":
+                    self.restore_pipeline()
+            decision.duration_seconds = time.time() - start_time
+            return decision
+            
+        if decision.action == "bidirectional":
+            if decision.hitl_required:
+                strategy = self._hitl_startup_prompt(decision)
+                decision.hitl_outcome = strategy
+                if strategy == "abort":
+                    decision.action = "abort"
+                else:
+                    self.sync_bidirectional(mode="delta", default_strategy=strategy)
+            decision.duration_seconds = time.time() - start_time
+            return decision
+            
+        decision.duration_seconds = time.time() - start_time
+        return decision
+
+    def _hitl_startup_prompt(self, decision: SyncDecision) -> str:
+        from database.backup.sync.resolution import UserConfirmationHandler
+        metrics = {"tables": {}}
+        for t in decision.local_proofs:
+            l_rows = decision.local_proofs[t].get("total_rows", 0)
+            c_rows = decision.cloud_proofs.get(t, {}).get("total_rows", 0)
+            if l_rows != c_rows or c_rows > 0:
+                conflict_count = abs(l_rows - c_rows) if (l_rows > 0 and c_rows > 0) else 0
+                metrics["tables"][t] = {
+                    "op_only": max(0, l_rows - c_rows),
+                    "cloud_only": max(0, c_rows - l_rows),
+                    "content_identical": [],
+                    "genuine_conflicts": [{}] * conflict_count,
+                    "timestamp_drift": []
+                }
+        return UserConfirmationHandler.hitl_prompt_sync_strategy(metrics)
 
     def sync_all(self, mode: str = "delta") -> dict:
         """Sync operational DB directly to Snowflake (no backup.db intermediary)."""
@@ -416,7 +611,7 @@ class SyncEngine:
                             cols = [desc[0] for desc in temp_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
                             for r in rows:
                                 op_transactions.append((f"INSERT OR REPLACE INTO {table_name} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", tuple(r)))
-                            results["op_restored"] += len(rows)
+                                results["op_restored"] += len(rows)
 
                 if selected_strategy == "cloud_wins" and deltas["op_only"]:
                     for op_id in deltas["op_only"]:
@@ -427,7 +622,7 @@ class SyncEngine:
                     verdict = ConflictResolver.resolve_conflict(conflict, strategy=selected_strategy)
                     if verdict == "manual":
                         verdict = UserConfirmationHandler.hitl_wait_for_sync_operator(table_name, conflict.get("id"), conflict.get("op_ts", ""), conflict.get("cloud_ts", ""))
-                    
+                        
                     if verdict == "cloud":
                         row = temp_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} = ?", (conflict["id"],)).fetchone()
                         if row:

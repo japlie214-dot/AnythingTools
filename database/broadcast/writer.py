@@ -83,7 +83,24 @@ def add_broadcast_details_bulk(
             (batch_id, article_id, is_top10, rank, now, now)
         ))
     if statements:
-        enqueue_transaction(statements)
+        receipt = enqueue_transaction(statements, track=True)
+        if receipt and receipt.wait(timeout=15.0) and not receipt.error:
+            from database.connection import DatabaseManager
+            from database.backup.writer.cloud_writer import enqueue_cloud_write_batch
+            try:
+                conn = DatabaseManager.get_read_connection()
+                ids = [a.get("ulid") or a.get("id") for a in articles if (a.get("ulid") or a.get("id"))]
+                placeholders = ",".join("?" for _ in ids)
+                if ids:
+                    rows = conn.execute(
+                        f"SELECT * FROM broadcast_details WHERE batch_id = ? AND article_id IN ({placeholders})",
+                        [batch_id] + ids
+                    ).fetchall()
+                    cloud_records = [dict(row) for row in rows]
+                    if cloud_records:
+                        enqueue_cloud_write_batch("broadcast_details", cloud_records, pk_col="detail_id")
+            except Exception:
+                pass
 
 
 def update_detail_publish_status(

@@ -14,7 +14,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Any
 from sqlalchemy import text
 
 from utils.logger import get_dual_logger
@@ -35,14 +35,22 @@ class CloudWriteTask:
 cloud_write_queue: queue.Queue = queue.Queue(maxsize=10000)
 _cloud_shutdown = threading.Event()
 _cloud_writer_thread: Optional[threading.Thread] = None
+_shared_cloud_engine: Optional[Any] = None
 
 
-def start_cloud_writer():
-    """Start the cloud writer thread (idempotent)."""
-    global _cloud_writer_thread
+def start_cloud_writer(cloud_engine: Optional[Any] = None):
+    """Start the cloud writer thread (idempotent).
+
+    If a shared CloudEngine instance is provided it will be used by the
+    background thread instead of creating its own. This allows the
+    SyncEngine to pass a single pooled engine instance to avoid connection
+    exhaustion.
+    """
+    global _cloud_writer_thread, _shared_cloud_engine
     if _cloud_writer_thread is not None and _cloud_writer_thread.is_alive():
         return
     
+    _shared_cloud_engine = cloud_engine
     _cloud_shutdown.clear()
     _cloud_writer_thread = threading.Thread(
         target=_cloud_writer_loop,
@@ -54,21 +62,26 @@ def start_cloud_writer():
         tag="Backup:CloudWriter:Start",
         message="Cloud writer thread started",
         level="INFO",
-        payload={"action": "start"}
+        payload={"action": "start", "shared_engine": cloud_engine is not None}
     )
 
 
-def enqueue_cloud_write(table_name: str, row_data: dict, pk_col: str = "id"):
+def enqueue_cloud_write(table_name: Any, row_data: Optional[dict] = None, pk_col: str = "id"):
     """Enqueue a best-effort cloud write. Non-blocking.
 
-    row_data: a mapping representing a single record
-    pk_col: primary key column name for the target table in Snowflake
+    Supports polymorphic signature:
+    - enqueue_cloud_write(task: CloudWriteTask)
+    - enqueue_cloud_write(table_name: str, row_data: dict, pk_col: str = "id")
     """
     try:
-        task = CloudWriteTask(table_name=table_name, operation="UPSERT", records=[row_data], pk_col=pk_col)
-        cloud_write_queue.put_nowait(task)
+        if isinstance(table_name, CloudWriteTask):
+            cloud_write_queue.put_nowait(table_name)
+        else:
+            task = CloudWriteTask(table_name=table_name, operation="UPSERT", records=[row_data], pk_col=pk_col)
+            cloud_write_queue.put_nowait(task)
     except queue.Full:
-        log.dual_log(tag="Backup:CloudWriter:QueueFull", level="DEBUG", message=f"Queue full, dropping write for {table_name}", payload={"table": table_name})
+        target_name = getattr(table_name, 'table_name', table_name)
+        log.dual_log(tag="Backup:CloudWriter:QueueFull", level="DEBUG", message=f"Queue full, dropping write for {target_name}", payload={"table": target_name})
 
 
 def enqueue_cloud_write_batch(table_name: str, records: list, pk_col: str = "id"):

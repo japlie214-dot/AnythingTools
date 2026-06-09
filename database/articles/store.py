@@ -6,7 +6,7 @@ import tempfile
 import random
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any
 
 from database.writer import enqueue_transaction
 from database.connection import DatabaseManager
@@ -57,7 +57,8 @@ class ArticleStore:
         article_id: str,
         meta: dict,
         embedding_bytes: Optional[bytes] = None,
-    ) -> None:
+        extra_statements: Optional[List[Tuple[str, tuple]]] = None,
+    ) -> Optional[Any]:
         """Create or update an article with SQLite writes and best-effort Cloud sync."""
         updated_at = meta.get("updated_at", datetime.now(timezone.utc).isoformat())
         meta["updated_at"] = updated_at
@@ -68,12 +69,25 @@ class ArticleStore:
             vec_rowid = self._ensure_unique_vec_rowid(int(vec_rowid), article_id)
             meta["vec_rowid"] = vec_rowid
 
+        # Compute content_hash for efficient cloud diff detection
+        try:
+            from database.backup.sync.foundation import ContentHasher
+            content_hash = ContentHasher.compute_row_hash("scraped_articles", {**meta, "id": article_id})
+        except Exception:
+            content_hash = ""
+
         # Enqueue SQLite upsert
         embedding_status = meta.get("embedding_status", "PENDING")
         db_statements = self._build_upsert_statements(
             article_id, meta, embedding_bytes, embedding_status
         )
-        self.enqueue_tx(db_statements)
+        if content_hash:
+            db_statements.append(("UPDATE scraped_articles SET content_hash = ? WHERE id = ?", (content_hash, article_id)))
+            
+        if extra_statements:
+            db_statements.extend(extra_statements)
+            
+        receipt = self.enqueue_tx(db_statements, track=True)
         
         # Enqueue Inline Cloud Sync
         try:
@@ -87,6 +101,7 @@ class ArticleStore:
                 "metadata_json": meta.get("metadata_json", "{}"),
                 "embedding_status": embedding_status,
                 "vec_rowid": vec_rowid,
+                "content_hash": content_hash,
                 "updated_at": updated_at
             }
             enqueue_cloud_write("scraped_articles", row_data, pk_col="id")
@@ -99,6 +114,7 @@ class ArticleStore:
             message=f"Upserted article {article_id}",
             payload={"article_id": article_id, "has_embedding": embedding_bytes is not None, "updated_at": updated_at},
         )
+        return receipt
 
     def _build_upsert_statements(
         self,
@@ -171,9 +187,10 @@ class ArticleStore:
     # ── SQLite Queue Helper ──────────────────────────────────────────────
 
     @staticmethod
-    def enqueue_tx(statements: List[Tuple[str, tuple]]) -> None:
+    def enqueue_tx(statements: List[Tuple[str, tuple]], track: bool = False) -> Optional[Any]:
         if statements:
-            enqueue_transaction(statements)
+            return enqueue_transaction(statements, track=track)
+        return None
 
 
 # ── Global Singleton ─────────────────────────────────────────────────────
