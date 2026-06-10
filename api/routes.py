@@ -244,11 +244,11 @@ async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
 
 @router.get("/backup/status", response_model=BackupMetricsResponse)
 async def get_backup_status():
-    from utils.startup import _global_dual_engine
-    if not _global_dual_engine:
+    from utils.startup import _global_sync_engine
+    if not _global_sync_engine:
         raise HTTPException(status_code=503, detail="Backup engine is not active")
     from database.backup.observability.metrics import BackupMetricsCollector
-    metrics = BackupMetricsCollector.get_metrics(_global_dual_engine)
+    metrics = BackupMetricsCollector.get_metrics(_global_sync_engine)
     return BackupMetricsResponse(**metrics)
 
 @router.post("/backup/export")
@@ -256,7 +256,7 @@ async def trigger_export(background_tasks: BackgroundTasks, mode: str = Query("d
     from database.backup.settings import BackupSettings
     from database.backup.runner import BackupRunner
     settings = BackupSettings()
-    if not settings.local.enabled and not settings.cloud.enabled:
+    if not settings.cloud.enabled:
         raise HTTPException(status_code=400, detail="Backups are completely disabled")
         
     job_id = str(ULID.generate())

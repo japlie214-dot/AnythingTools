@@ -88,6 +88,7 @@ class ArticleStore:
         # Enqueue Inline Cloud Sync
         try:
             from database.backup.writer.cloud_writer import enqueue_cloud_write
+            scraped_at = meta.get("scraped_at", datetime.now(timezone.utc).isoformat())
             row_data = {
                 "id": article_id,
                 "url": meta.get("url", ""),
@@ -98,9 +99,19 @@ class ArticleStore:
                 "embedding_status": embedding_status,
                 "vec_rowid": vec_rowid,
                 "content_hash": content_hash,
+                "scraped_at": scraped_at,
                 "updated_at": updated_at
             }
             enqueue_cloud_write("scraped_articles", row_data, pk_col="id")
+            # If we have a valid embedding, enqueue the vec backup record as well
+            if embedding_bytes and embedding_status == "EMBEDDED" and vec_rowid is not None:
+                vec_backup_data = {
+                    "rowid": vec_rowid,
+                    "article_id": article_id,
+                    "embedding": embedding_bytes,
+                    "hashed_at": updated_at
+                }
+                enqueue_cloud_write("scraped_articles_vec_backup", vec_backup_data, pk_col="rowid")
         except Exception:
             pass
 
@@ -127,7 +138,7 @@ class ArticleStore:
             INSERT INTO scraped_articles (
                 id, vec_rowid, url, title, conclusion, summary,
                 metadata_json, embedding_status, scraped_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(url) DO UPDATE SET
                 vec_rowid = excluded.vec_rowid,
                 title = excluded.title,
@@ -148,6 +159,7 @@ class ArticleStore:
                 meta.get("summary"),
                 meta.get("metadata_json", "{}"),
                 embedding_status,
+                meta.get("scraped_at", meta["updated_at"]),
                 meta["updated_at"],
             ),
         ))
@@ -156,6 +168,10 @@ class ArticleStore:
             statements.append(("DELETE FROM scraped_articles_vec WHERE rowid = ?", (vec_rowid,)))
             statements.append(("INSERT INTO scraped_articles_vec (rowid, embedding) VALUES (?, ?)", (vec_rowid, embedding_bytes)))
             statements.append(("UPDATE scraped_articles SET embedding_status = 'EMBEDDED' WHERE id = ?", (article_id,)))
+            statements.append((
+                "INSERT OR REPLACE INTO scraped_articles_vec_backup (rowid, article_id, embedding, hashed_at) VALUES (?, ?, ?, ?)",
+                (vec_rowid, article_id, embedding_bytes, meta["updated_at"])
+            ))
 
         return statements
 

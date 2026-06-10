@@ -65,3 +65,14 @@ class BackupSchemaRegistry:
         if not cols:
             return []
         return [c.name for c in cols if c.name.lower() not in ('embedding', 'vec_rowid')]
+
+    @classmethod
+    def get_non_nullable_columns(cls, table_name: str) -> List[str]:
+        """Returns columns that are NOT NULL in the SQLite schema."""
+        sqlite_ddl = cls.get_expected_sqlite_tables().get(table_name)
+        if not sqlite_ddl:
+            return []
+        cols = _columns_from_ddl_in_memory(sqlite_ddl, table_name)
+        if not cols:
+            return []
+        return [c.name for c in cols if c.notnull and c.name.lower() != 'rowid']

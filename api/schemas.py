@@ -37,14 +37,19 @@ class ResumeResponse(BaseModel):
     items_pending: int
     message: str
     details: Optional[Dict[str, Any]] = None
+
+
 class EngineMetrics(BaseModel):
     status: str
     error: Optional[str] = None
+
 
 class SyncMetrics(BaseModel):
     pending_conflicts: int = 0
     dead_letter_count: int = 0
     last_sync_time: Optional[str] = None
+    cloud_writer_stats: Optional[Dict[str, int]] = None
+
 
 class BackupMetricsResponse(BaseModel):
     local_engine: EngineMetrics

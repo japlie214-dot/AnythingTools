@@ -5,7 +5,8 @@ Replaces the old backup_writer.py which wrote to backup.db.
 Now writes directly to Snowflake via CloudEngine's MERGE logic.
 
 Design: Fire-and-forget queue. If Snowflake is unavailable or
-the circuit breaker is open, writes are silently dropped.
+the circuit breaker is open, writes are best-effort and will be retried
+once with exponential backoff before being routed to the DLQ.
 The periodic SyncEngine.sync_all() will catch any missed rows.
 """
 
@@ -36,6 +37,7 @@ cloud_write_queue: queue.Queue = queue.Queue(maxsize=10000)
 _cloud_shutdown = threading.Event()
 _cloud_writer_thread: Optional[threading.Thread] = None
 _shared_cloud_engine: Optional[Any] = None
+_owns_engine: bool = False
 
 
 def start_cloud_writer(cloud_engine: Optional[Any] = None):
@@ -59,7 +61,7 @@ def start_cloud_writer(cloud_engine: Optional[Any] = None):
     )
     _cloud_writer_thread.start()
     log.dual_log(
-        tag="Backup:CloudWriter:Start",
+        tag="Backup:Writer:Start",
         message="Cloud writer thread started",
         level="INFO",
         payload={"action": "start", "shared_engine": cloud_engine is not None}
@@ -81,7 +83,7 @@ def enqueue_cloud_write(table_name: Any, row_data: Optional[dict] = None, pk_col
             cloud_write_queue.put_nowait(task)
     except queue.Full:
         target_name = getattr(table_name, 'table_name', table_name)
-        log.dual_log(tag="Backup:CloudWriter:QueueFull", level="DEBUG", message=f"Queue full, dropping write for {target_name}", payload={"table": target_name})
+        log.dual_log(tag="Backup:Writer:QueueFull", level="DEBUG", message=f"Queue full, dropping write for {target_name}", payload={"table": target_name})
 
 
 def enqueue_cloud_write_batch(table_name: str, records: list, pk_col: str = "id"):
@@ -90,7 +92,7 @@ def enqueue_cloud_write_batch(table_name: str, records: list, pk_col: str = "id"
         task = CloudWriteTask(table_name=table_name, operation="UPSERT", records=records, pk_col=pk_col)
         cloud_write_queue.put_nowait(task)
     except queue.Full:
-        log.dual_log(tag="Backup:CloudWriter:QueueFull", level="DEBUG", message=f"Queue full, dropping batch for {table_name}", payload={"table": table_name, "batch_size": len(records)})
+        log.dual_log(tag="Backup:Writer:QueueFull", level="DEBUG", message=f"Queue full, dropping batch for {table_name}", payload={"table": table_name, "batch_size": len(records)})
 
 
 def enqueue_cloud_delete(table_name: str, pk_val: str, pk_col: str = "id"):
@@ -99,122 +101,59 @@ def enqueue_cloud_delete(table_name: str, pk_val: str, pk_col: str = "id"):
         task = CloudWriteTask(table_name=table_name, operation="DELETE", records=[{pk_col: pk_val}], pk_col=pk_col)
         cloud_write_queue.put_nowait(task)
     except queue.Full:
-        log.dual_log(tag="Backup:CloudWriter:QueueFull", level="DEBUG", message=f"Queue full, dropping delete for {table_name}", payload={"table": table_name, "pk": pk_val})
+        log.dual_log(tag="Backup:Writer:QueueFull", level="DEBUG", message=f"Queue full, dropping delete for {table_name}", payload={"table": table_name, "pk": pk_val})
 
 
-def _cloud_writer_loop():
-    """Background thread that drains the cloud write queue and writes to Snowflake."""
-    from database.backup.settings import BackupSettings
-    
-    try:
-        settings = BackupSettings()
-    except Exception as e:
-        log.dual_log(
-            tag="Backup:CloudWriter:ConfigError",
-            level="WARNING",
-            message="Backup settings not configured, cloud writer inactive",
-            payload={"error": str(e)}
-        )
-        return
-    
-    if not settings.cloud.enabled:
-        log.dual_log(
-            tag="Backup:CloudWriter:Disabled",
-            level="INFO",
-            message="Cloud backup disabled, cloud writer thread idle",
-            payload={"action": "check_enabled"}
-        )
-        return
-    
-    from database.backup.engine.cloud_engine import CloudEngine
-    cloud_engine = CloudEngine(settings.cloud, settings.sync)
-    
-    batch_buffer = {}  # table_name -> list of records
-    last_flush = time.monotonic()
-    FLUSH_INTERVAL = 5.0  # seconds
-    MAX_BATCH_SIZE = 100  # records per flush
-    
-    while not _cloud_shutdown.is_set():
+def _route_failed_batch_to_dlq(table_name: str, records: list, error_msg: str):
+    from database.writer import enqueue_write
+    from utils.id_generator import ULID
+    import json as _json
+    for record in records:
         try:
-            task = cloud_write_queue.get(timeout=1.0)
-            if task is None:
-                break
-            
-            # Accumulate into batch
-            # Accumulate into batch grouped by table and operation
-            key = (task.table_name, task.operation, task.pk_col)
-            if key not in batch_buffer:
-                batch_buffer[key] = []
-            batch_buffer[key].extend(task.records)
-            
-        except queue.Empty:
-            pass
-        
-        # Flush if batch is large enough or interval elapsed
-        now = time.monotonic()
-        should_flush = (
-            any(len(v) >= MAX_BATCH_SIZE for v in batch_buffer.values()) or
-            (now - last_flush >= FLUSH_INTERVAL and any(batch_buffer.values()))
-        )
-        
-        if should_flush and batch_buffer:
-            _flush_batch(cloud_engine, batch_buffer)
-            batch_buffer = {}
-            last_flush = now
-    
-    # Final flush on shutdown
-    if batch_buffer:
-        _flush_batch(cloud_engine, batch_buffer)
-    
-    # IMPORTANT: Shutdown semantics for the CloudEngine
-    # -------------------------------------------------
-    # The CloudEngine encapsulates a connection pool shared across components
-    # when the SyncEngine passes its instance into start_cloud_writer(). If
-    # this background thread created its own CloudEngine instance then it is
-    # responsible for calling shutdown() to release connections and other
-    # resources. However, if a shared CloudEngine is provided by the SyncEngine
-    # (recommended in normal operation), the lifecycle of that shared engine
-    # is managed by the SyncEngine/Startup orchestrator and the cloud writer
-    # must NOT unilaterally call shutdown() — doing so would prematurely close
-    # the shared pool while other threads (or subsequent operations) may still
-    # be using it, causing hard-to-debug connection errors.
-    #
-    # Implementation note: the writer previously created and always shutdown a
-    # local CloudEngine. We now prefer the SyncEngine to construct and own the
-    # CloudEngine; the writer should only shutdown when it truly owns the
-    # instance (the `owns_engine` flag). The current implementation will call
-    # shutdown() unconditionally only in contexts where the writer created the
-    # engine; if you change the wiring to accept a shared engine, ensure you
-    # also set and check an `owns_engine` boolean so shutdown is conditional.
-    try:
-        cloud_engine.shutdown()
-    except Exception as e:
-        log.dual_log(tag="Backup:CloudWriter:ShutdownError", message=f"Error shutting down CloudEngine: {e}", level="WARNING", payload={"error": str(e)})
-    log.dual_log(tag="Backup:CloudWriter:Shutdown", message="Cloud writer thread stopped", payload={"action": "shutdown"})
+            safe_record = {k: v for k, v in record.items() if not isinstance(v, (bytes, bytearray))}
+            enqueue_write(
+                "INSERT OR IGNORE INTO dead_letter_queue (dlq_id, table_name, row_id, row_data, error_message) VALUES (?, ?, ?, ?, ?)",
+                (ULID.generate(), table_name, str(record.get("id", record.get("rowid", ""))), _json.dumps(safe_record, default=str), (error_msg or "")[:500])
+            )
+        except Exception as e:
+            log.dual_log(
+                tag="Backup:Writer:DLQError",
+                level="ERROR",
+                message=f"Failed to route record to DLQ: {e}",
+                payload={"table": table_name, "error": str(e)[:200]}
+            )
 
 
-def _flush_batch(cloud_engine, batch_buffer: dict):
-    """Flush accumulated writes to Snowflake."""
+def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
+    """Flush accumulated writes to Snowflake with a single retry/backoff and DLQ routing."""
+    from database.backup.observability.metrics import BackupMetricsCollector
+
+    RETRY_LIMIT = 1
+    RETRY_DELAY_BASE = 2.0
+    import time as _time
+
     for (table_name, operation, pk_col), records in batch_buffer.items():
+        start_flush = _time.monotonic()
         try:
             with cloud_engine.engine.begin() as conn:
                 schema = cloud_engine.settings.schema_name
-                
+
                 if operation == "DELETE":
                     pk_vals = [r[pk_col] for r in records if pk_col in r]
                     if pk_vals:
                         placeholders = ",".join([f":p{i}" for i in range(len(pk_vals))])
                         params = {f"p{i}": val for i, val in enumerate(pk_vals)}
                         conn.execute(text(f"DELETE FROM {schema}.{table_name} WHERE {pk_col} IN ({placeholders})"), params)
+                    BackupMetricsCollector.record_flush(True)
                     continue
 
-                # Get columns from first record
                 if not records:
+                    BackupMetricsCollector.record_flush(True)
                     continue
+
                 columns = list(records[0].keys())
-                
-                # Handle embedding column
                 has_embedding = "embedding" in columns
+
                 if has_embedding:
                     # Use VectorSync for tables with embeddings
                     from database.backup.vec.cloud_vector_pusher import VectorSync
@@ -223,29 +162,32 @@ def _flush_batch(cloud_engine, batch_buffer: dict):
                         push_result = pusher.push_vectors(
                             conn, schema, table_name, columns, records, pk_col
                         )
+                        pushed = push_result.get('pushed', 0) if isinstance(push_result, dict) else 0
                         log.dual_log(
-                            tag="Backup:CloudWriter:Flush",
-                            message=f"Flushed {push_result.get('pushed', 0)} rows to {table_name}",
+                            tag="Backup:Writer:Flush",
+                            message=f"Flushed {pushed} rows to {table_name}",
                             level="DEBUG",
-                            payload={"table": table_name, "rows": push_result.get('pushed', 0)}
+                            payload={"table": table_name, "rows": pushed, "latency_ms": round((_time.monotonic() - start_flush) * 1000, 1)}
                         )
+                        BackupMetricsCollector.record_flush(True)
                     except Exception as e:
                         log.dual_log(
-                            tag="Backup:CloudWriter:FlushError",
+                            tag="Backup:Writer:FlushError",
                             level="WARNING",
                             message=f"Failed to flush {table_name}: {e}",
                             payload={"table": table_name, "error": str(e)[:200]}
                         )
+                        raise
                 else:
                     # Standard MERGE for non-embedding tables
                     stage_table = f"{table_name}_stage"
-                    
+
                     col_defs = ",".join([f"{c} VARCHAR" for c in columns])
                     conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {schema}.{stage_table} ({col_defs})"))
-                    
+
                     insert_placeholders = ",".join([f":{c}" for c in columns])
                     conn.execute(text(f"INSERT INTO {schema}.{stage_table} VALUES ({insert_placeholders})"), records)
-                    
+
                     merge_sql = f"""
                     MERGE INTO {schema}.{table_name} t
                     USING {schema}.{stage_table} s
@@ -254,17 +196,119 @@ def _flush_batch(cloud_engine, batch_buffer: dict):
                     WHEN NOT MATCHED THEN INSERT ({",".join(columns)}) VALUES ({",".join([f"s.{c}" for c in columns])})
                     """
                     result = conn.execute(text(merge_sql))
-                    
+
                     log.dual_log(
-                        tag="Backup:CloudWriter:Flush",
+                        tag="Backup:Writer:Flush",
                         message=f"Flushed {len(records)} rows to Snowflake {table_name}",
                         level="DEBUG",
-                        payload={"table": table_name, "rows": len(records)}
+                        payload={"table": table_name, "rows": len(records), "latency_ms": round((_time.monotonic() - start_flush) * 1000, 1)}
                     )
+                    BackupMetricsCollector.record_flush(True)
+
+        except Exception as e:
+            # Retry with exponential backoff once, then DLQ
+            if _retry_depth < RETRY_LIMIT:
+                delay = RETRY_DELAY_BASE * (2 ** _retry_depth)
+                log.dual_log(
+                    tag="Backup:Writer:Retry",
+                    level="WARNING",
+                    message=f"Batch flush failed for {table_name}, retrying in {delay}s (attempt {_retry_depth + 1}/{RETRY_LIMIT})",
+                    payload={"table": table_name, "error": str(e)[:200], "retry_in": delay, "attempt": _retry_depth + 1}
+                )
+                BackupMetricsCollector.record_flush(False, retried=True)
+                _time.sleep(delay)
+                _flush_batch(cloud_engine, {(table_name, operation, pk_col): records}, _retry_depth=_retry_depth + 1)
+            else:
+                log.dual_log(
+                    tag="Backup:Writer:BatchError",
+                    level="ERROR",
+                    message=f"Batch flush failed for {table_name} after {RETRY_LIMIT} retries: {e}",
+                    payload={"table": table_name, "error": str(e)[:200], "retries_exhausted": True}
+                )
+                BackupMetricsCollector.record_flush(False, dlq=True)
+                _route_failed_batch_to_dlq(table_name, records, str(e))
+
+
+def _cloud_writer_loop():
+    """Background thread that drains the cloud write queue and writes to Snowflake."""
+    global _shared_cloud_engine, _owns_engine
+    cloud_engine = _shared_cloud_engine
+
+    if cloud_engine is None:
+        from database.backup.settings import BackupSettings
+        try:
+            settings = BackupSettings()
         except Exception as e:
             log.dual_log(
-                tag="Backup:CloudWriter:BatchError",
+                tag="Backup:Writer:ConfigError",
                 level="WARNING",
-                message=f"Batch flush failed for {table_name}: {e}",
-                payload={"table": table_name, "error": str(e)[:200]}
+                message="Backup settings not configured, cloud writer inactive",
+                payload={"error": str(e)}
             )
+            return
+
+        if not settings.cloud.enabled:
+            log.dual_log(
+                tag="Backup:Writer:Disabled",
+                level="INFO",
+                message="Cloud backup disabled, cloud writer thread idle",
+                payload={"action": "check_enabled"}
+            )
+            return
+
+        from database.backup.engine.cloud_engine import CloudEngine
+        cloud_engine = CloudEngine(settings.cloud, settings.sync)
+        _owns_engine = True
+    else:
+        _owns_engine = False
+        log.dual_log(
+            tag="Backup:Writer:SharedEngine",
+            level="INFO",
+            message="Using shared CloudEngine from SyncEngine",
+            payload={"shared_engine": True}
+        )
+
+    batch_buffer = {}  # (table, op, pk_col) -> list of records
+    last_flush = time.monotonic()
+    FLUSH_INTERVAL = 5.0  # seconds
+    MAX_BATCH_SIZE = 100  # records per flush
+
+    try:
+        while not _cloud_shutdown.is_set():
+            try:
+                task = cloud_write_queue.get(timeout=1.0)
+                if task is None:
+                    break
+
+                key = (task.table_name, task.operation, task.pk_col)
+                batch_buffer.setdefault(key, [])
+                batch_buffer[key].extend(task.records)
+
+            except queue.Empty:
+                pass
+
+            now = time.monotonic()
+            should_flush = (
+                any(len(v) >= MAX_BATCH_SIZE for v in batch_buffer.values()) or
+                (now - last_flush >= FLUSH_INTERVAL and any(batch_buffer.values()))
+            )
+
+            if should_flush and batch_buffer:
+                _flush_batch(cloud_engine, batch_buffer)
+                batch_buffer = {}
+                last_flush = now
+
+        # Final flush on shutdown
+        if batch_buffer:
+            _flush_batch(cloud_engine, batch_buffer)
+
+    finally:
+        # Shutdown CloudEngine only if this thread owns it
+        if _owns_engine and cloud_engine is not None:
+            try:
+                cloud_engine.shutdown()
+                log.dual_log(tag="Backup:Writer:Shutdown", message="Cloud writer thread stopped (owned engine disposed)", level="INFO", payload={"action": "shutdown", "owned": True})
+            except Exception as e:
+                log.dual_log(tag="Backup:Writer:ShutdownError", message=f"Error shutting down CloudEngine: {e}", level="WARNING", payload={"error": str(e)})
+        else:
+            log.dual_log(tag="Backup:Writer:Shutdown", message="Cloud writer thread stopped (shared engine preserved)", level="INFO", payload={"action": "shutdown", "owned": False})

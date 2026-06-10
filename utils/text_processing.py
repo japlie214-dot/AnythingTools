@@ -35,8 +35,12 @@ def escape_markdown_v2(text: str) -> str:
     if not text:
         return ""
     
+    # Strip LLM-hallucinated plain-text backslash escapes (e.g. \/, \., \-, \:)
+    text = re.sub(r'\\([./\-:])', r'\1', text)
+    
     # Use r'...' and place hyphen at the end to avoid creating an ASCII range (+ to =)
     _ESC = re.compile(r'([\\_*\[\]()~`>#+=|{}.!\-])')
+
     # Match entities: code blocks, inline code, links, spoilers, bold, italic, strikethrough
     pat = re.compile(
         r'(```[\s\S]+?```|`[^`]+`'
