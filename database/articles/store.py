@@ -1,8 +1,4 @@
 # database/articles/store.py
-import json
-import hashlib
-import os
-import tempfile
 import random
 from pathlib import Path
 from datetime import datetime, timezone

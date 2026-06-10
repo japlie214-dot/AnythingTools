@@ -10,20 +10,20 @@ Always use the established backup and hydrate mechanism for state transitions.
 Do NOT write or add custom SQLite migration scripts.
 """
 
-from database.backup.settings import BackupSettings, CloudBackupSettings, SyncSettings
+from database.backup.settings import BackupSettings
 from database.backup.engine.cloud_engine import CloudEngine
 from database.backup.engine.sync_engine import SyncEngine
-from database.backup.models import ExportResult, RestoreResult, Watermark
+from database.backup.models import ExportResult, RestoreResult
 from database.backup.sync.diff_engine import DiffEngine
 from database.backup.sync.resolution import ConflictResolver, UserConfirmationHandler
-from database.backup.sync.foundation import SyncLedger, ContentHasher
+from database.backup.sync.foundation import ContentHasher
 from database.backup.schema_registry import BackupSchemaRegistry
 from database.backup.runner import BackupRunner
 
 __all__ = [
-    "BackupSettings", "CloudBackupSettings", "SyncSettings",
+    "BackupSettings",
     "CloudEngine", "SyncEngine", "BackupRunner",
-    "ExportResult", "RestoreResult", "Watermark",
-    "DiffEngine", "ConflictResolver", "SyncLedger", "ContentHasher",
+    "ExportResult", "RestoreResult",
+    "DiffEngine", "ConflictResolver", "ContentHasher",
     "BackupSchemaRegistry"
 ]

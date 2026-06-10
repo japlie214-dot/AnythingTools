@@ -175,4 +175,3 @@ class VectorSync:
                 pk_col
             ))
 
-CloudVectorPusher = VectorSync

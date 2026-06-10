@@ -76,23 +76,6 @@ def get_batch_articles(batch_id: str, top10_only: bool = False) -> List[Dict[str
     return [dict(row) for row in cur.fetchall()]
 
 
-def get_batch_top10_articles(batch_id: str) -> List[Dict[str, Any]]:
-    return get_batch_articles(batch_id, top10_only=True)
-
-
-def get_batch_non_top10_articles(batch_id: str) -> List[Dict[str, Any]]:
-    cur = _get_cursor()
-    cur.execute(
-        "SELECT sa.id as ulid, sa.url, sa.title "
-        "FROM broadcast_details bd "
-        "JOIN scraped_articles sa ON bd.article_id = sa.id "
-        "WHERE bd.batch_id = ? AND bd.is_top10 = 0 "
-        "ORDER BY bd.detail_id ASC",
-        (batch_id,)
-    )
-    return [dict(row) for row in cur.fetchall()]
-
-
 def get_batch_publish_progress(batch_id: str) -> Dict[str, int]:
     cur = _get_cursor()
     cur.execute(
@@ -117,23 +100,6 @@ def get_details_for_publish(batch_id: str) -> List[Dict[str, Any]]:
         "JOIN scraped_articles sa ON bd.article_id = sa.id "
         "WHERE bd.batch_id = ? "
         "AND bd.publish_status IN ('PENDING', 'FAILED', 'TRANSLATING', 'PUBLISHED_BRIEFING') "
-        "ORDER BY bd.is_top10 DESC, bd.top10_rank ASC, bd.detail_id ASC",
-        (batch_id,)
-    )
-    return [dict(row) for row in cur.fetchall()]
-
-
-def get_translated_articles(batch_id: str) -> List[Dict[str, Any]]:
-    cur = _get_cursor()
-    cur.execute(
-        "SELECT sa.id as ulid, sa.url, sa.title, sa.conclusion, sa.summary, "
-        "bd.is_top10, bd.top10_rank, bd.publish_status, bd.detail_id, "
-        "bd.translated_title, bd.translated_summary, bd.translated_conclusion "
-        "FROM broadcast_details bd "
-        "JOIN scraped_articles sa ON bd.article_id = sa.id "
-        "WHERE bd.batch_id = ? "
-        "AND bd.translated_title IS NOT NULL "
-        "AND bd.translated_title != '' "
         "ORDER BY bd.is_top10 DESC, bd.top10_rank ASC, bd.detail_id ASC",
         (batch_id,)
     )

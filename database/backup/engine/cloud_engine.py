@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, text
 from database.backup.settings import CloudBackupSettings
 from database.backup.schema_registry import BackupSchemaRegistry
 from database.backup.resilience.circuit_breaker import CircuitBreaker
+from database.backup.sync.helpers import introspect_table_columns, normalize_cloud_row
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
@@ -139,21 +140,40 @@ class CloudEngine(BackupEngine):
                 cloud_conn.execute(text(f"INSERT INTO {self.settings.schema_name}.{manifest_table} (id, content_hash) VALUES (:id, :content_hash)"), batch)
         return manifest_table
 
+    def _merge_to_cloud(self, cloud_conn, schema: str, table_name: str, columns: List[str], dict_rows: list, pk_col: str) -> int:
+        stage_table = f"{table_name}_stage"
+        col_defs = ",".join([f"{c} VARCHAR" for c in columns])
+        cloud_conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {schema}.{stage_table} ({col_defs})"))
+
+        insert_placeholders = ",".join([f":{c}" for c in columns])
+        cloud_conn.execute(text(f"INSERT INTO {schema}.{stage_table} VALUES ({insert_placeholders})"), dict_rows)
+
+        merge_sql = f"""
+        MERGE INTO {schema}.{table_name} t
+        USING {schema}.{stage_table} s
+        ON t.{pk_col} = s.{pk_col}
+        WHEN MATCHED THEN UPDATE SET {", ".join([f"t.{c} = s.{c}" for c in columns if c != pk_col])}
+        WHEN NOT MATCHED THEN INSERT ({",".join(columns)}) VALUES ({",".join([f"s.{c}" for c in columns])})
+        """
+        result = cloud_conn.execute(text(merge_sql))
+        return result.rowcount if hasattr(result, "rowcount") else len(dict_rows)
+    
     def sync_data(self, local_db_path: str, tables: dict, batch_size: int = 500, delta_only: bool = True) -> dict:
         if not self.settings.enabled or not self.engine:
             return {"status": "disabled"}
 
         def _execute_cloud_sync():
             import sqlite3
-            local_conn = sqlite3.connect(local_db_path, timeout=30.0)
+            local_conn = None
             results = {}
             
             try:
+                local_conn = sqlite3.connect(local_db_path, timeout=30.0)
                 with self.engine.begin() as cloud_conn:
                     for table_name in tables:
                         if 'VIRTUAL' in tables[table_name].upper():
                             continue
-                        
+                            
                         pk_col = "id"
                         hash_col = "content_hash"
                         has_hash = False
@@ -167,7 +187,7 @@ class CloudEngine(BackupEngine):
                         manifest_table = self._upload_local_manifest(local_conn, cloud_conn, table_name, pk_col, hash_col)
 
                         try:
-                            # Avoid 'C.CONTENT_HASH' exceptions if column is not supported in the table 
+                            # Avoid 'C.CONTENT_HASH' exceptions if column is not supported in the table
                             diff_query = f"""
                             SELECT m.id FROM {self.settings.schema_name}.{manifest_table} m
                             LEFT JOIN {self.settings.schema_name}.{table_name} c ON m.id = c.{pk_col}
@@ -211,41 +231,21 @@ class CloudEngine(BackupEngine):
                                 push_result = pusher.push_vectors(cloud_conn, self.settings.schema_name, table_name, columns, dict_rows, pk_col, batch_size=batch_size)
                                 results[table_name] = push_result["pushed"]
                             else:
-                                stage_table = f"{table_name}_stage"
-                                col_defs = ",".join([f"{c} VARCHAR" for c in columns])
-                                cloud_conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {self.settings.schema_name}.{stage_table} ({col_defs})"))
-                                insert_placeholders = ",".join([f":{c}" for c in columns])
-                                cloud_conn.execute(text(f"INSERT INTO {self.settings.schema_name}.{stage_table} VALUES ({insert_placeholders})"), dict_rows)
-                                merge_sql = f"""
-                                MERGE INTO {self.settings.schema_name}.{table_name} t
-                                USING {self.settings.schema_name}.{stage_table} s
-                                ON t.{pk_col} = s.{pk_col}
-                                WHEN MATCHED THEN UPDATE SET {", ".join([f"t.{c} = s.{c}" for c in columns if c != pk_col])}
-                                WHEN NOT MATCHED THEN INSERT ({",".join(columns)}) VALUES ({",".join([f"s.{c}" for c in columns])})
-                                """
-                                result = cloud_conn.execute(text(merge_sql))
-                                results[table_name] = result.rowcount if hasattr(result, "rowcount") else len(dict_rows)
+                                results[table_name] = self._merge_to_cloud(
+                                    cloud_conn, self.settings.schema_name, table_name, columns, dict_rows, pk_col
+                                )
                         else:
-                            stage_table = f"{table_name}_stage"
-                            col_defs = ",".join([f"{c} VARCHAR" for c in columns])
-                            cloud_conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {self.settings.schema_name}.{stage_table} ({col_defs})"))
-                            
-                            insert_placeholders = ",".join([f":{c}" for c in columns])
-                            cloud_conn.execute(text(f"INSERT INTO {self.settings.schema_name}.{stage_table} VALUES ({insert_placeholders})"), dict_rows)
-                            
-                            merge_sql = f"""
-                            MERGE INTO {self.settings.schema_name}.{table_name} t
-                            USING {self.settings.schema_name}.{stage_table} s
-                            ON t.{pk_col} = s.{pk_col}
-                            WHEN MATCHED THEN UPDATE SET {", ".join([f"t.{c} = s.{c}" for c in columns if c != pk_col])}
-                            WHEN NOT MATCHED THEN INSERT ({",".join(columns)}) VALUES ({",".join([f"s.{c}" for c in columns])})
-                            """
-                            result = cloud_conn.execute(text(merge_sql))
-                            results[table_name] = result.rowcount if hasattr(result, "rowcount") else len(dict_rows)
+                            results[table_name] = self._merge_to_cloud(
+                                cloud_conn, self.settings.schema_name, table_name, columns, dict_rows, pk_col
+                            )
 
                 return results
             finally:
-                local_conn.close()
+                if local_conn is not None:
+                    try:
+                        local_conn.close()
+                    except Exception:
+                        pass
 
         return self.circuit_breaker_push.call(_execute_cloud_sync)
 
@@ -253,96 +253,107 @@ class CloudEngine(BackupEngine):
         if not self.settings.enabled or not self.engine:
             return {"status": "disabled"}
             
-        import datetime
-        import struct
-        from decimal import Decimal
-        results = {}
-        
-        try:
-            import sqlite3
-            local_conn = sqlite3.connect(local_db_path, timeout=30.0)
-            with self.engine.begin() as cloud_conn:
-                for table_name in tables:
-                    if 'VIRTUAL' in tables[table_name].upper():
-                        continue
-                    
-                    pk_col = "id"
-                    hash_col = "content_hash"
-                    has_hash = False
-                    try:
-                        for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
-                            if col_info[5] > 0: pk_col = col_info[1]
-                            if col_info[1] == "content_hash": has_hash = True
-                        if not has_hash: hash_col = "''"
-                    except Exception: pass
-
-                    manifest_table = self._upload_local_manifest(local_conn, cloud_conn, table_name, pk_col, hash_col)
-
-                    # Dynamic conditional check prevents query failures on tables without content_hash
-                    diff_query = f"""
-                        SELECT c.* FROM {self.settings.schema_name}.{table_name} c
-                        LEFT JOIN {self.settings.schema_name}.{manifest_table} m ON c.{pk_col} = m.id
-                        WHERE m.id IS NULL
-                    """
-                    if has_hash:
-                        diff_query += " OR COALESCE(c.content_hash, '') != COALESCE(m.content_hash, '')"
-
-                    cloud_rows = cloud_conn.execute(text(diff_query)).fetchall()
-                    
-                    if not cloud_rows:
-                        results[table_name] = 0
-                        continue
-                        
-                    columns = [k.lower() for k in cloud_rows[0]._mapping.keys()]
-                    
-                    has_embedding = "embedding" in columns
-
-                    if has_embedding and self.vec0_settings.use_native_vector_type:
-                        from database.backup.vec.cloud_vector_pusher import VectorSync
-                        vector_sync = VectorSync()
-                        records, dlq_rows = vector_sync.pull_vectors_from_cloud(cloud_rows, columns)
-
-                        if dlq_rows:
-                            from database.backup.writer.cloud_writer import CloudWriteTask as BackupWriteTask, enqueue_cloud_write as enqueue_backup_write
-                            import json
-                            for dlq_row in dlq_rows:
-                                safe_dlq_row = {k: v for k, v in dlq_row.items() if k != "_error_msg" and not isinstance(v, bytes)}
-                                enqueue_backup_write(BackupWriteTask(
-                                    "dead_letter_queue", "DLQ",
-                                    [{
-                                        pk_col: dlq_row.get(pk_col, ""),
-                                        "table_name": table_name,
-                                        "row_data": json.dumps(safe_dlq_row, default=str),
-                                        "_error_msg": dlq_row.get("_error_msg", "Unknown error")
-                                    }],
-                                    pk_col
-                                ))
-                    else:
-                        records = []
-                        for row in cloud_rows:
-                            norm_row = []
-                            for val in row:
-                                if isinstance(val, (datetime.datetime, datetime.date)):
-                                    norm_row.append(val.isoformat())
-                                elif isinstance(val, Decimal):
-                                    norm_row.append(float(val))
-                                elif isinstance(val, list) and len(val) > 0 and isinstance(val[0], float):
-                                    norm_row.append(struct.pack(f'<{len(val)}f', *val))
-                                else:
-                                    norm_row.append(val)
-                            records.append(dict(zip(columns, norm_row)))
-
-                    if "content_hash" in columns:
-                        for r in records:
-                            if isinstance(r, dict) and not r.get("content_hash"):
-                                from database.backup.sync.foundation import ContentHasher
-                                new_hash = ContentHasher.compute_row_hash(table_name, r)
-                                r["content_hash"] = new_hash
-                                
-                    from database.backup.writer.cloud_writer import CloudWriteTask as BackupWriteTask, enqueue_cloud_write as enqueue_backup_write
-                    enqueue_backup_write(BackupWriteTask(table_name, "UPSERT", records, pk_col))
-                    results[table_name] = len(records)
-        finally:
-            local_conn.close()
+        def _execute_pull():
+            import datetime
+            import struct
+            from decimal import Decimal
+            results = {}
             
-        return results
+            try:
+                import sqlite3
+                local_conn = sqlite3.connect(local_db_path, timeout=30.0)
+                with self.engine.begin() as cloud_conn:
+                    for table_name in tables:
+                        if 'VIRTUAL' in tables[table_name].upper():
+                            continue
+                            
+                        pk_col = "id"
+                        hash_col = "content_hash"
+                        has_hash = False
+                        try:
+                            for col_info in local_conn.execute(f"PRAGMA table_info({table_name})").fetchall():
+                                if col_info[5] > 0: pk_col = col_info[1]
+                                if col_info[1] == "content_hash": has_hash = True
+                            if not has_hash: hash_col = "''"
+                        except Exception: pass
+
+                        manifest_table = self._upload_local_manifest(local_conn, cloud_conn, table_name, pk_col, hash_col)
+
+                        # Dynamic conditional check prevents query failures on tables without content_hash
+                        diff_query = f"""
+                            SELECT c.* FROM {self.settings.schema_name}.{table_name} c
+                            LEFT JOIN {self.settings.schema_name}.{manifest_table} m ON c.{pk_col} = m.id
+                            WHERE m.id IS NULL
+                        """
+                        if has_hash:
+                            diff_query += " OR COALESCE(c.content_hash, '') != COALESCE(m.content_hash, '')"
+
+                        cloud_rows = cloud_conn.execute(text(diff_query)).fetchall()
+                        
+                        if not cloud_rows:
+                            results[table_name] = 0
+                            continue
+                            
+                        columns = [k.lower() for k in cloud_rows[0]._mapping.keys()]
+                        
+                        has_embedding = "embedding" in columns
+
+                        if has_embedding and self.vec0_settings.use_native_vector_type:
+                            from database.backup.vec.cloud_vector_pusher import VectorSync
+                            vector_sync = VectorSync()
+                            records, dlq_rows = vector_sync.pull_vectors_from_cloud(cloud_rows, columns)
+
+                            if dlq_rows:
+                                from database.writer import enqueue_write
+                                import json
+                                from utils.id_generator import ULID
+                                for dlq_row in dlq_rows:
+                                    safe_dlq_row = {k: v for k, v in dlq_row.items() if k != "_error_msg" and not isinstance(v, bytes)}
+                                    enqueue_write(
+                                        "INSERT INTO dead_letter_queue (dlq_id, table_name, row_id, row_data, error_message) VALUES (?, ?, ?, ?, ?)",
+                                        (ULID.generate(), table_name, dlq_row.get(pk_col, ""), json.dumps(safe_dlq_row), dlq_row.get("_error_msg"))
+                                    )
+                        else:
+                            records = []
+                            for row in cloud_rows:
+                                norm_row = []
+                                for val in row:
+                                    if isinstance(val, (datetime.datetime, datetime.date)):
+                                        norm_row.append(val.isoformat())
+                                    elif isinstance(val, Decimal):
+                                        norm_row.append(float(val))
+                                    elif isinstance(val, list) and len(val) > 0 and isinstance(val[0], float):
+                                        norm_row.append(struct.pack(f'<{len(val)}f', *val))
+                                    else:
+                                        norm_row.append(val)
+                                records.append(dict(zip(columns, norm_row)))
+
+                        if "content_hash" in columns:
+                            for r in records:
+                                if isinstance(r, dict) and not r.get("content_hash"):
+                                    from database.backup.sync.foundation import ContentHasher
+                                    new_hash = ContentHasher.compute_row_hash(table_name, r)
+                                    r["content_hash"] = new_hash
+                                    
+                        if records:
+                            cols = list(records[0].keys())
+                            placeholders = ",".join(["?"] * len(cols))
+                            insert_sql = f"INSERT OR REPLACE INTO {table_name} ({','.join(cols)}) VALUES ({placeholders})"
+                            rows_as_tuples = [tuple(r.get(c) for c in cols) for r in records]
+                            local_conn.executemany(insert_sql, rows_as_tuples)
+                            local_conn.commit()
+                            
+                            log.dual_log(
+                                tag="Backup:Cloud:Pull:Written",
+                                message=f"Wrote {len(records)} rows to local table {table_name}",
+                                level="INFO",
+                                payload={"table": table_name, "rows": len(records)}
+                            )
+                        
+                        results[table_name] = len(records)
+            finally:
+                local_conn.close()
+                
+            return results
+            
+        return self.circuit_breaker_pull.call(_execute_pull)

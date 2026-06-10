@@ -1,7 +1,7 @@
 # database/articles/writer.py
 from typing import Optional
 from database.writer import WriteReceipt, enqueue_transaction, start_writer
-from database.articles.models import ArticleWriteTask, ArticleWriteResult, ArticleDeleteTask, ArticleDeleteResult
+from database.articles.models import ArticleWriteResult, ArticleDeleteResult
 from database.articles.store import get_article_store
 from utils.logger import get_dual_logger
 
