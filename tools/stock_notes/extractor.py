@@ -1,6 +1,7 @@
 # tools/stock_notes/extractor.py
 import json
 import re
+import hashlib
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -92,17 +93,21 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
         except ValueError: pass
         
     filing_id = f"{ticker}|{form}|{accession_no}"
+    filing_content = f"{ticker}|{form}|{accession_no}|{period}|{cik}"
+    filing_hash = hashlib.md5(filing_content.encode("utf-8", errors="replace")).hexdigest()
     enqueue_write(
-        """INSERT OR REPLACE INTO sn_filings (filing_id, ticker, form, filing_date, accession_no, period_of_report, company_name, cik, fiscal_year_end_month, quarter, year, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-        (filing_id, ticker, form, str(filing.filing_date), accession_no, period, str(getattr(filing, 'company', "Unknown")), cik, fy_month, quarter, year)
+        """INSERT OR REPLACE INTO sn_filings (filing_id, ticker, form, filing_date, accession_no, period_of_report, company_name, cik, fiscal_year_end_month, quarter, year, content_hash, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+        (filing_id, ticker, form, str(filing.filing_date), accession_no, period, str(getattr(filing, 'company', "Unknown")), cik, fy_month, quarter, year, filing_hash)
     )
     try:
         from database.backup.writer.cloud_writer import enqueue_cloud_write
+        now_ts = datetime.utcnow().isoformat()
         enqueue_cloud_write("sn_filings", {
             "filing_id": filing_id, "ticker": ticker, "form": form, "filing_date": str(filing.filing_date),
             "accession_no": accession_no, "period_of_report": period, "company_name": str(getattr(filing, 'company', "Unknown")),
-            "cik": cik, "fiscal_year_end_month": fy_month, "quarter": quarter, "year": year
+            "cik": cik, "fiscal_year_end_month": fy_month, "quarter": quarter, "year": year, "content_hash": filing_hash,
+            "created_at": now_ts, "updated_at": now_ts
         }, pk_col="filing_id")
     except Exception:
         pass
@@ -123,10 +128,39 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
         try:
             note_id = f"{filing_id}|N{note.number}"
             narrative = getattr(note, "text", "") or ""
+            narrative_hash = hashlib.md5(narrative.encode("utf-8", errors="replace")).hexdigest() if narrative else ""
             
-            note_payload = {"note_number": note.number, "title": note.title, "narrative": narrative, "tables": []}
+            expands = getattr(note, "expands", None) or []
+            expands_statements = getattr(note, "expands_statements", None) or []
+            expands_json = json.dumps(expands) if expands else "[]"
+            expands_stmts_json = json.dumps(expands_statements) if expands_statements else "[]"
             
-            if note.tables:
+            table_count = len(note.tables) if hasattr(note, "tables") and note.tables else 0
+            details_count = len(note.details) if hasattr(note, "details") and note.details else 0
+            note_content = f"{note.number}|{note.title}|{narrative_hash}|{table_count}|{details_count}"
+            note_hash = hashlib.md5(note_content.encode("utf-8", errors="replace")).hexdigest()
+            
+            note_payload = {"note_number": note.number, "title": note.title, "narrative": narrative, "tables": [], "details": []}
+            
+            if hasattr(note, "details") and note.details:
+                for di, d in enumerate(note.details):
+                    try:
+                        df = d.to_dataframe()
+                        if df is not None and not df.empty:
+                            detail_title = f"Detail_{di}"
+                            try:
+                                detail_title = str(d)[:100].split("\n")[0] if str(d) else f"Detail {di}"
+                            except Exception:
+                                pass
+                            dt_name = re.sub(r'[^a-zA-Z0-9]', '_', detail_title or f"Note{note.number}_D{di}")[:50].strip('_')
+                            
+                            count = upsert_detail_records(ticker, dt_name, df.to_dict(orient="records"), list(df.columns), quarter, year, q_status, accession_no, note.number)
+                            register_detail_table(ticker, dt_name, detail_title, note.number, accession_no, "detail", list(df.columns), count, quarter, year, q_status)
+                            total_detail_tables += 1
+                            note_payload["details"].append({"name": dt_name, "title": detail_title, "rows": count})
+                    except Exception: pass
+
+            if hasattr(note, "tables") and note.tables:
                 for ti, t in enumerate(note.tables):
                     try:
                         df = t.to_dataframe()
@@ -139,23 +173,32 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
                             total_detail_tables += 1
                             note_payload["tables"].append({"name": dt_name, "title": table_title, "rows": count, "data": df.to_dict(orient="records")})
                     except Exception: pass
-            
+
             enqueue_write(
-                """INSERT OR REPLACE INTO sn_notes (note_id, filing_id, ticker, form, accession_no, note_number, title, narrative_text, quarter, year, quarterly_status, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-                (note_id, filing_id, ticker, form, accession_no, note.number, note.title, narrative, quarter, year, q_status)
+                """INSERT OR REPLACE INTO sn_notes (note_id, filing_id, ticker, form, accession_no, note_number, title, short_name, narrative_text, narrative_hash, expands, expands_statements, table_count, details_count, quarter, year, quarterly_status, version, content_hash, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (note_id, filing_id, ticker, form, accession_no, note.number, note.title,
+                 getattr(note, "short_name", note.title) or note.title,
+                 narrative, narrative_hash, expands_json, expands_stmts_json,
+                 table_count, details_count, quarter, year, q_status, 1, note_hash)
             )
             try:
                 from database.backup.writer.cloud_writer import enqueue_cloud_write
+                now_ts = datetime.utcnow().isoformat()
                 enqueue_cloud_write("sn_notes", {
                     "note_id": note_id, "filing_id": filing_id, "ticker": ticker, "form": form, "accession_no": accession_no,
-                    "note_number": note.number, "title": note.title, "narrative_text": narrative, "quarter": quarter,
-                    "year": year, "quarterly_status": q_status
+                    "note_number": note.number, "title": note.title, "short_name": getattr(note, "short_name", note.title) or note.title,
+                    "narrative_text": narrative, "narrative_hash": narrative_hash,
+                    "expands": expands_json, "expands_statements": expands_stmts_json,
+                    "table_count": table_count, "details_count": details_count,
+                    "quarter": quarter, "year": year, "quarterly_status": q_status,
+                    "version": 1, "content_hash": note_hash,
+                    "created_at": now_ts, "updated_at": now_ts
                 }, pk_col="note_id")
             except Exception:
                 pass
             filing_payload["notes"].append(note_payload)
-            if job_id: update_item_status(job_id, note_meta, "COMPLETED", json.dumps({"tables": len(note_payload["tables"])}))
+            if job_id: update_item_status(job_id, note_meta, "COMPLETED", json.dumps({"tables": len(note_payload["tables"]), "details": len(note_payload.get("details", []))}))
         except Exception as e:
             if job_id: update_item_status(job_id, note_meta, "FAILED", json.dumps({"error": str(e)}))
             log.dual_log(tag="StockNotes:Extract:NoteError", message=f"Note {note.number} failed", level="WARNING", payload={"error": str(e)})

@@ -8,6 +8,18 @@ from database.writer import enqueue_write
 
 TABLE_PREFIX = "sn_dt_"
 
+def validate_quarter_date(date_str: str) -> tuple[bool, str]:
+    """Validate a quarter date string in YYYY-MM format.
+    Returns (is_valid, error_message).
+    """
+    import re
+    if not date_str:
+        return True, ""
+    if not re.match(r'^\d{4}-(?:0[1-9]|1[0-2])$', date_str):
+        return False, f"Invalid date format '{date_str}'. Expected YYYY-MM (e.g., 2025-03)."
+    return True, ""
+
+
 def get_full_table_name(ticker: str, detail_table_name: str) -> str:
     ticker_clean = re.sub(r'[^a-z0-9]', '_', ticker.lower())
     name_clean = re.sub(r'[^a-z0-9]', '_', detail_table_name.lower())
@@ -103,10 +115,18 @@ def upsert_detail_records(
     return upserted
 
 def query_detail_table(
-    ticker: str, detail_table_name: str, start_date: Optional[str] = None, 
+    ticker: str, detail_table_name: str, start_date: Optional[str] = None,
     end_date: Optional[str] = None, fiscal_year_end_month: int = 12, max_quarters: int = 12
 ) -> Tuple[str, List[Dict[str, Any]]]:
     from tools.stock_notes.fiscal import parse_quarter_date, fiscal_quarter_from_period_end, quarter_date_range
+    
+    if start_date:
+        valid, err = validate_quarter_date(start_date)
+        if not valid: raise ValueError(err)
+    if end_date:
+        valid, err = validate_quarter_date(end_date)
+        if not valid: raise ValueError(err)
+
     full_table_name = get_full_table_name(ticker, detail_table_name)
     conn = DatabaseManager.get_read_connection()
     if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (full_table_name,)).fetchone():
