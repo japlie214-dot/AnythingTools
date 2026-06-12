@@ -1,4 +1,3 @@
-# tools/stock_notes/tidy_transform.py
 import re
 import hashlib
 import pandas as pd
@@ -10,6 +9,16 @@ XBRL_METADATA_COLUMNS = frozenset({
     "is_breakdown", "label", "level", "parent_abstract_concept",
     "parent_concept", "preferred_sign", "standard_concept", "weight"
 })
+
+def make_registry_id(ticker: str, detail_table_name: str, accession_no: str, note_number: int) -> str:
+    """Deterministic primary key for sn_detail_registry.
+    
+    Same natural key always produces the same registry_id, regardless of
+    INSERT OR REPLACE history. This prevents Snowflake duplicate rows when
+    MERGE uses registry_id as the match key.
+    """
+    raw = f"{ticker}|{detail_table_name}|{accession_no}|{note_number}"
+    return hashlib.md5(raw.encode("utf-8", errors="replace")).hexdigest()
 
 def parse_period_column(col_name: str) -> dict:
     if not isinstance(col_name, str):

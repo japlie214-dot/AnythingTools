@@ -1,4 +1,3 @@
-# tools/stock_notes/tool.py
 import json
 from typing import Any
 from tools.base import BaseTool
@@ -74,10 +73,21 @@ class StockNotesTool(BaseTool):
             force_refresh = instructions.get("force_refresh", False)
             conn = DatabaseManager.get_read_connection()
             
-            exists_locally = conn.execute("SELECT 1 FROM sn_filings WHERE accession_no=?", (accession_no,)).fetchone()
-            if force_refresh or not exists_locally:
+            # Rehydration strategy: always rehydrate when drilling into a specific note
+            # (note_number provided), use cache only for listing view
+            if note_number is None:
+                exists_locally = conn.execute("SELECT 1 FROM sn_filings WHERE accession_no=?", (accession_no,)).fetchone()
+                if force_refresh or not exists_locally:
+                    try:
+                        await to_thread_with_context(extract_and_persist_filing, accession_no, ticker=ticker, job_id=job_id, force_refresh=force_refresh)
+                        await wait_for_writes(timeout=30.0)
+                        conn = DatabaseManager.get_read_connection()
+                    except Exception as e:
+                        return _fail(f"Extraction failed: {e}", "Ensure valid accession_no and EDGAR connectivity.")
+            else:
+                # Detail view: always rehydrate for freshness
                 try:
-                    await to_thread_with_context(extract_and_persist_filing, accession_no, ticker=ticker, job_id=job_id, force_refresh=force_refresh)
+                    await to_thread_with_context(extract_and_persist_filing, accession_no, ticker=ticker, job_id=job_id, force_refresh=True)
                     await wait_for_writes(timeout=30.0)
                     conn = DatabaseManager.get_read_connection()
                 except Exception as e:
@@ -136,18 +146,23 @@ class StockNotesTool(BaseTool):
                 
                 if catalog:
                     lines.append(f"\n## Concept Catalog ({len(catalog)} queryable concepts)\n")
-                    lines.append("| # | Concept | Label | Dimension | Sample |")
-                    lines.append("|---|---------|-------|-----------|--------|")
+                    lines.append("| # | Concept | Label | Axis | Member | Periods | Range |")
+                    lines.append("|---|---------|-------|------|--------|---------|-------|")
                     for ci, entry in enumerate(catalog, 1):
-                        dim = entry["dimension_member_label"] or "\u2014"
-                        lines.append(f"| {ci} | `{entry['concept']}` | {entry['label']} | {dim} | {entry['sample_value']} ({entry['period_type']}) |")
+                        axis_short = entry.get("dimension_axis", "").replace("us-gaap_", "").replace("Axis", "") if entry.get("dimension_axis") else "\u2014"
+                        member = entry.get("dimension_member_label") or "\u2014"
+                        er = entry.get("earliest_period", "")[:7] if entry.get("earliest_period") else "?"
+                        lr = entry.get("latest_period", "")[:7] if entry.get("latest_period") else "?"
+                        pc = entry.get("period_count", "?")
+                        lines.append(f"| {ci} | `{entry['concept']}` | {entry['label']} | {axis_short} | {member} | {pc} | {er} \u2192 {lr} |")
                     
-                    first = catalog[0]
-                    lines.append(f"\n**Query example:** `details` command with `{{\"ticker\": \"{f_ticker}\", \"concept\": \"{first['concept']}\", \"start_date\": \"{start_date}\", \"end_date\": \"{end_date}\"}}`")
-                    
+                    # Generate Quick Queries with date range from catalog data
                     distinct_concepts = list(dict.fromkeys(e["concept"] for e in catalog))
-                    if len(distinct_concepts) > 1:
-                        lines.append(f"\n**Other concepts:** {', '.join(f'`{c}`' for c in distinct_concepts[1:6])}")
+                    lines.append(f"\n**Quick Queries** (copy-paste into `details` command):")
+                    for c in distinct_concepts[:5]:
+                        lines.append(f'- `{{"ticker": "{f_ticker}", "concept": "{c}", "start_date": "{start_date}", "end_date": "{end_date}"}}`')
+                    if len(distinct_concepts) > 5:
+                        lines.append(f"\n...and {len(distinct_concepts) - 5} more concepts. See catalog above.")
                 else:
                     lines.append("\n*No queryable concepts found in this note (only abstract/grouping elements).*")
             else:

@@ -50,7 +50,7 @@ TABLES = {
     CREATE INDEX IF NOT EXISTS idx_sn_notes_ticker_quarter ON sn_notes(ticker, quarter, year);""",
 
     "sn_detail_registry": """CREATE TABLE IF NOT EXISTS sn_detail_registry (
-        registry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        registry_id TEXT PRIMARY KEY,
         ticker TEXT NOT NULL,
         detail_table_name TEXT NOT NULL,
         source_title TEXT NOT NULL DEFAULT '',
@@ -65,8 +65,7 @@ TABLES = {
         quarterly_status TEXT NOT NULL DEFAULT '',
         content_hash TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(ticker, detail_table_name, source_accession_no, source_note_number)
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE INDEX IF NOT EXISTS idx_sn_detail_registry_ticker ON sn_detail_registry(ticker, detail_table_name);
     CREATE INDEX IF NOT EXISTS idx_sn_detail_registry_quarter ON sn_detail_registry(ticker, quarter, year);""",

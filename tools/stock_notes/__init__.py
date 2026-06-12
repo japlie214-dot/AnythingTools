@@ -1,4 +1,3 @@
-# tools/stock_notes/__init__.py
 """
 Stock Notes Tool — SEC EDGAR Filing Footnote Explorer
 =====================================================
@@ -28,6 +27,7 @@ Step 2: List Notes in a Filing (The Index Phase)
     
     This retrieves a list of all notes (Note 1, Note 2, etc.) along with a
     short preview of the primary XBRL concepts detected within each note.
+    Data is cached locally; no re-extraction occurs for the listing view.
 
 Step 3: Open a Specific Note (The "Hydration" Phase)
     Extract the detailed narrative and display the Concept Catalog for a specific note.
@@ -35,24 +35,48 @@ Step 3: Open a Specific Note (The "Hydration" Phase)
     instructions: {"accession_no": "0000320193-26-000013", "note_number": 6}
     
     HYDRATION DETAILS:
-    To view a specific note's Concept Catalog, you must supply a `note_number`.
-    The system will parse the note, build a Concept Catalog (up to 50 concepts),
-    and render sample values and recommended date ranges.
-    
-    TROUBLESHOOTING & REHYDRATION:
-    If a subsequent query returns "No records found" or if you suspect data has
-    drifted (such as after an amended 10-K/A is filed), add `"force_refresh": true`
-    to your instructions. This forces a clean deletion of the local cache and
-    re-extracts fresh data from EDGAR.
+    When you specify a note_number, the system ALWAYS rehydrates: it deletes
+    any existing cached data for this filing and re-extracts fresh data from
+    SEC EDGAR. This ensures data freshness even if the original filing was
+    amended or the previous extraction was interrupted.
+
+    WHY REHYDRATION IS MANDATORY:
+    - Amended filings (10-K/A, 10-Q/A) supersede original data
+    - Previous extractions may have been interrupted by network errors
+    - Schema evolution requires re-extraction in the current format
+    - SEC EDGAR occasionally revises filing data post-submission
+
+    WHAT HAPPENS DURING REHYDRATION:
+    1. All existing rows for this accession_no are deleted from:
+       - sn_note_details (tidy data rows)
+       - sn_detail_registry (concept catalog metadata)
+       - sn_notes (note metadata and narratives)
+    2. Filing data is re-extracted from SEC EDGAR
+    3. Fresh data is written to both Operational and Cloud Backup databases
+    4. The Concept Catalog is rebuilt from the new data
+
+    CONCEPT CATALOG:
+    The catalog shows up to 50 queryable XBRL concepts with:
+    - Concept name (e.g., us-gaap_LongTermDebt)
+    - Human-readable label (e.g., Long-Term Debt)
+    - Dimension axis and member for dimensional breakdowns
+    - Period count and date range coverage
+    - Quick Query templates for copy-paste into the details command
+
+    TROUBLESHOOTING:
+    - If rehydration fails with a connection error, retry after a few minutes
+    - If rehydration fails with a rate limit error, wait 1+ minute before retrying
+    - If data appears incorrect, verify the accession_no matches the intended
+      filing (amended filings have different accession numbers)
 
 Step 4: Query Details by Concept
-    Extract historical time-series data (up to 12 quarters) across filings for a
+    Extract historical time-series data (up to 500 rows) across filings for a
     specific XBRL concept.
     command: "details"
     instructions: {"ticker": "AAPL", "concept": "us-gaap_LongTermDebt", "start_date": "2024-09", "end_date": "2026-03"}
     
-    The concept name and suggested start/end date ranges are copied directly from the
-    Concept Catalog displayed in Step 3.
+    The concept name and suggested start/end date ranges are copied directly
+    from the Quick Queries shown in Step 3's Concept Catalog.
 
 Schema:
 -------
@@ -73,10 +97,13 @@ Schema:
 
 Developer Notes:
 ----------------
-- Rehydration: The 'note' command supports an optional force_refresh flag to wipe local cache and re-extract.
-- Backup Integration: All writes to sn_note_details, sn_notes, and sn_detail_registry are synced to Snowflake.
+- Rehydration: Always performed when note_number is provided. Listing view uses cache.
+- Backup Integration: All writes to sn_note_details, sn_notes, and sn_detail_registry
+  are synced to Snowflake via inline dual-write (no read-back pattern).
 - Rate Limiting: Synchronous sliding-window rate limiting prevents SEC IP bans.
 - Resume Mechanism: Supports note-level resumption during extraction.
+- Deterministic PKs: sn_detail_registry uses MD5(ticker|table_name|accession_no|note_number)
+  as the primary key to prevent Snowflake MERGE duplicate row errors.
 """
 
 from .tool import StockNotesTool

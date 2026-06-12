@@ -1,4 +1,3 @@
-# tools/stock_notes/extractor.py
 import json
 import re
 import hashlib
@@ -77,7 +76,7 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
     if force_refresh:
         deleted_count = delete_filing_data(accession_no)
         if deleted_count > 0:
-            log.dual_log(tag="StockNotes:Rehydrate", message=f"Deleted {deleted_count} existing rows for rehydration", level="INFO", payload={"accession_no": accession_no})
+            log.dual_log(tag="StockNotes:Rehydrate:Delete", message=f"Deleted {deleted_count} existing rows for rehydration", level="INFO", payload={"accession_no": accession_no})
     
     cik = getattr(filing, 'cik', 0)
     if not ticker and cik:

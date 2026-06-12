@@ -1,4 +1,3 @@
-# tools/stock_notes/detail_manager.py
 import json
 import re
 from typing import Optional, Tuple, List, Dict, Any
@@ -67,8 +66,14 @@ def upsert_tidy_records(records: List[Dict[str, Any]]) -> int:
         chunk = records[i:i + cloud_batch_size]
         try:
             enqueue_cloud_write_batch("sn_note_details", chunk, pk_col="detail_id")
-        except Exception:
-            pass
+        except Exception as e:
+            from utils.logger import get_dual_logger
+            get_dual_logger(__name__).dual_log(
+                tag="StockNotes:Cloud:BatchFailed",
+                level="WARNING",
+                message=f"Cloud batch write failed for sn_note_details: {e}",
+                payload={"batch_size": len(chunk), "error": str(e)[:200]}
+            )
 
     return len(records)
 
@@ -131,8 +136,9 @@ def delete_filing_data(accession_no: str) -> int:
         )
         try:
             enqueue_cloud_delete("sn_note_details", accession_no, pk_col="accession_no")
-        except Exception:
-            pass
+        except Exception as e:
+            from utils.logger import get_dual_logger
+            get_dual_logger(__name__).dual_log(tag="StockNotes:Cloud:DeleteFailed", level="WARNING", message=f"Cloud delete failed for sn_note_details: {e}", payload={"accession_no": accession_no, "error": str(e)[:200]})
     
     enqueue_write(
         "DELETE FROM sn_detail_registry WHERE source_accession_no = ?",
@@ -140,8 +146,9 @@ def delete_filing_data(accession_no: str) -> int:
     )
     try:
         enqueue_cloud_delete("sn_detail_registry", accession_no, pk_col="source_accession_no")
-    except Exception:
-        pass
+    except Exception as e:
+        from utils.logger import get_dual_logger
+        get_dual_logger(__name__).dual_log(tag="StockNotes:Cloud:DeleteFailed", level="WARNING", message=f"Cloud delete failed for sn_detail_registry: {e}", payload={"accession_no": accession_no, "error": str(e)[:200]})
 
     enqueue_write(
         "DELETE FROM sn_notes WHERE accession_no = ?",
@@ -149,8 +156,9 @@ def delete_filing_data(accession_no: str) -> int:
     )
     try:
         enqueue_cloud_delete("sn_notes", accession_no, pk_col="accession_no")
-    except Exception:
-        pass
+    except Exception as e:
+        from utils.logger import get_dual_logger
+        get_dual_logger(__name__).dual_log(tag="StockNotes:Cloud:DeleteFailed", level="WARNING", message=f"Cloud delete failed for sn_notes: {e}", payload={"accession_no": accession_no, "error": str(e)[:200]})
     
     return count
 
@@ -158,7 +166,11 @@ def build_concept_catalog(ticker: str, accession_no: str, note_number: int) -> l
     conn = DatabaseManager.get_read_connection()
     
     cursor = conn.execute("""
-        SELECT concept, label, dimension_member_label, MAX(period_end_date) as max_period, value, period_type
+        SELECT concept, label, dimension_axis, dimension_member_label,
+               COUNT(DISTINCT period_end_date) as period_count,
+               MIN(period_end_date) as earliest_period,
+               MAX(period_end_date) as latest_period,
+               period_type, value
         FROM sn_note_details
         WHERE ticker = ? AND accession_no = ? AND note_number = ?
           AND abstract = 'False' AND value != ''
@@ -169,15 +181,17 @@ def build_concept_catalog(ticker: str, accession_no: str, note_number: int) -> l
     
     catalog = []
     for row in cursor.fetchall():
-        concept, label, dim_member, period_end, value, period_type = row
-        sample = _format_sample_value(value)
+        concept, label, dim_axis, dim_member, pcount, earliest, latest, ptype, value = row
         catalog.append({
             "concept": concept,
             "label": label,
+            "dimension_axis": dim_axis or "",
             "dimension_member_label": dim_member or "",
-            "sample_value": sample,
-            "period_type": period_type,
-            "period_end_date": period_end,
+            "period_count": pcount,
+            "earliest_period": earliest or "",
+            "latest_period": latest or "",
+            "period_type": ptype,
+            "sample_value": _format_sample_value(value),
         })
     
     return catalog
@@ -224,18 +238,34 @@ def register_detail_table(
     source_accession_no: str, role_or_type: str, unique_concepts: List[str], row_count: int,
     quarter: int, year: int, quarterly_status: str
 ):
+    from tools.stock_notes.tidy_transform import make_registry_id
+    from database.backup.writer.cloud_writer import enqueue_cloud_write
+    from datetime import datetime, timezone
+    from utils.logger import get_dual_logger
+    
+    log = get_dual_logger(__name__)
+    rid = make_registry_id(ticker, detail_table_name, source_accession_no, source_note_number)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    
     enqueue_write(
         """INSERT OR REPLACE INTO sn_detail_registry
-           (ticker, detail_table_name, source_title, source_note_number, source_accession_no, role_or_type, available_concepts, tidy_schema_version, row_count, quarter, year, quarterly_status, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-        (ticker, detail_table_name, source_title, source_note_number, source_accession_no, role_or_type, json.dumps(unique_concepts), row_count, quarter, year, quarterly_status)
+           (registry_id, ticker, detail_table_name, source_title, source_note_number, source_accession_no, role_or_type, available_concepts, tidy_schema_version, row_count, quarter, year, quarterly_status, content_hash, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, '', ?, ?)""",
+        (rid, ticker, detail_table_name, source_title, source_note_number, source_accession_no, role_or_type, json.dumps(unique_concepts), row_count, quarter, year, quarterly_status, now_iso, now_iso)
     )
+    # Inline dual-write: construct cloud record from same data, avoiding read-back
     try:
-        from database.connection import DatabaseManager
-        from database.backup.writer.cloud_writer import enqueue_cloud_write
-        conn = DatabaseManager.get_read_connection()
-        row = conn.execute("SELECT * FROM sn_detail_registry WHERE ticker = ? AND detail_table_name = ?", (ticker, detail_table_name)).fetchone()
-        if row:
-            enqueue_cloud_write("sn_detail_registry", dict(row), pk_col="registry_id")
-    except Exception:
-        pass
+        record = {
+            "registry_id": rid, "ticker": ticker, "detail_table_name": detail_table_name,
+            "source_title": source_title, "source_note_number": source_note_number,
+            "source_accession_no": source_accession_no, "role_or_type": role_or_type,
+            "available_concepts": json.dumps(unique_concepts), "tidy_schema_version": 1,
+            "row_count": row_count, "quarter": quarter, "year": year,
+            "quarterly_status": quarterly_status, "content_hash": "",
+            "created_at": now_iso, "updated_at": now_iso
+        }
+        enqueue_cloud_write("sn_detail_registry", record, pk_col="registry_id")
+    except Exception as e:
+        log.dual_log(tag="StockNotes:Cloud:WriteFailed", level="WARNING",
+                     message=f"Cloud write failed for sn_detail_registry: {e}",
+                     payload={"registry_id": rid, "error": str(e)[:200]})
