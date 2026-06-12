@@ -28,10 +28,10 @@ Step 3: Extract & Read a Specific Note
     command: "note"
     instructions: {"accession_no": "0000320193-24-000123", "note_number": 2}
 
-Step 4: Query a Detail Table
-    Extract historical tabular data (up to 12 quarters) from a specific detail table.
+Step 4: Query Details by Concept
+    Extract historical time-series data (up to 12 quarters) across filings for a specific XBRL concept found in a note.
     command: "details"
-    instructions: {"ticker": "AAPL", "detail_table_name": "aapl_revenue_breakdown", "start_date": "2023-01", "end_date": "2025-06"}
+    instructions: {"ticker": "AAPL", "concept": "us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax", "start_date": "2023-01", "end_date": "2025-06"}
 
 Schema:
 -------

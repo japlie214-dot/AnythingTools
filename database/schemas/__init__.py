@@ -19,6 +19,7 @@ PERSISTED_TABLES: list[str] = [
     "sn_filings",
     "sn_notes",
     "sn_detail_registry",
+    "sn_note_details",
 ]
 
 ALL_FTS_TABLES: Dict[str, str] = {

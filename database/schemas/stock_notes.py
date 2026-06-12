@@ -57,7 +57,8 @@ TABLES = {
         source_note_number INTEGER NOT NULL DEFAULT 0,
         source_accession_no TEXT NOT NULL DEFAULT '',
         role_or_type TEXT NOT NULL DEFAULT '',
-        column_schema TEXT NOT NULL DEFAULT '[]',
+        available_concepts TEXT NOT NULL DEFAULT '[]',
+        tidy_schema_version INTEGER NOT NULL DEFAULT 1,
         row_count INTEGER NOT NULL DEFAULT 0,
         quarter INTEGER NOT NULL DEFAULT 0,
         year INTEGER NOT NULL DEFAULT 0,
@@ -68,5 +69,43 @@ TABLES = {
         UNIQUE(ticker, detail_table_name, source_accession_no, source_note_number)
     );
     CREATE INDEX IF NOT EXISTS idx_sn_detail_registry_ticker ON sn_detail_registry(ticker, detail_table_name);
-    CREATE INDEX IF NOT EXISTS idx_sn_detail_registry_quarter ON sn_detail_registry(ticker, quarter, year);"""
+    CREATE INDEX IF NOT EXISTS idx_sn_detail_registry_quarter ON sn_detail_registry(ticker, quarter, year);""",
+
+    "sn_note_details": """CREATE TABLE IF NOT EXISTS sn_note_details (
+        detail_id TEXT PRIMARY KEY,
+        accession_no TEXT NOT NULL,
+        note_number INTEGER NOT NULL,
+        detail_index INTEGER NOT NULL DEFAULT 0,
+        ticker TEXT NOT NULL,
+        form TEXT NOT NULL,
+        concept TEXT NOT NULL DEFAULT '',
+        label TEXT NOT NULL DEFAULT '',
+        standard_concept TEXT NOT NULL DEFAULT '',
+        level INTEGER NOT NULL DEFAULT 0,
+        abstract TEXT NOT NULL DEFAULT 'False',
+        dimension TEXT NOT NULL DEFAULT 'False',
+        is_breakdown TEXT NOT NULL DEFAULT 'False',
+        dimension_axis TEXT NOT NULL DEFAULT '',
+        dimension_member TEXT NOT NULL DEFAULT '',
+        dimension_member_label TEXT NOT NULL DEFAULT '',
+        dimension_label TEXT NOT NULL DEFAULT '',
+        balance TEXT NOT NULL DEFAULT '',
+        weight TEXT NOT NULL DEFAULT '',
+        preferred_sign TEXT NOT NULL DEFAULT '',
+        parent_concept TEXT NOT NULL DEFAULT '',
+        parent_abstract_concept TEXT NOT NULL DEFAULT '',
+        period_raw TEXT NOT NULL DEFAULT '',
+        period_end_date TEXT NOT NULL,
+        period_type TEXT NOT NULL,
+        value TEXT NOT NULL DEFAULT '',
+        row_order INTEGER NOT NULL DEFAULT 0,
+        content_hash TEXT NOT NULL DEFAULT '',
+        extracted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(accession_no) REFERENCES sn_filings(accession_no) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_sn_note_details_ticker_period ON sn_note_details(ticker, period_type, period_end_date);
+    CREATE INDEX IF NOT EXISTS idx_sn_note_details_concept ON sn_note_details(concept, period_end_date);
+    CREATE INDEX IF NOT EXISTS idx_sn_note_details_accession ON sn_note_details(accession_no, note_number);"""
 }

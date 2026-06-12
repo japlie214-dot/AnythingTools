@@ -40,7 +40,7 @@ class StockNotesTool(BaseTool):
         forms = instructions.get("forms") or "10-K,10-Q"
         accession_no = (instructions.get("accession_no") or "").strip()
         note_number = instructions.get("note_number")
-        detail_table_name = (instructions.get("detail_table_name") or "").strip()
+        concept = (instructions.get("concept") or "").strip()
         start_date = (instructions.get("start_date") or "").strip() or None
         end_date = (instructions.get("end_date") or "").strip() or None
 
@@ -98,7 +98,7 @@ class StockNotesTool(BaseTool):
             if not note_row: return _fail(f"Note {note_number} not found", "Check available notes.")
             
             (n_num, n_title, n_short, n_narrative, n_expands, n_expands_stmts, n_tbl_count, n_dt_count, n_q_status) = note_row
-            dts = conn.execute("SELECT detail_table_name, source_title, role_or_type, row_count FROM sn_detail_registry WHERE source_accession_no=? AND source_note_number=?", (accession_no, note_number)).fetchall()
+            dts = conn.execute("SELECT detail_table_name, source_title, role_or_type, available_concepts FROM sn_detail_registry WHERE source_accession_no=? AND source_note_number=?", (accession_no, note_number)).fetchall()
             
             lines = [f"# Note {n_num}: {n_title}", f"**Company:** {f_company} ({f_ticker})", f"**Accession:** {accession_no} | **Form:** {f_form}", f"**Quarter:** Q{f_quarter} FY{f_year} | **Status:** {n_q_status}", f"**Tables:** {n_tbl_count} | **Details:** {n_dt_count} | **Detail Tables:** {len(dts)}"]
             if n_expands:
@@ -118,69 +118,36 @@ class StockNotesTool(BaseTool):
                 lines.append("\n*No narrative content available.*")
                 
             if dts:
-                lines.append(f"\n## Detail Tables ({len(dts)} tables)\n")
-                for dt_name, dt_title, dt_role, dt_rows in dts:
-                    lines.append(f"### {dt_title or dt_name}\n- **Table:** {dt_name} | **Role:** {dt_role} | **Rows:** {dt_rows}\n- Query: `details` command with instructions `{{\"ticker\": \"{f_ticker}\", \"detail_table_name\": \"{dt_name}\", \"start_date\": \"YYYY-MM\", \"end_date\": \"YYYY-MM\"}}`\n")
+                lines.append(f"\n## Extracted Concepts ({len(dts)} tables)\n")
+                for dt_name, dt_title, dt_role, concepts_json in dts:
+                    concepts = json.loads(concepts_json) if concepts_json else []
+                    lines.append(f"### Table Source: {dt_title or dt_name}\n- **Role:** {dt_role}\n- **Available Concepts:** {', '.join(concepts[:10])}{' ...' if len(concepts) > 10 else ''}\n- Query: `details` command with instructions `{{\"ticker\": \"{f_ticker}\", \"concept\": \"{concepts[0] if concepts else 'example_concept'}\", \"start_date\": \"YYYY-MM\", \"end_date\": \"YYYY-MM\"}}`\n")
             else:
-                lines.append("\n*No detail tables found for this note.*")
+                lines.append("\n*No detail concepts found for this note.*")
                 
             return _success("\n".join(lines), {"note_number": note_number}, artifacts)
             
         elif cmd == "details":
-            from .detail_manager import query_detail_table, format_as_markdown_table, list_available_detail_tables
-            from .extractor import extract_and_persist_filing
+            from .detail_manager import query_tidy_table, format_as_markdown_table
             from database.connection import DatabaseManager
 
-            if not ticker:
-                conn = DatabaseManager.get_read_connection()
-                rows = conn.execute("SELECT DISTINCT ticker, detail_table_name, source_title, MAX(quarter || '-' || year) as latest_quarter FROM sn_detail_registry GROUP BY ticker, detail_table_name ORDER BY ticker, detail_table_name").fetchall()
-                if not rows: return _success("No detail tables found. Extract notes first using the `note` command.", {})
-                lines = ["# Available Detail Tables\n", "| Ticker | Detail Table Name | Source Title | Latest Quarter |", "|--------|-------------------|-------------|----------------|"]
-                for r in rows: lines.append(f"| {r[0]} | {r[1]} | {r[2][:50]} | {r[3]} |")
-                return _success("\n".join(lines), {"total_tables": len(rows)})
-
-            if not detail_table_name:
-                tables = list_available_detail_tables(ticker)
-                if not tables: return _fail(f"No detail tables found for {ticker}.", "Extract notes first using the `note` command.")
-                lines = [f"# Available Detail Tables for {ticker}\n", "| Detail Table Name | Source Title | Rows | Latest Quarter |", "|-------------------|-------------|------|----------------|"]
-                seen = set()
-                for t in tables:
-                    if t["detail_table_name"] not in seen:
-                        seen.add(t["detail_table_name"])
-                        latest = f"Q{t['quarter']} FY{t['year']}" if t.get("quarter") else "N/A"
-                        lines.append(f"| {t['detail_table_name']} | {t['source_title'][:50]} | {t['row_count']} | {latest} |")
-                return _success("\n".join(lines), {"ticker": ticker, "table_count": len(seen)})
-
-            conn = DatabaseManager.get_read_connection()
-            fye_row = conn.execute("SELECT fiscal_year_end_month FROM sn_filings WHERE ticker = ? LIMIT 1", (ticker,)).fetchone()
-            fy_month = fye_row[0] if fye_row else 12
+            if not ticker or not concept:
+                return _fail("Missing ticker or concept.", "Provide both 'ticker' and 'concept' in the instructions payload.")
 
             try:
-                tbl, records = query_detail_table(ticker, detail_table_name, start_date, end_date, fiscal_year_end_month=fy_month, max_quarters=12)
+                records = query_tidy_table(ticker, concept, start_date, end_date)
             except ValueError as ve:
-                return _fail(str(ve), "Use YYYY-MM format (e.g., 2025-03) and max 12 quarters.")
+                return _fail(str(ve), "Use YYYY-MM format (e.g., 2025-03).")
 
             if not records:
-                reg_exists = conn.execute("SELECT source_accession_no FROM sn_detail_registry WHERE ticker=? AND detail_table_name=? LIMIT 1", (ticker, detail_table_name)).fetchone()
-                if reg_exists:
-                    try:
-                        await to_thread_with_context(extract_and_persist_filing, reg_exists[0], ticker=ticker, job_id=job_id)
-                        await wait_for_writes(timeout=15.0)
-                        conn = DatabaseManager.get_read_connection()
-                        tbl, records = query_detail_table(ticker, detail_table_name, start_date, end_date, fiscal_year_end_month=fy_month, max_quarters=12)
-                        if not records:
-                            return _fail(f"Rebuild failed for ephemeral table {detail_table_name}.", "Table could not be reconstructed from SEC data.")
-                    except Exception as e:
-                        return _fail(f"Rebuild failed for ephemeral table {detail_table_name}: {e}", "EDGAR API might be unavailable.")
-                else:
-                    return _fail(f"No records found in {detail_table_name} for {ticker}", "Adjust date range or extract notes first.")
+                return _fail(f"No records found for concept '{concept}' on ticker {ticker}", "Adjust date range or extract notes first.")
 
-            md_table = format_as_markdown_table(records, detail_table_name)
+            md_table = format_as_markdown_table(records, f"Time Series: {concept}")
             art_path = write_artifact(self.name, job_id, "detail_table", "md", md_table)
             
-            lines = [f"# Detail Table: {detail_table_name} ({ticker})", f"**Records:** {len(records)}"]
+            lines = [f"# Concept Details: {concept} ({ticker})", f"**Records:** {len(records)}"]
             if start_date and end_date: lines.append(f"**Date range:** {start_date} to {end_date}")
             lines.extend(["", md_table])
-            return _success("\n".join(lines), {"row_count": len(records), "table": tbl}, [{"filename": art_path.name, "type": "file", "description": "Full Detail Table"}])
+            return _success("\n".join(lines), {"row_count": len(records)}, [{"filename": art_path.name, "type": "file", "description": "Full Concept Detail Table"}])
             
         return _fail("Invalid command", "Use discover, note, or details.")

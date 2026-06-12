@@ -63,7 +63,8 @@ def discover_filings(ticker: str, form_types: Optional[List[str]] = None, limit:
 def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = "", job_id: str = "") -> Dict[str, Any]:
     from edgar import Company, find as edgar_find
     from tools.stock_notes.fiscal import get_fiscal_year_end_month, fiscal_quarter_from_period_end
-    from tools.stock_notes.detail_manager import upsert_detail_records, register_detail_table
+    from tools.stock_notes.detail_manager import upsert_tidy_records, register_detail_table
+    from tools.stock_notes.tidy_transform import transform_to_tidy
     from database.connection import DatabaseManager
     
     set_edgar_identity()
@@ -154,10 +155,14 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
                                 pass
                             dt_name = re.sub(r'[^a-zA-Z0-9]', '_', detail_title or f"Note{note.number}_D{di}")[:50].strip('_')
                             
-                            count = upsert_detail_records(ticker, dt_name, df.to_dict(orient="records"), list(df.columns), quarter, year, q_status, accession_no, note.number)
-                            register_detail_table(ticker, dt_name, detail_title, note.number, accession_no, "detail", list(df.columns), count, quarter, year, q_status)
-                            total_detail_tables += 1
-                            note_payload["details"].append({"name": dt_name, "title": detail_title, "rows": count})
+                            try:
+                                tidy_records, unique_concepts = transform_to_tidy(df, ticker, form, accession_no, note.number, di)
+                                count = upsert_tidy_records(tidy_records)
+                                register_detail_table(ticker, dt_name, detail_title, note.number, accession_no, "detail", unique_concepts, count, quarter, year, q_status)
+                                total_detail_tables += 1
+                                note_payload["details"].append({"name": dt_name, "title": detail_title, "rows": count})
+                            except Exception as df_e:
+                                log.dual_log(tag="StockNotes:Extract:MalformedTable", level="WARNING", message="Skipping malformed detail table", payload={"error": str(df_e), "accession": accession_no, "note": note.number})
                     except Exception: pass
 
             if hasattr(note, "tables") and note.tables:
@@ -168,10 +173,14 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
                             table_title = getattr(t.render(), "title", "") or f"Table {ti}"
                             dt_name = re.sub(r'[^a-zA-Z0-9]', '_', table_title or f"Note{note.number}_T{ti}")[:50].strip('_')
                             
-                            count = upsert_detail_records(ticker, dt_name, df.to_dict(orient="records"), list(df.columns), quarter, year, q_status, accession_no, note.number)
-                            register_detail_table(ticker, dt_name, table_title, note.number, accession_no, getattr(t, "role_or_type", ""), list(df.columns), count, quarter, year, q_status)
-                            total_detail_tables += 1
-                            note_payload["tables"].append({"name": dt_name, "title": table_title, "rows": count, "data": df.to_dict(orient="records")})
+                            try:
+                                tidy_records, unique_concepts = transform_to_tidy(df, ticker, form, accession_no, note.number, ti)
+                                count = upsert_tidy_records(tidy_records)
+                                register_detail_table(ticker, dt_name, table_title, note.number, accession_no, getattr(t, "role_or_type", ""), unique_concepts, count, quarter, year, q_status)
+                                total_detail_tables += 1
+                                note_payload["tables"].append({"name": dt_name, "title": table_title, "rows": count, "data": df.to_dict(orient="records")})
+                            except Exception as df_e:
+                                log.dual_log(tag="StockNotes:Extract:MalformedTable", level="WARNING", message="Skipping malformed table", payload={"error": str(df_e), "accession": accession_no, "note": note.number})
                     except Exception: pass
 
             enqueue_write(

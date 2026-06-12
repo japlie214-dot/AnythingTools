@@ -49,7 +49,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
     - `scraper/`: Browser-based extraction, hitl escalation, and LLM curation.
     - `publisher/`: Telegram delivery pipeline with sliding-window rate limiting.
     - `draft_editor/`: Atomic manipulation of curated lists.
-    - `stock_notes/`: SEC EDGAR footnote extraction and dynamic table management.
+    - `stock_notes/`: SEC EDGAR footnote extraction and tidy-format financial data storage.
     - `batch_reader/`: Hybrid semantic + keyword search across batches.
 - `utils/`: Cross-cutting utilities (logging, artifact management, browser daemon, SoM Javascript injection, rate limiters, text sanitization).
 - `scripts/`: Maintenance utilities.
@@ -100,7 +100,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 
 ## 7. State, Persistence, and Data
 ### Storage Locations
-- **Operational DB (`data/sumanal.db`)**: Source of truth for `jobs`, `job_items`, `scraped_articles`, `broadcast_batches`, `sn_filings`, and the `sync_ledger`.
+- **Operational DB (`data/sumanal.db`)**: Source of truth for `jobs`, `job_items`, `scraped_articles`, `broadcast_batches`, `sn_filings`, `sn_notes`, `sn_detail_registry`, `sn_note_details`, and the `sync_ledger`.
 - **Telemetry DB (`data/logs.db`)**: High-throughput event store. Recreated fresh on every application startup.
 - **Snowflake**: Cloud target for analytical querying and remote backup.
 - **Artifacts (`data/temp/multimodal` / `artifacts/`)**: Ephemeral or receipt files (JSON, screenshots) served via the API.
@@ -146,24 +146,3 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **Extremely Fragile**: `database/writer.py` and `database/logs_writer.py`. Altering the queue logic, thread handling, and transaction boundaries here will cause immediate database locking or silent data loss.
 - **Tightly Coupled**: The `SyncEngine` synchronization (`database/backup/engine/`) heavily relies on `database/backup/schema_registry.py` for precise type mapping. Changing SQLite schemas requires verifying the `sqlglot` output for Snowflake.
 - **Easily Extensible**: Adding a new tool is trivial. Create a subclass of `BaseTool` in `tools/`, define an `INPUT_MODEL`, and it will be automatically discovered by `registry.py` and exposed via the `/api/manifest` endpoint.
-
-## 13. Changes (Evolutionary Analysis from Current Code)
-
-### Transition from 3-Tier to 2-Tier Backup Architecture
-- **Pain Point Addressed**: The prior system used a 3-tier model (Operational DB $\rightarrow$ local `backup.db` $\rightarrow$ Snowflake). This introduced significant redundancy, complex 3-way diffing logic, and a "local backup" layer that acted as a bottleneck and a point of failure. Evidence: The presence of `deprecated/` logic and the complete purge of `local_engine.py` and `backup_writer.py`.
-- **Solution Implemented**: Replaced the `DualEngine` with a `SyncEngine` (`database/backup/engine/sync_engine.py`) that synchronizes the Operational DB directly to Snowflake. Introduced an asynchronous `cloud_writer` (`database/backup/writer/cloud_writer.py`) using a `queue.Queue` to perform "best-effort" inline writes without blocking application logic.
-- **Impact & Evidence**: 
-    - *Architectural:* Removed the intermediate `backup.db` from the critical path. `database/connection.py` now resolves the operational path dynamically via `OPERATIONAL_DB_PATH`.
-    - *Behavioral:* Application stores (e.g., `ArticleStore`) now trigger asynchronous cloud writes immediately upon local commit, reducing the window of data loss.
-    - *Developer Experience:* Simplified the differential engine to a 2-way comparison (Operational vs. Cloud), as evidenced by the rewritten `DiffEngine.compute_deltas`.
-    - *New Risks/Trade-offs:* Introduced a potential for "best-effort" data loss if the application crashes before the async queue is drained, mitigated by a 10-second shutdown drain in `app.py`.
-- **Confidence Level**: High (Directly evidenced by the massive purge of legacy files and the structural shift in the `backup/` directory).
-
-### Observability and Logging Contract Hardening
-- **Pain Point Addressed**: Inconsistent logging and tag formats led to `Logger:Contract:TagViolation` warnings and runtime `TypeError` crashes due to missing required `payload` arguments in `dual_log`.
-- **Solution Implemented**: Standardized all tags to a 3-part hierarchy (`Category:Sub-Category:Action`) and enforced the inclusion of structured payloads in all `dual_log` calls across the startup and sync pipelines.
-- **Impact & Evidence**: 
-    - *Architectural:* The logging system now strictly enforces a contract that allows for reliable SQL-based filtering of logs.
-    - *Behavioral:* Eliminated runtime crashes during critical lifecycle events (startup/shutdown).
-    - *Developer Experience:* Increased transparency in autonomous decisions (e.g., HITL bypasses now log the exact Boolean reason and row metrics).
-- **Confidence Level**: High (Directly evidenced by the systematic updates to `dual_log` calls and the specific `Backup:CloudWriter` tag formatting).
