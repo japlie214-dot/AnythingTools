@@ -21,9 +21,16 @@ def validate_quarter_date(date_str: str) -> tuple[bool, str]:
 def upsert_tidy_records(records: List[Dict[str, Any]]) -> int:
     from database.writer import enqueue_transaction
     from database.backup.writer.cloud_writer import enqueue_cloud_write_batch
+    from datetime import datetime, timezone
     
     if not records:
         return 0
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for r in records:
+        r["extracted_at"] = r.get("extracted_at") or now_iso
+        r["created_at"] = r.get("created_at") or now_iso
+        r["updated_at"] = r.get("updated_at") or now_iso
 
     columns = [
         "detail_id", "accession_no", "note_number", "detail_index", "ticker", "form",
@@ -31,7 +38,7 @@ def upsert_tidy_records(records: List[Dict[str, Any]]) -> int:
         "is_breakdown", "dimension_axis", "dimension_member", "dimension_member_label",
         "dimension_label", "balance", "weight", "preferred_sign", "parent_concept",
         "parent_abstract_concept", "period_raw", "period_end_date", "period_type",
-        "value", "row_order", "content_hash"
+        "value", "row_order", "content_hash", "extracted_at", "created_at", "updated_at"
     ]
     
     sql = f'''INSERT OR REPLACE INTO sn_note_details ({", ".join(columns)})
@@ -106,17 +113,111 @@ def format_as_markdown_table(records: List[Dict[str, Any]], table_name: str) -> 
         lines.append("| " + " | ".join(str(record.get(col, "")) for col in display_cols) + " |")
     return "\n".join(lines)
 
-def list_available_detail_tables(ticker: str) -> List[Dict[str, Any]]:
+def delete_filing_data(accession_no: str) -> int:
+    from database.writer import enqueue_write
+    from database.backup.writer.cloud_writer import enqueue_cloud_delete
+    
     conn = DatabaseManager.get_read_connection()
     cursor = conn.execute(
-        "SELECT detail_table_name, source_title, role_or_type, available_concepts, row_count, quarter, year, quarterly_status FROM sn_detail_registry WHERE ticker = ? ORDER BY detail_table_name, year DESC, quarter DESC",
-        (ticker,)
+        "SELECT COUNT(*) FROM sn_note_details WHERE accession_no = ?",
+        (accession_no,)
     )
-    return [{
-        "detail_table_name": r[0], "source_title": r[1], "role_or_type": r[2],
-        "concepts": json.loads(r[3]) if r[3] else [], "row_count": r[4],
-        "quarter": r[5], "year": r[6], "quarterly_status": r[7]
-    } for r in cursor.fetchall()]
+    count = cursor.fetchone()[0]
+    
+    if count > 0:
+        enqueue_write(
+            "DELETE FROM sn_note_details WHERE accession_no = ?",
+            (accession_no,)
+        )
+        try:
+            enqueue_cloud_delete("sn_note_details", accession_no, pk_col="accession_no")
+        except Exception:
+            pass
+    
+    enqueue_write(
+        "DELETE FROM sn_detail_registry WHERE source_accession_no = ?",
+        (accession_no,)
+    )
+    try:
+        enqueue_cloud_delete("sn_detail_registry", accession_no, pk_col="source_accession_no")
+    except Exception:
+        pass
+
+    enqueue_write(
+        "DELETE FROM sn_notes WHERE accession_no = ?",
+        (accession_no,)
+    )
+    try:
+        enqueue_cloud_delete("sn_notes", accession_no, pk_col="accession_no")
+    except Exception:
+        pass
+    
+    return count
+
+def build_concept_catalog(ticker: str, accession_no: str, note_number: int) -> list[dict]:
+    conn = DatabaseManager.get_read_connection()
+    
+    cursor = conn.execute("""
+        SELECT concept, label, dimension_member_label, MAX(period_end_date) as max_period, value, period_type
+        FROM sn_note_details
+        WHERE ticker = ? AND accession_no = ? AND note_number = ?
+          AND abstract = 'False' AND value != ''
+        GROUP BY concept, dimension_member_label
+        ORDER BY concept, dimension_member_label
+        LIMIT 50
+    """, (ticker, accession_no, note_number))
+    
+    catalog = []
+    for row in cursor.fetchall():
+        concept, label, dim_member, period_end, value, period_type = row
+        sample = _format_sample_value(value)
+        catalog.append({
+            "concept": concept,
+            "label": label,
+            "dimension_member_label": dim_member or "",
+            "sample_value": sample,
+            "period_type": period_type,
+            "period_end_date": period_end,
+        })
+    
+    return catalog
+
+def _format_sample_value(value: str) -> str:
+    try:
+        num = float(value)
+        if abs(num) >= 1e9:
+            return f"{num/1e9:.1f}B"
+        elif abs(num) >= 1e6:
+            return f"{num/1e6:.1f}M"
+        elif abs(num) >= 1e3:
+            return f"{num/1e3:.1f}K"
+        else:
+            return f"{num:.2f}"
+    except (ValueError, TypeError):
+        return value[:20]
+
+def get_date_range_for_filing(accession_no: str) -> tuple[str, str]:
+    conn = DatabaseManager.get_read_connection()
+    row = conn.execute(
+        "SELECT period_of_report, fiscal_year_end_month FROM sn_filings WHERE accession_no = ?",
+        (accession_no,)
+    ).fetchone()
+    
+    if not row or not row[0]:
+        return "", ""
+    
+    period_str = row[0][:10]
+    fy_month = row[1] or 12
+    
+    from datetime import datetime
+    try:
+        period_date = datetime.strptime(period_str, "%Y-%m-%d")
+        end_date = period_date.strftime("%Y-%m")
+        start_year = period_date.year - 2
+        start_date = f"{start_year:04d}-{fy_month:02d}"
+        return start_date, end_date
+    except ValueError:
+        return "", ""
 
 def register_detail_table(
     ticker: str, detail_table_name: str, source_title: str, source_note_number: int,

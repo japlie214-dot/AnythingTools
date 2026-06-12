@@ -60,16 +60,24 @@ def discover_filings(ticker: str, form_types: Optional[List[str]] = None, limit:
     results.sort(key=lambda x: x.get("filing_date", ""), reverse=True)
     return results[:limit]
 
-def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = "", job_id: str = "") -> Dict[str, Any]:
+def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = "", job_id: str = "", force_refresh: bool = False) -> Dict[str, Any]:
     from edgar import Company, find as edgar_find
     from tools.stock_notes.fiscal import get_fiscal_year_end_month, fiscal_quarter_from_period_end
-    from tools.stock_notes.detail_manager import upsert_tidy_records, register_detail_table
+    from tools.stock_notes.detail_manager import upsert_tidy_records, register_detail_table, delete_filing_data
     from tools.stock_notes.tidy_transform import transform_to_tidy
     from database.connection import DatabaseManager
     
     set_edgar_identity()
     edgar_limiter.wait()
     filing = edgar_find(search_id=accession_no)
+    
+    if not filing:
+        raise ValueError(f"Filing {accession_no} not found in EDGAR.")
+        
+    if force_refresh:
+        deleted_count = delete_filing_data(accession_no)
+        if deleted_count > 0:
+            log.dual_log(tag="StockNotes:Rehydrate", message=f"Deleted {deleted_count} existing rows for rehydration", level="INFO", payload={"accession_no": accession_no})
     
     cik = getattr(filing, 'cik', 0)
     if not ticker and cik:
@@ -119,8 +127,6 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
     q_status = "direct" if form in ("10-Q", "6-K") else ("from_annual_filing" if form in ("10-K", "20-F") else "unknown")
     total_detail_tables = 0
     
-    # Store complete payload via JSON/bin archive (Backup Integration)
-    filing_payload = {"notes": []}
 
     for note in list(obj.notes):
         note_meta = make_metadata("extract_note", f"{filing_id}|N{note.number}")
@@ -141,7 +147,6 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
             note_content = f"{note.number}|{note.title}|{narrative_hash}|{table_count}|{details_count}"
             note_hash = hashlib.md5(note_content.encode("utf-8", errors="replace")).hexdigest()
             
-            note_payload = {"note_number": note.number, "title": note.title, "narrative": narrative, "tables": [], "details": []}
             
             if hasattr(note, "details") and note.details:
                 for di, d in enumerate(note.details):
@@ -160,28 +165,10 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
                                 count = upsert_tidy_records(tidy_records)
                                 register_detail_table(ticker, dt_name, detail_title, note.number, accession_no, "detail", unique_concepts, count, quarter, year, q_status)
                                 total_detail_tables += 1
-                                note_payload["details"].append({"name": dt_name, "title": detail_title, "rows": count})
                             except Exception as df_e:
                                 log.dual_log(tag="StockNotes:Extract:MalformedTable", level="WARNING", message="Skipping malformed detail table", payload={"error": str(df_e), "accession": accession_no, "note": note.number})
                     except Exception: pass
 
-            if hasattr(note, "tables") and note.tables:
-                for ti, t in enumerate(note.tables):
-                    try:
-                        df = t.to_dataframe()
-                        if df is not None and not df.empty:
-                            table_title = getattr(t.render(), "title", "") or f"Table {ti}"
-                            dt_name = re.sub(r'[^a-zA-Z0-9]', '_', table_title or f"Note{note.number}_T{ti}")[:50].strip('_')
-                            
-                            try:
-                                tidy_records, unique_concepts = transform_to_tidy(df, ticker, form, accession_no, note.number, ti)
-                                count = upsert_tidy_records(tidy_records)
-                                register_detail_table(ticker, dt_name, table_title, note.number, accession_no, getattr(t, "role_or_type", ""), unique_concepts, count, quarter, year, q_status)
-                                total_detail_tables += 1
-                                note_payload["tables"].append({"name": dt_name, "title": table_title, "rows": count, "data": df.to_dict(orient="records")})
-                            except Exception as df_e:
-                                log.dual_log(tag="StockNotes:Extract:MalformedTable", level="WARNING", message="Skipping malformed table", payload={"error": str(df_e), "accession": accession_no, "note": note.number})
-                    except Exception: pass
 
             enqueue_write(
                 """INSERT OR REPLACE INTO sn_notes (note_id, filing_id, ticker, form, accession_no, note_number, title, short_name, narrative_text, narrative_hash, expands, expands_statements, table_count, details_count, quarter, year, quarterly_status, version, content_hash, updated_at)
@@ -206,23 +193,9 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
                 }, pk_col="note_id")
             except Exception:
                 pass
-            filing_payload["notes"].append(note_payload)
-            if job_id: update_item_status(job_id, note_meta, "COMPLETED", json.dumps({"tables": len(note_payload["tables"]), "details": len(note_payload.get("details", []))}))
+            if job_id: update_item_status(job_id, note_meta, "COMPLETED", json.dumps({"tables": 0, "details": 1}))
         except Exception as e:
             if job_id: update_item_status(job_id, note_meta, "FAILED", json.dumps({"error": str(e)}))
             log.dual_log(tag="StockNotes:Extract:NoteError", message=f"Note {note.number} failed", level="WARNING", payload={"error": str(e)})
-
-    # JSON Archive Integration
-    try:
-        # Filing store logic is currently handled via direct SQL writes to sn_filings/sn_notes.
-        # Payload archiving to a dedicated store is currently unimplemented.
-        pass
-    except Exception as e:
-        log.dual_log(tag="StockNotes:Store:Error", message=f"FilingStore failed for {accession_no}", level="ERROR", payload={"error": str(e)})
-        # Filing store logic is currently handled via direct SQL writes to sn_filings/sn_notes.
-        # Payload archiving to a dedicated store is currently unimplemented.
-        pass
-    except Exception as e:
-        log.dual_log(tag="StockNotes:Store:Error", message=f"FilingStore failed for {accession_no}", level="ERROR", payload={"error": str(e)})
 
     return {"filing_id": filing_id, "ticker": ticker, "accession_no": accession_no, "note_count": len(obj.notes), "detail_table_count": total_detail_tables}

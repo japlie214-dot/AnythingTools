@@ -66,17 +66,22 @@ class StockNotesTool(BaseTool):
             
         elif cmd == "note":
             from .extractor import extract_and_persist_filing
+            from .detail_manager import build_concept_catalog, get_date_range_for_filing
             from database.connection import DatabaseManager
+            
             if not accession_no: return _fail("Missing accession_no", "Provide an accession number in the instructions payload.")
             
+            force_refresh = instructions.get("force_refresh", False)
             conn = DatabaseManager.get_read_connection()
-            if not conn.execute("SELECT 1 FROM sn_filings WHERE accession_no=?", (accession_no,)).fetchone():
+            
+            exists_locally = conn.execute("SELECT 1 FROM sn_filings WHERE accession_no=?", (accession_no,)).fetchone()
+            if force_refresh or not exists_locally:
                 try:
-                    await to_thread_with_context(extract_and_persist_filing, accession_no, ticker=ticker, job_id=job_id)
-                    await wait_for_writes(timeout=15.0)
+                    await to_thread_with_context(extract_and_persist_filing, accession_no, ticker=ticker, job_id=job_id, force_refresh=force_refresh)
+                    await wait_for_writes(timeout=30.0)
                     conn = DatabaseManager.get_read_connection()
                 except Exception as e:
-                    return _fail(f"Extraction failed: {e}", "Ensure valid accession_no.")
+                    return _fail(f"Extraction failed: {e}", "Ensure valid accession_no and EDGAR connectivity.")
             
             filing_row = conn.execute("SELECT ticker, form, company_name, period_of_report, quarter, year, fiscal_year_end_month FROM sn_filings WHERE accession_no=?", (accession_no,)).fetchone()
             if not filing_row:
@@ -88,10 +93,18 @@ class StockNotesTool(BaseTool):
                 if not notes: return _success(f"No notes found in filing {accession_no}.", {"accession_no": accession_no})
                 
                 lines = [f"# Notes in {f_form} Filing: {f_company} ({f_ticker})", f"**Accession:** {accession_no} | **Period:** {f_period} | Q{f_quarter} FY{f_year}\n"]
-                lines.append("| Note# | Title | Tables | Details | Q Status |")
-                lines.append("|-------|-------|--------|---------|----------|")
+                lines.append("| Note# | Title | Tables | Details | Q Status | Concepts Preview |")
+                lines.append("|-------|-------|--------|---------|----------|------------------|")
                 for n in notes:
-                    lines.append(f"| {n[0]} | {n[1]} | {n[3]} | {n[4]} | {n[5]} |")
+                    concept_str = ""
+                    if n[4] > 0:
+                        concepts = conn.execute(
+                            "SELECT DISTINCT concept FROM sn_note_details WHERE accession_no = ? AND note_number = ? AND abstract = 'False' AND value != '' LIMIT 5",
+                            (accession_no, n[0])
+                        ).fetchall()
+                        if concepts:
+                            concept_str = ", ".join(c[0].replace("us-gaap_", "") for c in concepts)
+                    lines.append(f"| {n[0]} | {n[1]} | {n[3]} | {n[4]} | {n[5]} | {concept_str} |")
                 return _success("\n".join(lines), {"notes_count": len(notes), "accession_no": accession_no})
             
             note_row = conn.execute("SELECT note_number, title, short_name, narrative_text, expands, expands_statements, table_count, details_count, quarterly_status FROM sn_notes WHERE accession_no=? AND note_number=?", (accession_no, note_number)).fetchone()
@@ -118,10 +131,25 @@ class StockNotesTool(BaseTool):
                 lines.append("\n*No narrative content available.*")
                 
             if dts:
-                lines.append(f"\n## Extracted Concepts ({len(dts)} tables)\n")
-                for dt_name, dt_title, dt_role, concepts_json in dts:
-                    concepts = json.loads(concepts_json) if concepts_json else []
-                    lines.append(f"### Table Source: {dt_title or dt_name}\n- **Role:** {dt_role}\n- **Available Concepts:** {', '.join(concepts[:10])}{' ...' if len(concepts) > 10 else ''}\n- Query: `details` command with instructions `{{\"ticker\": \"{f_ticker}\", \"concept\": \"{concepts[0] if concepts else 'example_concept'}\", \"start_date\": \"YYYY-MM\", \"end_date\": \"YYYY-MM\"}}`\n")
+                catalog = build_concept_catalog(f_ticker, accession_no, note_number)
+                start_date, end_date = get_date_range_for_filing(accession_no)
+                
+                if catalog:
+                    lines.append(f"\n## Concept Catalog ({len(catalog)} queryable concepts)\n")
+                    lines.append("| # | Concept | Label | Dimension | Sample |")
+                    lines.append("|---|---------|-------|-----------|--------|")
+                    for ci, entry in enumerate(catalog, 1):
+                        dim = entry["dimension_member_label"] or "\u2014"
+                        lines.append(f"| {ci} | `{entry['concept']}` | {entry['label']} | {dim} | {entry['sample_value']} ({entry['period_type']}) |")
+                    
+                    first = catalog[0]
+                    lines.append(f"\n**Query example:** `details` command with `{{\"ticker\": \"{f_ticker}\", \"concept\": \"{first['concept']}\", \"start_date\": \"{start_date}\", \"end_date\": \"{end_date}\"}}`")
+                    
+                    distinct_concepts = list(dict.fromkeys(e["concept"] for e in catalog))
+                    if len(distinct_concepts) > 1:
+                        lines.append(f"\n**Other concepts:** {', '.join(f'`{c}`' for c in distinct_concepts[1:6])}")
+                else:
+                    lines.append("\n*No queryable concepts found in this note (only abstract/grouping elements).*")
             else:
                 lines.append("\n*No detail concepts found for this note.*")
                 

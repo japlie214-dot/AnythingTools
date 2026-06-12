@@ -110,7 +110,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - Local schema reconciliation uses surgical `ALTER TABLE` operations to add or drop columns. Column drops are protected by pre-drop backups via the SQLite native `.backup()` API and automated pruning of dependent indexes.
 - Cloud schema management (`SnowflakeSchemaManager`) supports bidirectional evolution, performing both `ADD COLUMN` and `DROP COLUMN` operations to maintain parity with the Operational DB.
 - SQLite DDL is transpiled to Snowflake DDL at runtime using `sqlglot`. Embedding fields (`float[1024]`) are dynamically mapped to Snowflake native `VECTOR(FLOAT, 1024)`.
-- **Constraint Handling**: The system strips `DEFAULT CURRENT_TIMESTAMP` from Snowflake DDL to avoid type mismatches between `VARCHAR` and `TIMESTAMP_LTZ`.
+- **Constraint Handling**: The system strips `DEFAULT CURRENT_TIMESTAMP` from Snowflake DDL to avoid type mismatches between `VARCHAR` and `TIMESTAMP_LTZ`. To maintain integrity, timestamps are generated in Python and explicitly inserted.
 
 ## 8. Dependencies & Integration
 - **FastAPI**: REST API layer.
