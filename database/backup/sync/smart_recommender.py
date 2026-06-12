@@ -89,6 +89,7 @@ class SmartRecommender:
         return outcomes
 
     def format_outcomes_display(self, rec: Recommendation) -> str:
+        """Format metrics outcomes for human-in-the-loop sync decision preview."""
         lines = ["=== PER-TABLE BREAKDOWN ==="]
         for tbl_name, tbl in sorted(rec.per_table.items()):
             lines.append(f"  {tbl_name}: op_only={tbl.op_only} cloud_only={tbl.cloud_only} identical={tbl.identical} conflicts={tbl.conflicts}")
@@ -98,3 +99,4 @@ class SmartRecommender:
             if any(v > 0 for v in outcome.values()):
                 lines.append(f"  {strategy_key}: {outcome}")
         return "\n".join(lines)
+

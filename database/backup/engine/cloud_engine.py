@@ -12,7 +12,7 @@ log = get_dual_logger(__name__)
 
 class SnowflakeSchemaManager:
     @staticmethod
-    def reconcile_non_destructive(engine, schema_name: str):
+    def reconcile(engine, schema_name: str):
         with engine.begin() as conn:
             res = conn.execute(text("""
                 SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
@@ -31,6 +31,7 @@ class SnowflakeSchemaManager:
                     conn.execute(text(sf_ddl))
                     log.dual_log(tag="Backup:Cloud:Schema", message=f"Created missing table {t_name}", level="INFO", payload={"table": t_name})
                 else:
+                    from database.backup.sync.helpers import introspect_table_columns
                     import sqlite3
                     sqlite_cols = []
                     with sqlite3.connect(":memory:") as temp_db:
@@ -38,15 +39,25 @@ class SnowflakeSchemaManager:
                             temp_db.executescript(ddl)
                             sqlite_cols = temp_db.execute(f"PRAGMA table_info({t_name})").fetchall()
                         except sqlite3.OperationalError:
-                            # Fallback for virtual tables that require unloaded extensions
                             if "vec0" in ddl.lower():
                                 sqlite_cols = [(0, "rowid", "INTEGER", 0, None, 1), (1, "embedding", "BLOB", 0, None, 0)]
+                    
+                    desired_col_names = set()
                     for col in sqlite_cols:
                         c_name = col[1].lower()
+                        desired_col_names.add(c_name)
                         if c_name not in existing[t_name]:
-                            c_type = "VARCHAR" if "TEXT" in col[2].upper() else "NUMBER"
+                            sqlite_type = col[2].upper()
                             if c_name == "embedding":
                                 c_type = "VECTOR(FLOAT, 1024)"
+                            elif "TEXT" in sqlite_type or "CHAR" in sqlite_type:
+                                c_type = "VARCHAR"
+                            elif "REAL" in sqlite_type or "FLOA" in sqlite_type:
+                                c_type = "FLOAT"
+                            elif "BLOB" in sqlite_type:
+                                c_type = "BINARY"
+                            else:
+                                c_type = "NUMBER"
                             conn.execute(text(f"ALTER TABLE {t_name} ADD COLUMN {c_name} {c_type}"))
                             log.dual_log(tag="Backup:Cloud:Schema", message=f"Added column {c_name} to {t_name}", level="INFO", payload={"table": t_name, "column": c_name})
                         elif c_name == "embedding":
@@ -58,6 +69,16 @@ class SnowflakeSchemaManager:
                                     level="WARNING",
                                     payload={"table": t_name, "column": c_name}
                                 )
+                    
+                    # Drop unexpected columns
+                    cloud_col_names = set(existing[t_name].keys())
+                    extra_cols = cloud_col_names - desired_col_names
+                    for c_name in extra_cols:
+                        try:
+                            conn.execute(text(f"ALTER TABLE {t_name} DROP COLUMN {c_name}"))
+                            log.dual_log(tag="Backup:Cloud:DropColumn", level="WARNING", message=f"Dropped unexpected column {c_name} from {t_name}", payload={"table": t_name, "column": c_name})
+                        except Exception as e:
+                            log.dual_log(tag="Backup:Cloud:DropColumnFailed", level="WARNING", message=f"Failed to drop column {c_name} from {t_name}: {e}", payload={"table": t_name, "column": c_name, "error": str(e)})
 
 from database.backup.engine.base import BackupEngine
 
@@ -112,7 +133,7 @@ class CloudEngine(BackupEngine):
         def _do_startup():
             with self.engine.begin() as conn:
                 conn.execute(text("SELECT CURRENT_VERSION()"))
-            SnowflakeSchemaManager.reconcile_non_destructive(self.engine, self.settings.schema_name)
+            SnowflakeSchemaManager.reconcile(self.engine, self.settings.schema_name)
             return {"status": "ok"}
         return self.circuit_breaker_push.call(_do_startup)
 

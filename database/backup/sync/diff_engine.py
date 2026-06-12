@@ -40,15 +40,8 @@ class DiffEngine:
             CREATE TABLE diff_cloud (pk TEXT PRIMARY KEY, content_hash TEXT DEFAULT '', ts TEXT DEFAULT '');
         """)
         
-        pk_col = "id"
-        has_content_hash_op = False
-        try:
-            cols = op_conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-            for col in cols:
-                if col[5] > 0: pk_col = col[1]
-                if col[1] == "content_hash": has_content_hash_op = True
-        except Exception:
-            pass
+        from database.backup.sync.helpers import introspect_table_columns
+        pk_col, _, has_content_hash_op = introspect_table_columns(op_conn, table_name)
 
         if has_content_hash_op:
             try:
@@ -76,13 +69,8 @@ class DiffEngine:
             op_rows = []
         mem_db.executemany("INSERT INTO diff_op (pk, content_hash, ts) VALUES (?, ?, ?)", [(str(r[0]), str(r[1] or ""), str(r[2] or "")) for r in op_rows])
 
-        has_content_hash_cloud = False
-        try:
-            cloud_cols = cloud_conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-            for col in cloud_cols:
-                if col[1] == "content_hash": has_content_hash_cloud = True
-        except Exception:
-            pass
+        from database.backup.sync.helpers import introspect_table_columns
+        _, _, has_content_hash_cloud = introspect_table_columns(cloud_conn, table_name)
 
         hash_col_cloud = "content_hash" if has_content_hash_cloud else "''"
         try:

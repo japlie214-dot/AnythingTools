@@ -46,6 +46,20 @@ def _normalize_type_affinity(type_str: str) -> str:
         return "REAL"
     return "NUMERIC"
 
+def _extract_default_from_ddl(ddl: str, table_name: str, column_name: str) -> Optional[str]:
+    """Extract the DEFAULT clause value for a column from its DDL definition.
+    
+    Per SQLite docs, ALTER TABLE ADD COLUMN requires a DEFAULT for NOT NULL columns.
+    This function extracts the declared default so it can be used in ALTER statements.
+    """
+    cols = _columns_from_ddl_in_memory(ddl, table_name)
+    if not cols:
+        return None
+    for c in cols:
+        if c.name.lower() == column_name.lower():
+            return c.dflt_value
+    return None
+
 def _columns_from_ddl_in_memory(ddl: str, table_name: str) -> Optional[List[ColumnInfo]]:
     """Execute DDL against a temporary :memory: DB and introspect PRAGMA table_info."""
     try:

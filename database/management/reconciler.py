@@ -66,15 +66,24 @@ class SchemaReconciler:
             # 1. Prune unexpected tables
             self._prune_unexpected(report)
             
-            # 2. Validate structures (tables + columns)
-            self._validate_structures(report)
+            # 2. Validate structures (tables + columns) and collect pending auto-fills
+            pending_fills = self._validate_structures(report)
             
-            # 3. Validate triggers
+            # 3. Validate triggers (recreate dropped or missing triggers)
             self._validate_triggers(report)
 
-            # 4. Verify vec0 readability (Read-only probe)
+            # 4. Execute auto-fill scripts (safe now that schema and triggers are finalized)
+            self._run_pending_auto_fills(pending_fills, report)
+
+            # 5. Verify vec0 readability
             self._verify_vec0_readability(report)
             
+            # Summary Log
+            added = sum(1 for a in report.actions if a.action == "altered" and "AddColumn" in (a.reason or ""))
+            dropped = sum(1 for a in report.actions if a.action == "altered" and "DropColumn" in (a.reason or ""))
+            recreated = sum(1 for a in report.actions if a.action == "recreated")
+            log.dual_log(tag="Database:Schema:Summary", level="INFO", message=f"Schema reconciliation complete: {added} added, {dropped} dropped, {recreated} recreated", payload={"added": added, "dropped": dropped, "recreated": recreated})
+
             self.conn.commit()
             return report
 
@@ -123,8 +132,9 @@ class SchemaReconciler:
         ).fetchone()
         return res and "VIRTUAL" in (res[0] or "").upper()
 
-    def _validate_structures(self, report: ReconciliationReport):
+    def _validate_structures(self, report: ReconciliationReport) -> dict:
         """Deep validation of tables and columns with granular logging."""
+        pending_fills = {}
         for name, ddl in self.expected_tables.items():
             log.dual_log(tag="Database:Schema:CheckTable", message=f"[{self.label}] Checking table: {name}", payload={"label": self.label, "table": name})
             
@@ -143,62 +153,150 @@ class SchemaReconciler:
                 report.add(ReconciliationAction(name, "unchanged"))
                 continue
 
-            # Deep Column Check (Only for regular tables)
+            # Deep Column Check
             actual_cols = {c.name.lower(): c for c in _get_columns(self.conn, name)}
             desired_cols = {c.name.lower(): c for c in (_columns_from_ddl_in_memory(ddl, name) or [])}
             
-            missing = []
+            missing = [c for c in desired_cols if c not in actual_cols]
             type_mismatches = []
             constraint_mismatches = []
             
             for col_name, d_col in desired_cols.items():
-                if col_name not in actual_cols:
-                    missing.append(col_name)
-                    log.dual_log(tag="Database:Schema:MissingColumn", level="WARNING",
-                               message=f"[{self.label}] {name}: Missing column '{col_name}'",
-                               payload={"label": self.label, "table": name, "missing_column": col_name})
-                else:
+                if col_name in actual_cols:
                     a_col = actual_cols[col_name]
-                    # Use type affinity normalization
                     if _normalize_type_affinity(a_col.type) != _normalize_type_affinity(d_col.type):
                         type_mismatches.append((col_name, a_col.type, d_col.type))
-                        log.dual_log(tag="Database:Schema:TypeMismatch", level="WARNING", message=f"[{self.label}] {name}: Type mismatch '{col_name}' (expected: {d_col.type}, actual: {a_col.type})", payload={"label": self.label, "table": name, "column": col_name, "expected": d_col.type, "actual": a_col.type})
                     if a_col.notnull != d_col.notnull:
                         constraint_mismatches.append((col_name, 'NOT NULL', d_col.notnull))
                     if a_col.pk != d_col.pk:
                         constraint_mismatches.append((col_name, 'PRIMARY KEY', d_col.pk))
             
-            # Check for extra columns
             extra = set(actual_cols.keys()) - set(desired_cols.keys())
-            for col_name in extra:
-                log.dual_log(tag="Database:Schema:ExtraColumn", level="WARNING", message=f"[{self.label}] {name}: Extra column '{col_name}'", payload={"label": self.label, "table": name, "extra_column": col_name})
             
-            has_drift = any([missing, type_mismatches, constraint_mismatches, extra])
+            altered = False
             
-            if has_drift and missing == ["content_hash"] and not type_mismatches and not constraint_mismatches and not extra:
-                log.dual_log(tag="Database:Schema:AddColumn", level="INFO", message=f"[{self.label}] Adding content_hash to {name}", payload={"table": name})
-                self.conn.execute(f"ALTER TABLE {name} ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
-                report.add(ReconciliationAction(name, "altered"))
-                continue
+            if missing:
+                if self._add_missing_columns(name, ddl, missing, desired_cols, report):
+                    altered = True
+                    pending_fills[name] = missing
 
-            if has_drift:
+            if extra:
+                if self._drop_extra_columns(name, extra, report):
+                    altered = True
+
+            if type_mismatches or constraint_mismatches:
                 is_master = name in self.master_tables
                 if is_master:
                     self._snapshot_master(name)
                 
                 reason_parts = []
-                if missing: reason_parts.append(f"missing: {', '.join(missing)}")
                 if type_mismatches: reason_parts.append(f"type_drift: {len(type_mismatches)}")
-                if extra: reason_parts.append(f"extra: {', '.join(extra)}")
+                if constraint_mismatches: reason_parts.append(f"constraint_drift: {len(constraint_mismatches)}")
                 reason = '; '.join(reason_parts)
                 
                 log.dual_log(tag="Database:Schema:RecreateTable", level="WARNING", message=f"[{self.label}] Recreating {name} due to: {reason}", payload={"label": self.label, "table": name, "reason": reason})
                 self.conn.execute(f"DROP TABLE IF EXISTS {name}")
                 self.conn.executescript(ddl)
                 report.add(ReconciliationAction(name, "recreated", is_master, reason))
+            elif altered:
+                pass # report already updated in sub-methods
             else:
                 log.dual_log(tag="Database:Schema:StructureValid", message=f"[{self.label}] {name}: Structure valid", payload={"label": self.label, "table": name, "status": "valid"})
                 report.add(ReconciliationAction(name, "unchanged"))
+                
+        return pending_fills
+
+    def _add_missing_columns(self, table_name: str, ddl: str, missing_cols: list, desired_cols: dict, report: ReconciliationReport) -> bool:
+        from database.management.schema_introspector import _extract_default_from_ddl
+        added = False
+        for col_name in missing_cols:
+            d_col = desired_cols[col_name]
+            col_type = d_col.type or "TEXT"
+            col_def = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+            
+            if d_col.notnull:
+                default_val = _extract_default_from_ddl(ddl, table_name, col_name)
+                if default_val is None:
+                    affinity = _normalize_type_affinity(col_type)
+                    if affinity == "INTEGER": default_val = "0"
+                    elif affinity == "REAL": default_val = "0.0"
+                    else: default_val = "''"
+                col_def += f" NOT NULL DEFAULT {default_val}"
+            elif d_col.dflt_value is not None:
+                col_def += f" DEFAULT {d_col.dflt_value}"
+                
+            try:
+                log.dual_log(tag="Database:Schema:AddColumn", level="INFO", message=f"[{self.label}] Adding column '{col_name}' to {table_name}", payload={"table": table_name, "column": col_name, "definition": col_def})
+                self.conn.execute(col_def)
+                added = True
+                report.add(ReconciliationAction(table_name, "altered", reason=f"AddColumn:{col_name}"))
+            except Exception as e:
+                log.dual_log(tag="Database:Schema:AddColumnFailed", level="WARNING", message=f"[{self.label}] Failed to add column '{col_name}': {e}", payload={"table": table_name, "error": str(e)})
+        return added
+
+    def _drop_extra_columns(self, table_name: str, extra_cols: set, report: ReconciliationReport) -> bool:
+        import sqlite3
+        db_path = None
+        for row in self.conn.execute("PRAGMA database_list").fetchall():
+            if row[1] == "main":
+                db_path = row[2]
+                break
+
+        dropped = False
+        for col_name in extra_cols:
+            backup_path = f"{db_path}.bak" if db_path else None
+            if backup_path:
+                try:
+                    with sqlite3.connect(backup_path) as bck:
+                        self.conn.backup(bck)
+                except Exception as be:
+                    log.dual_log(tag="Database:Schema:BackupFailed", level="WARNING", message=f"Failed to backup before drop: {be}", payload={"table": table_name})
+                    backup_path = None
+
+            try:
+                # Drop dependent indexes first
+                indexes = self.conn.execute(f"PRAGMA index_list({table_name})").fetchall()
+                for idx in indexes:
+                    idx_name = idx[1]
+                    if idx_name.startswith("sqlite_autoindex"): continue
+                    idx_cols = self.conn.execute(f"PRAGMA index_info({idx_name})").fetchall()
+                    if any(c[2].lower() == col_name.lower() for c in idx_cols):
+                        self.conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
+                        log.dual_log(tag="Database:Schema:DropIndex", level="INFO", message=f"Dropped dependent index '{idx_name}'", payload={"index": idx_name})
+
+                log.dual_log(tag="Database:Schema:DropColumn", level="WARNING", message=f"[{self.label}] Dropping column '{col_name}' from {table_name}", payload={"table": table_name, "column": col_name})
+                self.conn.execute(f"ALTER TABLE {table_name} DROP COLUMN {col_name}")
+                dropped = True
+                report.add(ReconciliationAction(table_name, "altered", reason=f"DropColumn:{col_name}"))
+            except Exception as e:
+                log.dual_log(tag="Database:Schema:DropColumnFailed", level="WARNING", message=f"[{self.label}] Cannot drop column '{col_name}' from {table_name}: {e}. Fallback to table recreation required.", payload={"table": table_name, "column": col_name, "error": str(e)})
+                if backup_path:
+                    try:
+                        self.conn.rollback()
+                        with sqlite3.connect(backup_path) as bck:
+                            bck.backup(self.conn)
+                    except Exception as re:
+                        log.dual_log(tag="Database:Schema:RestoreFailed", level="ERROR", message=f"Failed to restore database from backup: {re}")
+                    raise RuntimeError(f"ALTER TABLE DROP COLUMN failed on {table_name}.{col_name}. Reverted database to pre-drop backup.") from e
+        return dropped
+
+    def _run_pending_auto_fills(self, pending_fills: dict, report: ReconciliationReport) -> None:
+        from database.schemas.column_defaults import get_filler
+        for table_name, new_columns in pending_fills.items():
+            for col_name in new_columns:
+                filler = get_filler(table_name, col_name)
+                if not filler:
+                    continue
+                try:
+                    row_count = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                    if row_count == 0:
+                        continue
+                    
+                    log.dual_log(tag="Database:Schema:AutoFill", level="INFO", message=f"[{self.label}] Auto-filling column '{col_name}' in {table_name}", payload={"table": table_name, "column": col_name, "rows": row_count})
+                    filled = filler(self.conn, table_name, col_name)
+                    log.dual_log(tag="Database:Schema:AutoFillComplete", level="INFO", message=f"[{self.label}] Auto-filled {filled} rows", payload={"table": table_name, "filled": filled})
+                except Exception as e:
+                    log.dual_log(tag="Database:Schema:AutoFillError", level="WARNING", message=f"[{self.label}] Auto-fill failed for '{col_name}': {e}", payload={"table": table_name, "error": str(e)})
 
     def _validate_triggers(self, report: ReconciliationReport):
         """Validate triggers with logging."""

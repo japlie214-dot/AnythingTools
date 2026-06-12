@@ -107,7 +107,8 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 
 ### Data Management Rules
 - Schema management is performed at startup via `database.management.reconciler`.
-- Cloud schema management (`SnowflakeSchemaManager`) is strictly additive (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD COLUMN`). It never drops data.
+- Local schema reconciliation uses surgical `ALTER TABLE` operations to add or drop columns. Column drops are protected by pre-drop backups via the SQLite native `.backup()` API and automated pruning of dependent indexes.
+- Cloud schema management (`SnowflakeSchemaManager`) supports bidirectional evolution, performing both `ADD COLUMN` and `DROP COLUMN` operations to maintain parity with the Operational DB.
 - SQLite DDL is transpiled to Snowflake DDL at runtime using `sqlglot`. Embedding fields (`float[1024]`) are dynamically mapped to Snowflake native `VECTOR(FLOAT, 1024)`.
 - **Constraint Handling**: The system strips `DEFAULT CURRENT_TIMESTAMP` from Snowflake DDL to avoid type mismatches between `VARCHAR` and `TIMESTAMP_LTZ`.
 
@@ -145,4 +146,5 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 ## 12. Change Sensitivity
 - **Extremely Fragile**: `database/writer.py` and `database/logs_writer.py`. Altering the queue logic, thread handling, and transaction boundaries here will cause immediate database locking or silent data loss.
 - **Tightly Coupled**: The `SyncEngine` synchronization (`database/backup/engine/`) heavily relies on `database/backup/schema_registry.py` for precise type mapping. Changing SQLite schemas requires verifying the `sqlglot` output for Snowflake.
+- **Schema Evolution**: The `database/management/reconciler` is tightly coupled with `database/schemas/column_defaults.py` for auto-filling computed columns (e.g., `content_hash`) after surgical additions.
 - **Easily Extensible**: Adding a new tool is trivial. Create a subclass of `BaseTool` in `tools/`, define an `INPUT_MODEL`, and it will be automatically discovered by `registry.py` and exposed via the `/api/manifest` endpoint.
