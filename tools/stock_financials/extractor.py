@@ -214,7 +214,7 @@ def upsert_quarterly_records(records: List[Dict[str, Any]]) -> int:
     columns = ["ticker", "statement_type", "concept", "label", "quarter", "period_end", "fiscal_period", "fiscal_year", "numeric_value", "unit", "period_type", "depth", "is_total", "concept_order", "content_hash", "extracted_at", "created_at", "updated_at"]
     
     sql = f"""INSERT INTO sf_quarterly_facts ({', '.join(columns)}) VALUES ({', '.join(['?']*len(columns))})
-              ON CONFLICT(ticker, statement_type, concept, quarter) DO UPDATE SET 
+              ON CONFLICT(ticker, statement_type, concept, quarter) DO UPDATE SET
               label=excluded.label, period_end=excluded.period_end, fiscal_period=excluded.fiscal_period, fiscal_year=excluded.fiscal_year, numeric_value=excluded.numeric_value, unit=excluded.unit, period_type=excluded.period_type, depth=excluded.depth, is_total=excluded.is_total, concept_order=excluded.concept_order, content_hash=excluded.content_hash, updated_at=CURRENT_TIMESTAMP"""
     
     batch_size = 500
@@ -224,20 +224,36 @@ def upsert_quarterly_records(records: List[Dict[str, Any]]) -> int:
         for r in chunk:
             r["concept"] = normalize_concept(r.get("concept"))
             r["quarter"] = r.get("quarter_label", "")
-            r["numeric_value"] = str(r.get("numeric_value", ""))
+            r["numeric_value"] = "" if pd.isna(r.get("numeric_value")) else str(r.get("numeric_value", ""))
             r["content_hash"] = compute_fact_hash(r)
             r["extracted_at"] = r.get("extracted_at", now_iso)
             r["created_at"] = r.get("created_at", now_iso)
+            r["updated_at"] = now_iso
+            
+            # Sanitize remaining NaN/NaT for SQLite insertion to prevent InterfaceError
+            for key, val in list(r.items()):
+                if pd.isna(val):
+                    r[key] = None
+                    
+            values = tuple(r.get(c, "" if c not in ("fiscal_year", "depth", "is_total", "concept_order") else 0) for c in columns)
+            statements.append((sql, values))
         enqueue_transaction(statements)
         
     cloud_batch_size = 5000
     for i in range(0, len(records), cloud_batch_size):
         chunk = records[i:i+cloud_batch_size]
+        
+        # Filter to only schema columns before sending to cloud
+        filtered_chunk = []
+        for r in chunk:
+            filtered = {c: r[c] for c in columns if c in r}
+            filtered_chunk.append(filtered)
+            
         try:
             # Composite primary key for Snowflake MERGE
-            enqueue_cloud_write_batch("sf_quarterly_facts", chunk, pk_col=["ticker", "statement_type", "concept", "quarter"])
+            enqueue_cloud_write_batch("sf_quarterly_facts", filtered_chunk, pk_col=["ticker", "statement_type", "concept", "quarter"])
         except Exception as e:
-            log.dual_log(tag="StockFin:Cloud:BatchFailed", level="WARNING", message=f"Cloud batch write failed: {e}", payload={"batch_size": len(chunk), "error": str(e)[:200]})
+            log.dual_log(tag="StockFin:Cloud:BatchFailed", level="WARNING", message=f"Cloud batch write failed: {e}", payload={"batch_size": len(filtered_chunk), "error": str(e)[:200]})
     return len(records)
 
 def extract_and_persist(ticker: str, num_quarters: int, refresh: bool, job_id: str | None = None) -> Dict[str, Any]:

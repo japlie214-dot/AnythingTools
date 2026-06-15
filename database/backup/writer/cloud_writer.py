@@ -1,5 +1,5 @@
 # database/backup/writer/cloud_writer.py
-"""database/backup/writer/cloud_writer.py
+"""
 Cloud writer thread for best-effort inline Snowflake writes.
 
 Replaces the old backup_writer.py which wrote to backup.db.
@@ -165,6 +165,9 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
                 if not records:
                     BackupMetricsCollector.record_flush(True)
                     continue
+
+                from database.backup.engine.type_sanitizer import sanitize_snowflake_params
+                records = sanitize_snowflake_params(records)
 
                 columns = list(records[0].keys())
                 

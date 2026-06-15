@@ -74,17 +74,42 @@ class StockNotesTool(BaseTool):
             force_refresh = instructions.get("force_refresh", False)
             conn = DatabaseManager.get_read_connection()
             
-            # Rehydration strategy: always rehydrate when drilling into a specific note
-            # (note_number provided), use cache only for listing view
-            if note_number is None:
-                exists_locally = conn.execute("SELECT 1 FROM sn_filings WHERE accession_no=?", (accession_no,)).fetchone()
-                if force_refresh or not exists_locally:
+            # Cache-first strategy: use local data unless explicitly refreshed or missing
+            exists_locally = conn.execute(
+                "SELECT 1 FROM sn_filings WHERE accession_no=?", (accession_no,)
+            ).fetchone()
+            
+            if force_refresh or not exists_locally:
+                try:
+                    await to_thread_with_context(
+                        extract_and_persist_filing, accession_no,
+                        ticker=ticker, job_id=job_id, force_refresh=force_refresh
+                    )
+                    await wait_for_writes(timeout=30.0)
+                    conn = DatabaseManager.get_read_connection()
+                except Exception as e:
+                    return _fail(f"Extraction failed: {e}", "Ensure valid accession_no and EDGAR connectivity.")
+            
+            if note_number is not None:
+                # Check if this specific note has been processed (exists in sn_notes)
+                note_exists = conn.execute(
+                    "SELECT 1 FROM sn_notes WHERE accession_no=? AND note_number=? LIMIT 1",
+                    (accession_no, note_number)
+                ).fetchone()
+                
+                if not note_exists and not force_refresh:
+                    # Auto-hydrate: filing might exist but this note is missing
                     try:
-                        await to_thread_with_context(extract_and_persist_filing, accession_no, ticker=ticker, job_id=job_id, force_refresh=force_refresh)
+                        await to_thread_with_context(
+                            extract_and_persist_filing, accession_no,
+                            ticker=ticker, job_id=job_id, force_refresh=False
+                        )
                         await wait_for_writes(timeout=30.0)
                         conn = DatabaseManager.get_read_connection()
                     except Exception as e:
-                        return _fail(f"Extraction failed: {e}", "Ensure valid accession_no and EDGAR connectivity.")
+                        log.dual_log(tag="StockNotes:AutoHydrate", level="WARNING",
+                                     message=f"Auto-hydration failed for note {note_number}: {e}",
+                                     payload={"accession_no": accession_no, "note_number": note_number})
             
             filing_row = conn.execute("SELECT ticker, form, company_name, period_of_report, quarter, year, fiscal_year_end_month FROM sn_filings WHERE accession_no=?", (accession_no,)).fetchone()
             if not filing_row:
