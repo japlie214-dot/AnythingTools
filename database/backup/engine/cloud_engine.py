@@ -110,16 +110,6 @@ class SnowflakeSchemaManager:
                 for col in desired_cols:
                     c_name = col.name.lower()
                     expected_sf_type = sqlite_type_to_snowflake(col.type)
-                    if c_name in existing[t_name]:
-                        actual_sf_type = existing[t_name][c_name]
-                        import re
-                        strip_act = re.sub(r'\(.*\)', '', actual_sf_type).upper()
-                        strip_exp = re.sub(r'\(.*\)', '', expected_sf_type).upper()
-                        if strip_act != strip_exp:
-                            mismatches.append(ColumnMismatch(
-                                column_name=c_name, actual_type=actual_sf_type,
-                                expected_type=expected_sf_type, is_primary_key=(col.pk > 0)
-                            ))
 
                 if mismatches:
                     timestamp = int(time.time())

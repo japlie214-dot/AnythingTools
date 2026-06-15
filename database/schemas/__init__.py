@@ -3,7 +3,7 @@
 import re
 from typing import Dict, Optional
 from database.connection import SQLITE_VEC_AVAILABLE
-from database.schemas import jobs, vector, logs, stock_notes, sync_audit
+from database.schemas import jobs, vector, logs, stock_notes, sync_audit, stock_financials
 
 # RULE: PERSISTED_TABLES must be an ordered list (parents before children) for FK-safe restores.
 # RULE: Derived/External FTS tables (e.g., scraped_articles_fts) must NEVER be included here.
@@ -20,6 +20,8 @@ PERSISTED_TABLES: list[str] = [
     "sn_notes",
     "sn_detail_registry",
     "sn_note_details",
+    "sf_tickers",
+    "sf_quarterly_facts",
 ]
 
 ALL_FTS_TABLES: Dict[str, str] = {
@@ -27,7 +29,7 @@ ALL_FTS_TABLES: Dict[str, str] = {
 }
 
 ALL_TABLES: Dict[str, str] = {
-    **jobs.TABLES, **vector.TABLES, **stock_notes.TABLES, **sync_audit.TABLES
+    **jobs.TABLES, **vector.TABLES, **stock_notes.TABLES, **sync_audit.TABLES, **stock_financials.TABLES
 }
 
 ALL_VEC_TABLES: Dict[str, str] = {

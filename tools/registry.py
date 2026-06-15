@@ -59,7 +59,7 @@ class ToolRegistry:
         package_dir = Path(__file__).parent
 
         # Load explicitly whitelisted core tools (No backup)
-        core_tools = ["scraper", "draft_editor", "publisher", "batch_reader", "stock_notes"]
+        core_tools = ["scraper", "draft_editor", "publisher", "batch_reader", "stock_notes", "stock_financials"]
         
         for tool_dir in core_tools:
             self._discover_tool(package_dir, tool_dir, temp_tools, temp_discovery)

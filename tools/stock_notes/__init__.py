@@ -1,109 +1,95 @@
 """tools/stock_notes/__init__.py
-Stock Notes Tool — SEC EDGAR Filing Footnote Explorer
-=====================================================
+Stock Notes Tool — SEC EDGAR Footnote Narrative and Tidy Concept Explorer
+========================================================================
 
-Explores, extracts, and queries financial footnotes from SEC EDGAR filings
-(10-K, 10-Q, 20-F, 6-K) using tidy XBRL data.
+An advanced footnote extraction and analysis tool that drills into detailed SEC 
+filing footnotes (10-K, 10-Q, 20-F, 6-K) to isolate narratives, parse embedded data 
+tables, and expose dimensional XBRL concepts (tidy-format).
 
-Interface:
-  command: "discover" | "note" | "details"
-  instructions: JSON object with command-specific parameters
+API Interface & Command Reference:
+----------------------------------
+All payloads must follow the nested JobCreateRequest structure, where commands are passed 
+inside the 'args' field:
 
-Workflow Guide
---------------
+1. COMMAND: "discover"
+   Finds and lists recent filings, exposing their accession numbers.
+   
+   Example Payload:
+   {
+     "command": "discover",
+     "instructions": {
+       "ticker": "AAPL",
+       "forms": "10-K,10-Q"
+     }
+   }
 
-Step 1: Discover Filings
-    Find the unique accession_no for recent filings.
-    command: "discover"
-    instructions: {"ticker": "AAPL", "forms": "10-K,10-Q"}
-    
-    This queries the SEC EDGAR API and returns a table of recent filings,
-    including their date, period, and accession_no. No data is stored yet.
+2. COMMAND: "note" (Listing Index View)
+   Retrieve a list of all notes (Note 1, Note 2, etc.) inside a specific filing.
+   This view uses the local operational database cache by default.
+   
+   Example Payload:
+   {
+     "command": "note",
+     "instructions": {
+       "accession_no": "0000320193-26-000013"
+     }
+   }
 
-Step 2: List Notes in a Filing (The Index Phase)
-    Find available notes inside a specific filing and see what concepts they hold.
-    command: "note"
-    instructions: {"accession_no": "0000320193-26-000013"}
-    
-    This retrieves a list of all notes (Note 1, Note 2, etc.) along with a
-    short preview of the primary XBRL concepts detected within each note.
-    Data is cached locally; no re-extraction occurs for the listing view.
+3. COMMAND: "note" (Drill-Down / Hydration View)
+   Specify a 'note_number' to unpack a note's full text and generate a queryable Concept Catalog.
+   
+   Example Payload:
+   {
+     "command": "note",
+     "instructions": {
+       "accession_no": "0000320193-26-000013",
+       "note_number": 6,
+       "force_refresh": false
+     }
+   }
+   
+   *Conditional Hydration Mechanics:*
+     By default, if a note's details have already been cached locally, it loads instantly 
+     from the database to save bandwidth. Pass `"force_refresh": true` to force-purge 
+     local records and rehydrate fresh tables from SEC EDGAR.
 
-Step 3: Open a Specific Note (The "Hydration" Phase)
-    Extract the detailed narrative and display the Concept Catalog for a specific note.
-    command: "note"
-    instructions: {"accession_no": "0000320193-26-000013", "note_number": 6}
-    
-    HYDRATION DETAILS:
-    When you specify a note_number, the system ALWAYS rehydrates: it deletes
-    any existing cached data for this filing and re-extracts fresh data from
-    SEC EDGAR. This ensures data freshness even if the original filing was
-    amended or the previous extraction was interrupted.
+4. COMMAND: "details"
+   Extract historical time-series data across filings for a specific XBRL concept.
+   
+   Example Payload:
+   {
+     "command": "details",
+     "instructions": {
+       "ticker": "AAPL",
+       "concept": "us-gaap_LongTermDebt",
+       "start_date": "2024-09",
+       "end_date": "2026-03"
+     }
+   }
+   
+   *Concept Note:* Copy concept names directly from the quick queries displayed in Step 3's Concept Catalog.
 
-    WHY REHYDRATION IS MANDATORY:
-    - Amended filings (10-K/A, 10-Q/A) supersede original data
-    - Previous extractions may have been interrupted by network errors
-    - Schema evolution requires re-extraction in the current format
-    - SEC EDGAR occasionally revises filing data post-submission
-
-    WHAT HAPPENS DURING REHYDRATION:
-    1. All existing rows for this accession_no are deleted from:
-       - sn_note_details (tidy data rows)
-       - sn_detail_registry (concept catalog metadata)
-       - sn_notes (note metadata and narratives)
-    2. Filing data is re-extracted from SEC EDGAR
-    3. Fresh data is written to both Operational and Cloud Backup databases
-    4. The Concept Catalog is rebuilt from the new data
-
-    CONCEPT CATALOG:
-    The catalog shows up to 50 queryable XBRL concepts with:
-    - Concept name (e.g., us-gaap_LongTermDebt)
-    - Human-readable label (e.g., Long-Term Debt)
-    - Dimension axis and member for dimensional breakdowns
-    - Period count and date range coverage
-    - Quick Query templates for copy-paste into the details command
-
-    TROUBLESHOOTING:
-    - If rehydration fails with a connection error, retry after a few minutes
-    - If rehydration fails with a rate limit error, wait 1+ minute before retrying
-    - If data appears incorrect, verify the accession_no matches the intended
-      filing (amended filings have different accession numbers)
-
-Step 4: Query Details by Concept
-    Extract historical time-series data (up to 500 rows) across filings for a
-    specific XBRL concept.
-    command: "details"
-    instructions: {"ticker": "AAPL", "concept": "us-gaap_LongTermDebt", "start_date": "2024-09", "end_date": "2026-03"}
-    
-    The concept name and suggested start/end date ranges are copied directly
-    from the Quick Queries shown in Step 3's Concept Catalog.
-
-Schema:
--------
-{
-  "type": "object",
-  "properties": {
-    "command": {
-      "type": "string",
-      "description": "REQUIRED: The action to perform. Must be one of: 'discover', 'note', 'details'."
-    },
-    "instructions": {
-      "type": "object",
-      "description": "REQUIRED: A JSON object containing the parameters required for the command."
-    }
-  },
-  "required": ["command", "instructions"]
-}
-
-Developer Notes:
-----------------
-- Rehydration: Always performed when note_number is provided. Listing view uses cache.
-- Backup Integration: All writes to sn_note_details, sn_notes, and sn_detail_registry
-  are synced to Snowflake via inline dual-write (no read-back pattern).
-- Rate Limiting: Synchronous sliding-window rate limiting prevents SEC IP bans.
-- Resume Mechanism: Supports note-level resumption during extraction.
-- Deterministic PKs: sn_detail_registry uses MD5(ticker|table_name|accession_no|note_number)
-  as the primary key to prevent Snowflake MERGE duplicate row errors.
+Troubleshooting and Diagnostics:
+-------------------------------
+  1. ISSUE: "No data found for concept" or Empty Concept Catalog
+     - Resolution: The footnote has not been hydrated. Run the `note` command specifying 
+       the `accession_no` and `note_number` to rehydrate the catalog and its tidy rows.
+  2. ISSUE: amended Filings (10-K/A, 10-Q/A) or Stale Cached Data
+     - Resolution: Amended filings have different accession numbers. If you need to force-purge 
+       the cache for an existing accession number, execute the `note` command with 
+       `"force_refresh": true`.
+  3. ISSUE: Footnote Tables Missing Columns or Corrupted Values
+     - Resolution: Footnotes can contain extremely irregular tables with highly customized 
+       company-specific columns. The extractor converts non-standard tables into tidy rows. 
+       Use the "details" command to query the flattened concept values.
+  4. ISSUE: AnythingLLM Integration - "Files not showing up"
+     - Resolution: The long narratives are written directly to AnythingLLM's `custom-documents/` 
+       directory via `artifact_manager.py`. Never try to send the raw markdown file as a 
+       base64 string attachment; let AnythingLLM ingest it natively from the workspace path.
+  5. ISSUE: Unique Constraint Violations / duplicate rows on Snowflake Cloud
+     - Resolution: `sn_detail_registry` uses an MD5 hash of `(ticker, detail_table_name, accession_no, note_number)` 
+       as the primary key to ensure idempotent, duplicate-free Snowflake merging. If you experience 
+       reconciliation errors, check '/api/diagnostics'.
 """
 
 from .tool import StockNotesTool

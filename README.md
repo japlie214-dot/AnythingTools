@@ -42,18 +42,18 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
     - `schemas/`: Canonical SQL definitions.
     - `backup/`: The SyncEngine system. Contains `engine/` (`SyncEngine`, `CloudEngine`), `sync/` (`DiffEngine`, `resolution`, `smart_recommender`), and `writer/` (`cloud_writer.py` for async Snowflake writes).
     - `broadcast/`: Domain logic for Telegram publishing state.
-    - `management/`: Schema reconciliation and database health checks.
+    - `management/`: Schema reconciliation, migration coordination, and database health checks.
 - `tools/`:
     - `base.py`: Abstract base class and `ResumeReport` contracts.
     - `registry.py`: Whitelist-based dynamic tool discovery.
     - `scraper/`: Browser-based extraction, hitl escalation, and LLM curation.
     - `publisher/`: Telegram delivery pipeline with sliding-window rate limiting.
     - `draft_editor/`: Atomic manipulation of curated lists.
-    - `stock_notes/`: SEC EDGAR footnote extraction and tidy-format financial data storage.
+    - `stock_financials/`: SEC EDGAR quarterly fact extraction and tabular storage.
+    - `stock_notes/`: SEC EDGAR footnote extraction, tidy-format transformation, and concept cataloging.
     - `batch_reader/`: Hybrid semantic + keyword search across batches.
 - `utils/`: Cross-cutting utilities (logging, artifact management, browser daemon, SoM Javascript injection, rate limiters, text sanitization).
-- `scripts/`: Maintenance utilities.
-- `deprecated/`: Legacy logic (e.g., `bot/core/agent.py`, `tools/finance/`) that has been superseded by the current modular tool architecture.
+- `deprecated/`: Legacy logic (e.g., `tools/finance/`) that has been superseded by the current modular tool architecture.
 
 ## 4. Core Concepts & Domain Model
 ### Key Abstractions
@@ -85,6 +85,15 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **Sync Conflicts (Split-Brain)**: If versions of a row differ between Operational and Cloud states, `ConflictResolver` flags it. The system employs automated strategies (`newest_overall_wins`, etc.) or escalates to the `UserConfirmationHandler` for manual terminal-based decision.
 - **Circuit Breaking**: If Snowflake is unreachable, `CircuitBreaker` opens, and CloudEngine operations fail fast. The system operates locally and sets a `sync_pending` flag for future reconciliation.
 
+### Financial Data Extraction Workflow (SEC EDGAR)
+The `stock_financials` and `stock_notes` tools implement a multi-stage pipeline:
+1. **Discovery**: Identify relevant filings (10-K, 10-Q) via SEC EDGAR.
+2. **Extraction**: 
+    - `stock_financials`: Extracts quarterly facts into `sf_quarterly_facts`.
+    - `stock_notes`: Extracts full filing text, identifies footnotes, and decomposes them into "tidy" detail tables.
+3. **Transformation**: `stock_notes` uses a `tidy_transform` process to convert complex XBRL/HTML tables into a normalized `sn_note_details` format.
+4. **Querying**: Provides a "Concept Catalog" allowing users to query specific financial concepts (e.g., `us-gaap:Assets`) across time series.
+
 ## 6. Public Interfaces
 ### REST API
 - `POST /api/tools/{tool_name}`: Enqueues a tool execution. Requires valid payload matching the tool's `INPUT_MODEL`.
@@ -99,55 +108,52 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - `REGISTRY.schema_list()`: Returns MCP-compatible tool definitions.
 
 ## 7. State, Persistence, and Data
-### Storage Locations
-- **Operational DB (`data/sumanal.db`)**: Source of truth for `jobs`, `job_items`, `scraped_articles`, `broadcast_batches`, `sn_filings`, `sn_notes`, `sn_detail_registry`, `sn_note_details`, and the `sync_ledger`.
-- **Telemetry DB (`data/logs.db`)**: High-throughput event store. Recreated fresh on every application startup.
-- **Snowflake**: Cloud target for analytical querying and remote backup.
-- **Artifacts (`data/temp/multimodal` / `artifacts/`)**: Ephemeral or receipt files (JSON, screenshots) served via the API.
+### Operational Storage (SQLite)
+- **`jobs` / `job_items`**: Core task tracking and granular progress logs.
+- **`sf_tickers` / `sf_quarterly_facts`**: Cached financial data. `sf_quarterly_facts` uses a composite PK `(ticker, statement_type, concept, quarter)`.
+- **`sn_filings` / `sn_notes` / `sn_note_details`**: SEC filing hierarchy. `sn_note_details` stores normalized footnote data.
+- **`dead_letter_queue`**: Stores failed cloud writes for manual recovery.
 
-### Data Management Rules
-- Schema management is performed at startup via `database.management.reconciler`.
-- Local schema reconciliation uses surgical `ALTER TABLE` operations to add or drop columns. Column drops are protected by pre-drop backups via the SQLite native `.backup()` API and automated pruning of dependent indexes.
-- **Operational Migration Pipeline**: For critical type or constraint drift, the system implements a schema-driven migration pipeline: `Clone` $\rightarrow$ `Recreate` $\rightarrow$ `Repopulate` $\rightarrow$ `Autofill` $\rightarrow$ `Validate`. This ensures data is preserved and validated before any destructive schema changes are finalized.
-- Cloud schema management (`SnowflakeSchemaManager`) supports bidirectional evolution, performing both `ADD COLUMN` and `DROP COLUMN` operations to maintain parity with the Operational DB.
-- SQLite DDL is transpiled to Snowflake DDL at runtime using `sqlglot`. Embedding fields (`float[1024]`) are dynamically mapped to Snowflake native `VECTOR(FLOAT, 1024)`.
-- **Cloud Rebuild Pipeline**: When Snowflake type drift is detected, the system performs a full table rebuild using the operational DB as the source of truth. This utilizes a temporary staging table and `INSERT INTO ... SELECT` syntax to bypass Snowflake `VALUES` clause compilation limits for `VECTOR` types.
-- **Constraint Handling**: The system strips `DEFAULT CURRENT_TIMESTAMP` from Snowflake DDL to avoid type mismatches between `VARCHAR` and `TIMESTAMP_LTZ`. To maintain integrity, timestamps are generated in Python and explicitly inserted.
+### Cloud Storage (Snowflake)
+- **Mirroring**: Every persisted SQLite table is mirrored in Snowflake.
+- **Vector Storage**: Tables containing `embedding` columns are pushed using the `VectorSync` engine, mapping SQLite BLOBs to Snowflake `VECTOR(FLOAT, 1024)`.
+- **Composite Keys**: The `cloud_writer` supports both single-column (`id`) and composite PKs (passed as tuples) to generate `MERGE` statements in Snowflake, ensuring idempotency.
 
 ## 8. Dependencies & Integration
-- **FastAPI**: REST API layer.
-- **SQLite (stdlib)**: Primary persistence mechanism.
-- **sqlite-vec**: C extension for vector similarity search (`MATCH`).
-- **Snowflake-SQLAlchemy & Cryptography**: Connection pooling, key-pair authentication, and `INSERT` operations for cloud sync.
-- **sqlglot**: SQL dialect transpilation (SQLite -> Snowflake).
-- **Pydantic & Pydantic-Settings**: Data validation, input schema generation, and strict environment configuration (`BackupSettings`).
-- **Botasaurus**: Chrome automation (stealth, CDP interactions).
-- **python-telegram-bot**: Passive delivery of translated briefings.
-- **OpenAI SDK**: Interface to Azure OpenAI and Chutes (Llama 3) models.
+- **LLM Providers**: Azure OpenAI and Chutes (via `clients/llm/`).
+- **Browser Automation**: Botasaurus / Chrome (via `utils/browser_daemon.py`).
+- **Database**: SQLite (Operational) and Snowflake (Backup/Analytics).
+- **Frameworks**: FastAPI (API), Pydantic (Validation), SQLAlchemy (Cloud Connectivity), Pandas (Data Processing).
 
 ## 9. Setup, Build, and Execution
-1. Install dependencies: `pip install -r requirements.txt`. (Requires compiling `sqlite-vec` if not using pre-built wheels).
-2. Configure `.env` file (parsed by `pydantic-settings` for backup) and environment variables for legacy configs (`config.py`).
-    - Required: `API_KEY`, `AZURE_ENDPOINT`, `EDGAR_IDENTITY`.
-    - Optional Backup: `BACKUP_CLOUD__ACCOUNT`, `BACKUP_CLOUD__USER`, etc.
-3. Run the application: `python -m uvicorn app:app --reload --port 8000`.
-4. *Startup Sequence*: The app enforces `WEB_CONCURRENCY=1`, mounts static artifacts, drops and recreates `logs.db`, validates `sqlite-vec`, runs schema migrations, initializes the `SyncEngine` and `cloud_writer`, executes a cloud pull sync, and warms up the browser daemon.
+### Environment Configuration
+Requires a `.env` file containing:
+- `API_KEY`: Authentication for the REST API.
+- `SNOWFLAKE_*`: Credentials for cloud backup.
+- `AZURE_OPENAI_*` / `CHUTES_*`: LLM API keys.
+- `EDGAR_IDENTITY`: Required for SEC EDGAR access.
+
+### Execution
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Start the service
+python -m uvicorn app:app --port 8000
+```
+*Note: Must be run with `WEB_CONCURRENCY=1` to prevent database corruption.*
 
 ## 10. Testing & Validation
-- **Health Checks**: Extensive runtime health checks during startup (e.g., PRAGMA `integrity_check`, CDP ping probes in `ChromeDaemonManager`).
-- **Diagnostics API**: `/api/diagnostics` and `/api/metrics` expose queue depths, dropped logs, and active job counts.
-- **Unit/Integration Testing**: Test suites exist for E2E browser flows and backup mechanics.
-- **Gaps**: Isolated unit test coverage is low for individual agent actions; heavily reliant on E2E flows and manual log reconstruction.
+- **`tests/test_backup.py`**: Validates the `SyncEngine`'s ability to detect and resolve drifts between SQLite and Snowflake.
+- **`tests/inspect_notes.py`**: Validates the extraction and tidy-transformation of SEC footnotes.
+- **`tests/test_browser_e2e.py`**: End-to-end validation of the browser-tool-orchestrator loop.
 
 ## 11. Known Limitations & Non-Goals
-- **Single-Node Limitation**: The architecture strictly relies on in-memory locks (`browser_lock.py`), in-memory context variables (`utils/logger/state.py`), and a local SQLite WAL. It cannot be horizontally scaled across multiple containers.
-- **Browser State Fragility**: Relying on headless/headful Chrome introduces inherent fragility regarding CDP timeouts, zombie processes, and changing target DOMs.
-- **Telegram Limits**: Global API rate limits are heavily constrained; `SlidingWindowRateLimiter` ensures compliance but forces slow, serialized delivery of large news batches.
-- **Memory Consumption**: `DiffEngine` uses SQLite temp tables to avoid Python OOMs, but massive data transfers in Snowflake may still incur noticeable memory overhead in SQLAlchemy.
+- **SQLite Locking**: While the single-writer pattern mitigates locking, extremely high write volumes may still cause contention.
+- **Browser Overhead**: Chrome instances are resource-intensive; the system limits execution to one browser-tool at a time.
+- **Cloud Latency**: Real-time Snowflake writes are "best-effort"; the `SyncEngine` is the final authority for data consistency.
 
 ## 12. Change Sensitivity
-- **Extremely Fragile**: `database/writer.py` and `database/logs_writer.py`. Altering the queue logic, thread handling, and transaction boundaries here will cause immediate database locking or silent data loss.
-- **Type-Sensitive**: `database/backup/engine/cloud_engine.py` and `database/backup/writer/cloud_writer.py`. The interaction between the Snowflake Python connector's query optimizer and the native `VECTOR` type is highly specific; changing the `INSERT ... SELECT` or staging table pattern will likely trigger `InterfaceError` or compilation failures.
-- **Tightly Coupled**: The `SyncEngine` synchronization (`database/backup/engine/`) heavily relies on `database/backup/schema_registry.py` for precise type mapping. Changing SQLite schemas requires verifying the `sqlglot` output for Snowflake.
-- **Schema Evolution**: The `database/management/reconciler` is tightly coupled with `database/schemas/column_defaults.py` for auto-filling computed columns (e.g., `content_hash`) after surgical additions.
-- **Easily Extensible**: Adding a new tool is trivial. Create a subclass of `BaseTool` in `tools/`, define an `INPUT_MODEL`, and it will be automatically discovered by `registry.py` and exposed via the `/api/manifest` endpoint.
+- **Schema Changes**: Any change to `database/schemas/` requires a corresponding migration. The `SchemaReconciler` will detect mismatches and may trigger a table recreation (clone $\rightarrow$ drop $\rightarrow$ recreate $\rightarrow$ repopulate).
+- **Tool Interface**: Modifying `INPUT_MODEL` in a tool changes the API contract and the `manifest` exposed to the LLM.
+- **Snowflake DDL**: Changes to the cloud schema must be managed via `BackupSchemaRegistry` to ensure `sqlglot` transpilation remains consistent.

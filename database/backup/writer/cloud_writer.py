@@ -1,3 +1,4 @@
+# database/backup/writer/cloud_writer.py
 """database/backup/writer/cloud_writer.py
 Cloud writer thread for best-effort inline Snowflake writes.
 
@@ -15,7 +16,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Union, Tuple
 from sqlalchemy import text
 
 from utils.logger import get_dual_logger
@@ -29,7 +30,7 @@ class CloudWriteTask:
     table_name: str
     operation: str  # UPSERT, DELETE
     records: List[dict]
-    pk_col: str = "id"
+    pk_col: Union[str, Tuple[str, ...]] = "id"
 
 
 # Global cloud write queue
@@ -68,13 +69,15 @@ def start_cloud_writer(cloud_engine: Optional[Any] = None):
     )
 
 
-def enqueue_cloud_write(table_name: Any, row_data: Optional[dict] = None, pk_col: str = "id"):
+def enqueue_cloud_write(table_name: Any, row_data: Optional[dict] = None, pk_col: Union[str, Tuple[str, ...], List[str]] = "id"):
     """Enqueue a best-effort cloud write. Non-blocking.
 
     Supports polymorphic signature:
     - enqueue_cloud_write(task: CloudWriteTask)
     - enqueue_cloud_write(table_name: str, row_data: dict, pk_col: str = "id")
     """
+    if isinstance(pk_col, list):
+        pk_col = tuple(pk_col)
     try:
         if isinstance(table_name, CloudWriteTask):
             cloud_write_queue.put_nowait(table_name)
@@ -86,8 +89,10 @@ def enqueue_cloud_write(table_name: Any, row_data: Optional[dict] = None, pk_col
         log.dual_log(tag="Backup:Writer:QueueFull", level="DEBUG", message=f"Queue full, dropping write for {target_name}", payload={"table": target_name})
 
 
-def enqueue_cloud_write_batch(table_name: str, records: list, pk_col: str = "id"):
+def enqueue_cloud_write_batch(table_name: str, records: list, pk_col: Union[str, Tuple[str, ...], List[str]] = "id"):
     """Enqueue a batch of records for best-effort cloud upsert."""
+    if isinstance(pk_col, list):
+        pk_col = tuple(pk_col)
     try:
         task = CloudWriteTask(table_name=table_name, operation="UPSERT", records=records, pk_col=pk_col)
         cloud_write_queue.put_nowait(task)
@@ -95,10 +100,13 @@ def enqueue_cloud_write_batch(table_name: str, records: list, pk_col: str = "id"
         log.dual_log(tag="Backup:Writer:QueueFull", level="DEBUG", message=f"Queue full, dropping batch for {table_name}", payload={"table": table_name, "batch_size": len(records)})
 
 
-def enqueue_cloud_delete(table_name: str, pk_val: str, pk_col: str = "id"):
+def enqueue_cloud_delete(table_name: str, pk_val: Any, pk_col: Union[str, Tuple[str, ...], List[str]] = "id"):
     """Enqueue a best-effort cloud delete (by PK)."""
+    if isinstance(pk_col, list):
+        pk_col = tuple(pk_col)
+    records = [pk_val] if isinstance(pk_col, tuple) else [{pk_col: pk_val}]
     try:
-        task = CloudWriteTask(table_name=table_name, operation="DELETE", records=[{pk_col: pk_val}], pk_col=pk_col)
+        task = CloudWriteTask(table_name=table_name, operation="DELETE", records=records, pk_col=pk_col)
         cloud_write_queue.put_nowait(task)
     except queue.Full:
         log.dual_log(tag="Backup:Writer:QueueFull", level="DEBUG", message=f"Queue full, dropping delete for {table_name}", payload={"table": table_name, "pk": pk_val})
@@ -137,13 +145,20 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
         try:
             with cloud_engine.engine.begin() as conn:
                 schema = cloud_engine.settings.schema_name
+                pk_cols = [pk_col] if isinstance(pk_col, str) else list(pk_col)
 
                 if operation == "DELETE":
-                    pk_vals = [r[pk_col] for r in records if pk_col in r]
-                    if pk_vals:
-                        placeholders = ",".join([f":p{i}" for i in range(len(pk_vals))])
-                        params = {f"p{i}": val for i, val in enumerate(pk_vals)}
-                        conn.execute(text(f"DELETE FROM {schema}.{table_name} WHERE {pk_col} IN ({placeholders})"), params)
+                    if isinstance(pk_col, str):
+                        pk_vals = [r[pk_col] for r in records if pk_col in r]
+                        if pk_vals:
+                            placeholders = ",".join([f":p{i}" for i in range(len(pk_vals))])
+                            params = {f"p{i}": val for i, val in enumerate(pk_vals)}
+                            conn.execute(text(f"DELETE FROM {schema}.{table_name} WHERE {pk_col} IN ({placeholders})"), params)
+                    else:
+                        for r in records:
+                            conds = " AND ".join([f"{c} = :{c}" for c in pk_cols])
+                            params = {c: r[c] for c in pk_cols if c in r}
+                            conn.execute(text(f"DELETE FROM {schema}.{table_name} WHERE {conds}"), params)
                     BackupMetricsCollector.record_flush(True)
                     continue
 
@@ -153,10 +168,13 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
 
                 columns = list(records[0].keys())
                 
-                # Deduplicate records by pk_col (keep only the latest/newest record for each PK in this batch)
+                # Deduplicate records by pk_cols (keep only the latest/newest record for each PK in this batch)
                 deduped_records = {}
                 for r in records:
-                    pk_val = r.get(pk_col)
+                    if isinstance(pk_col, str):
+                        pk_val = r.get(pk_col)
+                    else:
+                        pk_val = tuple(r.get(c) for c in pk_cols) if all(c in r for c in pk_cols) else None
                     if pk_val is not None:
                         deduped_records[pk_val] = r
                     else:
@@ -201,11 +219,14 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
                     insert_placeholders = ",".join([f":{c}" for c in columns])
                     conn.execute(text(f"INSERT INTO {schema}.{stage_table} VALUES ({insert_placeholders})"), records)
 
+                    merge_on = " AND ".join([f"t.{c} = s.{c}" for c in pk_cols])
+                    update_set = ", ".join([f"t.{c} = s.{c}" for c in columns if c not in pk_cols])
+                    
                     merge_sql = f"""
                     MERGE INTO {schema}.{table_name} t
                     USING {schema}.{stage_table} s
-                    ON t.{pk_col} = s.{pk_col}
-                    WHEN MATCHED THEN UPDATE SET {", ".join([f"t.{c} = s.{c}" for c in columns if c != pk_col])}
+                    ON {merge_on}
+                    WHEN MATCHED THEN UPDATE SET {update_set}
                     WHEN NOT MATCHED THEN INSERT ({",".join(columns)}) VALUES ({",".join([f"s.{c}" for c in columns])})
                     """
                     result = conn.execute(text(merge_sql))

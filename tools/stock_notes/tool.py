@@ -1,3 +1,4 @@
+# tools/stock_notes/tool.py
 import json
 from typing import Any
 from tools.base import BaseTool
@@ -84,14 +85,6 @@ class StockNotesTool(BaseTool):
                         conn = DatabaseManager.get_read_connection()
                     except Exception as e:
                         return _fail(f"Extraction failed: {e}", "Ensure valid accession_no and EDGAR connectivity.")
-            else:
-                # Detail view: always rehydrate for freshness
-                try:
-                    await to_thread_with_context(extract_and_persist_filing, accession_no, ticker=ticker, job_id=job_id, force_refresh=True)
-                    await wait_for_writes(timeout=30.0)
-                    conn = DatabaseManager.get_read_connection()
-                except Exception as e:
-                    return _fail(f"Extraction failed: {e}", "Ensure valid accession_no and EDGAR connectivity.")
             
             filing_row = conn.execute("SELECT ticker, form, company_name, period_of_report, quarter, year, fiscal_year_end_month FROM sn_filings WHERE accession_no=?", (accession_no,)).fetchone()
             if not filing_row:
