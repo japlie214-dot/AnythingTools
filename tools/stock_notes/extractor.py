@@ -157,7 +157,9 @@ def extract_and_persist_filing(accession_no: str, ticker: str = "", form: str = 
                                 detail_title = str(d)[:100].split("\n")[0] if str(d) else f"Detail {di}"
                             except Exception:
                                 pass
-                            dt_name = re.sub(r'[^a-zA-Z0-9]', '_', detail_title or f"Note{note.number}_D{di}")[:50].strip('_')
+                            # Strip whitespaces to ensure correct fallback, and append the unique loop index (_D{di}) to guarantee no duplicate names
+                            safe_title = (detail_title or "").strip()
+                            dt_name = re.sub(r'[^a-zA-Z0-9]', '_', safe_title or f"Note{note.number}_D{di}")[:40].strip('_') + f"_D{di}"
                             
                             try:
                                 tidy_records, unique_concepts = transform_to_tidy(df, ticker, form, accession_no, note.number, di)

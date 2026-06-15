@@ -1,4 +1,4 @@
-"""
+"""tools/stock_notes/__init__.py
 Stock Notes Tool — SEC EDGAR Filing Footnote Explorer
 =====================================================
 

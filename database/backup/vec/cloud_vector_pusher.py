@@ -99,6 +99,9 @@ class VectorSync:
     def _push_batch(self, cloud_conn, schema: str, table_name: str, columns: List[str], batch: List[Dict], pk_col: str) -> int:
         stage_table = f"{table_name}_stage"
         
+        from database.backup.schema_registry import BackupSchemaRegistry
+        expected_types = BackupSchemaRegistry.expected_snowflake_types(table_name)
+        
         stage_col_defs = []
         for col in columns:
             if col == "embedding":
@@ -106,7 +109,7 @@ class VectorSync:
             elif col in ("rowid", pk_col):
                 stage_col_defs.append(f"{col} NUMBER")
             else:
-                stage_col_defs.append(f"{col} VARCHAR")
+                stage_col_defs.append(f"{col} {expected_types.get(col.lower(), 'VARCHAR')}")
 
         stage_ddl = f"CREATE OR REPLACE TEMPORARY TABLE {schema}.{stage_table} ({', '.join(stage_col_defs)})"
         cloud_conn.execute(text(stage_ddl))

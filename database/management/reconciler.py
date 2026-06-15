@@ -10,6 +10,7 @@ This reconciler operates exclusively on schemas passed as arguments:
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
+from database.management.migration_types import TypeMismatchPlan, ColumnMismatch
 
 from database.management.schema_introspector import (
     schema_matches, table_exists, trigger_exists,
@@ -32,6 +33,7 @@ class ReconciliationAction:
 class ReconciliationReport:
     actions: List[ReconciliationAction] = field(default_factory=list)
     master_tables_recreated: List[str] = field(default_factory=list)
+    type_mismatch_plans: List[TypeMismatchPlan] = field(default_factory=list)
 
     def add(self, action: ReconciliationAction) -> None:
         self.actions.append(action)
@@ -116,6 +118,10 @@ class SchemaReconciler:
                 log.dual_log(tag="Database:Schema:PreserveShadow", message=f"[{self.label}] Preserving shadow: {table}", payload={"label": self.label, "table": table, "action": "preserve_shadow"})
                 continue
             
+            if table.startswith("_migrate_") or table.startswith("_old_"):
+                log.dual_log(tag="Database:Schema:PreserveClone", message=f"[{self.label}] Preserving migration clone: {table}", payload={"label": self.label, "table": table})
+                continue
+            
             if table.startswith("sn_dt_"):
                 log.dual_log(tag="Database:Schema:PreserveDynamic", message=f"[{self.label}] Preserving dynamic table: {table}", payload={"label": self.label, "table": table, "action": "preserve_dynamic"})
                 continue
@@ -175,6 +181,20 @@ class SchemaReconciler:
             
             altered = False
             
+            if type_mismatches or constraint_mismatches:
+                is_master = name in self.master_tables
+                plan = self._compute_mismatch_plan(name, ddl, type_mismatches, constraint_mismatches, is_master)
+                report.type_mismatch_plans.append(plan)
+                
+                reason_parts = []
+                if type_mismatches: reason_parts.append(f"type_drift: {len(type_mismatches)}")
+                if constraint_mismatches: reason_parts.append(f"constraint_drift: {len(constraint_mismatches)}")
+                reason = '; '.join(reason_parts)
+                report.add(ReconciliationAction(name, "needs_migration", is_master, reason))
+                continue  # Skip alters as the entire table is being dropped and recreated
+                
+            altered = False
+            
             if missing:
                 if self._add_missing_columns(name, ddl, missing, desired_cols, report):
                     altered = True
@@ -183,21 +203,15 @@ class SchemaReconciler:
             if extra:
                 if self._drop_extra_columns(name, extra, report):
                     altered = True
-
-            if type_mismatches or constraint_mismatches:
                 is_master = name in self.master_tables
-                if is_master:
-                    self._snapshot_master(name)
+                plan = self._compute_mismatch_plan(name, ddl, type_mismatches, constraint_mismatches, is_master)
+                report.type_mismatch_plans.append(plan)
                 
                 reason_parts = []
                 if type_mismatches: reason_parts.append(f"type_drift: {len(type_mismatches)}")
                 if constraint_mismatches: reason_parts.append(f"constraint_drift: {len(constraint_mismatches)}")
                 reason = '; '.join(reason_parts)
-                
-                log.dual_log(tag="Database:Schema:RecreateTable", level="WARNING", message=f"[{self.label}] Recreating {name} due to: {reason}", payload={"label": self.label, "table": name, "reason": reason})
-                self.conn.execute(f"DROP TABLE IF EXISTS {name}")
-                self.conn.executescript(ddl)
-                report.add(ReconciliationAction(name, "recreated", is_master, reason))
+                report.add(ReconciliationAction(name, "needs_migration", is_master, reason))
             elif altered:
                 pass # report already updated in sub-methods
             else:
@@ -205,6 +219,49 @@ class SchemaReconciler:
                 report.add(ReconciliationAction(name, "unchanged"))
                 
         return pending_fills
+
+    def _compute_mismatch_plan(self, table_name: str, ddl: str, type_mismatches: list, constraint_mismatches: list, is_master: bool) -> TypeMismatchPlan:
+        """Compute a migration plan from detected mismatches."""
+        import time
+        timestamp = int(time.time())
+        clone_name = f"_migrate_{table_name}_{timestamp}"
+        
+        mismatches = [
+            ColumnMismatch(
+                column_name=col_name,
+                actual_type=actual.type,
+                expected_type=desired.type,
+                is_primary_key=False
+            )
+            for col_name, actual, desired in type_mismatches
+        ]
+        
+        pk_col = "id"
+        for c in _get_columns(self.conn, table_name):
+            if c.pk > 0:
+                pk_col = c.name
+                
+        for m in mismatches:
+            if m.column_name.lower() == pk_col.lower():
+                object.__setattr__(m, 'is_primary_key', True)
+                
+        try:
+            row_count = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        except Exception:
+            row_count = 0
+            
+        columns_to_skip = [m.column_name for m in mismatches]
+        
+        return TypeMismatchPlan(
+            table_name=table_name,
+            mismatches=mismatches,
+            clone_table_name=clone_name,
+            new_ddl=ddl,
+            columns_to_skip=columns_to_skip,
+            pk_column=pk_col,
+            total_rows=row_count,
+            is_master=is_master
+        )
 
     def _add_missing_columns(self, table_name: str, ddl: str, missing_cols: list, desired_cols: dict, report: ReconciliationReport) -> bool:
         from database.management.schema_introspector import _extract_default_from_ddl
@@ -370,23 +427,3 @@ class SchemaReconciler:
                 self.conn.executescript(ddl)
                 report.add(ReconciliationAction(name, "recreated", is_master=is_master, reason=f"vec0 read probe failed: {e}"))
 
-    def _snapshot_master(self, table_name: str):
-        """Pre-drop snapshot for master tables by locally renaming them to prevent loss and avoid circular runner loops."""
-        try:
-            import time
-            timestamp = int(time.time())
-            backup_name = f"_old_{table_name}_{timestamp}"
-            self.conn.execute(f"ALTER TABLE {table_name} RENAME TO {backup_name}")
-            log.dual_log(
-                tag="Database:Schema:LocalSnapshot",
-                level="INFO",
-                message=f"[{self.label}] Locally renamed master table {table_name} to {backup_name} before recreation",
-                payload={"label": self.label, "table": table_name, "backup_table": backup_name}
-            )
-        except Exception as e:
-            log.dual_log(
-                tag="Database:Schema:SnapshotFailed",
-                level="CRITICAL",
-                message=f"[{self.label}] Local snapshot of master table {table_name} failed. Error: {e}",
-                payload={"label": self.label, "table": table_name, "error": str(e)},
-            )

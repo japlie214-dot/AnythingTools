@@ -1,7 +1,7 @@
 # database/backup/schema_registry.py
 import re
 import sqlglot
-from typing import Dict, List
+from typing import Dict, List, Optional
 from database.schemas import ALL_TABLES, ALL_VEC_TABLES, PERSISTED_TABLES
 from database.connection import SQLITE_VEC_AVAILABLE
 from database.management.schema_introspector import _columns_from_ddl_in_memory
@@ -76,3 +76,15 @@ class BackupSchemaRegistry:
         if not cols:
             return []
         return [c.name for c in cols if c.notnull and c.name.lower() != 'rowid']
+
+    @classmethod
+    def expected_snowflake_types(cls, table_name: str) -> Dict[str, str]:
+        """Return expected Snowflake column types for a table based on SQLite DDL."""
+        from database.management.schema_introspector import _columns_from_ddl_in_memory, sqlite_type_to_snowflake
+        sqlite_ddl = cls.get_expected_sqlite_tables().get(table_name)
+        if not sqlite_ddl:
+            return {}
+        cols = _columns_from_ddl_in_memory(sqlite_ddl, table_name)
+        if not cols:
+            return {}
+        return {c.name.lower(): sqlite_type_to_snowflake(c.type) for c in cols}

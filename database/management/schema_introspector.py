@@ -46,6 +46,19 @@ def _normalize_type_affinity(type_str: str) -> str:
         return "REAL"
     return "NUMERIC"
 
+def sqlite_type_to_snowflake(sqlite_type: str) -> str:
+    """Map a SQLite declared type to the expected Snowflake type based on affinity."""
+    t = (sqlite_type or "").upper()
+    if "INT" in t:
+        return "NUMBER"
+    if "CHAR" in t or "CLOB" in t or "TEXT" in t:
+        return "VARCHAR"
+    if "BLOB" in t or not t:
+        return "BINARY"
+    if "REAL" in t or "FLOA" in t or "DOUB" in t:
+        return "FLOAT"
+    return "NUMBER"
+
 def _extract_default_from_ddl(ddl: str, table_name: str, column_name: str) -> Optional[str]:
     """Extract the DEFAULT clause value for a column from its DDL definition.
     

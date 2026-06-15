@@ -152,6 +152,17 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
                     continue
 
                 columns = list(records[0].keys())
+                
+                # Deduplicate records by pk_col (keep only the latest/newest record for each PK in this batch)
+                deduped_records = {}
+                for r in records:
+                    pk_val = r.get(pk_col)
+                    if pk_val is not None:
+                        deduped_records[pk_val] = r
+                    else:
+                        deduped_records[id(r)] = r
+                records = list(deduped_records.values())
+
                 has_embedding = "embedding" in columns
 
                 if has_embedding:
@@ -182,7 +193,9 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
                     # Standard MERGE for non-embedding tables
                     stage_table = f"{table_name}_stage"
 
-                    col_defs = ",".join([f"{c} VARCHAR" for c in columns])
+                    from database.backup.schema_registry import BackupSchemaRegistry
+                    expected_types = BackupSchemaRegistry.expected_snowflake_types(table_name)
+                    col_defs = ",".join([f"{c} {expected_types.get(c.lower(), 'VARCHAR')}" for c in columns])
                     conn.execute(text(f"CREATE OR REPLACE TEMPORARY TABLE {schema}.{stage_table} ({col_defs})"))
 
                     insert_placeholders = ",".join([f":{c}" for c in columns])

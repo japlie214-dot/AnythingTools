@@ -80,6 +80,142 @@ class SnowflakeSchemaManager:
                         except Exception as e:
                             log.dual_log(tag="Backup:Cloud:DropColumnFailed", level="WARNING", message=f"Failed to drop column {c_name} from {t_name}: {e}", payload={"table": t_name, "column": c_name, "error": str(e)})
 
+    @staticmethod
+    def reconcile_types(engine, schema_name: str) -> list:
+        """Detect type mismatches between expected and actual Snowflake schema."""
+        from database.management.migration_types import TypeMismatchPlan, ColumnMismatch
+        from database.management.schema_introspector import sqlite_type_to_snowflake, _columns_from_ddl_in_memory
+        from database.backup.schema_registry import BackupSchemaRegistry
+        import time
+
+        plans = []
+        with engine.begin() as conn:
+            res = conn.execute(text("""
+                SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = :schema
+            """).bindparams(schema=schema_name.upper()))
+            existing = {}
+            for row in res:
+                t_name, c_name, d_type = row[0].lower(), row[1].lower(), row[2]
+                existing.setdefault(t_name, {})[c_name] = d_type.upper()
+
+            expected_tables = BackupSchemaRegistry.get_expected_sqlite_tables()
+            for t_name, ddl in expected_tables.items():
+                if t_name not in existing: continue
+                desired_cols = _columns_from_ddl_in_memory(ddl, t_name)
+                if not desired_cols: continue
+
+                mismatches = []
+                for col in desired_cols:
+                    c_name = col.name.lower()
+                    expected_sf_type = sqlite_type_to_snowflake(col.type)
+                    if c_name in existing[t_name]:
+                        actual_sf_type = existing[t_name][c_name]
+                        import re
+                        strip_act = re.sub(r'\(.*\)', '', actual_sf_type).upper()
+                        strip_exp = re.sub(r'\(.*\)', '', expected_sf_type).upper()
+                        if strip_act != strip_exp:
+                            mismatches.append(ColumnMismatch(
+                                column_name=c_name, actual_type=actual_sf_type,
+                                expected_type=expected_sf_type, is_primary_key=(col.pk > 0)
+                            ))
+
+                if mismatches:
+                    timestamp = int(time.time())
+                    plans.append(TypeMismatchPlan(
+                        table_name=t_name, mismatches=mismatches,
+                        clone_table_name=f"_migrate_{t_name}_{timestamp}",
+                        new_ddl=BackupSchemaRegistry.get_snowflake_ddl(t_name),
+                        columns_to_skip=[m.column_name for m in mismatches],
+                        pk_column=next((c.name for c in desired_cols if c.pk > 0), "id"),
+                        is_master=True
+                    ))
+        return plans
+
+    @staticmethod
+    def rebuild_table(engine, schema_name: str, plan, op_db_path: str):
+        """Recreate a Snowflake table from operational DB data."""
+        import sqlite3
+        with engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS {schema_name}.{plan.table_name}"))
+            conn.execute(text(plan.new_ddl))
+            log.dual_log(tag="Migration:Cloud:Recreate", level="INFO", message=f"Recreated Snowflake table {plan.table_name}", payload={"table": plan.table_name})
+
+        local_conn = sqlite3.connect(op_db_path, timeout=30.0)
+        try:
+            cursor = local_conn.execute(f"PRAGMA table_info({plan.table_name})")
+            insert_cols = [row[1] for row in cursor.fetchall()]
+
+            if not insert_cols: return 0
+
+            batch_size = 1000
+            total_inserted = 0
+            offset = 0
+
+            while True:
+                rows = local_conn.execute(
+                    f"SELECT {','.join(insert_cols)} FROM {plan.table_name} LIMIT {batch_size} OFFSET {offset}"
+                ).fetchall()
+                if not rows: break
+
+                dict_rows = []
+                for r in rows:
+                    row_dict = dict(zip(insert_cols, r))
+                    if "embedding" in row_dict and isinstance(row_dict["embedding"], bytes):
+                        import struct
+                        import json
+                        blob = row_dict["embedding"]
+                        if len(blob) == 4096:
+                            float_list = list(struct.unpack('<1024f', blob))
+                            row_dict["embedding"] = json.dumps(float_list)
+                    dict_rows.append(row_dict)
+
+                with engine.begin() as conn:
+                    # 1. Create temporary staging table with correct types (embedding as VARCHAR)
+                    stage_table = f"{plan.table_name}_stage"
+                    from database.backup.schema_registry import BackupSchemaRegistry
+                    expected_types = BackupSchemaRegistry.expected_snowflake_types(plan.table_name)
+                    
+                    stage_cols = []
+                    for c in insert_cols:
+                        if c == "embedding":
+                            stage_cols.append(f"{c} VARCHAR")
+                        else:
+                            stage_cols.append(f"{c} {expected_types.get(c.lower(), 'VARCHAR')}")
+                            
+                    stage_ddl = f"CREATE OR REPLACE TEMPORARY TABLE {schema_name}.{stage_table} ({', '.join(stage_cols)})"
+                    conn.execute(text(stage_ddl))
+
+                    # 2. Insert batch using optimized multi-row VALUES write
+                    col_placeholders = ", ".join([f":{c}" for c in insert_cols])
+                    col_names = ", ".join(insert_cols)
+                    insert_sql = f"INSERT INTO {schema_name}.{stage_table} ({col_names}) VALUES ({col_placeholders})"
+                    conn.execute(text(insert_sql), dict_rows)
+
+                    # 3. Insert into target with inline type casting for vector
+                    select_expressions = []
+                    for c in insert_cols:
+                        if c == "embedding":
+                            select_expressions.append("PARSE_JSON(embedding)::VECTOR(FLOAT, 1024) as embedding")
+                        else:
+                            select_expressions.append(c)
+                            
+                    repopulate_sql = f"""
+                        INSERT INTO {schema_name}.{plan.table_name} ({col_names})
+                        SELECT {', '.join(select_expressions)}
+                        FROM {schema_name}.{stage_table}
+                    """
+                    conn.execute(text(repopulate_sql))
+
+                total_inserted += len(rows)
+                offset += batch_size
+
+            log.dual_log(tag="Migration:Cloud:Repopulate", level="INFO", message=f"Repopulated {total_inserted} rows to Snowflake {plan.table_name}", payload={"table": plan.table_name})
+            return total_inserted
+        finally:
+            local_conn.close()
+
 from database.backup.engine.base import BackupEngine
 
 class CloudEngine(BackupEngine):
@@ -134,6 +270,13 @@ class CloudEngine(BackupEngine):
             with self.engine.begin() as conn:
                 conn.execute(text("SELECT CURRENT_VERSION()"))
             SnowflakeSchemaManager.reconcile(self.engine, self.settings.schema_name)
+            
+            # Reconcile types and rebuild if mismatched
+            mismatch_plans = SnowflakeSchemaManager.reconcile_types(self.engine, self.settings.schema_name)
+            for plan in mismatch_plans:
+                from database.connection import DB_PATH
+                SnowflakeSchemaManager.rebuild_table(self.engine, self.settings.schema_name, plan, str(DB_PATH))
+                
             return {"status": "ok"}
         return self.circuit_breaker_push.call(_do_startup)
 
