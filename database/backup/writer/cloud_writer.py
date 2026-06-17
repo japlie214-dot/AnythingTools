@@ -118,10 +118,24 @@ def _route_failed_batch_to_dlq(table_name: str, records: list, error_msg: str):
     import json as _json
     for record in records:
         try:
-            safe_record = {k: v for k, v in record.items() if not isinstance(v, (bytes, bytearray))}
+            record_dict = dict(record)
+            safe_record = {k: v for k, v in record_dict.items() if not isinstance(v, (bytes, bytearray))}
+            row_id_val = ""
+            if "id" in record_dict:
+                row_id_val = str(record_dict["id"])
+            elif "rowid" in record_dict:
+                row_id_val = str(record_dict["rowid"])
+            else:
+                keys = ["ticker", "statement_type", "concept", "quarter"]
+                if all(k in record_dict for k in keys):
+                    row_id_val = "|".join(str(record_dict[k]) for k in keys)
+                else:
+                    import hashlib
+                    row_id_val = hashlib.md5(_json.dumps(safe_record, sort_keys=True, default=str).encode()).hexdigest()
+
             enqueue_write(
                 "INSERT OR IGNORE INTO dead_letter_queue (dlq_id, table_name, row_id, row_data, error_message) VALUES (?, ?, ?, ?, ?)",
-                (ULID.generate(), table_name, str(record.get("id", record.get("rowid", ""))), _json.dumps(safe_record, default=str), (error_msg or "")[:500])
+                (ULID.generate(), table_name, row_id_val, _json.dumps(safe_record, default=str), (error_msg or "")[:500])
             )
         except Exception as e:
             log.dual_log(

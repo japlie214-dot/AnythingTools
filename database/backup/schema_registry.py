@@ -53,6 +53,18 @@ class BackupSchemaRegistry:
         # has already generated and populated the timestamp strings.
         sf_ddl = re.sub(r"(?i)\s*DEFAULT\s+CURRENT_TIMESTAMP(?:\(\))?", "", sf_ddl)
         
+        try:
+            from database.schemas.stock_financials import SNOWFLAKE_COLUMN_OVERRIDES
+            overrides = SNOWFLAKE_COLUMN_OVERRIDES.get(table_name, {})
+            for col_lower, sf_type in overrides.items():
+                pattern = re.compile(
+                    rf'(?i)((?:\b|"){re.escape(col_lower)}(?:\b|")\s+)([A-Z0-9_]+(?:\s*\([^)]*\))?)',
+                    re.IGNORECASE
+                )
+                sf_ddl = pattern.sub(rf"\1{sf_type}", sf_ddl)
+        except ImportError:
+            pass
+
         return sf_ddl
 
     @classmethod
@@ -87,4 +99,9 @@ class BackupSchemaRegistry:
         cols = _columns_from_ddl_in_memory(sqlite_ddl, table_name)
         if not cols:
             return {}
-        return {c.name.lower(): sqlite_type_to_snowflake(c.type) for c in cols}
+        try:
+            from database.schemas.stock_financials import SNOWFLAKE_COLUMN_OVERRIDES
+            overrides = SNOWFLAKE_COLUMN_OVERRIDES.get(table_name, {})
+        except ImportError:
+            overrides = {}
+        return {c.name.lower(): overrides.get(c.name.lower(), sqlite_type_to_snowflake(c.type)) for c in cols}

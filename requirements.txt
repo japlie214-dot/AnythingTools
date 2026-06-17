@@ -28,7 +28,7 @@ pyarrow>=15.0.0
 
 # Yahoo Finance and EDGAR
 yfinance>=0.2.18
-edgartools>=2.0.0
+edgartools>=4.5.1,<6.0
 sec-edgar-downloader>=4.0.0
 
 # Utilities

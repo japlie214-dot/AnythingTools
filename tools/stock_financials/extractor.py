@@ -95,7 +95,7 @@ def _enrich_with_blueprint(df: pd.DataFrame, blueprint: pd.DataFrame) -> pd.Data
     
     df["label"] = df["concept"].map(label_map).fillna(df["concept"].apply(lambda c: c.split(":")[-1]))
     df["depth"] = df["concept"].map(depth_map).fillna(0).astype(int)
-    df["is_total"] = df["concept"].map(total_map).fillna(False).astype(bool)
+    df["is_total"] = df["concept"].map(total_map).fillna(False).astype(bool).astype(int)
     df["concept_order"] = df["concept"].map(order_map).fillna(999).astype(int)
     return df
 
@@ -235,7 +235,7 @@ def upsert_quarterly_records(records: List[Dict[str, Any]]) -> int:
                 if pd.isna(val):
                     r[key] = None
                     
-            values = tuple(r.get(c, "" if c not in ("fiscal_year", "depth", "is_total", "concept_order") else 0) for c in columns)
+            values = tuple(r.get(c, None if c == "numeric_value" else ("" if c not in ("fiscal_year", "depth", "is_total", "concept_order") else 0)) for c in columns)
             statements.append((sql, values))
         enqueue_transaction(statements)
         
@@ -271,7 +271,7 @@ def extract_and_persist(ticker: str, num_quarters: int, refresh: bool, job_id: s
     if refresh:
         from database.writer import enqueue_write
         enqueue_write("DELETE FROM sf_quarterly_facts WHERE ticker = ?", (ticker,))
-        enqueue_cloud_delete("sf_quarterly_facts", {"ticker": ticker}, pk_col=["ticker"])
+        enqueue_cloud_delete("sf_quarterly_facts", {"ticker": ticker}, pk_col="ticker")
         
     company = Company(ticker)
     now_iso = datetime.now(timezone.utc).isoformat()

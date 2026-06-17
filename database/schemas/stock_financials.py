@@ -39,3 +39,9 @@ TABLES = {
     CREATE INDEX IF NOT EXISTS idx_sf_facts_ticker_quarter ON sf_quarterly_facts(ticker, quarter, statement_type);
     CREATE INDEX IF NOT EXISTS idx_sf_facts_concept ON sf_quarterly_facts(concept, ticker);"""
 }
+
+SNOWFLAKE_COLUMN_OVERRIDES = {
+    "sf_quarterly_facts": {
+        "is_total": "BOOLEAN",
+    },
+}

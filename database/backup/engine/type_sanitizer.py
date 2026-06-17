@@ -35,8 +35,14 @@ def _sanitize_value(value: Any) -> Any:
     if value is None:
         return None
 
+    if isinstance(value, bool):
+        return int(value)
+
     pd = _get_pandas()
     np = _get_numpy()
+
+    if np is not None and isinstance(value, np.bool_):
+        return int(value)
 
     if pd is not None and isinstance(value, pd.Timestamp):
         if pd.isna(value):
