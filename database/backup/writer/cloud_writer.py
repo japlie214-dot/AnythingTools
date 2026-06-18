@@ -101,9 +101,34 @@ def enqueue_cloud_write_batch(table_name: str, records: list, pk_col: Union[str,
 
 
 def enqueue_cloud_delete(table_name: str, pk_val: Any, pk_col: Union[str, Tuple[str, ...], List[str]] = "id"):
-    """Enqueue a best-effort cloud delete (by PK)."""
+    """Enqueue a best-effort cloud delete (by PK).
+
+    Contract:
+      - pk_val is a SCALAR (str, int, etc.) when pk_col is a str.
+      - pk_val is a DICT (column_name -> value) when pk_col is a tuple of multiple
+        column names (composite PK).
+
+    Do NOT pass a dict when pk_col is a str — the dict will end up as a bound
+    parameter and Snowflake's DBAPI rejects dict values with
+    "Binding data in type (dict) is not supported".
+    """
     if isinstance(pk_col, list):
         pk_col = tuple(pk_col)
+    
+    # Defense in depth: catch the dict-when-scalar mistake at enqueue time
+    # rather than at flush time (which is async and harder to debug).
+    if isinstance(pk_col, str) and isinstance(pk_val, dict):
+        log.dual_log(
+            tag="Backup:Writer:DeleteBadPayload",
+            level="ERROR",
+            message=f"enqueue_cloud_delete received a dict pk_val for scalar pk_col '{pk_col}' on {table_name}",
+            payload={"table": table_name, "pk_col": pk_col, "pk_val_type": type(pk_val).__name__}
+        )
+        raise TypeError(
+            f"enqueue_cloud_delete('{table_name}', pk_val=<{type(pk_val).__name__}>, pk_col='{pk_col}'): "
+            f"pk_val must be a scalar when pk_col is a string. Pass the value directly, not a dict."
+        )
+        
     records = [pk_val] if isinstance(pk_col, tuple) else [{pk_col: pk_val}]
     try:
         task = CloudWriteTask(table_name=table_name, operation="DELETE", records=records, pk_col=pk_col)

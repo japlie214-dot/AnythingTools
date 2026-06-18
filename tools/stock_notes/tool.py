@@ -131,7 +131,9 @@ class StockNotesTool(BaseTool):
                             (accession_no, n[0])
                         ).fetchall()
                         if concepts:
-                            concept_str = ", ".join(c[0].replace("us-gaap_", "") for c in concepts)
+                            # Concepts are stored in raw form ("us-gaap:Assets").
+                            # Strip the namespace prefix to display the short name.
+                            concept_str = ", ".join(c[0].replace("us-gaap:", "") for c in concepts)
                     lines.append(f"| {n[0]} | {n[1]} | {n[3]} | {n[4]} | {n[5]} | {concept_str} |")
                 return _success("\n".join(lines), {"notes_count": len(notes), "accession_no": accession_no})
             
@@ -167,7 +169,8 @@ class StockNotesTool(BaseTool):
                     lines.append("| # | Concept | Label | Axis | Member | Periods | Range |")
                     lines.append("|---|---------|-------|------|--------|---------|-------|")
                     for ci, entry in enumerate(catalog, 1):
-                        axis_short = entry.get("dimension_axis", "").replace("us-gaap_", "").replace("Axis", "") if entry.get("dimension_axis") else "\u2014"
+                        # Same concept-format fix as above — strip raw prefix.
+                        axis_short = entry.get("dimension_axis", "").replace("us-gaap:", "").replace("Axis", "") if entry.get("dimension_axis") else "\u2014"
                         member = entry.get("dimension_member_label") or "\u2014"
                         er = entry.get("earliest_period", "")[:7] if entry.get("earliest_period") else "?"
                         lr = entry.get("latest_period", "")[:7] if entry.get("latest_period") else "?"

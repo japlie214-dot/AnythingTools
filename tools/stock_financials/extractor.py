@@ -13,9 +13,14 @@ from database.backup.writer.cloud_writer import enqueue_cloud_write_batch, enque
 
 log = get_dual_logger(__name__)
 
-MAX_QUARTERLY_DURATION_DAYS = 95
-PER_SHARE_UNITS = {"USD per share", "USD/shares"}
-SHARE_UNITS = {"shares"}
+# Maximum duration of a "quarterly" period in days.
+#
+# A standard 13-week quarter is 91 days. A 14-week quarter (used by
+# 52/53-week fiscal calendars — Apple, Microsoft, many retailers) is 98 days.
+# 105 admits 14-week quarters plus a small buffer for reporting drift.
+# Reference: https://www.sec.gov/ix?doc=/Archives/edgar/data/320193/000032019324000006/aapl-20231230.htm
+# (Apple 10-K: "An additional week is included in the first fiscal quarter…")
+MAX_QUARTERLY_DURATION_DAYS = 105
 
 def _parse_quarter_label(qlabel: str) -> Tuple[int, int]:
     try:
@@ -55,8 +60,6 @@ def compute_fact_hash(record: dict) -> str:
     parts = [record.get("ticker", ""), record.get("statement_type", ""), record.get("concept", ""), record.get("quarter", ""), str(record.get("numeric_value", ""))]
     return hashlib.md5("||".join(parts).encode("utf-8", errors="replace")).hexdigest()
 
-def normalize_concept(concept: str) -> str:
-    return concept.replace(":", "_") if concept else concept
 
 def _is_non_additive_concept(concept: str) -> bool:
     patterns = [r"EarningsPerShare", r"WeightedAverageNumberOf.*Shares", r"CommonStockDividendsPerShare", r"AntidilutiveSecurities"]
@@ -222,7 +225,6 @@ def upsert_quarterly_records(records: List[Dict[str, Any]]) -> int:
         chunk = records[i:i+batch_size]
         statements = []
         for r in chunk:
-            r["concept"] = normalize_concept(r.get("concept"))
             r["quarter"] = r.get("quarter_label", "")
             r["numeric_value"] = "" if pd.isna(r.get("numeric_value")) else str(r.get("numeric_value", ""))
             r["content_hash"] = compute_fact_hash(r)
@@ -271,7 +273,10 @@ def extract_and_persist(ticker: str, num_quarters: int, refresh: bool, job_id: s
     if refresh:
         from database.writer import enqueue_write
         enqueue_write("DELETE FROM sf_quarterly_facts WHERE ticker = ?", (ticker,))
-        enqueue_cloud_delete("sf_quarterly_facts", {"ticker": ticker}, pk_col="ticker")
+        # Pass the scalar ticker — see enqueue_cloud_delete contract in
+        # database/backup/writer/cloud_writer.py. Passing a dict triggers
+        # "Binding data in type (dict) is not supported" at Snowflake DBAPI.
+        enqueue_cloud_delete("sf_quarterly_facts", ticker, pk_col="ticker")
         
     company = Company(ticker)
     now_iso = datetime.now(timezone.utc).isoformat()

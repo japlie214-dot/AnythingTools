@@ -20,10 +20,6 @@ class QueryInstructions(BaseModel):
     @field_validator("ticker")
     @classmethod
     def normalize_ticker(cls, v: str) -> str: return v.upper().strip()
-    @field_validator("concept")
-    @classmethod
-    def normalize_concept(cls, v: Optional[str]) -> Optional[str]:
-        return v.replace(":", "_").strip() if v else v
 
 class StatusInstructions(BaseModel):
     ticker: str = Field(..., min_length=1, max_length=10)

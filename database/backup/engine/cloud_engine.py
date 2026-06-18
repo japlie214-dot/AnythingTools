@@ -1,4 +1,5 @@
 # database/backup/engine/cloud_engine.py
+import warnings
 import struct
 from typing import List
 from sqlalchemy import create_engine, text
@@ -9,6 +10,19 @@ from database.backup.sync.helpers import introspect_table_columns, normalize_clo
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
+
+# Suppress the RequestsDependencyWarning emitted by snowflake-connector-python's
+# vendored requests library when chardet 7.x is installed transitively.
+# This is a known Snowflake-side bug (issue #2883, open as of v4.6.0):
+# https://github.com/snowflakedb/snowflake-connector-python/issues/2883
+# The warning is cosmetic (the connector's actual dependencies are satisfied
+# by charset_normalizer) and the suppression is wrapped in try/except so it
+# cannot break startup if the import path changes in a future connector release.
+try:
+    from snowflake.connector.vendored.requests.exceptions import RequestsDependencyWarning
+    warnings.simplefilter("ignore", RequestsDependencyWarning)
+except Exception:
+    pass
 
 
 from database.backup.engine.base import BackupEngine
@@ -25,11 +39,54 @@ class CloudEngine(BackupEngine):
             url = f"snowflake://{settings.user}@{settings.account}/{settings.database}/{settings.schema_name}?warehouse={settings.warehouse}"
             self.engine = create_engine(
                 url,
-                connect_args={'private_key': self._load_private_key()},
+                connect_args={
+                    'private_key': self._load_private_key(),
+                    # Keep the Snowflake session alive indefinitely. Per the
+                    # Snowflake docs, the connector emits a periodic heartbeat
+                    # that refreshes the master token, preventing 390111 errors
+                    # caused by idle-session timeout.
+                    # https://docs.snowflake.com/en/sql-reference/parameters
+                    # (CLIENT_SESSION_KEEP_ALIVE — "Snowflake keeps the session
+                    # active indefinitely as long as the connection is active")
+                    'client_session_keep_alive': True,
+                    # Heartbeat frequency: 1800 s (30 min) — within the allowed
+                    # range [900, 3600] per Snowflake docs
+                    # (CLIENT_SESSION_KEEP_ALIVE_HEARTBEAT_FREQUENCY).
+                    'client_session_keep_alive_heartbeat_frequency': 1800,
+                    # Login and network retry behavior per Snowflake Python
+                    # Connector docs:
+                    # https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-connect
+                    # (Section: "Managing connection timeouts")
+                    'login_timeout': 60,
+                    'network_timeout': 30,
+                },
                 pool_size=settings.pool_size,
                 max_overflow=settings.max_overflow,
-                pool_pre_ping=True
+                # pool_pre_ping runs a liveness check at checkout time only.
+                # Per SQLAlchemy docs: "the pre-ping approach does not
+                # accommodate for connections dropped in the middle of
+                # transactions or other SQL operations."
+                # https://docs.sqlalchemy.org/en/20/core/pooling.html#sqlalchemy.create_engine.params.pool_pre_ping
+                # We keep it ON as a first line of defense; the handle_error
+                # listener + with_session_recovery decorator (registered
+                # below) handle mid-statement 390111 errors that pre-ping
+                # cannot catch.
+                pool_pre_ping=True,
+                # Recycle connections proactively. Even with client_session_keep_alive,
+                # Snowflake may invalidate sessions server-side (admin kill,
+                # account policy change, network partition). pool_recycle
+                # ensures we never hold a connection longer than 1 hour.
+                # https://docs.sqlalchemy.org/en/20/core/pooling.html#sqlalchemy.engine.Engine.dispose
+                pool_recycle=3600,
             )
+
+            # Register the handle_error listener that recognises Snowflake
+            # 390111 as a disconnect condition, forcing pool invalidation.
+            # This complements pool_pre_ping (which only checks at checkout)
+            # by also handling mid-statement session-gone errors.
+            # https://docs.sqlalchemy.org/en/20/core/events.html#sqlalchemy.events.DialectEvents.handle_error
+            from database.backup.resilience.session_recovery import register_session_recovery
+            register_session_recovery(self.engine, log)
         else:
             self.engine = None
 

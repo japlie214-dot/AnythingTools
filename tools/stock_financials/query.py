@@ -1,5 +1,6 @@
 # tools/stock_financials/query.py
 import sqlite3
+import logging
 from typing import List, Dict, Any, Optional
 from database.connection import DatabaseManager
 
@@ -16,8 +17,14 @@ def query_facts(
     where = ["ticker = ?", "statement_type = ?"]
     params: List[Any] = [ticker.upper(), statement_type.lower()]
     if concept:
+        # Concepts are stored in raw SEC EDGAR XBRL form (e.g. "us-gaap:Assets").
+        # Backward-compat: if a caller passes the legacy normalized form
+        # ("us-gaap_Assets"), restore the colon and emit a deprecation warning.
+        normalized = concept.replace("_", ":", 1) if concept.startswith("us-gaap_") else concept
+        if normalized != concept:
+            logging.getLogger(__name__).warning("StockFin:Concept:LegacyFormat — received '%s', normalized to '%s'. Update caller to use the raw XBRL format.", concept, normalized)
         where.append("concept = ?")
-        params.append(concept.replace(":", "_"))
+        params.append(normalized)
     if start_quarter:
         where.append("quarter >= ?")
         params.append(start_quarter)

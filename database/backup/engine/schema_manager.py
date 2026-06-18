@@ -88,6 +88,16 @@ class SnowflakeSchemaManager:
 
     @staticmethod
     def reconcile_types(engine, schema_name: str) -> list:
+        """Detect type mismatches between the local SQLite schema and the
+        Snowflake cloud schema.
+
+        IMPORTANT: This method MUST consult BackupSchemaRegistry.expected_snowflake_types()
+        (which applies SNOWFLAKE_COLUMN_OVERRIDES) instead of calling
+        sqlite_type_to_snowflake() directly. Otherwise, override-registered
+        columns (e.g. scraped_articles_vec_backup.embedding VECTOR(FLOAT, 1024))
+        would be flagged as mismatches on every startup, triggering spurious
+        table rebuilds.
+        """
         plans = []
         with engine.begin() as conn:
             res = conn.execute(text("""
@@ -108,13 +118,29 @@ class SnowflakeSchemaManager:
                 if not desired_cols:
                     continue
 
+                # Pre-compute the override-aware expected types for this table.
+                # BackupSchemaRegistry.expected_snowflake_types() consults the
+                # SNOWFLAKE_COLUMN_OVERRIDES registry (defined in
+                # database/schemas/_snowflake_overrides.py), so columns like
+                # scraped_articles_vec_backup.embedding (BLOB in SQLite,
+                # VECTOR(FLOAT, 1024) in Snowflake) are correctly recognized
+                # as matching and NOT flagged for rebuild.
+                expected_sf_types_for_table = BackupSchemaRegistry.expected_snowflake_types(t_name)
+
                 mismatches = []
                 pk_column = "id"
                 for col in desired_cols:
                     c_name = col.name.lower()
                     if col.pk > 0:
                         pk_column = col.name
-                    expected_sf_type = sqlite_type_to_snowflake(col.type)
+                    # Look up the expected Snowflake type from the override-aware
+                    # registry. Fall back to the generic transpiler only if the
+                    # column is not present (which would be a programming error
+                    # since expected_snowflake_types covers all columns in the DDL).
+                    expected_sf_type = expected_sf_types_for_table.get(
+                        c_name,
+                        sqlite_type_to_snowflake(col.type),
+                    )
                     actual_sf_type = existing[t_name].get(c_name, "").upper()
                     if actual_sf_type and expected_sf_type.upper() != actual_sf_type:
                         if {expected_sf_type.upper(), actual_sf_type} <= {"VARCHAR", "TEXT"}:

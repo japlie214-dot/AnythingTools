@@ -48,15 +48,17 @@ Step 2: Query Financial Data
     instructions: {
       "ticker": "NVDA",
       "statement_type": "income",
-      "concept": "us-gaap_Revenue",
+      "concept": "us-gaap:Revenue",
       "start_quarter": "2024-Q1",
       "end_quarter": "2026-Q1",
       "limit": 100
     }
 
     *Statement Types:* income, balance, cashflow
-    *Concept Format:* Use `us-gaap_<ConceptName>` (e.g., `us-gaap_Revenue`).
-      The colon syntax (`us-gaap:Revenue`) is also accepted and auto-converted.
+    *Concept Format:* Use the raw SEC EDGAR XBRL notation `us-gaap:<ConceptName>`
+      (e.g., `us-gaap:Revenue`). This matches the canonical FASB US-GAAP taxonomy
+      and the format used by the `stock_notes` tool.
+      Reference: https://xbrl.org/guidance/xbrl-glossary
     *Results:* Returns a pivot table with concepts as rows and quarters as columns,
       with intelligent formatting for large numbers ($1.2B, 14.9B shares).
 

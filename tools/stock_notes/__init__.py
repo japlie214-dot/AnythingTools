@@ -74,7 +74,7 @@ passed inside the 'args' field:
      "command": "details",
      "instructions": {
        "ticker": "AAPL",
-       "concept": "us-gaap_LongTermDebt",
+       "concept": "us-gaap:LongTermDebt",
        "start_date": "2024-09",
        "end_date": "2026-03"
      }

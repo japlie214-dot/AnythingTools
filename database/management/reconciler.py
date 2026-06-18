@@ -84,7 +84,17 @@ class SchemaReconciler:
             added = sum(1 for a in report.actions if a.action == "altered" and "AddColumn" in (a.reason or ""))
             dropped = sum(1 for a in report.actions if a.action == "altered" and "DropColumn" in (a.reason or ""))
             recreated = sum(1 for a in report.actions if a.action == "recreated")
-            log.dual_log(tag="Database:Schema:Summary", level="INFO", message=f"Schema reconciliation complete: {added} added, {dropped} dropped, {recreated} recreated", payload={"added": added, "dropped": dropped, "recreated": recreated})
+            log.dual_log(
+                tag="Database:Schema:Summary",
+                level="INFO",
+                message=f"[{self.label}] Schema reconciliation complete: {added} added, {dropped} dropped, {recreated} recreated",
+                payload={
+                    "label": self.label,
+                    "added": added,
+                    "dropped": dropped,
+                    "recreated": recreated,
+                },
+            )
 
             self.conn.commit()
             return report
