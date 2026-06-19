@@ -6,7 +6,7 @@ from enum import Enum
 class MigrationPhase(str, Enum):
     CLONE = "clone"
     RECREATE = "recreate"
-    REPORULATE = "repopulate"
+    REPOPULATE = "repopulate"
     AUTOFILL = "autofill"
     VALIDATE = "validate"
     CLOUD_RECREATE = "cloud_recreate"

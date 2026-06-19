@@ -10,6 +10,7 @@ from database.management.schema_introspector import (
     ColumnInfo,
 )
 from utils.logger import get_dual_logger
+from database.backup.engine.type_normalizer import types_match, normalize_snowflake_type
 
 log = get_dual_logger(__name__)
 
@@ -91,12 +92,26 @@ class SnowflakeSchemaManager:
         """Detect type mismatches between the local SQLite schema and the
         Snowflake cloud schema.
 
-        IMPORTANT: This method MUST consult BackupSchemaRegistry.expected_snowflake_types()
-        (which applies SNOWFLAKE_COLUMN_OVERRIDES) instead of calling
-        sqlite_type_to_snowflake() directly. Otherwise, override-registered
-        columns (e.g. scraped_articles_vec_backup.embedding VECTOR(FLOAT, 1024))
-        would be flagged as mismatches on every startup, triggering spurious
-        table rebuilds.
+        Compares the actual Snowflake column type (from
+        INFORMATION_SCHEMA.COLUMNS.DATA_TYPE) against the expected type
+        (from BackupSchemaRegistry.expected_snowflake_types, which consults
+        SNOWFLAKE_COLUMN_OVERRIDES).
+
+        Type comparison uses types_match() from type_normalizer.py which
+        normalizes both sides to the base type name (e.g.
+        "VECTOR(FLOAT, 1024)" → "VECTOR"). This is necessary because
+        Snowflake's INFORMATION_SCHEMA.COLUMNS.DATA_TYPE returns only the
+        base type for parameterized types, per the docs:
+        https://docs.snowflake.com/en/sql-reference/data-types-structured
+        "For columns of structured types, the INFORMATION_SCHEMA COLUMNS
+         view only provides information about the basic data type of the
+         column (ARRAY, OBJECT, or MAP)."
+
+        Without normalization, override-registered columns (e.g.
+        scraped_articles_vec_backup.embedding VECTOR(FLOAT, 1024)) would
+        be flagged as mismatches on every startup ("VECTOR(FLOAT, 1024)"
+        != "VECTOR"), triggering spurious table rebuilds that re-push
+        hundreds of rows of embeddings each time.
         """
         plans = []
         with engine.begin() as conn:
@@ -142,8 +157,17 @@ class SnowflakeSchemaManager:
                         sqlite_type_to_snowflake(col.type),
                     )
                     actual_sf_type = existing[t_name].get(c_name, "").upper()
-                    if actual_sf_type and expected_sf_type.upper() != actual_sf_type:
-                        if {expected_sf_type.upper(), actual_sf_type} <= {"VARCHAR", "TEXT"}:
+                    # Use types_match() which normalizes both sides to the
+                    # base type name, so VECTOR(FLOAT, 1024) matches VECTOR.
+                    # Ref: https://docs.snowflake.com/en/sql-reference/data-types-structured
+                    if actual_sf_type and not types_match(expected_sf_type, actual_sf_type):
+                        # Backward-compat: VARCHAR and TEXT are semantically
+                        # equivalent in Snowflake (both are variable-length
+                        # strings). Ref: https://docs.snowflake.com/en/sql-reference/data-types-text
+                        # Normalize both and check if they're in the VARCHAR/TEXT family.
+                        norm_expected = normalize_snowflake_type(expected_sf_type)
+                        norm_actual = normalize_snowflake_type(actual_sf_type)
+                        if {norm_expected, norm_actual} <= {"VARCHAR", "TEXT"}:
                             continue
                         is_pk = col.pk > 0
                         mismatches.append(ColumnMismatch(
@@ -155,6 +179,30 @@ class SnowflakeSchemaManager:
 
                 if mismatches:
                     timestamp = int(time.time())
+                    # Log the WHY: column-level mismatch details before
+                    # rebuilding. Without this, operators see "Recreated
+                    # table X" but never see "because column Y drifted
+                    # from A to B". The payload includes the full mismatch
+                    # list and a preview of the new DDL.
+                    log.dual_log(
+                        tag="Migration:Cloud:RebuildContext",
+                        level="WARNING",
+                        message=f"Type mismatch detected for {t_name}: {len(mismatches)} column(s)",
+                        payload={
+                            "table": t_name,
+                            "trigger": "type_mismatch",
+                            "mismatches": [
+                                {
+                                    "column": m.column_name,
+                                    "actual_type": m.actual_type,
+                                    "expected_type": m.expected_type,
+                                    "is_primary_key": m.is_primary_key,
+                                }
+                                for m in mismatches
+                            ],
+                            "new_ddl_preview": BackupSchemaRegistry.get_snowflake_ddl(t_name)[:500],
+                        },
+                    )
                     plans.append(TypeMismatchPlan(
                         table_name=t_name,
                         mismatches=mismatches,
@@ -168,9 +216,59 @@ class SnowflakeSchemaManager:
 
     @staticmethod
     def rebuild_table(engine, schema_name: str, plan, op_db_path: str):
+        """Rebuild a Snowflake table: DROP + CREATE + repopulate from SQLite.
+
+        Logs the WHY (mismatch details) before rebuilding and the row-count
+        comparison after repopulating. If the CREATE TABLE DDL fails, logs
+        the full DDL and error so operators can diagnose without re-running.
+        """
+        rebuild_start = time.time()
+        # Query local row count BEFORE dropping (for post-rebuild comparison).
+        # This catches silent data loss if repopulate inserts fewer rows
+        # than expected (e.g. due to a concurrent delete or a chunking bug).
+        local_row_count = 0
+        try:
+            local_conn_probe = sqlite3.connect(op_db_path, timeout=30.0)
+            try:
+                local_row_count = local_conn_probe.execute(
+                    f"SELECT COUNT(*) FROM {plan.table_name}"
+                ).fetchone()[0]
+            finally:
+                local_conn_probe.close()
+        except Exception as e:
+            log.dual_log(
+                tag="Migration:Cloud:RebuildContext",
+                level="WARNING",
+                message=f"Could not pre-count rows for {plan.table_name}: {e}",
+                payload={"table": plan.table_name, "error": str(e)[:200]},
+            )
+
         with engine.begin() as conn:
-            conn.execute(text(f"DROP TABLE IF EXISTS {schema_name}.{plan.table_name}"))
-            conn.execute(text(plan.new_ddl))
+            try:
+                conn.execute(text(f"DROP TABLE IF EXISTS {schema_name}.{plan.table_name}"))
+                conn.execute(text(plan.new_ddl))
+            except Exception as ddl_err:
+                # Log the full DDL that failed so operators can diagnose
+                # without re-running. This is critical for cases like the
+                # IS_TOTAL bug where the DDL has an incompatible DEFAULT
+                # clause — the error message alone ("002262: Default value
+                # data type does not match") is useless without the DDL.
+                log.dual_log(
+                    tag="Migration:Cloud:RebuildFailed",
+                    level="ERROR",
+                    message=f"DDL failed for {plan.table_name}: {ddl_err}",
+                    payload={
+                        "table": plan.table_name,
+                        "trigger": "ddl_failure",
+                        "error": str(ddl_err)[:1000],
+                        "failed_ddl": plan.new_ddl[:2000],
+                        "mismatches": [
+                            {"column": m.column_name, "actual": m.actual_type, "expected": m.expected_type}
+                            for m in plan.mismatches
+                        ],
+                    },
+                )
+                raise
             log.dual_log(tag="Migration:Cloud:Recreate", level="INFO", message=f"Recreated Snowflake table {plan.table_name}", payload={"table": plan.table_name})
 
         local_conn = sqlite3.connect(op_db_path, timeout=30.0)
@@ -243,7 +341,36 @@ class SnowflakeSchemaManager:
                 total_inserted += len(rows)
                 offset += batch_size
 
-            log.dual_log(tag="Migration:Cloud:Repopulate", level="INFO", message=f"Repopulated {total_inserted} rows to Snowflake {plan.table_name}", payload={"table": plan.table_name})
+            # Log row-count comparison: if total_inserted != local_row_count,
+            # data was silently lost. This is a WARNING, not an ERROR, because
+            # the table may have been legitimately smaller than expected
+            # (e.g. concurrent deletes during rebuild). But the operator
+            # MUST be alerted to investigate.
+            row_count_match = (total_inserted == local_row_count)
+            log.dual_log(
+                tag="Migration:Cloud:Repopulate",
+                level="INFO" if row_count_match else "WARNING",
+                message=f"Repopulate complete for {plan.table_name}: inserted={total_inserted}, expected={local_row_count}",
+                payload={
+                    "table": plan.table_name,
+                    "rows_inserted": total_inserted,
+                    "rows_expected": local_row_count,
+                    "row_count_match": row_count_match,
+                    "duration_seconds": round(time.time() - rebuild_start, 2),
+                },
+            )
+            if not row_count_match:
+                log.dual_log(
+                    tag="Migration:Cloud:RowCountMismatch",
+                    level="WARNING",
+                    message=f"Row count mismatch for {plan.table_name}: inserted {total_inserted} but expected {local_row_count}. Possible data loss.",
+                    payload={
+                        "table": plan.table_name,
+                        "inserted": total_inserted,
+                        "expected": local_row_count,
+                        "delta": local_row_count - total_inserted,
+                    },
+                )
             return total_inserted
         finally:
             local_conn.close()

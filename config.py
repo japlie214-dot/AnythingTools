@@ -12,6 +12,27 @@ ANYTHINGTOOLS_PORT: int = int(os.getenv("ANYTHINGTOOLS_PORT", "8000"))
 # --- Operational Database Path ---
 OPERATIONAL_DB_PATH: str = os.getenv("OPERATIONAL_DB_PATH", "data/sumanal.db")
 
+# --- Database Integration Master Toggle ---
+# When False, ALL database writes are skipped:
+#   - SQLite operational DB (enqueue_write, enqueue_transaction, enqueue_execscript)
+#   - SQLite logs DB (logs_enqueue_write)
+#   - Snowflake cloud DB (enqueue_cloud_write, enqueue_cloud_write_batch, enqueue_cloud_delete)
+#   - Startup phases: init_database_layer, run_db_migrations, validate_vec0,
+#     init_backup, sync_from_backup all become no-ops.
+#
+# This is DISTINCT from BACKUP_CLOUD_ENABLED (in database/backup/settings.py):
+#   - BACKUP_CLOUD_ENABLED=false → cloud sync disabled, SQLite still writes.
+#   - DATABASE_INTEGRATION_ENABLED=false → entire DB stack disabled (for testing).
+#
+# Intended use case: integration tests and local development where you want
+# to run the application without a real database (e.g. with mock data).
+#
+# Per Python os.getenv docs: https://docs.python.org/3/library/os.html#os.getenv
+# Accepts "true", "1", "yes", "on" (case-insensitive) as truthy.
+DATABASE_INTEGRATION_ENABLED: bool = os.getenv(
+    "DATABASE_INTEGRATION_ENABLED", "true"
+).lower() in ("true", "1", "yes", "on")
+
 # --- Schema Reset Control ---
 # Set SUMANAL_ALLOW_SCHEMA_RESET=1 to allow destructive schema reset on version mismatch.
 # WARNING: This drops ALL data on every restart if the schema version changes. Defaults to 0 (disabled).

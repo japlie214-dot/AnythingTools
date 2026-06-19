@@ -76,6 +76,16 @@ def enqueue_cloud_write(table_name: Any, row_data: Optional[dict] = None, pk_col
     - enqueue_cloud_write(task: CloudWriteTask)
     - enqueue_cloud_write(table_name: str, row_data: dict, pk_col: str = "id")
     """
+    # Honor the master DB integration toggle. When disabled (e.g. for
+    # testing), all cloud writes are silently skipped. This is the single
+    # chokepoint for cloud writes.
+    try:
+        import config
+        if not getattr(config, "DATABASE_INTEGRATION_ENABLED", True):
+            return
+    except ImportError:
+        pass
+
     if isinstance(pk_col, list):
         pk_col = tuple(pk_col)
     try:
@@ -86,18 +96,48 @@ def enqueue_cloud_write(table_name: Any, row_data: Optional[dict] = None, pk_col
             cloud_write_queue.put_nowait(task)
     except queue.Full:
         target_name = getattr(table_name, 'table_name', table_name)
-        log.dual_log(tag="Backup:Writer:QueueFull", level="DEBUG", message=f"Queue full, dropping write for {target_name}", payload={"table": target_name})
+        # Promoted from DEBUG to WARNING: dropped writes are operationally
+        # significant and must be visible in production logs. The payload
+        # includes queue depth and capacity so operators can correlate
+        # drops with throughput spikes.
+        log.dual_log(
+            tag="Backup:Writer:QueueFull",
+            level="WARNING",
+            message=f"Cloud write queue full, dropping write for {target_name}",
+            payload={
+                "table": target_name,
+                "queue_size": cloud_write_queue.qsize(),
+                "queue_max": cloud_write_queue.maxsize,
+            },
+        )
 
 
 def enqueue_cloud_write_batch(table_name: str, records: list, pk_col: Union[str, Tuple[str, ...], List[str]] = "id"):
     """Enqueue a batch of records for best-effort cloud upsert."""
+    try:
+        import config
+        if not getattr(config, "DATABASE_INTEGRATION_ENABLED", True):
+            return
+    except ImportError:
+        pass
+
     if isinstance(pk_col, list):
         pk_col = tuple(pk_col)
     try:
         task = CloudWriteTask(table_name=table_name, operation="UPSERT", records=records, pk_col=pk_col)
         cloud_write_queue.put_nowait(task)
     except queue.Full:
-        log.dual_log(tag="Backup:Writer:QueueFull", level="DEBUG", message=f"Queue full, dropping batch for {table_name}", payload={"table": table_name, "batch_size": len(records)})
+        log.dual_log(
+            tag="Backup:Writer:QueueFull",
+            level="WARNING",
+            message=f"Cloud write queue full, dropping batch for {table_name}",
+            payload={
+                "table": table_name,
+                "batch_size": len(records),
+                "queue_size": cloud_write_queue.qsize(),
+                "queue_max": cloud_write_queue.maxsize,
+            },
+        )
 
 
 def enqueue_cloud_delete(table_name: str, pk_val: Any, pk_col: Union[str, Tuple[str, ...], List[str]] = "id"):
@@ -134,7 +174,17 @@ def enqueue_cloud_delete(table_name: str, pk_val: Any, pk_col: Union[str, Tuple[
         task = CloudWriteTask(table_name=table_name, operation="DELETE", records=records, pk_col=pk_col)
         cloud_write_queue.put_nowait(task)
     except queue.Full:
-        log.dual_log(tag="Backup:Writer:QueueFull", level="DEBUG", message=f"Queue full, dropping delete for {table_name}", payload={"table": table_name, "pk": pk_val})
+        log.dual_log(
+            tag="Backup:Writer:QueueFull",
+            level="WARNING",
+            message=f"Cloud write queue full, dropping delete for {table_name}",
+            payload={
+                "table": table_name,
+                "pk": pk_val,
+                "queue_size": cloud_write_queue.qsize(),
+                "queue_max": cloud_write_queue.maxsize,
+            },
+        )
 
 
 def _route_failed_batch_to_dlq(table_name: str, records: list, error_msg: str):

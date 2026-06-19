@@ -213,15 +213,30 @@ class SchemaReconciler:
             if extra:
                 if self._drop_extra_columns(name, extra, report):
                     altered = True
-                is_master = name in self.master_tables
-                plan = self._compute_mismatch_plan(name, ddl, type_mismatches, constraint_mismatches, is_master)
-                report.type_mismatch_plans.append(plan)
-                
-                reason_parts = []
-                if type_mismatches: reason_parts.append(f"type_drift: {len(type_mismatches)}")
-                if constraint_mismatches: reason_parts.append(f"constraint_drift: {len(constraint_mismatches)}")
-                reason = '; '.join(reason_parts)
-                report.add(ReconciliationAction(name, "needs_migration", is_master, reason))
+                # Only create a migration plan if there are actual type or
+                # constraint mismatches. Extra columns alone are handled by
+                # _drop_extra_columns above — forcing a full clone-recreate-
+                # repopulate cycle just to drop columns is wasteful and risks
+                # data loss. This guard prevents spurious migrations.
+                if type_mismatches or constraint_mismatches:
+                    is_master = name in self.master_tables
+                    plan = self._compute_mismatch_plan(name, ddl, type_mismatches, constraint_mismatches, is_master)
+                    report.type_mismatch_plans.append(plan)
+                    
+                    reason_parts = []
+                    if type_mismatches: reason_parts.append(f"type_drift: {len(type_mismatches)}")
+                    if constraint_mismatches: reason_parts.append(f"constraint_drift: {len(constraint_mismatches)}")
+                    reason = '; '.join(reason_parts)
+                    report.add(ReconciliationAction(name, "needs_migration", is_master, reason))
+                elif altered:
+                    pass  # report already updated in _drop_extra_columns
+                else:
+                    log.dual_log(
+                        tag="Database:Schema:StructureValid",
+                        message=f"[{self.label}] {name}: Structure valid (extra columns dropped)",
+                        payload={"label": self.label, "table": name, "status": "valid"},
+                    )
+                    report.add(ReconciliationAction(name, "unchanged"))
             elif altered:
                 pass # report already updated in sub-methods
             else:

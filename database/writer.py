@@ -337,6 +337,16 @@ def db_writer_worker() -> None:
 
 def enqueue_write(sql: str, params: tuple = (), *, track: bool = False) -> Optional[WriteReceipt]:
     global _writer_thread
+    # Honor the master DB integration toggle. When disabled (e.g. for
+    # testing), all writes are silently skipped. This is the single
+    # chokepoint for operational DB writes.
+    try:
+        import config
+        if not getattr(config, "DATABASE_INTEGRATION_ENABLED", True):
+            return None
+    except ImportError:
+        pass
+
     if _writer_thread is None or not _writer_thread.is_alive():
         try:
             start_writer()
@@ -362,6 +372,16 @@ def enqueue_write(sql: str, params: tuple = (), *, track: bool = False) -> Optio
 
 def enqueue_execscript(script_text: str, *, track: bool = False) -> Optional[WriteReceipt]:
     global _writer_thread
+    # Honor the master DB integration toggle. When disabled (e.g. for
+    # testing), all writes are silently skipped. This is the single
+    # chokepoint for operational DB writes.
+    try:
+        import config
+        if not getattr(config, "DATABASE_INTEGRATION_ENABLED", True):
+            return None
+    except ImportError:
+        pass
+
     if _writer_thread is None or not _writer_thread.is_alive():
         try:
             start_writer()
@@ -387,6 +407,16 @@ def enqueue_execscript(script_text: str, *, track: bool = False) -> Optional[Wri
 
 def enqueue_transaction(statements: List[Tuple[str, Tuple]], *, track: bool = False) -> Optional[WriteReceipt]:
     global _writer_thread
+    # Honor the master DB integration toggle. When disabled (e.g. for
+    # testing), all writes are silently skipped. This is the single
+    # chokepoint for operational DB writes.
+    try:
+        import config
+        if not getattr(config, "DATABASE_INTEGRATION_ENABLED", True):
+            return None
+    except ImportError:
+        pass
+
     if _writer_thread is None or not _writer_thread.is_alive():
         try:
             start_writer()

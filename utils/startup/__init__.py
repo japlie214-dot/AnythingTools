@@ -11,6 +11,19 @@ from .recovery import run_startup_recovery
 _global_sync_engine = None
 
 async def _init_backup_step() -> None:
+    # Honor the master DB integration toggle. When disabled, skip backup
+    # engine initialization and cloud-writer startup entirely.
+    import config
+    if not getattr(config, "DATABASE_INTEGRATION_ENABLED", True):
+        log = get_dual_logger(__name__)
+        log.dual_log(
+            tag="Database:Integration:Disabled",
+            level="INFO",
+            message="Database integration disabled; skipping init_backup",
+            payload={"action": "skip", "reason": "toggle_disabled"},
+        )
+        return
+
     from database.backup.settings import BackupSettings
     from database.backup.engine.sync_engine import SyncEngine
     from database.backup.writer.cloud_writer import start_cloud_writer

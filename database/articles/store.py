@@ -113,7 +113,24 @@ class ArticleStore:
                 }
                 enqueue_cloud_write("scraped_articles_vec_backup", vec_backup_data, pk_col="rowid")
         except Exception:
-            pass
+            # Replace silent swallow with structured WARNING. The local
+            # SQLite write has already succeeded (enqueued above), so this
+            # failure only affects cloud sync. The periodic SyncEngine.sync_all()
+            # will catch missed rows on the next cycle, but the operator
+            # MUST be alerted that cloud sync was skipped for this article.
+            import sys
+            exc = sys.exc_info()[1]
+            log.dual_log(
+                tag="Article:Cloud:EnqueueFailed",
+                level="WARNING",
+                message=f"Cloud enqueue failed for article {article_id}: {exc}",
+                payload={
+                    "article_id": article_id,
+                    "error": str(exc)[:300],
+                    "error_type": type(exc).__name__,
+                    "has_embedding": embedding_bytes is not None,
+                },
+            )
 
         log.dual_log(
             tag="Article:Store:Upsert",
@@ -187,7 +204,18 @@ class ArticleStore:
             from database.backup.writer.cloud_writer import enqueue_cloud_delete
             enqueue_cloud_delete("scraped_articles", article_id, pk_col="id")
         except Exception:
-            pass
+            import sys
+            exc = sys.exc_info()[1]
+            log.dual_log(
+                tag="Article:Cloud:DeleteFailed",
+                level="WARNING",
+                message=f"Cloud delete failed for article {article_id}: {exc}",
+                payload={
+                    "article_id": article_id,
+                    "error": str(exc)[:300],
+                    "error_type": type(exc).__name__,
+                },
+            )
 
         log.dual_log(
             tag="Article:Store:Delete",

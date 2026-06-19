@@ -108,6 +108,13 @@ def logs_write_worker():
 
 def logs_enqueue_write(sql, params=(), *, track=False):
     """Enqueue a write operation to the logs database with overflow protection."""
+    # Honor the master DB integration toggle.
+    try:
+        import config
+        if not getattr(config, "DATABASE_INTEGRATION_ENABLED", True):
+            return
+    except ImportError:
+        pass
     global _logs_writer_thread, _logs_dropped_count
     if _logs_writer_thread is None or not _logs_writer_thread.is_alive():
         start_logs_writer()

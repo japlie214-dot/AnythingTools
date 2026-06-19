@@ -7,7 +7,7 @@ import warnings
 import traceback
 
 from utils.id_generator import ULID
-from utils.logger.formatters import _serialize_payload
+from utils.logger.formatters import _serialize_payload, MaskableData
 from utils.logger.handlers import (
     _cache_lock,
     _get_master_handlers,

@@ -62,6 +62,31 @@ class BackupSchemaRegistry:
                     re.IGNORECASE
                 )
                 sf_ddl = pattern.sub(rf"\1{sf_type}", sf_ddl)
+
+                # If the override changed the column type to BOOLEAN, convert
+                # any numeric DEFAULT (0/1) to BOOLEAN (FALSE/TRUE). Snowflake
+                # rejects "BOOLEAN ... DEFAULT 0" in some account configurations
+                # with error 002262 "Default value data type does not match
+                # data type for column". Per the Snowflake BOOLEAN docs, the
+                # correct DEFAULT for a BOOLEAN column is FALSE or TRUE.
+                # Ref: https://docs.snowflake.com/en/sql-reference/data-types-logical
+                # Ref: https://docs.snowflake.com/en/release-notes/bcr-bundles/2023_08/bcr-1425
+                # (BCR-1425 restricts incompatible DEFAULT pairs; BOOLEAN+NUMBER
+                # is not explicitly listed but empirically rejected in some
+                # accounts, so we convert defensively.)
+                if sf_type.upper() == "BOOLEAN":
+                    # Convert: <col> BOOLEAN [NOT NULL] DEFAULT 0 → ... DEFAULT FALSE
+                    sf_ddl = re.sub(
+                        rf'(?i)\b{re.escape(col_lower)}\b\s+BOOLEAN\s+((?:NOT\s+NULL\s+)?DEFAULT\s+)0\b',
+                        rf'{col_lower} BOOLEAN \1FALSE',
+                        sf_ddl,
+                    )
+                    # Convert: <col> BOOLEAN [NOT NULL] DEFAULT 1 → ... DEFAULT TRUE
+                    sf_ddl = re.sub(
+                        rf'(?i)\b{re.escape(col_lower)}\b\s+BOOLEAN\s+((?:NOT\s+NULL\s+)?DEFAULT\s+)1\b',
+                        rf'{col_lower} BOOLEAN \1TRUE',
+                        sf_ddl,
+                    )
         except ImportError:
             pass
 

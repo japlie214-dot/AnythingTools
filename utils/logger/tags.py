@@ -79,3 +79,27 @@ BACKUP_CLOUDWRITER_SHUTDOWN = "Backup:Writer:Shutdown"
 BACKUP_PULL_WRITTEN = "Backup:Pull:Written"
 BACKUP_SYNC_VALIDATION = "Backup:Sync:Validation"
 BACKUP_SYNC_COMPLETE = "Backup:Sync:Complete"
+
+# ── Database Integration Toggle ────────────────────────────────────────────────
+# Emitted when DATABASE_INTEGRATION_ENABLED=false causes a startup phase to skip.
+DATABASE_INTEGRATION_DISABLED = "Database:Integration:Disabled"
+
+# ── Migration Context (WHY logging) ────────────────────────────────────────────
+# Emitted by SnowflakeSchemaManager to explain WHY a table is being rebuilt
+# or repopulated. Without these, operators see "Recreated table X" but never
+# see "because column Y drifted from A to B".
+MIGRATION_CLOUD_REBUILD_CONTEXT = "Migration:Cloud:RebuildContext"
+MIGRATION_CLOUD_REBUILD_FAILED = "Migration:Cloud:RebuildFailed"
+MIGRATION_CLOUD_ROWCOUNT_MISMATCH = "Migration:Cloud:RowCountMismatch"
+
+# ── Article Store (replacing silent except: pass) ─────────────────────────────
+# Emitted by ArticleStore when cloud-enqueue fails. Previously these failures
+# were silently swallowed (except Exception: pass), making cloud sync gaps
+# invisible to operators.
+ARTICLE_CLOUD_ENQUEUE_FAILED = "Article:Cloud:EnqueueFailed"
+ARTICLE_CLOUD_DELETE_FAILED = "Article:Cloud:DeleteFailed"
+
+# ── Metrics Query Failures ────────────────────────────────────────────────────
+# Emitted by BackupMetricsCollector when a metrics query (dead_letter_count,
+# last_sync_time) fails. Logged at DEBUG to avoid noise.
+METRICS_QUERY_FAILED = "Backup:Metrics:QueryFailed"

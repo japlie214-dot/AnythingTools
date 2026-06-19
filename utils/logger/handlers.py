@@ -5,7 +5,7 @@ import sys
 import threading
 from typing import Any
 
-from utils.logger.formatters import ConsoleFormatter, FileFormatter, PayloadOrErrorFilter
+from utils.logger.formatters import ConsoleFormatter
 from utils.logger.routing import _LOG_DIR
 from utils.logger.state import _log_config
 

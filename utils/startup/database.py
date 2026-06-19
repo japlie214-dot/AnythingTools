@@ -15,7 +15,21 @@ log = get_dual_logger(__name__)
 
 async def init_database_layer() -> None:
     """Initialize database layer with explicit file probing and fresh logs.db policy."""
+    # Honor the master DB integration toggle. When disabled (e.g. for
+    # testing), skip ALL DB initialization: no writer threads, no logs DB
+    # wipe, no pragma tuning, no readiness check. The application can still
+    # run but all DB writes will be no-ops (the enqueue_* functions also
+    # check this toggle).
     import config
+    if not getattr(config, "DATABASE_INTEGRATION_ENABLED", True):
+        log.dual_log(
+            tag="Database:Integration:Disabled",
+            level="INFO",
+            message="Database integration disabled via DATABASE_INTEGRATION_ENABLED=false; skipping init_database_layer",
+            payload={"action": "skip", "reason": "toggle_disabled"},
+        )
+        return
+
     if not getattr(config, "EDGAR_IDENTITY", None):
         sys.stderr.write("[FATAL] EDGAR_IDENTITY environment variable is missing. Aborting startup.\n")
         os.kill(os.getpid(), signal.SIGTERM)
