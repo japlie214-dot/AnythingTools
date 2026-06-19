@@ -140,8 +140,7 @@ A standalone, read-only utility for inspecting `logs.db`.
 ## 9. Setup, Build, and Execution
 ### Environment Configuration
 Requires a `.env` file containing:
-- `API_KEY`: Authentication for the REST API.
-- `SNOWFLAKE_*`: Credentials for cloud backup.
+ - `SNOWFLAKE_*`: Credentials for cloud backup.
 - `AZURE_OPENAI_*` / `CHUTES_*`: LLM API keys.
 - `EDGAR_IDENTITY`: Required for SEC EDGAR access.
 
@@ -157,8 +156,9 @@ python -m uvicorn app:app --port 8000
 
 ## 10. Testing & Validation
 - **`tests/test_backup.py`**: Validates the `SyncEngine`'s ability to detect and resolve drifts, composite PK detection, and session recovery logic.
-- **`tests/inspect_notes.py`**: Validates the extraction and tidy-transformation of SEC footnotes.
-- **`tests/test_browser_e2e.py`**: End-to-end validation of the browser-tool-orchestrator loop.
+- **`tests/test_inspect_notes.py`**: Live SEC EDGAR contract test for the edgartools API surface (notes, tables, details, to_dataframe). Requires `EDGAR_IDENTITY`; skip with `-m "not network"`.
+- **`tests/test_browser_e2e.py`**: E2E validation of the scraper tool's browser-orchestrator loop. Skipped automatically if no Chrome/Chromium binary is on PATH; skip in CI with `-m "not network"`.
+- **`tests/test_backup.py::TestCompositePKSerialization`**: Regression test for composite-PK round-trip with special characters in PK values.
 
 ## 11. Known Limitations & Non-Goals
 - **SQLite Locking**: While the single-writer pattern mitigates locking, extremely high write volumes may still cause contention.

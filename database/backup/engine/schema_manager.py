@@ -34,14 +34,44 @@ class SnowflakeSchemaManager:
             expected_tables = BackupSchemaRegistry.get_expected_sqlite_tables()
             for t_name, ddl in expected_tables.items():
                 if t_name not in existing:
-                    sf_ddl = BackupSchemaRegistry.get_snowflake_ddl(t_name)
-                    conn.execute(text(sf_ddl))
-                    log.dual_log(
-                        tag="Backup:Cloud:Schema",
-                        message=f"Created missing table {t_name}",
-                        level="INFO",
-                        payload={"table": t_name},
-                    )
+                    # Per Pushback 2: get_snowflake_ddl may raise RuntimeError
+                    # if the sqlglot AST rewrite fails. We must NOT let one bad
+                    # table abort the entire reconcile loop — the app would fail
+                    # to start. Wrap each table's DDL generation in try/except,
+                    # log CRITICAL, and continue to the next table.
+                    #
+                    # Per FastAPI lifespan docs:
+                    # https://fastapi.tiangolo.com/advanced/events/
+                    # "Starlette will not start serving any incoming requests
+                    # until the lifespan has been run." An unhandled exception
+                    # in startup prevents serving.
+                    try:
+                        sf_ddl = BackupSchemaRegistry.get_snowflake_ddl(t_name)
+                        conn.execute(text(sf_ddl))
+                        log.dual_log(
+                            tag="Backup:Cloud:Schema",
+                            message=f"Created missing table {t_name}",
+                            level="INFO",
+                            payload={"table": t_name},
+                        )
+                    except RuntimeError as e:
+                        # DDL generation failed for this table. The
+                        # BackupSchemaRegistry already logged a CRITICAL with
+                        # full diagnostic context. Log a per-table ERROR here
+                        # so operators can see which table in the reconcile
+                        # loop was skipped, then continue.
+                        log.dual_log(
+                            tag="Backup:Cloud:Schema:Skipped",
+                            level="ERROR",
+                            message=f"Skipping table {t_name} during reconcile: DDL generation failed",
+                            payload={
+                                "table": t_name,
+                                "error": str(e)[:1000],
+                                "error_type": type(e).__name__,
+                                "impact": "Table will not be created in Snowflake; cloud sync for this table is degraded until the AST rewrite is fixed.",
+                            },
+                        )
+                        continue
                 else:
                     SnowflakeSchemaManager._reconcile_columns(
                         conn, t_name, ddl, existing[t_name]
@@ -203,19 +233,48 @@ class SnowflakeSchemaManager:
                                 }
                                 for m in mismatches
                             ],
-                            "new_ddl_preview": BackupSchemaRegistry.get_snowflake_ddl(t_name)[:500],
-                        },
+                            "new_ddl_preview": SnowflakeSchemaManager._safe_get_snowflake_ddl_preview(t_name),
+                         },
                     )
+                    # Per Pushback 2: wrap the DDL generation in try/except so
+                    # a single bad table does not abort reconcile_types.
+                    try:
+                        new_ddl = BackupSchemaRegistry.get_snowflake_ddl(t_name)
+                    except RuntimeError as e:
+                        log.dual_log(
+                            tag="Backup:Cloud:Schema:Skipped",
+                            level="ERROR",
+                            message=f"Skipping type-mismatch rebuild for {t_name}: DDL generation failed",
+                            payload={
+                                "table": t_name,
+                                "error": str(e)[:1000],
+                                "error_type": type(e).__name__,
+                                "impact": "Table will retain its current Snowflake schema; type mismatch will be re-detected on next startup.",
+                            },
+                        )
+                        continue
                     plans.append(TypeMismatchPlan(
                         table_name=t_name,
                         mismatches=mismatches,
                         clone_table_name=f"_migrate_{t_name}_{timestamp}",
-                        new_ddl=BackupSchemaRegistry.get_snowflake_ddl(t_name),
+                        new_ddl=new_ddl,
                         columns_to_skip=[m.column_name for m in mismatches],
                         pk_column=pk_column,
                         is_master=True,
                     ))
         return plans
+
+    @staticmethod
+    def _safe_get_snowflake_ddl_preview(table_name: str) -> str:
+        """Get a DDL preview for logging, returning an error marker on failure.
+
+        Used in logging contexts where a DDL generation failure should not
+        abort the surrounding log emission.
+        """
+        try:
+            return BackupSchemaRegistry.get_snowflake_ddl(table_name)[:500]
+        except Exception as e:
+            return f"[DDL_GENERATION_FAILED: {type(e).__name__}: {str(e)[:200]}]"
 
     @staticmethod
     def rebuild_table(engine, schema_name: str, plan, op_db_path: str):

@@ -36,6 +36,6 @@ sqlite-vec>=0.1.0
 openai>=1.0.0          # clients/llm/providers/azure.py, chutes.py, utils.py
 botasaurus>=3.0.0       # tools/scraper/browser.py, extraction.py, task.py, utils/browser_*.py
 yfinance>=0.2.0         # deprecated/tools/finance/price_updater.py, pipeline.py
-edgartools>=2.0.0       # tests/inspect_notes.py
+edgartools>=2.0.0       # tests/test_inspect_notes.py
 psutil>=5.9.0           # utils/browser_daemon.py, utils/startup/cleanup.py
 cryptography>=41.0.0    # database/backup/engine/cloud_engine.py

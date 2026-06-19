@@ -1,5 +1,5 @@
 # api/routes.py
-from fastapi import APIRouter, HTTPException, status, Request, Depends, BackgroundTasks, Query
+from fastapi import APIRouter, HTTPException, status, Request, BackgroundTasks, Query
 from typing import Dict, Any, Optional
 import threading
 import asyncio

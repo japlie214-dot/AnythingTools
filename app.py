@@ -144,22 +144,10 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 
 # === Mount routers ===
 from api.routes import router as api_router
-app.include_router(api_router, prefix="/api", dependencies=[Depends(verify_api_key)])
-
-# === Public routes (no API key required) ===
-from api.routes import router as public_router
-# Public router is the same but without auth - for now, only /manifest is public
-from fastapi import APIRouter
-
-public_router_no_auth = APIRouter()
-
-@public_router_no_auth.get("/manifest")
-async def public_manifest():
-    from tools.registry import REGISTRY
-    return {"tools": REGISTRY.schema_list()}
-
-
-app.include_router(public_router_no_auth, prefix="/api")
+# /manifest is defined on api_router itself (api/routes.py:41), so a single
+# include covers all /api/* endpoints. The previous public_router_no_auth
+# block was redundant once auth was removed.
+app.include_router(api_router, prefix="/api")
 
 @app.get("/", include_in_schema=False)
 async def root():

@@ -1,11 +1,24 @@
 # database/backup/schema_registry.py
+"""Snowflake DDL generation from SQLite DDL via sqlglot transpilation.
+
+Fail-fast policy: if the sqlglot AST rewrite raises SqlglotError (the
+documented base class for parse/transform failures — see
+https://sqlglot.com/sqlglot/errors.html), we raise RuntimeError with
+full diagnostic context. The previous `except Exception:` silent-fallback
+to a regex-based patch was fragile (regex on DDL is collision-prone) and
+was the exact pattern the AST rewrite was introduced to replace.
+"""
 import re
 import sqlglot
+import sqlglot.errors
 from sqlglot import exp
 from typing import Dict, List, Optional
 from database.schemas import ALL_TABLES, ALL_VEC_TABLES, PERSISTED_TABLES
 from database.connection import SQLITE_VEC_AVAILABLE
 from database.management.schema_introspector import _columns_from_ddl_in_memory
+from utils.logger import get_dual_logger
+
+log = get_dual_logger(__name__)
 
 class BackupSchemaRegistry:
     @classmethod
@@ -153,45 +166,65 @@ class BackupSchemaRegistry:
             # a simple, well-defined token removal that has zero substring
             # collision risk (it matches a SQL keyword, not a column name).
             sf_ddl = re.sub(r"(?i)\s*DEFAULT\s+CURRENT_TIMESTAMP(?:\(\))?", "", sf_ddl)
-        except Exception:
-            # AST transformation failed for an unexpected reason. Fall back
-            # to the raw transpiled DDL with only CURRENT_TIMESTAMP stripped.
-            # This is safe because reconcile_types() will detect type
-            # mismatches on next startup.
-            sf_ddl = re.sub(r"(?i)\s*DEFAULT\s+CURRENT_TIMESTAMP(?:\(\))?", "", sf_ddl)
-            for col_lower, sf_type in overrides.items():
-                pattern = re.compile(
-                    rf'(?i)((?:\b|"){re.escape(col_lower)}(?:\b|")\s+)([A-Z0-9_]+(?:\s*\([^)]*\))?)',
-                    re.IGNORECASE
-                )
-                sf_ddl = pattern.sub(rf"\1{sf_type}", sf_ddl)
-
-                # If the override changed the column type to BOOLEAN, convert
-                # any numeric DEFAULT (0/1) to BOOLEAN (FALSE/TRUE). Snowflake
-                # rejects "BOOLEAN ... DEFAULT 0" in some account configurations
-                # with error 002262 "Default value data type does not match
-                # data type for column". Per the Snowflake BOOLEAN docs, the
-                # correct DEFAULT for a BOOLEAN column is FALSE or TRUE.
-                # Ref: https://docs.snowflake.com/en/sql-reference/data-types-logical
-                # Ref: https://docs.snowflake.com/en/release-notes/bcr-bundles/2023_08/bcr-1425
-                # (BCR-1425 restricts incompatible DEFAULT pairs; BOOLEAN+NUMBER
-                # is not explicitly listed but empirically rejected in some
-                # accounts, so we convert defensively.)
-                if sf_type.upper() == "BOOLEAN":
-                    # Convert: <col> BOOLEAN [NOT NULL] DEFAULT 0 → ... DEFAULT FALSE
-                    sf_ddl = re.sub(
-                        rf'(?i)\b{re.escape(col_lower)}\b\s+BOOLEAN\s+((?:NOT\s+NULL\s+)?DEFAULT\s+)0\b',
-                        rf'{col_lower} BOOLEAN \1FALSE',
-                        sf_ddl,
-                    )
-                    # Convert: <col> BOOLEAN [NOT NULL] DEFAULT 1 → ... DEFAULT TRUE
-                    sf_ddl = re.sub(
-                        rf'(?i)\b{re.escape(col_lower)}\b\s+BOOLEAN\s+((?:NOT\s+NULL\s+)?DEFAULT\s+)1\b',
-                        rf'{col_lower} BOOLEAN \1TRUE',
-                        sf_ddl,
-                    )
-        except ImportError:
-            pass
+        except sqlglot.errors.SqlglotError as e:
+            # Fail-fast on parser/unsupported errors. Per the sqlglot error
+            # hierarchy docs: https://sqlglot.com/sqlglot/errors.html
+            # "SqlglotError(Exception) is the base; subclasses UnsupportedError,
+            # ParseError, TokenError, OptimizeError, SchemaError, ExecuteError."
+            #
+            # The previous silent fallback to a regex-based patch was the
+            # exact pattern the AST rewrite was introduced to replace (regex
+            # on DDL is collision-prone). Surfacing the failure forces the
+            # AST rewrite to be fixed rather than silently degrading.
+            #
+            # Note on Snowflake BOOLEAN: per BCR-1425
+            # (https://docs.snowflake.com/en/release-notes/bcr-bundles/2023_08/bcr-1425)
+            # the failing-combinations table lists BOOLEAN/VARCHAR but NOT
+            # BOOLEAN/NUMBER. Per the logical-data-types doc
+            # (https://docs.snowflake.com/en/sql-reference/data-types-logical)
+            # "Zero (0) is converted to FALSE. Any non-zero value is converted
+            # to TRUE." — so BOOLEAN DEFAULT 0/1 is valid via implicit
+            # conversion. The defensive rewrite to FALSE/TRUE is still applied
+            # in the AST path for clarity, but is not strictly required.
+            log.dual_log(
+                tag="Backup:SchemaRegistry:DDLFallbackFailed",
+                level="CRITICAL",
+                message=f"sqlglot AST rewrite failed for {table_name}: {e}",
+                payload={
+                    "table": table_name,
+                    "original_sqlite_ddl": sqlite_ddl[:2000],
+                    "transpiled_ddl_before_patch": sf_ddl[:2000],
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
+            raise RuntimeError(
+                f"Snowflake DDL generation failed for table '{table_name}': "
+                f"{type(e).__name__}: {e}. The AST rewrite in "
+                f"database/backup/schema_registry.py must be updated to "
+                f"handle this case. The raw transpiled DDL is not safe to "
+                f"use because the regex-based fallback is intentionally "
+                f"disabled (it was the source of prior DDL corruption bugs)."
+            ) from e
+        except Exception as e:
+            # Non-sqlglot exception (programming error in the rewrite logic).
+            # Also fail-fast — silently returning unpatched DDL is unsafe.
+            log.dual_log(
+                tag="Backup:SchemaRegistry:DDLFallbackFailed",
+                level="CRITICAL",
+                message=f"Unexpected exception during AST rewrite for {table_name}: {e}",
+                payload={
+                    "table": table_name,
+                    "original_sqlite_ddl": sqlite_ddl[:2000],
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+                exc_info=e,
+            )
+            raise RuntimeError(
+                f"Unexpected error generating Snowflake DDL for '{table_name}': "
+                f"{type(e).__name__}: {e}"
+            ) from e
 
         return sf_ddl
 

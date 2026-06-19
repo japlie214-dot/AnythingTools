@@ -1,4 +1,12 @@
 # database/backup/sync/diff_engine.py
+"""
+Purely computational 2-way set diff between operational and cloud SQLite DBs.
+
+Composite PKs are serialized as JSON strings (not pipe-delimited) so that
+PK values containing "|" or any other special character survive the
+round-trip through SyncEngine. Ref: RFC 8259 — https://datatracker.ietf.org/doc/html/rfc8259
+"""
+import json
 import sqlite3
 from typing import Dict, Any
 

@@ -9,6 +9,9 @@ thread. This engine handles:
   4. Periodic sync as safety net for missed inline writes
 """
 
+# json: for lossless composite-PK serialization (replaces pipe-delimited strings).
+# Ref: RFC 8259 — https://datatracker.ietf.org/doc/html/rfc8259
+import json
 import sqlite3
 import time
 import os
@@ -593,11 +596,6 @@ class SyncEngine:
             for table_name, ddl in tables.items():
                 if 'VIRTUAL' in ddl.upper() or 'updated_at' not in ddl.lower():
                     continue
-                # Backfill content hashes BEFORE computing deltas.
-                # This was previously a hidden write side-effect inside
-                # DiffEngine.compute_deltas. Extracted here as an explicit
-                # mutation step so the DiffEngine remains purely computational.
-                self._backfill_content_hashes(op_conn, table_name)
                 try:
                     op_count = op_conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
                     op_latest = op_conn.execute(f"SELECT MAX(updated_at) FROM {table_name}").fetchone()[0]
@@ -672,13 +670,29 @@ class SyncEngine:
                             ).fetchall()
                         else:
                             # Composite PK — OR-of-ANDs pattern.
-                            # Each cloud_only entry is a pipe-delimited string
-                            # like "AAPL|BS|Revenue|2024-Q1". Split back into
-                            # individual values for the WHERE clause.
+                            # Each cloud_only entry is a JSON-encoded list
+                            # (e.g. '["AAPL","BS","Revenue|Sub","2024-Q1"]') so
+                            # PK values containing "|" or any other special
+                            # character survive the round-trip through
+                            # DiffEngine._insert_diff_rows (which serializes
+                            # via json.dumps). Ref: RFC 8259.
                             or_clauses = []
                             params = []
                             for pk_str in chunk:
-                                pk_vals = pk_str.split("|")
+                                try:
+                                    pk_vals = json.loads(pk_str)
+                                except (ValueError, TypeError):
+                                    # Malformed entry — log and skip rather
+                                    # than silently dropping via the old
+                                    # len() guard. The previous behavior
+                                    # would lose the row without a trace.
+                                    log.dual_log(
+                                        tag="Backup:Sync:MalformedPK",
+                                        level="WARNING",
+                                        message=f"Could not deserialize composite PK for {table_name} restore",
+                                        payload={"table": table_name, "pk_repr": str(pk_str)[:200]},
+                                    )
+                                    continue
                                 if len(pk_vals) == len(pk_col):
                                     and_parts = " AND ".join([f"{c} = ?" for c in pk_col])
                                     or_clauses.append(f"({and_parts})")
@@ -702,8 +716,17 @@ class SyncEngine:
                         if isinstance(pk_col, str):
                             op_transactions.append((f"DELETE FROM {table_name} WHERE {pk_col} = ?", (op_id,)))
                         else:
-                            # Composite PK: op_id is pipe-delimited
-                            pk_vals = op_id.split("|")
+                            # Composite PK: op_id is a JSON-encoded list.
+                            try:
+                                pk_vals = json.loads(op_id)
+                            except (ValueError, TypeError):
+                                log.dual_log(
+                                    tag="Backup:Sync:MalformedPK",
+                                    level="WARNING",
+                                    message=f"Could not deserialize composite PK for {table_name} delete",
+                                    payload={"table": table_name, "pk_repr": str(op_id)[:200]},
+                                )
+                                continue
                             if len(pk_vals) == len(pk_col):
                                 where = " AND ".join([f"{c} = ?" for c in pk_col])
                                 op_transactions.append((f"DELETE FROM {table_name} WHERE {where}", tuple(pk_vals)))
@@ -719,7 +742,16 @@ class SyncEngine:
                         if isinstance(pk_col, str):
                             row = temp_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} = ?", (conflict_id,)).fetchone()
                         else:
-                            pk_vals = conflict_id.split("|")
+                            try:
+                                pk_vals = json.loads(conflict_id)
+                            except (ValueError, TypeError):
+                                log.dual_log(
+                                    tag="Backup:Sync:MalformedPK",
+                                    level="WARNING",
+                                    message=f"Could not deserialize composite PK for {table_name} conflict",
+                                    payload={"table": table_name, "pk_repr": str(conflict_id)[:200]},
+                                )
+                                continue
                             where = " AND ".join([f"{c} = ?" for c in pk_col])
                             row = temp_conn.execute(f"SELECT * FROM {table_name} WHERE {where}", tuple(pk_vals)).fetchone()
                         if row:

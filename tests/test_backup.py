@@ -233,3 +233,101 @@ class TestCompositePKDetection:
         assert _compute_chunk_size(["id"]) == MAX_CHUNK_SIZE
         assert _compute_chunk_size(["a", "b"]) == SQLITE_HOST_PARAM_LIMIT // 2
         assert _compute_chunk_size(["a", "b", "c", "d"]) == SQLITE_HOST_PARAM_LIMIT // 4
+
+class TestCompositePKSerialization:
+    """Verify composite-PK round-trip through DiffEngine → SyncEngine
+    is lossless even when PK values contain '|' or other special chars.
+
+    This is a regression test for the pipe-delimiter bug:
+    DiffEngine._insert_diff_rows serialized composite PKs as 'a|b|c',
+    and SyncEngine.split('|') deserialized them. If any PK value
+    contained '|', the split produced the wrong number of values and
+    the row was silently dropped.
+
+    Ref: RFC 8259 — https://datatracker.ietf.org/doc/html/rfc8259
+    """
+
+    def test_pk_values_containing_pipe_survive_round_trip(self, tmp_path):
+        """A composite PK value like 'Revenue|Sub' must round-trip
+        through DiffEngine.compute_deltas without data loss."""
+        import sqlite3
+        import json
+        from database.backup.sync.diff_engine import DiffEngine
+
+        # Build two DBs: op has one row, cloud has zero rows.
+        # The PK value 'Revenue|Sub' contains a pipe — the old bug
+        # would have split it into ['Revenue', 'Sub'] and dropped the row.
+        schema = """
+            CREATE TABLE test_composite (
+                concept TEXT NOT NULL,
+                quarter TEXT NOT NULL,
+                content_hash TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (concept, quarter)
+            );
+        """
+        op_db = tmp_path / "op.db"
+        cloud_db = tmp_path / "cloud.db"
+        op_conn = sqlite3.connect(op_db); op_conn.executescript(schema)
+        cloud_conn = sqlite3.connect(cloud_db); cloud_conn.executescript(schema)
+
+        op_conn.execute(
+            "INSERT INTO test_composite (concept, quarter, content_hash, updated_at) VALUES (?, ?, ?, ?)",
+            ("Revenue|Sub", "2024-Q1", "hash1", "2024-01-01T00:00:00Z"),
+        )
+        op_conn.commit()
+
+        deltas = DiffEngine.compute_deltas(op_conn, cloud_conn, "test_composite")
+
+        # The row must appear in op_only (cloud is empty).
+        assert len(deltas["op_only"]) == 1, (
+            f"Expected 1 op_only row, got {len(deltas['op_only'])} — "
+            f"the pipe-delimiter bug may have returned."
+        )
+        pk_serialized = deltas["op_only"][0]
+
+        # The serialized PK must deserialize back to the original values.
+        pk_vals = json.loads(pk_serialized)
+        assert pk_vals == ["Revenue|Sub", "2024-Q1"], (
+            f"PK round-trip corrupted: expected ['Revenue|Sub', '2024-Q1'], got {pk_vals}"
+        )
+
+        op_conn.close(); cloud_conn.close()
+
+    def test_pk_values_containing_quotes_and_newlines_survive(self, tmp_path):
+        """JSON handles all special characters per RFC 8259."""
+        import sqlite3
+        import json
+        from database.backup.sync.diff_engine import DiffEngine
+
+        schema = """
+            CREATE TABLE test_special (
+                a TEXT NOT NULL,
+                b TEXT NOT NULL,
+                content_hash TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (a, b)
+            );
+        """
+        op_db = tmp_path / "op.db"
+        cloud_db = tmp_path / "cloud.db"
+        op_conn = sqlite3.connect(op_db); op_conn.executescript(schema)
+        cloud_conn = sqlite3.connect(cloud_db); cloud_conn.executescript(schema)
+
+        # PK values with quotes, backslashes, newlines, and Unicode.
+        nasty_a = 'value"with"quotes\\and\\backslashes\nand newline'
+        nasty_b = 'unicode: 中文 émoji 🎉'
+        op_conn.execute(
+            "INSERT INTO test_special (a, b, content_hash, updated_at) VALUES (?, ?, ?, ?)",
+            (nasty_a, nasty_b, "hash1", "2024-01-01T00:00:00Z"),
+        )
+        op_conn.commit()
+
+        deltas = DiffEngine.compute_deltas(op_conn, cloud_conn, "test_special")
+        assert len(deltas["op_only"]) == 1
+        pk_vals = json.loads(deltas["op_only"][0])
+        assert pk_vals == [nasty_a, nasty_b], (
+            f"PK round-trip corrupted for special chars: got {pk_vals}"
+        )
+
+        op_conn.close(); cloud_conn.close()
