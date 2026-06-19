@@ -1,6 +1,7 @@
 # utils/logger/formatters.py
 import json
 import logging
+import re as _re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -45,8 +46,12 @@ def _serialize_payload(payload: Any, depth: int = 0) -> Any:
         except Exception:
             return "[MASKED]"
     if isinstance(payload, str):
-        # short strings pass through
-        return payload
+        # Apply secret redaction as a safety net for values not
+        # explicitly wrapped in MaskableData, then truncate if huge.
+        result = _redact_secrets_in_string(payload)
+        if len(result) > _MAX_PAYLOAD_CHARS:
+            return result[:_MAX_PAYLOAD_CHARS] + f"...[TRUNCATED: {len(result) - _MAX_PAYLOAD_CHARS} more chars]"
+        return result
     if isinstance(payload, (bytes, bytearray)):
         return f"[MASKED: Binary Data | {len(payload)} bytes]"
     if isinstance(payload, (int, float, bool)):
@@ -72,6 +77,56 @@ def _serialize_payload(payload: Any, depth: int = 0) -> Any:
         return repr(payload)
     except Exception:
         return "<unserializable>"
+    
+    
+    # Regex pattern for automatic redaction of common secret patterns.
+    # This is a SAFETY NET: it catches credentials that engineers forgot
+    # to wrap in MaskableData. It runs on every serialized payload value
+    # that is a string, checking for patterns like:
+    #   - api_key=abc123  / api_key: abc123
+    #   - password=secret  / password: secret
+    #   - token=xyz  / token: xyz
+    #   - Bearer abc123def
+    #
+    # The pattern requires a structural delimiter (= or :) after the key
+    # name, which prevents false positives on words like "keyboard".
+_REDACT_PEEK_PATTERN = _re.compile(
+    r'(?i)((?:api[_-]?key|secret|password|passwd|token|credential|auth'
+    r'|private[_-]?key)(?:\s*[=:]\s*))(\S+)',
+)
+
+# Maximum payload string length before truncation.
+# Prevents unbounded memory from huge binary blobs or embedding arrays.
+_MAX_PAYLOAD_CHARS = 10000
+
+
+def _redact_secrets_in_string(s: str) -> str:
+    """Apply regex-based secret redaction to a string value.
+    
+    Catches patterns NOT explicitly wrapped in MaskableData.
+    For example, if an engineer logs {"config": "api_key=SK_live_abc123"},
+    this function redacts it to {"config": "api_key=[REDACTED]"}.
+    """
+    return _REDACT_PEEK_PATTERN.sub(r'\1[REDACTED]', s)
+
+
+def _mask_payload_if_large(payload: Any) -> Any:
+    """Safety valve to prevent massive binary blobs from saturating storage.
+    
+    If the serialized form of a payload exceeds _MAX_PAYLOAD_CHARS,
+    it is truncated with a clear indicator. This prevents a single
+    erroneous log entry (e.g., an entire embedding array) from
+    consuming excessive storage in logs.db.
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, (bytes, bytearray)):
+        if len(payload) > _MAX_PAYLOAD_CHARS:
+            return f"[MASKED: Binary Data | {len(payload)} bytes]"
+    if isinstance(payload, str):
+        if len(payload) > _MAX_PAYLOAD_CHARS:
+            return payload[:_MAX_PAYLOAD_CHARS] + f"...[TRUNCATED: {len(payload) - _MAX_PAYLOAD_CHARS} more chars]"
+    return payload
 
 
 class ConsoleFormatter(logging.Formatter):

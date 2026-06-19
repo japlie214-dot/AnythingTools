@@ -92,25 +92,47 @@ def _detect_pk_columns(local_conn, table_name: str) -> tuple[Union[str, List[str
     return (pk_cols[0] if len(pk_cols) == 1 else pk_cols), has_hash
 
 
-def _compute_chunk_size(pk_cols_list: list[str]) -> int:
-    """Compute the safe chunk size for a batch operation based on the
-    number of PK columns.
+def _compute_chunk_size(pk_cols_list: list[str], *, total_params_per_row: int = 0) -> int:
+    """Compute the safe chunk size for a batch operation.
 
-    Each row in the OR-of-ANDs WHERE clause uses len(pk_cols_list) host
-    parameters. To stay within SQLite's SQLITE_MAX_VARIABLE_NUMBER limit
-    (999 on older SQLite, 32766 on SQLite 3.32+), we divide the limit by
-    the PK column count and cap at MAX_CHUNK_SIZE for performance.
+    Determines how many rows can be safely included in a single SQL
+    statement without exceeding SQLite's SQLITE_MAX_VARIABLE_NUMBER
+    limit (999 on SQLite < 3.32.0, 32766 on SQLite >= 3.32.0).
+    Per https://www.sqlite.org/limits.html
 
-    Examples:
+    Two usage modes:
+    
+    1. WHERE clause batching (default): Each row uses len(pk_cols_list)
+       host parameters in an OR-of-ANDs WHERE clause. Example:
+       WHERE (pk1=? AND pk2=?) OR (pk1=? AND pk2=?) ...
+       Call: _compute_chunk_size(pk_cols_list)
+    
+    2. INSERT/MERGE batching: Each row uses total_params_per_row host
+       parameters (typically len(columns) per row). Example:
+       INSERT INTO t (c1,c2,...,c10) VALUES (?,?,...,?) -- repeated N times
+       Call: _compute_chunk_size(pk_cols_list, total_params_per_row=10)
+    
+    WARNING: The default mode (total_params_per_row=0) assumes WHERE-
+    clause usage where each row contributes len(pk_cols_list) parameters.
+    If you are computing chunk sizes for INSERT or multi-column batch
+    operations, you MUST pass total_params_per_row explicitly. Failure
+    to do so will cause SQLITE_MAX_VARIABLE_NUMBER violations.
+
+    Examples (WHERE clause mode):
         Single-PK table:     min(999 // 1, 900) = 900
-        2-column composite:  min(999 // 2, 900) = 499
-        3-column composite:  min(999 // 3, 900) = 333
         4-column composite:  min(999 // 4, 900) = 249
+
+    Examples (INSERT mode with 10-column table):
+        Single-PK:           min(999 // 10, 900) = 99
 
     Reference: https://www.sqlite.org/limits.html
     """
     n_cols = max(1, len(pk_cols_list))
-    return min(SQLITE_HOST_PARAM_LIMIT // n_cols, MAX_CHUNK_SIZE)
+    if total_params_per_row > 0:
+        params_per_row = total_params_per_row
+    else:
+        params_per_row = n_cols
+    return min(SQLITE_HOST_PARAM_LIMIT // max(1, params_per_row), MAX_CHUNK_SIZE)
 
 
 def upload_local_manifest(

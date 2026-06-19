@@ -5,8 +5,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- API Security ---
-API_KEY: str = os.getenv("API_KEY", "dev_default_key_change_me_in_production")
 ANYTHINGTOOLS_PORT: int = int(os.getenv("ANYTHINGTOOLS_PORT", "8000"))
 
 # --- Operational Database Path ---
@@ -90,7 +88,7 @@ GOOGLE_API_KEY: str | None = os.getenv("GOOGLE_API_KEY")
 # LOGGER_TRUNCATION_LIMIT is still honored by log formatters via getattr on _log_config.
 
 # --- AnythingLLM Integration ---
-ANYTHINGLLM_API_KEY: str = os.getenv("ANYTHINGLLM_API_KEY", "YEZTCHW-KHT4C1J-GP8DPW5-SK77TE5")
+ANYTHINGLLM_API_KEY: str | None = os.getenv("ANYTHINGLLM_API_KEY")
 ANYTHINGLLM_BASE_URL: str = os.getenv("ANYTHINGLLM_BASE_URL", "http://localhost:3001")
 ANYTHINGLLM_WORKSPACE_SLUG: str = os.getenv("ANYTHINGLLM_WORKSPACE_SLUG", "my-workspace")
 ANYTHINGLLM_CALLBACK_TIMEOUT: int = int(os.getenv("ANYTHINGLLM_CALLBACK_TIMEOUT", "120"))

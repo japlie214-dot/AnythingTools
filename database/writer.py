@@ -55,6 +55,11 @@ EXEC_SCRIPT = "__EXEC_SCRIPT__"
 TRANSACTION_MARKER = "__TRANSACTION__"
 MAX_REPAIR_RETRIES = 1
 
+# Truncation boundaries for log payloads.
+# Error messages are NEVER truncated — they are the diagnostic lifeline.
+# SQL statements are truncated at 2000 chars with an indicator.
+_SQL_PREVIEW_LIMIT = 2000
+
 
 def _extract_table_name(error_msg: str) -> Optional[str]:
     match = re.search(r'no such table:\s*(?:\"|[\w\.]+\.)?(\w+)\"?', error_msg, re.IGNORECASE)
@@ -245,7 +250,7 @@ def db_writer_worker() -> None:
                                 if table_name and _attempt_table_repair(conn, table_name) and attempt < MAX_REPAIR_RETRIES:
                                     continue
                             elif _is_foreign_key_error(e):
-                                log.dual_log(tag="DB:Writer:FK", message="FK constraint failed", level="ERROR", payload={"sql": sql, "params": params})
+                                log.dual_log(tag="DB:Writer:FK", message="FK constraint failed", level="ERROR", payload={"sql": sql[:_SQL_PREVIEW_LIMIT], "params": params})
                                 try:
                                     conn.rollback()
                                 except Exception:
@@ -255,7 +260,7 @@ def db_writer_worker() -> None:
                                 break
                             elif _is_recoverable_vec0_error(e):
                                 param_summary = [f"<BLOB: {len(p)} bytes>" if isinstance(p, bytes) else p for p in params]
-                                log.dual_log(tag="DB:Writer:VecError", message="sqlite-vec recoverable error", level="WARNING", payload={"sql_preview": str(sql)[:200], "params_preview": str(param_summary)[:200], "error": str(e)})
+                                log.dual_log(tag="DB:Writer:VecError", message="sqlite-vec recoverable error", level="WARNING", payload={"sql_preview": sql[:_SQL_PREVIEW_LIMIT], "params_preview": str(param_summary)[:200], "error": str(e)})
                                 # Removed write warm attempts; rely on higher-level reconciliation and nuke if necessary.
                                 try:
                                     conn.rollback()
@@ -266,7 +271,7 @@ def db_writer_worker() -> None:
                                 break
                             elif _is_fatal_vec0_error(e):
                                 param_summary = [f"<BLOB: {len(p)} bytes>" if isinstance(p, bytes) else p for p in params]
-                                log.dual_log(tag="DB:Writer:VecFatal", message="sqlite-vec fatal error", level="ERROR", payload={"sql_preview": str(sql)[:200], "params_preview": str(param_summary)[:200], "error": str(e)})
+                                log.dual_log(tag="DB:Writer:VecFatal", message="sqlite-vec fatal error", level="ERROR", payload={"sql_preview": sql[:_SQL_PREVIEW_LIMIT], "params_preview": str(param_summary)[:200], "error": str(e)})
                                 try:
                                     conn.rollback()
                                 except Exception:
@@ -276,7 +281,7 @@ def db_writer_worker() -> None:
                                 break
     
                             # Unhandled error: reject receipt and break
-                            log.dual_log(tag="DB:Writer:Error", message=f"Write failed: {e}", level="ERROR", payload={"sql_preview": str(sql)[:200], "params_preview": str(params)[:200]} , exc_info=e)
+                            log.dual_log(tag="DB:Writer:Error", message=f"Write failed", level="ERROR", payload={"sql_preview": sql[:_SQL_PREVIEW_LIMIT], "params_preview": str(params)[:200], "error": str(e)}, exc_info=e)
                             try:
                                 conn.rollback()
                             except Exception:
@@ -288,7 +293,7 @@ def db_writer_worker() -> None:
             except Exception as e:
                 # Global per-task failure handler
                 try:
-                    log.dual_log(tag="DB:Writer:Error", message="Database write failed.", level="ERROR", payload={"sql_preview": str(sql)[:200], "params_preview": str(params)[:200]}, exc_info=e)
+                    log.dual_log(tag="DB:Writer:Error", message="Database write failed", level="ERROR", payload={"sql_preview": sql[:_SQL_PREVIEW_LIMIT], "params_preview": str(params)[:200], "error": str(e)}, exc_info=e)
                 except Exception:
                     try:
                         import sys
@@ -362,7 +367,7 @@ def enqueue_write(sql: str, params: tuple = (), *, track: bool = False) -> Optio
         write_queue.put_nowait((receipt, sql, params))
     except queue.Full:
         try:
-            log.dual_log(tag="DB:Writer:Overflow", message="Write queue full; dropping write.", level="WARNING", payload={"sql_preview": sql[:200], "qsize": write_queue.qsize()})
+            log.dual_log(tag="DB:Writer:Overflow", message="Write queue full; dropping write", level="WARNING", payload={"sql_preview": sql[:_SQL_PREVIEW_LIMIT], "qsize": write_queue.qsize()})
         except Exception:
             pass
         if receipt:
@@ -397,7 +402,7 @@ def enqueue_execscript(script_text: str, *, track: bool = False) -> Optional[Wri
         write_queue.put_nowait((receipt, EXEC_SCRIPT, (script_text,)))
     except queue.Full:
         try:
-            log.dual_log(tag="DB:Writer:Overflow", message="Write queue full; dropping execscript.", level="WARNING", payload={"script_head": script_text[:200], "qsize": write_queue.qsize()})
+            log.dual_log(tag="DB:Writer:Overflow", message="Write queue full; dropping execscript", level="WARNING", payload={"script_head": script_text[:_SQL_PREVIEW_LIMIT], "qsize": write_queue.qsize()})
         except Exception:
             pass
         if receipt:

@@ -14,6 +14,9 @@ from database.backup.engine.type_normalizer import types_match, normalize_snowfl
 
 log = get_dual_logger(__name__)
 
+from database.backup.settings import Vec0BackupSettings as _Vec0Settings
+_vec0_settings = _Vec0Settings()
+
 class SnowflakeSchemaManager:
     @staticmethod
     def reconcile(engine, schema_name: str):
@@ -75,7 +78,7 @@ class SnowflakeSchemaManager:
     @staticmethod
     def _add_column(conn, t_name: str, c_name: str, sqlite_type: str):
         if c_name == "embedding":
-            c_type = "VECTOR(FLOAT, 1024)"
+            c_type = f"VECTOR(FLOAT, {_vec0_settings.dim})"
         elif "TEXT" in sqlite_type or "CHAR" in sqlite_type:
             c_type = "VARCHAR"
         elif "REAL" in sqlite_type or "FLOA" in sqlite_type:
@@ -297,8 +300,9 @@ class SnowflakeSchemaManager:
                         import struct
                         import json
                         blob = row_dict["embedding"]
-                        if len(blob) == 4096:
-                            float_list = list(struct.unpack('<1024f', blob))
+                        expected_bytes = _vec0_settings.dim * 4  # float32 = 4 bytes
+                        if len(blob) == expected_bytes:
+                            float_list = list(struct.unpack(f'<{_vec0_settings.dim}f', blob))
                             row_dict["embedding"] = json.dumps(float_list)
                     dict_rows.append(row_dict)
 
@@ -327,7 +331,7 @@ class SnowflakeSchemaManager:
                     select_expressions = []
                     for c in insert_cols:
                         if c == "embedding":
-                            select_expressions.append("PARSE_JSON(embedding)::VECTOR(FLOAT, 1024) as embedding")
+                            select_expressions.append(f"PARSE_JSON(embedding)::VECTOR(FLOAT, {_vec0_settings.dim}) as embedding")
                         else:
                             select_expressions.append(c)
 

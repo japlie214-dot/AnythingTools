@@ -1,10 +1,6 @@
 # database/backup/engine/sync_engine.py
 """Unified backup engine: Direct Operational DB  Snowflake sync.
 
-Replaces the old DualEngine (Operational  backup.db  Snowflake).
-Now syncs directly from the operational SQLite database to Snowflake,
-eliminating the intermediate backup.db staging layer.
-
 Inline cloud writes (from enqueue_write) are handled by the CloudWriter
 thread. This engine handles:
   1. Full/delta sync (operational  Snowflake)
@@ -597,6 +593,11 @@ class SyncEngine:
             for table_name, ddl in tables.items():
                 if 'VIRTUAL' in ddl.upper() or 'updated_at' not in ddl.lower():
                     continue
+                # Backfill content hashes BEFORE computing deltas.
+                # This was previously a hidden write side-effect inside
+                # DiffEngine.compute_deltas. Extracted here as an explicit
+                # mutation step so the DiffEngine remains purely computational.
+                self._backfill_content_hashes(op_conn, table_name)
                 try:
                     op_count = op_conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
                     op_latest = op_conn.execute(f"SELECT MAX(updated_at) FROM {table_name}").fetchone()[0]
@@ -655,19 +656,57 @@ class SyncEngine:
                 pk_col = deltas["pk_col"]
                 
                 if selected_strategy in ("cloud_wins", "newest_overall_wins") and deltas["cloud_only"]:
-                    for chunk_idx in range(0, len(deltas["cloud_only"]), 900):
-                        chunk = deltas["cloud_only"][chunk_idx:chunk_idx+900]
-                        placeholders = ",".join(["?"] * len(chunk))
-                        rows = temp_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} IN ({placeholders})", chunk).fetchall()
+                    # Composite-PK-aware cloud→local restore.
+                    # For single PK: WHERE pk_col IN (?,?,...)
+                    # For composite PK: WHERE (c1=? AND c2=? AND ...) OR (c1=? AND c2=? AND ...)
+                    pk_cols_list = [pk_col] if isinstance(pk_col, str) else list(pk_col)
+                    chunk_size = 900 // max(1, len(pk_cols_list))
+                    for chunk_idx in range(0, len(deltas["cloud_only"]), chunk_size):
+                        chunk = deltas["cloud_only"][chunk_idx:chunk_idx+chunk_size]
+                        if isinstance(pk_col, str):
+                            # Single PK — simple IN clause
+                            placeholders = ",".join(["?"] * len(chunk))
+                            rows = temp_conn.execute(
+                                f"SELECT * FROM {table_name} WHERE {pk_col} IN ({placeholders})",
+                                chunk,
+                            ).fetchall()
+                        else:
+                            # Composite PK — OR-of-ANDs pattern.
+                            # Each cloud_only entry is a pipe-delimited string
+                            # like "AAPL|BS|Revenue|2024-Q1". Split back into
+                            # individual values for the WHERE clause.
+                            or_clauses = []
+                            params = []
+                            for pk_str in chunk:
+                                pk_vals = pk_str.split("|")
+                                if len(pk_vals) == len(pk_col):
+                                    and_parts = " AND ".join([f"{c} = ?" for c in pk_col])
+                                    or_clauses.append(f"({and_parts})")
+                                    params.extend(pk_vals)
+                            if or_clauses:
+                                where = " OR ".join(or_clauses)
+                                rows = temp_conn.execute(
+                                    f"SELECT * FROM {table_name} WHERE {where}",
+                                    params,
+                                ).fetchall()
+                            else:
+                                rows = []
                         if rows:
                             cols = [desc[0] for desc in temp_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
                             for r in rows:
                                 op_transactions.append((f"INSERT OR REPLACE INTO {table_name} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", tuple(r)))
-                                results["op_restored"] += len(rows)
+                                results["op_restored"] += 1
 
                 if selected_strategy == "cloud_wins" and deltas["op_only"]:
                     for op_id in deltas["op_only"]:
-                        op_transactions.append((f"DELETE FROM {table_name} WHERE {pk_col} = ?", (op_id,)))
+                        if isinstance(pk_col, str):
+                            op_transactions.append((f"DELETE FROM {table_name} WHERE {pk_col} = ?", (op_id,)))
+                        else:
+                            # Composite PK: op_id is pipe-delimited
+                            pk_vals = op_id.split("|")
+                            if len(pk_vals) == len(pk_col):
+                                where = " AND ".join([f"{c} = ?" for c in pk_col])
+                                op_transactions.append((f"DELETE FROM {table_name} WHERE {where}", tuple(pk_vals)))
                     results["op_deleted"] += len(deltas["op_only"])
 
                 for conflict in deltas.get("genuine_conflicts", []):
@@ -676,7 +715,13 @@ class SyncEngine:
                         verdict = UserConfirmationHandler.hitl_wait_for_sync_operator(table_name, conflict.get("id"), conflict.get("op_ts", ""), conflict.get("cloud_ts", ""))
                         
                     if verdict == "cloud":
-                        row = temp_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} = ?", (conflict["id"],)).fetchone()
+                        conflict_id = conflict["id"]
+                        if isinstance(pk_col, str):
+                            row = temp_conn.execute(f"SELECT * FROM {table_name} WHERE {pk_col} = ?", (conflict_id,)).fetchone()
+                        else:
+                            pk_vals = conflict_id.split("|")
+                            where = " AND ".join([f"{c} = ?" for c in pk_col])
+                            row = temp_conn.execute(f"SELECT * FROM {table_name} WHERE {where}", tuple(pk_vals)).fetchone()
                         if row:
                             cols = [desc[0] for desc in temp_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
                             op_transactions.append((f"INSERT OR REPLACE INTO {table_name} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", tuple(row)))

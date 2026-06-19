@@ -2,11 +2,36 @@
 # scripts/logs_query.py
 """LLM-friendly CLI for querying logs.db.
 
-Design constraints:
-- Zero imports from the AnythingTools project to avoid initialization side-effects.
-- Opens logs.db in read-only URI mode (file:...?mode=ro).
-- WAL mode allows concurrent readers without blocking the writer.
-- Output is markdown by default; --json switches to a single JSON array.
+DESIGN CONSTRAINTS:
+  - Zero imports from the AnythingTools project to avoid initialization
+    side-effects. This script must remain runnable even if the main
+    application's dependencies are not installed.
+  - Opens logs.db in read-only URI mode (file:...?mode=ro).
+  - Output is markdown by default; --json switches to a single JSON array.
+
+ARCHITECTURAL CONTEXT (SQLite WAL + Read-Only Connections):
+  This script opens logs.db in read-only URI mode (file:...?mode=ro).
+  WAL mode on logs.db allows concurrent readers without blocking the
+  writer thread. Per SQLite docs (https://www.sqlite.org/wal.html):
+  "Readers do not block writers and a writer does not block readers."
+
+  URI mode with ?mode=ro is critical because:
+  1. It prevents accidental writes to logs.db from this diagnostic tool.
+  2. Per https://www.sqlite.org/uri.html: "If 'mode=ro' is specified,
+     the database is opened in read-only mode."
+  3. The busy_timeout=5000ms ensures we wait up to 5 seconds if the
+     WAL checkpoint lock is held, rather than failing immediately.
+
+  WAL MODE CONSTRAINTS (for future maintainers):
+  - Never open logs.db in read-write mode from this script; it would
+    compete with the writer thread's WAL lock.
+  - Do not add PRAGMA journal_mode commands; the database is already
+    in WAL mode and attempting to change it would require a write lock.
+  - The _open_readonly function creates a fresh connection on each
+    invocation for cmd_tail, because long-lived read-only connections
+    in WAL mode may not see commits that occurred after the connection
+    was opened (unless PRAGMA wal_checkpoint is run, which requires a
+    write lock). Reconnecting ensures we see the latest data.
 
 PATH RESOLUTION:
   1. --db <path>            (explicit CLI argument)

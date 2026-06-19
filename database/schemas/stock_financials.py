@@ -1,4 +1,4 @@
-# database?schemas/stock_financials.py
+# database/schemas/stock_financials.py
 TABLES = {
     "sf_tickers": """CREATE TABLE IF NOT EXISTS sf_tickers (
         ticker TEXT PRIMARY KEY,

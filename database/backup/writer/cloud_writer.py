@@ -187,38 +187,78 @@ def enqueue_cloud_delete(table_name: str, pk_val: Any, pk_col: Union[str, Tuple[
         )
 
 
-def _route_failed_batch_to_dlq(table_name: str, records: list, error_msg: str):
+def _route_failed_batch_to_dlq(
+    table_name: str,
+    records: list,
+    error_msg: str,
+    pk_col: Union[str, Tuple[str, ...]] = "id",
+):
+    """Route failed records to the Dead Letter Queue with full observability.
+    
+    Args:
+        table_name: The target table that failed.
+        records: List of record dicts that failed to write.
+        error_msg: The complete error message (never truncated).
+        pk_col: Primary key column name(s). String for single PK,
+            tuple for composite PK. Used to construct a stable
+            row_id for DLQ deduplication and operator traceability.
+    """
     from database.writer import enqueue_write
     from utils.id_generator import ULID
     import json as _json
     for record in records:
         try:
             record_dict = dict(record)
-            safe_record = {k: v for k, v in record_dict.items() if not isinstance(v, (bytes, bytearray))}
-            row_id_val = ""
-            if "id" in record_dict:
-                row_id_val = str(record_dict["id"])
-            elif "rowid" in record_dict:
-                row_id_val = str(record_dict["rowid"])
-            else:
-                keys = ["ticker", "statement_type", "concept", "quarter"]
-                if all(k in record_dict for k in keys):
-                    row_id_val = "|".join(str(record_dict[k]) for k in keys)
-                else:
-                    import hashlib
-                    row_id_val = hashlib.md5(_json.dumps(safe_record, sort_keys=True, default=str).encode()).hexdigest()
+            safe_record = {
+                k: v for k, v in record_dict.items()
+                if not isinstance(v, (bytes, bytearray))
+            }
+
+            # Construct row_id from primary key column(s).
+            # Resolution: composite PK join → single PK value →
+            # 'id' fallback → 'rowid' fallback → MD5 hash.
+            row_id_val = _build_row_id(pk_col, record_dict)
 
             enqueue_write(
                 "INSERT OR IGNORE INTO dead_letter_queue (dlq_id, table_name, row_id, row_data, error_message) VALUES (?, ?, ?, ?, ?)",
-                (ULID.generate(), table_name, row_id_val, _json.dumps(safe_record, default=str), (error_msg or "")[:500])
+                (ULID.generate(), table_name, row_id_val,
+                 _json.dumps(safe_record, default=str), error_msg or "")
             )
         except Exception as e:
             log.dual_log(
                 tag="Backup:Writer:DLQError",
                 level="ERROR",
-                message=f"Failed to route record to DLQ: {e}",
-                payload={"table": table_name, "error": str(e)[:200]}
+                message=f"Failed to route record to DLQ for {table_name}",
+                payload={"table": table_name, "error": str(e), "record_count": len(records)}
             )
+
+
+def _build_row_id(
+    pk_col: Union[str, Tuple[str, ...]], record: dict
+) -> str:
+    """Construct a stable row identifier from PK columns and record data.
+    
+    Resolution order:
+    1. Composite PK: join values with '|' delimiter
+    2. Single PK: use the value directly
+    3. Fallback to 'id' column
+    4. Fallback to 'rowid' column
+    5. MD5 hash of the safe record data
+    """
+    import hashlib
+    import json
+    
+    if isinstance(pk_col, tuple) and len(pk_col) > 1:
+        if all(k in record for k in pk_col):
+            return "|".join(str(record[k]) for k in pk_col)
+    if isinstance(pk_col, str) and pk_col in record:
+        return str(record[pk_col])
+    if "id" in record:
+        return str(record["id"])
+    if "rowid" in record:
+        return str(record["rowid"])
+    safe = {k: v for k, v in record.items() if not isinstance(v, (bytes, bytearray))}
+    return hashlib.md5(json.dumps(safe, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
@@ -295,8 +335,8 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
                         log.dual_log(
                             tag="Backup:Writer:FlushError",
                             level="WARNING",
-                            message=f"Failed to flush {table_name}: {e}",
-                            payload={"table": table_name, "error": str(e)[:200]}
+                            message=f"Failed to flush {table_name}",
+                            payload={"table": table_name, "error": str(e)}
                         )
                         raise
                 else:
@@ -339,7 +379,7 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
                     tag="Backup:Writer:Retry",
                     level="WARNING",
                     message=f"Batch flush failed for {table_name}, retrying in {delay}s (attempt {_retry_depth + 1}/{RETRY_LIMIT})",
-                    payload={"table": table_name, "error": str(e)[:200], "retry_in": delay, "attempt": _retry_depth + 1}
+                    payload={"table": table_name, "error": str(e), "retry_in": delay, "attempt": _retry_depth + 1}
                 )
                 BackupMetricsCollector.record_flush(False, retried=True)
                 _time.sleep(delay)
@@ -348,11 +388,14 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
                 log.dual_log(
                     tag="Backup:Writer:BatchError",
                     level="ERROR",
-                    message=f"Batch flush failed for {table_name} after {RETRY_LIMIT} retries: {e}",
-                    payload={"table": table_name, "error": str(e)[:200], "retries_exhausted": True}
+                    message=f"Batch flush failed for {table_name} after {RETRY_LIMIT} retries",
+                    payload={
+                        "table": table_name, "error": str(e),
+                        "retries_exhausted": True, "record_count": len(records),
+                    }
                 )
                 BackupMetricsCollector.record_flush(False, dlq=True)
-                _route_failed_batch_to_dlq(table_name, records, str(e))
+                _route_failed_batch_to_dlq(table_name, records, str(e), pk_col=pk_col)
 
 
 def _cloud_writer_loop():

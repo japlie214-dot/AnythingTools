@@ -2,6 +2,36 @@
 import sqlite3
 from typing import Dict, Any
 
+def _insert_diff_rows(mem_db: sqlite3.Connection, table: str, rows: list, pk_col) -> None:
+    """Insert rows into an in-memory diff table, handling composite PKs.
+    
+    For single-PK tables, pk_col is a string and the PK is r[0].
+    For composite-PK tables, pk_col is a list and the PK is the first
+    N columns joined with '|'.
+    
+    Uses INSERT OR IGNORE to handle duplicate PKs gracefully (keeps the
+    first occurrence). This prevents UNIQUE constraint violations when
+    multiple rows share the same first PK column value in a composite-PK
+    table where the old introspect_table_columns returned only the last
+    PK column.
+    """
+    pk_count = len(pk_col) if isinstance(pk_col, (list, tuple)) else 1
+    mem_rows = []
+    for r in rows:
+        if pk_count > 1:
+            pk_str = "|".join(str(r[i]) for i in range(pk_count))
+            hash_val = str(r[pk_count] or "")
+            ts_val = str(r[pk_count + 1] or "")
+        else:
+            pk_str = str(r[0])
+            hash_val = str(r[1] or "")
+            ts_val = str(r[2] or "")
+        mem_rows.append((pk_str, hash_val, ts_val))
+    mem_db.executemany(
+        f"INSERT OR IGNORE INTO {table} (pk, content_hash, ts) VALUES (?, ?, ?)",
+        mem_rows,
+    )
+
 def _safe_ts_compare(ts1: str, ts2: str) -> int:
     """Returns 1 if ts1 > ts2, -1 if ts1 < ts2, 0 if equal. Safely parses ISO8601 strings."""
     from datetime import datetime
@@ -24,15 +54,19 @@ def _safe_ts_compare(ts1: str, ts2: str) -> int:
 
 class DiffEngine:
     @staticmethod
-    def compute_deltas(op_conn: sqlite3.Connection, cloud_conn: sqlite3.Connection, table_name: str) -> Dict[str, Any]:
-        """Memory-safe 2-way Set Diff using in-memory SQLite with content_hash awareness.
+    def compute_deltas(op_conn: sqlite3.Connection, cloud_conn: sqlite3.Connection, table_name: str, pk_col=None) -> Dict[str, Any]:
+        """Purely computational 2-way Set Diff using in-memory SQLite.
 
         Strategy:
-        - Populate lightweight in-memory tables with pk, content_hash, and updated_at timestamps.
-        - Backfill missing content_hash values in the operational DB on-the-fly using ContentHasher.
+        - Populate lightweight in-memory tables with pk, content_hash, and
+          updated_at timestamps (if the column exists).
         - Perform a single LEFT JOIN pass (via UNION trick) to classify rows.
+        
+        IMPORTANT: This function is strictly computational. It does NOT modify
+        either database. Content hash backfilling must be done BEFORE calling
+        this function by the orchestrator (SyncEngine).
         """
-        from database.backup.sync.foundation import ContentHasher
+        from database.backup.engine.sync_operations import _detect_pk_columns
 
         mem_db = sqlite3.connect(":memory:")
         mem_db.executescript("""
@@ -40,45 +74,43 @@ class DiffEngine:
             CREATE TABLE diff_cloud (pk TEXT PRIMARY KEY, content_hash TEXT DEFAULT '', ts TEXT DEFAULT '');
         """)
         
-        from database.backup.sync.helpers import introspect_table_columns
-        pk_col, _, has_content_hash_op = introspect_table_columns(op_conn, table_name)
-
-        if has_content_hash_op:
-            try:
-                from database.connection import DatabaseManager
-                write_conn = DatabaseManager.create_write_connection()
-                try:
-                    count = write_conn.execute(f"SELECT COUNT(*) FROM {table_name} WHERE content_hash = '' OR content_hash IS NULL").fetchone()[0]
-                    if count > 0:
-                        op_rows = write_conn.execute(f"SELECT * FROM {table_name} WHERE content_hash = '' OR content_hash IS NULL").fetchall()
-                        col_names = [d[0] for d in write_conn.execute(f"SELECT * FROM {table_name} LIMIT 1").description]
-                        for r in op_rows:
-                            row_dict = dict(zip(col_names, r))
-                            new_hash = ContentHasher.compute_row_hash(table_name, row_dict)
-                            write_conn.execute(f"UPDATE {table_name} SET content_hash = ? WHERE {pk_col} = ?", (new_hash, row_dict[pk_col]))
-                        write_conn.commit()
-                finally:
-                    write_conn.close()
-            except Exception:
-                pass
+        # Use provided pk_col or detect from PRAGMA table_info
+        if pk_col is None:
+            pk_col, has_content_hash_op = _detect_pk_columns(op_conn, table_name)
+        else:
+            _, has_content_hash_op = _detect_pk_columns(op_conn, table_name)
 
         hash_col_op = "content_hash" if has_content_hash_op else "''"
+        
+        # Check if updated_at column exists — not all tables have it
+        has_updated_at = False
         try:
-            op_rows = op_conn.execute(f"SELECT {pk_col}, {hash_col_op}, updated_at FROM {table_name}").fetchall()
+            cols_info = op_conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            has_updated_at = any(c[1] == "updated_at" for c in cols_info)
+        except Exception:
+            pass
+        ts_col = "updated_at" if has_updated_at else "''"
+        
+        try:
+            # Build SELECT for PK columns
+            if isinstance(pk_col, (list, tuple)):
+                pk_select = ", ".join(pk_col)
+            else:
+                pk_select = pk_col
+            op_rows = op_conn.execute(f"SELECT {pk_select}, {hash_col_op}, {ts_col} FROM {table_name}").fetchall()
         except Exception:
             op_rows = []
-        mem_db.executemany("INSERT INTO diff_op (pk, content_hash, ts) VALUES (?, ?, ?)", [(str(r[0]), str(r[1] or ""), str(r[2] or "")) for r in op_rows])
+        _insert_diff_rows(mem_db, "diff_op", op_rows, pk_col)
 
         from database.backup.sync.helpers import introspect_table_columns
         _, _, has_content_hash_cloud = introspect_table_columns(cloud_conn, table_name)
 
         hash_col_cloud = "content_hash" if has_content_hash_cloud else "''"
         try:
-            cloud_rows = cloud_conn.execute(f"SELECT {pk_col}, {hash_col_cloud}, updated_at FROM {table_name}").fetchall()
+            cloud_rows = cloud_conn.execute(f"SELECT {pk_select}, {hash_col_cloud}, {ts_col} FROM {table_name}").fetchall()
         except Exception:
             cloud_rows = []
-        mem_db.executemany("INSERT INTO diff_cloud (pk, content_hash, ts) VALUES (?, ?, ?)", [(str(r[0]), str(r[1] or ""), str(r[2] or "")) for r in cloud_rows])
-
+        _insert_diff_rows(mem_db, "diff_cloud", cloud_rows, pk_col)
         result = mem_db.execute("""
             SELECT COALESCE(o.pk, c.pk) as pk,
                    CASE WHEN o.pk IS NOT NULL THEN 1 ELSE 0 END as in_op,
