@@ -92,13 +92,36 @@ import os
 def _resolve_db_path() -> Path:
     import config
     path_str = getattr(config, "OPERATIONAL_DB_PATH", None) or os.getenv("OPERATIONAL_DB_PATH", "data/sumanal.db")
+
+    # Staging override: when DATABASE_STAGING_ENABLED=true, divert the
+    # operational DB to data/staging/sumanal.db regardless of OPERATIONAL_DB_PATH.
+    # This prevents health-check jobs from writing to production data.
+    # The staging toggle is the single source of truth for path diversion;
+    # DATABASE_INTEGRATION_ENABLED and BACKUP_CLOUD_ENABLED continue to
+    # control write semantics (what gets written), not path location
+    # (where it gets written).
+    if getattr(config, "DATABASE_STAGING_ENABLED", False):
+        path_str = "data/staging/sumanal.db"
+
     p = Path(path_str)
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
 DB_PATH = _resolve_db_path()
-LOGS_DB_PATH = Path("data") / "logs.db"
 
+def _resolve_logs_db_path() -> Path:
+    # Staging-aware logs DB path. logs.db must always be writable
+    # (it is the observability substrate), so it follows the same
+    # staging diversion as the operational DB.
+    import config
+    if getattr(config, "DATABASE_STAGING_ENABLED", False):
+        p = Path("data/staging/logs.db")
+    else:
+        p = Path("data") / "logs.db"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+LOGS_DB_PATH = _resolve_logs_db_path()
 # Connection configuration constants
 READ_TIMEOUT_SECONDS = 30.0
 BUSY_TIMEOUT_MS = 5000

@@ -133,13 +133,12 @@ def logs_write_worker():
 
 def logs_enqueue_write(sql, params=(), *, track=False):
     """Enqueue a write operation to the logs database with overflow protection."""
-    # Honor the master DB integration toggle.
-    try:
-        import config
-        if not getattr(config, "DATABASE_INTEGRATION_ENABLED", True):
-            return
-    except ImportError:
-        pass
+    # NOTE: logs.db writes are intentionally NOT gated by
+    # DATABASE_INTEGRATION_ENABLED. The logs database is the observability
+    # substrate — it must always capture events, even when the operational
+    # DB is disabled (e.g., during health checks or staging runs).
+    # Path-level isolation is handled by DATABASE_STAGING_ENABLED in
+    # database/connection.py, which diverts logs.db to data/staging/logs.db.
     global _logs_writer_thread, _logs_dropped_count
     if _logs_writer_thread is None or not _logs_writer_thread.is_alive():
         start_logs_writer()

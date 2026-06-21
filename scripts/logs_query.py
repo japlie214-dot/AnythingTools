@@ -1,15 +1,55 @@
 #!/usr/bin/env python3
 # scripts/logs_query.py
-"""LLM-friendly CLI for querying logs.db.
+"""Logs Query CLI — Developer Command-Line Guide
+================================================
 
-DESIGN CONSTRAINTS:
-  - Zero imports from the AnythingTools project to avoid initialization
-    side-effects. This script must remain runnable even if the main
-    application's dependencies are not installed.
-  - Opens logs.db in read-only URI mode (file:...?mode=ro).
-  - Output is markdown by default; --json switches to a single JSON array.
+A standalone, zero-dependency CLI for inspecting the AnythingTools logs.db.
+Safe to run while the server is live (opens in read-only URI mode).
 
-ARCHITECTURAL CONTEXT (SQLite WAL + Read-Only Connections):
+QUICK START
+-----------
+  # Show the 20 most recent log entries (markdown table)
+  python scripts/logs_query.py recent --limit 20
+
+  # Show all errors from the last hour
+  python scripts/logs_query.py errors --since 1h
+
+  # Tail live log entries (like `tail -f`)
+  python scripts/logs_query.py tail --interval 2
+
+  # Show all logs for a specific job
+  python scripts/logs_query.py by-job 01J5Q...
+
+  # Full-text search log messages
+  python scripts/logs_query.py search "callback failed"
+
+  # Show aggregate statistics
+  python scripts/logs_query.py stats
+
+  # List all unique tags with counts
+  python scripts/logs_query.py tags --limit 30
+
+  # Show full detail of a single log entry (by ULID)
+  python scripts/logs_query.py show 01J5Q...
+
+OUTPUT FORMATS
+--------------
+  Default:  Markdown table (list commands) or markdown section (show)
+  --json:   JSON array (list commands) or JSON object (show)
+  --full:   Include payload_json column in markdown tables
+
+PATH RESOLUTION (first match wins)
+-----------------------------------
+  1. --db <path>                    (explicit CLI argument)
+  2. $LOGS_DB_PATH                  (environment variable)
+  3. $OPERATIONAL_DB_PATH/../logs.db (derived from operational DB path)
+  4. ./data/logs.db                 (default)
+
+  Note: When DATABASE_STAGING_ENABLED=true, logs.db is at
+  ./data/staging/logs.db. Set --db explicitly or use $LOGS_DB_PATH.
+
+ARCHITECTURAL CONTEXT
+---------------------
   This script opens logs.db in read-only URI mode (file:...?mode=ro).
   WAL mode on logs.db allows concurrent readers without blocking the
   writer thread. Per SQLite docs (https://www.sqlite.org/wal.html):
@@ -30,14 +70,21 @@ ARCHITECTURAL CONTEXT (SQLite WAL + Read-Only Connections):
   - The _open_readonly function creates a fresh connection on each
     invocation for cmd_tail, because long-lived read-only connections
     in WAL mode may not see commits that occurred after the connection
-    was opened (unless PRAGMA wal_checkpoint is run, which requires a
-    write lock). Reconnecting ensures we see the latest data.
+    was opened. Reconnecting ensures we see the latest data.
 
-PATH RESOLUTION:
-  1. --db <path>            (explicit CLI argument)
-  2. $LOGS_DB_PATH          (environment variable)
-  3. $OPERATIONAL_DB_PATH/../logs.db
-  4. ./data/logs.db         (default)
+DESIGN CONSTRAINTS
+------------------
+  - Zero imports from the AnythingTools project to avoid initialization
+    side-effects. This script must remain runnable even if the main
+    application's dependencies are not installed.
+  - Only depends on the Python standard library (argparse, json, sqlite3).
+
+SSE INTEGRATION
+---------------
+  The SSE broker (utils/sse/broker.py) tails the same logs.db to stream
+  events to subscribers. This script provides the offline (non-SSE)
+  inspection interface. For real-time streaming via HTTP, use:
+    GET /api/jobs/{job_id}/stream
 """
 from __future__ import annotations
 

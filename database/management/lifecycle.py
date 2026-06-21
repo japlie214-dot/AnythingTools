@@ -14,6 +14,7 @@ from database.connection import DB_PATH, DatabaseManager, LogsDatabaseManager, L
 from database.schemas import get_init_script, get_logs_init_script
 from database.management.health import restore_orphaned_backup, check_database_file_state
 from database.management.reconciler import SchemaReconciler, ReconciliationReport
+from database.management.migration_types import TypeMismatchPlan, ColumnMismatch
 from database.writer import start_writer, enqueue_write, enqueue_execscript, wait_for_writes
 from utils.logger import get_dual_logger
 
@@ -33,8 +34,110 @@ def _remove_db_files(path) -> None:
                 pass
 
 
+def migrate_drop_pending_callback_status() -> None:
+    """One-time migration: rebuild jobs table to remove PENDING_CALLBACK enum.
+
+    SQLite CHECK constraints cannot be altered in-place. The canonical
+    migration pattern is clone-recreate-repopulate, documented at:
+    https://www.sqlite.org/lang_altertable.html#otheralter
+
+    This function:
+    1. Checks sqlite_master.sql for the jobs table.
+    2. If the SQL contains 'PENDING_CALLBACK', performs the rebuild.
+    3. Any existing rows with status='PENDING_CALLBACK' are mapped to 'FAILED'
+       (they were waiting for a callback delivery that will never come).
+    4. The clone table is dropped after successful repopulation.
+    """
+    conn = DatabaseManager.create_write_connection()
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
+        ).fetchone()
+        if not row or not row[0]:
+            return  # Table doesn't exist yet; reconciler will create it
+
+        current_sql = row[0]
+        if "PENDING_CALLBACK" not in current_sql:
+            log.dual_log(
+                tag="Migration:PendingCallback:Skip",
+                message="jobs table already lacks PENDING_CALLBACK; no migration needed",
+                payload={"action": "skip"}
+            )
+            return
+
+        log.dual_log(
+            tag="Migration:PendingCallback:Start",
+            level="WARNING",
+            message="Rebuilding jobs table to drop PENDING_CALLBACK enum",
+            payload={"action": "start", "reason": "callback system removed"}
+        )
+
+        import time
+        timestamp = int(time.time())
+        clone_name = f"_migrate_jobs_{timestamp}"
+
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            # 1. Clone the existing table
+            conn.execute(f"ALTER TABLE jobs RENAME TO {clone_name}")
+
+            # 2. Create the new table with updated DDL (from database/schemas/jobs.py)
+            from database.schemas.jobs import TABLES
+            conn.executescript(TABLES["jobs"])
+
+            # 3. Repopulate, mapping PENDING_CALLBACK -> FAILED
+            conn.execute("""
+                INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, retry_count, resume_count, created_at, updated_at, result_json)
+                SELECT job_id, session_id, tool_name, args_json,
+                       CASE WHEN status = 'PENDING_CALLBACK' THEN 'FAILED' ELSE status END,
+                       retry_count, resume_count, created_at, updated_at, result_json
+                FROM {}
+            """.format(clone_name))
+
+            # 4. Drop the clone
+            conn.execute(f"DROP TABLE {clone_name}")
+            conn.commit()
+
+            migrated = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='FAILED'").fetchone()[0]
+            log.dual_log(
+                tag="Migration:PendingCallback:Complete",
+                level="INFO",
+                message="jobs table rebuilt without PENDING_CALLBACK",
+                payload={"action": "complete", "clone_dropped": clone_name, "rows_migrated_to_failed": migrated}
+            )
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+    except Exception as e:
+        log.dual_log(
+            tag="Migration:PendingCallback:Error",
+            level="CRITICAL",
+            message=f"Failed to migrate jobs table: {e}",
+            exc_info=e,
+            payload={"error": str(e)}
+        )
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 async def run_database_lifecycle() -> None:
     """Main database lifecycle: Iterates through all registered database contexts."""
+    # Pre-reconciliation: run the PENDING_CALLBACK migration if needed.
+    # This must happen BEFORE the reconciler runs, because the reconciler
+    # does not detect CHECK constraint changes (only column type/NOT NULL/PK).
+    try:
+        migrate_drop_pending_callback_status()
+    except Exception as e:
+        log.dual_log(
+            tag="Database:Lifecycle:MigrationError",
+            level="CRITICAL",
+            message=f"Pre-reconciliation migration failed: {e}",
+            payload={"error": str(e)}
+        )
+        # Continue with reconciliation — the reconciler may still be able to
+        # handle the table if the migration partially succeeded.
+
     # 1. Import schemas (orchestration layer is allowed to know about domains)
     from database.schemas import (
         ALL_TABLES, ALL_VEC_TABLES, ALL_FTS_TABLES, ALL_TRIGGERS,

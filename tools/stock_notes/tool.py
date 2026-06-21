@@ -1,7 +1,7 @@
 # tools/stock_notes/tool.py
 import json
 from typing import Any
-from tools.base import BaseTool
+from tools.base import BaseTool, HealthCheckPayload
 from .models import StockNotesInput
 from utils.logger import get_dual_logger
 from utils.artifact_manager import write_artifact
@@ -13,7 +13,22 @@ log = get_dual_logger(__name__)
 class StockNotesTool(BaseTool):
     name = "stock_notes"
     INPUT_MODEL = StockNotesInput
-    
+
+    def health_check_payload(self) -> HealthCheckPayload:
+        return HealthCheckPayload(
+            happy_path_args={
+                "command": "discover",
+                "instructions": {"ticker": "AAPL", "forms": "10-K,10-Q"}
+            },
+            error_path_args={
+                "command": "note",
+                "instructions": {"accession_no": "INVALID-ACCESSION-12345"}
+            },
+            expected_happy_status="COMPLETED",
+            expected_error_status="FAILED",
+            timeout_seconds=120,
+        )
+
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return True
         
@@ -22,10 +37,10 @@ class StockNotesTool(BaseTool):
         job_id = kwargs.get("job_id", "")
         
         def _fail(summary: str, next_steps: str) -> str:
-            return json.dumps({"_callback_format": "structured", "tool_name": self.name, "status": "FAILED", "summary": summary, "status_overrides": {"FAILED": {"description": "Stock Notes execution failed", "next_steps": next_steps, "rerunnable": True}}}, ensure_ascii=False)
+            return f"**Error:** {summary}\n\n{next_steps}"
             
-        def _success(summary: str, details: dict, artifacts: list = None) -> str:
-            return json.dumps({"_callback_format": "structured", "tool_name": self.name, "status": "COMPLETED", "summary": summary, "details": details, "artifacts": artifacts or []}, ensure_ascii=False)
+        def _success(summary: str, details: dict = None, artifacts: list = None) -> str:
+            return summary
 
         raw_inst = args.get("instructions", {})
         if isinstance(raw_inst, str):

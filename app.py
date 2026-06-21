@@ -13,16 +13,10 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends
-from fastapi.security.api_key import APIKeyHeader
-from fastapi import Security, HTTPException
+from fastapi import FastAPI
 import logging
 
 import config as config_module
-
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
-
 
 from utils.logger.core import get_dual_logger
 
@@ -34,9 +28,9 @@ async def lifespan(app: FastAPI):
     # Initialize SSE registries on the running event loop. MUST happen before
     # any SSE route is hit. Ref:
     # https://docs.python.org/3/library/asyncio-sync.html#asyncio.Event
-    from api.sse import shutdown, log_notify
-    shutdown.init_shutdown_registry(asyncio.get_running_loop())
-    log_notify.init_log_notify_bus(asyncio.get_running_loop())
+    from utils.sse import get_global_broker
+    broker = get_global_broker()
+    await broker.start_tailer()
 
     # Enforce single-process execution to protect manifest integrity
     if int(os.environ.get("WEB_CONCURRENCY", "1")) > 1:
@@ -67,10 +61,10 @@ async def lifespan(app: FastAPI):
         # 60s _active_jobs drain. Per Pushback 6: os._exit(1) at line 125
         # would otherwise kill generators without a final event.
         try:
-            from api.sse import shutdown as sse_shutdown
-            sse_shutdown.signal_shutdown()
-            # Give projectors ~3s to emit final events and close connections.
-            await asyncio.sleep(3.0)
+            from utils.sse import get_global_broker
+            broker = get_global_broker()
+            await broker.stop_tailer()
+            await asyncio.sleep(1.0)
         except Exception:
             pass
 
@@ -148,17 +142,15 @@ app = FastAPI(lifespan=lifespan, title="AnythingTools API", version="1.0.0")
 
 # === Middlewares ===
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, lock this down
-    allow_credentials=True,
+    # allow_credentials=True is incompatible with allow_origins=["*"] per the W3C CORS spec.
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 
 # === Mount routers ===
 from api.routes import router as api_router

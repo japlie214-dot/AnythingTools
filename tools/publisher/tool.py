@@ -8,7 +8,7 @@ import sqlite3
 from typing import Any
 from pydantic import BaseModel, Field
 
-from tools.base import BaseTool
+from tools.base import BaseTool, HealthCheckPayload
 from database.connection import DatabaseManager
 from utils.telegram.pipeline import PublisherPipeline
 
@@ -25,25 +25,27 @@ class PublisherTool(BaseTool):
     """Publisher Tool: Translates and delivers curated intelligence via Producer-Consumer pipeline."""
     
     name = "publisher"
-    
+
+    def health_check_payload(self) -> HealthCheckPayload:
+        """Health check: publish a test batch (happy) and missing batch (error).
+
+        The happy path requires a pre-existing test batch in staging.
+        The error path uses a non-existent batch ID.
+        """
+        return HealthCheckPayload(
+            happy_path_args={"batch_id": "HEALTH_CHECK_TEST_BATCH", "finalize": True},
+            error_path_args={"batch_id": "NONEXISTENT_BATCH_ID_12345"},
+            expected_happy_status="COMPLETED",
+            expected_error_status="FAILED",
+            timeout_seconds=180,
+        )
+
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return True
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         def _fail(summary: str, next_steps: str) -> str:
-            return json.dumps({
-                "_callback_format": "structured",
-                "tool_name": self.name,
-                "status": "FAILED",
-                "summary": summary,
-                "status_overrides": {
-                    "FAILED": {
-                        "description": "Publisher encountered a validation error.",
-                        "next_steps": next_steps,
-                        "rerunnable": False
-                    }
-                }
-            }, ensure_ascii=False)
+            return f"**Error:** {summary}\n\n{next_steps}"
 
         batch_id = args.get("batch_id")
         if not batch_id:
@@ -64,22 +66,12 @@ class PublisherTool(BaseTool):
 
         batch_status = batch_info["status"]
         if batch_status == "COMPLETED" and not reset and not finalize:
-            payload = {
-                "_callback_format": "structured", "tool_name": self.name, "status": "COMPLETED",
-                "summary": f"Batch {batch_id} is already fully published.",
-                "status_overrides": {"COMPLETED": {"description": "Batch is already published.", "next_steps": "No further actions required.", "rerunnable": False}}
-            }
-            return json.dumps(payload, ensure_ascii=False)
+            return f"Batch {batch_id} is already fully published."
 
         if finalize and batch_status in ("PARTIAL", "PUBLISHING"):
             enqueue_write("UPDATE broadcast_details SET publish_status = 'SKIPPED', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ? AND publish_status NOT IN ('PUBLISHED_ARCHIVE')", (batch_id,))
             enqueue_write("UPDATE broadcast_batches SET status = 'COMPLETED', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?", (batch_id,))
-            payload = {
-                "_callback_format": "structured", "tool_name": self.name, "status": "COMPLETED",
-                "summary": f"Batch {batch_id} finalized to COMPLETED.",
-                "status_overrides": {"COMPLETED": {"description": "Batch was manually finalized.", "next_steps": "No further actions required.", "rerunnable": False}}
-            }
-            return json.dumps(payload, ensure_ascii=False)
+            return f"Batch {batch_id} finalized to COMPLETED."
             
         if reset:
             reset_batch_publish_status(batch_id)

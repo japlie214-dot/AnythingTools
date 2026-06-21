@@ -11,7 +11,7 @@ import sqlite3
 from typing import Any
 from pydantic import BaseModel, Field
 
-from tools.base import BaseTool
+from tools.base import BaseTool, HealthCheckPayload
 from database.connection import DatabaseManager
 from database.broadcast.queries import get_batch_info, get_batch_articles
 from database.writer import enqueue_transaction
@@ -32,17 +32,22 @@ class DraftEditorTool(BaseTool):
     """Draft Editor Tool: Deterministic SWAP list manager for Top 10 curation."""
     
     name = "draft_editor"
-    
+
+    def health_check_payload(self) -> HealthCheckPayload:
+        return HealthCheckPayload(
+            happy_path_args={"batch_id": "HEALTH_CHECK_TEST_BATCH", "operations": []},
+            error_path_args={"batch_id": "NONEXISTENT_BATCH_ID_12345", "operations": [{"index_top10": 0, "target_identifier": "invalid"}]},
+            expected_happy_status="COMPLETED",
+            expected_error_status="FAILED",
+            timeout_seconds=30,
+        )
+
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return False
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         def _fail(summary: str, next_steps: str) -> str:
-            return json.dumps({
-                "_callback_format": "structured", "tool_name": self.name,
-                "status": "FAILED", "summary": summary,
-                "status_overrides": {"FAILED": {"description": "Draft Editor error.", "next_steps": next_steps, "rerunnable": False}}
-            }, ensure_ascii=False)
+            return f"**Error:** {summary}\n\n{next_steps}"
 
         batch_id = args.get("batch_id")
         operations = args.get("operations", [])

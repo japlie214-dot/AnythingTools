@@ -17,10 +17,11 @@ from database.writer import start_writer, enqueue_write
 from database.connection import DatabaseManager, LogsDatabaseManager
 from database.logs_writer import logs_enqueue_write
 from database.diagnostics import get_queue_metrics
-from utils.artifact_manager import artifact_url_from_request
 from bot.engine.worker import get_manager
 from utils.hitl_resolution import hitl_registry, VALID_DECISIONS
-from api.sse.projector import stream_job
+from fastapi.responses import StreamingResponse
+from utils.sse import get_global_broker, StreamEndEvent
+from api.schemas import HealthCheckRequest, HealthCheckResponse
 from pydantic import ValidationError
 
 log = get_dual_logger(__name__)
@@ -83,19 +84,6 @@ async def get_job_status(job_id: str, request: Request):
             # The worker wraps output in {"status": ..., "result": ...}
             final_payload = parsed_result.get("result", parsed_result)
             
-            # If artifacts are present, add artifact_url entries
-            if isinstance(final_payload, dict):
-                arts = final_payload.get("artifacts") or final_payload.get("attachment_paths")
-                if arts:
-                    urls = []
-                    for a in arts:
-                        try:
-                            # Normalize relative path and build absolute URL
-                            url = artifact_url_from_request(request, a)
-                            urls.append(url)
-                        except Exception:
-                            pass
-                    final_payload["artifact_urls"] = urls
     except Exception:
         final_payload = {"raw": row["result_json"] if row else None}
 
@@ -317,3 +305,180 @@ async def trigger_restore(background_tasks: BackgroundTasks):
     job_id = str(ULID.generate())
     background_tasks.add_task(BackupRunner.restore, manual_job_id=job_id)
     return {"status": "RESTORE_QUEUED", "job_id": job_id}
+
+# ─── SSE Streaming Endpoint ─────────────────────────────────────────────
+# Refs:
+#   https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse
+#   https://html.spec.whatwg.org/multipage/server-sent-events.html
+#   https://www.starlette.io/requests/#disconnecting
+
+@router.get("/jobs/{job_id}/stream")
+async def stream_job_events(job_id: str, request: Request):
+    """Stream real-time SSE events for a job.
+
+    Emits event types:
+      - job.status_changed: when the job's status transitions
+      - log.appended: for each new log entry in logs.db
+      - tool.progress: intermediate progress from the tool
+      - stream.end: when the job reaches terminal state or client disconnects
+
+    The stream uses the SSE wire format (text/event-stream) with:
+      - 15-second keep-alive comment lines to prevent proxy timeouts
+      - Cache-Control: no-cache to prevent intermediary caching
+      - X-Accel-Buffering: no to disable nginx buffering
+
+    Ref: https://html.spec.whatwg.org/multipage/server-sent-events.html#authoring-notes
+    """
+    broker = get_global_broker()
+    await broker.start_tailer()
+
+    # Check subscriber limit
+    async with broker._lock:
+        current_count = len(broker._subscribers.get(job_id, set()))
+    if current_count >= config.SSE_MAX_SUBSCRIBERS_PER_JOB:
+        raise HTTPException(status_code=429, detail="Too many SSE subscribers for this job")
+
+    queue = await broker.subscribe(job_id)
+
+    async def event_generator():
+        """Async generator yielding SSE-formatted events.
+
+        Each event is serialized as ``data: <json>\n\n`` per the HTML spec.
+        Comment lines (``: ping\n\n``) are sent every 15 seconds when idle.
+        """
+        try:
+            while True:
+                # Check for client disconnect
+                # Ref: https://www.starlette.io/requests/#disconnecting
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    event = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=config.SSE_KEEPALIVE_INTERVAL_SECONDS
+                    )
+                    # Serialize event to SSE wire format
+                    # Ref: https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream
+                    data = event.to_sse_data()
+                    yield f"event: {event.event_type}\ndata: {data}\n\n".encode("utf-8")
+
+                    # If terminal event, close the stream
+                    if isinstance(event, StreamEndEvent):
+                        break
+
+                except asyncio.TimeoutError:
+                    # Send keep-alive comment to prevent proxy idle-timeout close.
+                    # Ref: https://html.spec.whatwg.org/multipage/server-sent-events.html#authoring-notes
+                    yield b": ping\n\n"
+
+        finally:
+            await broker.unsubscribe(job_id, queue, reason="stream_closed")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ─── Health Check Endpoint ──────────────────────────────────────────────
+
+@router.post("/health-check/{tool_name}", response_model=HealthCheckResponse)
+async def health_check_tool(tool_name: str, request: Request):
+    """Enqueue a health-check job for a tool and return a stream URL.
+
+    This endpoint:
+      1. Validates DATABASE_STAGING_ENABLED is True (health checks must
+         not write to production data).
+      2. Validates the tool exists and implements health_check_payload().
+      3. Enqueues a real job using the tool's happy_path_args.
+      4. Returns the job_id and a stream URL for SSE consumption.
+
+    The client subscribes to the stream URL to receive real-time
+    execution events. The stream closes when the job reaches terminal
+    state (COMPLETED or FAILED).
+
+    Health checks run both happy and error paths sequentially. The
+    happy path job is enqueued first; the error path can be triggered
+    by calling the endpoint again with ?path=error query param.
+    """
+    # Gate: staging must be enabled
+    if not getattr(config, "DATABASE_STAGING_ENABLED", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Health checks require DATABASE_STAGING_ENABLED=true to protect production data."
+        )
+
+    # Validate tool exists
+    meta = REGISTRY._tools.get(tool_name)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+
+    tool_cls = meta.get("cls")
+    if not tool_cls or not hasattr(tool_cls, "health_check_payload"):
+        raise HTTPException(
+            status_code=501,
+            detail=f"Tool '{tool_name}' does not implement health_check_payload()."
+        )
+
+    # Get health check payload (instantiate tool to call the method)
+    tool_instance = REGISTRY.create_tool_instance(tool_name)
+    if not tool_instance:
+        raise HTTPException(status_code=500, detail=f"Failed to instantiate tool '{tool_name}'")
+
+    payload = tool_instance.health_check_payload()
+
+    # Determine which path to run (default: happy)
+    path = request.query_params.get("path", "happy")
+    if path == "error":
+        args = payload.error_path_args
+        expected_status = payload.expected_error_status
+    else:
+        args = payload.happy_path_args
+        expected_status = payload.expected_happy_status
+
+    # Enqueue the job
+    job_id = ULID.generate()
+    session_id = get_session_id(request)
+
+    enqueue_write(
+        "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (job_id, session_id, tool_name, json.dumps(args), "QUEUED", now_iso(), now_iso())
+    )
+
+    _ensure_writer_running()
+    get_manager().start()
+
+    # Build stream URL
+    base_url = str(request.base_url).rstrip("/")
+    stream_url = f"{base_url}/api/jobs/{job_id}/stream"
+
+    log.dual_log(
+        tag="HealthCheck:Enqueued",
+        message=f"Health check enqueued for {tool_name} (path={path})",
+        payload={
+            "who": f"health_check_endpoint",
+            "what": "enqueue_health_check",
+            "when": now_iso(),
+            "where": f"tool:{tool_name}",
+            "why": f"validate_{path}_path",
+            "how": "POST /api/health-check/{tool_name}",
+            "job_id": job_id,
+            "tool_name": tool_name,
+            "path": path,
+            "expected_status": expected_status,
+            "timeout_seconds": payload.timeout_seconds or config.HEALTH_CHECK_TIMEOUT_SECONDS,
+        },
+    )
+
+    return HealthCheckResponse(
+        job_id=job_id,
+        tool_name=tool_name,
+        stream_url=stream_url,
+        timeout_seconds=payload.timeout_seconds or config.HEALTH_CHECK_TIMEOUT_SECONDS,
+    )

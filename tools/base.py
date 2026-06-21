@@ -1,7 +1,15 @@
 # tools/base.py
 """Base classes for tool implementations.
 
-Each tool must inherit from ``BaseTool`` and implement the ``run`` coroutine.
+Each tool must inherit from ``BaseTool`` and implement:
+  - ``run(args, telemetry, **kwargs) -> str``  — the tool's execution logic
+  - ``health_check_payload()``                 — returns inputs for E2E health checks
+
+The ``run`` method must return a plain string (markdown). The previous
+``_callback_format: structured`` dict pattern has been removed in favor
+of SSE-streamed events. Tools that need to emit intermediate progress
+can call ``telemetry(self.status(message, state))`` which the SSE broker
+intercepts and forwards to subscribers.
 """
 
 from __future__ import annotations
@@ -12,23 +20,13 @@ from typing import Any, Optional
 from enum import Enum
 from dataclasses import dataclass, field
 
-class HitlPaused(Exception):
-    """Raised by tools to signal Human-in-the-Loop pause.
-
-    MUST be re-raised by run_tool_safely (not converted to ToolResult) so the
-    worker can transition jobs.status to PAUSED_FOR_HITL. Carries an optional
-    `reason` string for SSE clients.
-    """
-    def __init__(self, reason: str = "HITL pause requested"):
-        self.reason = reason
-        super().__init__(reason)
-
 
 class FailureSeverity(str, Enum):
     TRANSIENT = "transient"
     PERMANENT = "permanent"
     CONFIGURATION = "configuration"
     DATA = "data"
+
 
 @dataclass
 class StatusOverride:
@@ -47,24 +45,37 @@ class StatusOverride:
             "diagnostics": self.diagnostics or []
         }
 
-@dataclass
-class JobStatusReport:
-    status: str
-    summary: str
-    status_overrides: dict[str, StatusOverride] = field(default_factory=dict)
-    details: Optional[dict[str, Any]] = None
-    attachment_paths: Optional[list[str]] = None
 
-    def to_callback_dict(self, tool_name: str) -> dict:
-        overrides_dict = {k: v.to_dict() for k, v in self.status_overrides.items()}
-        return {
-            "_callback_format": "structured",
-            "tool_name": tool_name,
-            "status": self.status,
-            "summary": self.summary,
-            "status_overrides": overrides_dict,
-            "details": self.details or {},
-        }
+@dataclass
+class HealthCheckPayload:
+    """Describes the inputs for a tool's health check.
+
+    A health check runs the tool end-to-end against the staging database
+    (DATABASE_STAGING_ENABLED=true). Both happy and error paths are
+    exercised to validate the tool's full execution surface.
+
+    Attributes:
+        happy_path_args: Input args that should result in a successful
+            execution (status=COMPLETED). This validates the tool's
+            primary workflow.
+        error_path_args: Input args that should trigger a controlled
+            failure (status=FAILED). This validates the tool's error
+            handling and that failures are surfaced (not silently
+            swallowed).
+        expected_happy_status: The expected terminal status for the
+            happy path. Usually "COMPLETED" but some tools (e.g.,
+            publisher with an empty batch) may legitimately end in
+            "PARTIAL" or "FAILED".
+        expected_error_status: The expected terminal status for the
+            error path. Usually "FAILED".
+        timeout_seconds: Override for HEALTH_CHECK_TIMEOUT_SECONDS.
+            Set higher for browser-based tools (scraper).
+    """
+    happy_path_args: dict[str, Any]
+    error_path_args: dict[str, Any]
+    expected_happy_status: str = "COMPLETED"
+    expected_error_status: str = "FAILED"
+    timeout_seconds: int | None = None
 
 
 @dataclass
@@ -112,7 +123,8 @@ class ToolResult:
 class BaseTool(abc.ABC):
     """Abstract base class for all tools.
 
-    Subclasses should set ``name`` and implement ``run``.
+    Subclasses must set ``name`` and implement both ``run`` and
+    ``health_check_payload``.
     """
 
     name: str
@@ -122,7 +134,11 @@ class BaseTool(abc.ABC):
         return False
 
     def status(self, message: str, status: str = "RUNNING", payload: dict | None = None) -> dict:
-        """Convenience helper to create a status update for this tool."""
+        """Convenience helper to create a status update for this tool.
+
+        The SSE broker intercepts telemetry calls and forwards them as
+        ``tool.progress`` events to subscribers.
+        """
         from datetime import datetime, timezone
         result = {
             "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
@@ -139,14 +155,33 @@ class BaseTool(abc.ABC):
         """Execute tool logic and emit telemetry via the provided callback.
 
         MANDATORY DEVELOPER CONTRACT:
-        The returned string must be a complete, human-readable text summary that
-        stands alone without any attached files.  Attachment files (images, PDFs,
-        documents) are subject to FIFO eviction by the orchestrator at any time;
-        the text return value is the only guaranteed-persistent output.
+        The returned string must be a complete, human-readable markdown
+        summary that stands alone without any attached files. Attachment
+        files (images, PDFs, documents) are subject to FIFO eviction by
+        the orchestrator at any time; the text return value is the only
+        guaranteed-persistent output.
+
+        Do NOT return JSON with ``_callback_format: structured`` — that
+        pattern has been removed. Return plain markdown text.
 
         Additional keyword arguments may include:
         - dry_run: bool    - When True, skip external side effects.
         - session_id: str  - Unique identifier for the current session.
+        - job_id: str      - The job's ULID for log correlation.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def health_check_payload(self) -> HealthCheckPayload:
+        """Return inputs for end-to-end health checking.
+
+        The health check enqueues a real job using these args against
+        the staging database. Both happy and error paths are exercised.
+
+        Tools that require external resources (EDGAR, browser, Telegram)
+        must ensure their health-check payloads use safe, non-destructive
+        inputs (e.g., a well-known stable ticker like AAPL, a test batch
+        ID, a dry-run flag).
         """
         raise NotImplementedError
 

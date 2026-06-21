@@ -8,36 +8,40 @@ load_dotenv()
 ANYTHINGTOOLS_PORT: int = int(os.getenv("ANYTHINGTOOLS_PORT", "8000"))
 
 # --- Operational Database Path ---
+# When DATABASE_STAGING_ENABLED=true, this is overridden to data/staging/sumanal.db
+# Ref: https://docs.python.org/3/library/os.html#os.getenv
+_staging_enabled: bool = os.getenv(
+    "DATABASE_STAGING_ENABLED", "false"
+).lower() in ("true", "1", "yes", "on")
+
+DATABASE_STAGING_ENABLED: bool = _staging_enabled
+
+# The base operational DB path. If staging is enabled, the actual path
+# is resolved in database/connection.py to data/staging/sumanal.db.
 OPERATIONAL_DB_PATH: str = os.getenv("OPERATIONAL_DB_PATH", "data/sumanal.db")
 
 # --- Database Integration Master Toggle ---
-# When False, ALL database writes are skipped:
-#   - SQLite operational DB (enqueue_write, enqueue_transaction, enqueue_execscript)
-#   - SQLite logs DB (logs_enqueue_write)
-#   - Snowflake cloud DB (enqueue_cloud_write, enqueue_cloud_write_batch, enqueue_cloud_delete)
-#   - Startup phases: init_database_layer, run_db_migrations, validate_vec0,
-#     init_backup, sync_from_backup all become no-ops.
+# When False, operational DB writes (enqueue_write, enqueue_transaction,
+# enqueue_execscript) and Snowflake cloud writes are skipped.
+# Startup phases init_database_layer, run_db_migrations, validate_vec0,
+# init_backup, sync_from_backup become no-ops.
+#
+# logs.db writes are NOT affected by this toggle — logs.db always writes
+# so observability is never lost. See database/logs_writer.py.
 #
 # This is DISTINCT from BACKUP_CLOUD_ENABLED (in database/backup/settings.py):
 #   - BACKUP_CLOUD_ENABLED=false → cloud sync disabled, SQLite still writes.
-#   - DATABASE_INTEGRATION_ENABLED=false → entire DB stack disabled (for testing).
-#
-# Intended use case: integration tests and local development where you want
-# to run the application without a real database (e.g. with mock data).
+#   - DATABASE_INTEGRATION_ENABLED=false → operational DB + cloud disabled.
+#   - DATABASE_STAGING_ENABLED=true → diverts file paths to data/staging/,
+#     overriding the above. Staging always wins.
 #
 # Per Python os.getenv docs: https://docs.python.org/3/library/os.html#os.getenv
-# Accepts "true", "1", "yes", "on" (case-insensitive) as truthy.
 DATABASE_INTEGRATION_ENABLED: bool = os.getenv(
     "DATABASE_INTEGRATION_ENABLED", "true"
 ).lower() in ("true", "1", "yes", "on")
 
-# --- Schema Reset Control ---
-# Set SUMANAL_ALLOW_SCHEMA_RESET=1 to allow destructive schema reset on version mismatch.
-# WARNING: This drops ALL data on every restart if the schema version changes. Defaults to 0 (disabled).
-
 # --- Telegram Push Notifications (Optional) ---
 TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
-# TELEGRAM_USER_ID is now dynamically bound via startup handshake.
 
 # --- Browser / Chrome Data Dir ---
 CHROME_USER_DATA_DIR: str = os.getenv("CHROME_USER_DATA_DIR", "chrome_profile")
@@ -56,7 +60,12 @@ JOB_STALE_THRESHOLD_SECONDS: int = int(os.getenv("JOB_STALE_THRESHOLD_SECONDS", 
 MAX_RESUME_ATTEMPTS: int = int(os.getenv("MAX_RESUME_ATTEMPTS", "3"))
 
 # --- Artifacts Root ---
-ANYTHINGLLM_ARTIFACTS_DIR: str | None = os.getenv("ANYTHINGLLM_ARTIFACTS_DIR")
+# Decoupled from AnythingLLM. Tools write audit/debug artifacts here.
+# When DATABASE_STAGING_ENABLED=true, this defaults to data/staging/artifacts/.
+ARTIFACTS_DIR: str = os.getenv(
+    "ARTIFACTS_DIR",
+    "data/staging/artifacts" if DATABASE_STAGING_ENABLED else "data/artifacts"
+)
 
 # --- Azure OpenAI (for LLM client) ---
 AZURE_OPENAI_KEY: str | None = os.getenv("AZURE_OPENAI_KEY")
@@ -84,15 +93,6 @@ EDGAR_IDENTITY: str | None = os.getenv("EDGAR_IDENTITY")
 # --- Google ---
 GOOGLE_API_KEY: str | None = os.getenv("GOOGLE_API_KEY")
 
-# Logger agent / debugger configuration removed — drifting legacy values.
-# LOGGER_TRUNCATION_LIMIT is still honored by log formatters via getattr on _log_config.
-
-# --- SSE Streaming ---
-# Poll interval fallback when no LogNotifyBus event arrives within the window.
-SSE_POLL_FALLBACK_SECONDS: float = float(os.getenv("SSE_POLL_FALLBACK_SECONDS", "1.0"))
-# Cap historical log replay to prevent OOM on long-running jobs.
-SSE_MAX_HISTORY_ROWS: int = int(os.getenv("SSE_MAX_HISTORY_ROWS", "5000"))
-
 # --- Telegram Destination Routing ---
 TELEGRAM_BRIEFING_CHAT_ID: str | None = os.getenv("TELEGRAM_BRIEFING_CHAT_ID")
 TELEGRAM_ARCHIVE_CHAT_ID: str | None = os.getenv("TELEGRAM_ARCHIVE_CHAT_ID")
@@ -112,7 +112,25 @@ BATCH_READER_KEYWORD_WEIGHT: float = float(os.getenv("BATCH_READER_KEYWORD_WEIGH
 
 # --- Context Limits & Truncation ---
 LLM_CONTEXT_CHAR_LIMIT: int = int(os.getenv("LLM_CONTEXT_CHAR_LIMIT", "800000"))
-CALLBACK_TRUNCATION_MULTIPLIER: float = float(os.getenv("CALLBACK_TRUNCATION_MULTIPLIER", "0.5"))
+
+# --- SSE Configuration ---
+# SSE keep-alive interval in seconds. The HTML spec recommends emitting a
+# comment line every 15 seconds to prevent proxy idle-timeout closes.
+# Ref: https://html.spec.whatwg.org/multipage/server-sent-events.html#authoring-notes
+SSE_KEEPALIVE_INTERVAL_SECONDS: float = float(os.getenv("SSE_KEEPALIVE_INTERVAL_SECONDS", "15.0"))
+
+# Maximum number of concurrent SSE subscribers per job. Excess subscribers
+# receive a 429 Too Many Requests.
+SSE_MAX_SUBSCRIBERS_PER_JOB: int = int(os.getenv("SSE_MAX_SUBSCRIBERS_PER_JOB", "20"))
+
+# Slow-consumer drop policy: if a subscriber's queue exceeds this size,
+# the subscriber is disconnected to prevent memory exhaustion.
+SSE_SUBSCRIBER_QUEUE_MAXSIZE: int = int(os.getenv("SSE_SUBSCRIBER_QUEUE_MAXSIZE", "100"))
+
+# --- Health Check Configuration ---
+# Maximum wall-clock seconds for a health-check job before it is marked
+# as timed out. Browser-based tools (scraper) can take several minutes.
+HEALTH_CHECK_TIMEOUT_SECONDS: int = int(os.getenv("HEALTH_CHECK_TIMEOUT_SECONDS", "300"))
 
 # --- Backup Configuration ---
 # Backup is now fully managed via pydantic-settings in database/backup/settings.py

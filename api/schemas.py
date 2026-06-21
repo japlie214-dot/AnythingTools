@@ -1,4 +1,24 @@
 # api/schemas.py
+
+from pydantic import BaseModel
+
+class HealthCheckRequest(BaseModel):
+    """Request body for POST /api/health-check/{tool_name}.
+    Empty body — the tool's health_check_payload() provides the args.
+    """
+    pass
+
+
+class HealthCheckResponse(BaseModel):
+    """Initial response for POST /api/health-check/{tool_name}.
+    Returns the job_id and a stream URL for SSE consumption.
+    """
+    job_id: str
+    tool_name: str
+    stream_url: str
+    timeout_seconds: int
+
+from pydantic import BaseModel
 from pydantic import BaseModel, Field
 from typing import Literal
 from typing import Any, Dict, List, Optional
