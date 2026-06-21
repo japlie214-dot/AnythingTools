@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 from tools.base import BaseTool
 from database.connection import DatabaseManager
 from utils.logger import get_dual_logger
-from utils.callback_helper import format_callback_message
 import config
 from utils.hybrid_search import execute_hybrid_search
 

@@ -10,7 +10,7 @@ previously embedded in BaseTool.execute().
 import traceback
 import json
 from typing import Any, Dict
-from tools.base import ToolResult, BaseTool
+from tools.base import ToolResult, BaseTool, HitlPaused
 from utils.logger import get_dual_logger
 from clients.llm import get_llm_client, LLMRequest
 from utils.text_processing import escape_prompt_separators
@@ -24,6 +24,11 @@ async def run_tool_safely(tool: BaseTool, args: Dict[str, Any], telemetry: Any, 
     job_id = kwargs.get("job_id")
     try:
         return await tool.execute(args, telemetry, **kwargs)
+    except HitlPaused:
+        # MUST re-raise: the worker's _run_job except block transitions
+        # jobs.status to PAUSED_FOR_HITL. Converting to ToolResult would
+        # hide the pause signal and mark the job as FAILED.
+        raise
     except Exception as exc:
         raw_tb = traceback.format_exc()
         error_msg = f"Tool Execution Failure: {str(exc)}\n\nTraceback:\n{raw_tb}"

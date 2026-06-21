@@ -1,7 +1,17 @@
 # api/schemas.py
 from pydantic import BaseModel, Field
+from typing import Literal
 from typing import Any, Dict, List, Optional
 from enum import Enum
+
+
+class ResumeRequest(BaseModel):
+    """Request body for POST /api/jobs/{id}/resume.
+
+    `decision` is only meaningful for PAUSED_FOR_HITL jobs (delivered to the
+    worker via HitlResolutionRegistry). Ignored for INTERRUPTED/FAILED/PARTIAL.
+    """
+    decision: Literal["proceed", "skip", "cancel"] = "proceed"
 
 
 class JobCreateRequest(BaseModel):

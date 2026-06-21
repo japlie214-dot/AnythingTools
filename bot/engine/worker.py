@@ -20,12 +20,7 @@ from database.writer import enqueue_write
 from utils.id_generator import ULID
 from utils.context_helpers import spawn_thread_with_context
 from tools.registry import REGISTRY
-import httpx
-import base64
-import os
-import mimetypes
-import shutil
-from pathlib import Path
+from utils.hitl_resolution import hitl_registry
 
 log = get_dual_logger(__name__)
 
@@ -34,144 +29,6 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _do_callback_with_logging(job_id: str, tool_output: Any, attachment_paths: list[str]) -> bool:
-    """Execute HTTP callback and log all operations via enqueue_write.
-    
-    Returns True if callback succeeds (2xx), False otherwise.
-    """
-    if not getattr(config, "ANYTHINGLLM_BASE_URL", None) or not getattr(config, "ANYTHINGLLM_API_KEY", None):
-        return True
-
-    url = f"{config.ANYTHINGLLM_BASE_URL.rstrip('/')}/api/v1/workspace/{config.ANYTHINGLLM_WORKSPACE_SLUG}/chat"
-    headers = {"Authorization": f"Bearer {config.ANYTHINGLLM_API_KEY}", "Content-Type": "application/json"}
-
-    # -------------------------------------------------------------------------
-    # ⚠️ MANDATORY ARCHITECTURE RULE: THE "CUSTOM-DOCUMENTS" DIRECTIVE
-    # -------------------------------------------------------------------------
-    # Do NOT send artifact files (like top10.json) as Base64 attachments via 
-    # the AnythingLLM Chat API. 
-    # Dropping the file directly into AnythingLLM's `custom-documents/` folder 
-    # (via artifact_manager.py) is the ONLY right way to expose files to the LLM. 
-    #
-    # The `attachments` payload below MUST remain empty for markdown-based 
-    # tool callbacks.
-    # -------------------------------------------------------------------------
-    
-    # Construct structured markdown callback
-    tool_name = "unknown"
-    status = "COMPLETED"
-    summary = ""
-    details = None
-    artifacts = None
-    status_overrides = None
-
-    if isinstance(tool_output, dict):
-        if tool_output.get("_callback_format") == "structured":
-            tool_name = tool_output.get("tool_name", tool_name)
-            status = tool_output.get("status", status)
-            summary = tool_output.get("summary", "")
-            details = tool_output.get("details")
-            artifacts = tool_output.get("artifacts")
-            status_overrides = tool_output.get("status_overrides")
-        else:
-            tool_name = tool_output.get("tool_name", tool_name)
-            status = tool_output.get("status", status)
-            summary = f"Job {job_id} finished with status: {status}"
-            details = tool_output
-    elif isinstance(tool_output, str):
-        summary = tool_output[:500]
-        details = {"raw_output": tool_output[:2000]}
-
-    # Get artifacts directory if available
-    artifacts_subdir = None
-    try:
-        if details and isinstance(details, dict) and details.get("artifacts_directory"):
-            artifacts_subdir = details.get("artifacts_directory")
-        else:
-            from utils.artifact_manager import get_artifacts_root
-            root = get_artifacts_root()
-            artifacts_subdir = root.as_posix() if hasattr(root, "as_posix") else str(root).replace("\\", "/")
-    except Exception:
-        artifacts_subdir = getattr(config, "ANYTHINGLLM_ARTIFACTS_DIR", "artifacts")
-        if artifacts_subdir:
-            artifacts_subdir = str(artifacts_subdir).replace("\\", "/")
-
-    from utils.callback_helper import format_callback_message, truncate_message
-
-    callback_message = format_callback_message(
-        job_id=job_id,
-        status=status,
-        tool_name=tool_name,
-        summary=summary,
-        details=details,
-        artifacts=artifacts,
-        artifacts_subdir=artifacts_subdir,
-        status_overrides=status_overrides
-    )
-
-    callback_message = truncate_message(callback_message)
-
-    callback_payload = {
-        "message": f"TOOL_RESULT_CORRELATION_ID:{job_id}\n\n{callback_message}",
-        "mode": "chat",
-        "attachments": [],  # ENFORCED: No Base64 attachments.
-        "reset": False,
-    }
-
-    max_retries = 3
-    base_delay = 2.0
-    attempt = 0
-
-    while attempt < max_retries:
-        attempt += 1
-        try:
-            with httpx.Client(timeout=config.ANYTHINGLLM_CALLBACK_TIMEOUT) as client:
-                resp = client.post(url, json=callback_payload, headers=headers)
-                resp.raise_for_status()
-
-            from database.logs_writer import logs_enqueue_write
-            logs_enqueue_write(
-                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ULID.generate(), job_id, "Worker:Callback:Success", "INFO", None, "Callback delivered", json.dumps({"attempt": attempt, "tool": tool_name, "status": status, "summary_len": len(summary)}), ULID.generate(), None, now_iso())
-            )
-            return True
-
-        except httpx.HTTPStatusError as e:
-            status_code = e.response.status_code
-            if 400 <= status_code < 500:
-                from database.logs_writer import logs_enqueue_write
-                logs_enqueue_write(
-                    "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (ULID.generate(), job_id, "Worker:Callback:ClientError", "ERROR", None, "HTTP client error (no retry)", json.dumps({"status_code": status_code}), ULID.generate(), None, now_iso())
-                )
-                return False
-            # Non-4xx HTTP errors are considered transient/server and may be retried
-            from database.logs_writer import logs_enqueue_write
-            logs_enqueue_write(
-                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ULID.generate(), job_id, "Worker:Callback:ServerError", "WARNING", None, "HTTP server error (retry)", json.dumps({"status_code": status_code}), ULID.generate(), None, now_iso())
-            )
-        except Exception as e:
-            from database.logs_writer import logs_enqueue_write
-            logs_enqueue_write(
-                "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ULID.generate(), job_id, "Worker:Callback:Transient", "WARNING", None, "Transient error in callback", json.dumps({"error": str(e)}), ULID.generate(), None, now_iso())
-            )
-
-        if attempt < max_retries:
-            time.sleep(base_delay * (2 ** (attempt - 1)))
-
-    from database.logs_writer import logs_enqueue_write
-    logs_enqueue_write(
-        "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (ULID.generate(), job_id, "Worker:Callback:MaxRetries", "ERROR", None, "Max callback retries reached", json.dumps({"max_retries": max_retries}), ULID.generate(), None, now_iso())
-    )
-    return False
 
 
 class UnifiedWorkerManager:
@@ -209,14 +66,10 @@ class UnifiedWorkerManager:
                 
                 conn = DatabaseManager.get_read_connection()
                 # Prioritize INTERRUPTED (recovery) jobs, then QUEUED
-                # Also poll PENDING_CALLBACK jobs that are ready for retry
-                delay = config.ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS
                 rows = conn.execute(
                     "SELECT job_id, session_id, tool_name, args_json, status, result_json, retry_count FROM jobs "
                     "WHERE status IN ('QUEUED', 'INTERRUPTED') "
-                    "   OR (status = 'PENDING_CALLBACK' AND updated_at < datetime('now', '-' || ? || ' seconds')) "
                     "ORDER BY status ASC, created_at ASC LIMIT 5",
-                    (delay,)
                 ).fetchall()
                 
             except Exception as e:
@@ -230,22 +83,6 @@ class UnifiedWorkerManager:
                 tool_name = r["tool_name"]
                 status = r["status"]
                 
-                if status == "PENDING_CALLBACK":
-                    result_json = r["result_json"] or "{}"
-                    try:
-                        parsed_result = json.loads(result_json)
-                    except Exception:
-                        parsed_result = {"raw": result_json}
-                    
-                    retry_count = r["retry_count"]
-                    t = spawn_thread_with_context(
-                        self._retry_callback_only,
-                        args=(job_id, parsed_result, retry_count),
-                        name=f"callback-retry-{job_id}",
-                        daemon=True
-                    )
-                    self._active_jobs[job_id] = t
-                    continue
                 
                 try:
                     args = json.loads(r["args_json"] or "{}")
@@ -268,9 +105,19 @@ class UnifiedWorkerManager:
                     )
                     log.dual_log(tag="Worker:Job:Recovery", message="Recovered interrupted job", payload={"job_id": job_id, "recovery_notice": recovery_msg})
 
-                # Prepare cancellation flag
-                flag = threading.Event()
-                self.cancellation_flags[job_id] = flag
+                # Prepare cancellation flag. Per Pushback 5: do NOT clobber an
+                # existing flag — DELETE /jobs/{id} may have set it while the
+                # job was still QUEUED, and overwriting it would drop the
+                # cancellation request.
+                with threading.Lock():
+                    existing = self.cancellation_flags.get(job_id)
+                    if existing is not None and existing.is_set():
+                        # Operator already cancelled; honor it by not starting
+                        # the job. The CANCELLING status was set by DELETE.
+                        log.dual_log(tag="Worker:Job:SkipCancelled", message=f"Skipping cancelled job {job_id}", payload={"job_id": job_id})
+                        continue
+                    flag = existing or threading.Event()
+                    self.cancellation_flags[job_id] = flag
 
                 # Spawn execution thread
                 t = spawn_thread_with_context(
@@ -283,37 +130,6 @@ class UnifiedWorkerManager:
 
             time.sleep(self.poll_interval)
 
-    def _retry_callback_only(self, job_id: str, result_data: dict, retry_count: int) -> None:
-        try:
-            attachments = result_data.get("attachment_paths", []) if isinstance(result_data, dict) else []
-            tool_output = result_data.get("result", result_data) if isinstance(result_data, dict) else result_data
-            success = _do_callback_with_logging(job_id, tool_output, attachments)
-            if success:
-                enqueue_write(
-                    "UPDATE jobs SET status = 'COMPLETED', updated_at = ? WHERE job_id = ?",
-                    (now_iso(), job_id)
-                )
-            else:
-                new_retry_count = retry_count + 1
-                if new_retry_count >= 3:
-                    enqueue_write(
-                        "UPDATE jobs SET status = 'PARTIAL', retry_count = ?, updated_at = ? WHERE job_id = ?",
-                        (new_retry_count, now_iso(), job_id)
-                    )
-                    from database.logs_writer import logs_enqueue_write
-                    logs_enqueue_write(
-                        "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (ULID.generate(), job_id, "Worker:Callback:Abandoned", "ERROR", None, "Max callback retries exceeded, marked as PARTIAL", json.dumps({"retry_count": new_retry_count}), ULID.generate(), None, now_iso())
-                    )
-                else:
-                    enqueue_write(
-                        "UPDATE jobs SET retry_count = ?, updated_at = ? WHERE job_id = ?",
-                        (new_retry_count, now_iso(), job_id)
-                    )
-        finally:
-            if job_id in self._active_jobs:
-                del self._active_jobs[job_id]
 
     def _run_job(self, job_id: str, session_id: str, tool_name: str, args: dict, cancellation_flag: threading.Event) -> None:
         """Execute a single job using direct tool invocation."""
@@ -368,24 +184,13 @@ class UnifiedWorkerManager:
             status_str = normal.get("status", "FAILED")
             payload_json = json.dumps(normal, ensure_ascii=False)
 
-            # We don't set terminal status yet if callback applies.
-            if status_str in ("COMPLETED", "PARTIAL"):
-                success = _do_callback_with_logging(job_id, normal.get("result"), attachments)
-                if success:
-                    enqueue_write(
-                        "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
-                        (status_str, payload_json, now_iso(), job_id),
-                    )
-                else:
-                    enqueue_write(
-                        "UPDATE jobs SET status = 'PENDING_CALLBACK', result_json = ?, retry_count = 1, updated_at = ? WHERE job_id = ?",
-                        (payload_json, now_iso(), job_id),
-                    )
-            else:
-                enqueue_write(
-                    "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
-                    (status_str, payload_json, now_iso(), job_id),
-                )
+            # Always write the terminal status directly. The old callback
+            # retry path is removed — SSE clients read result_json via the
+            # completed event.
+            enqueue_write(
+                "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
+                (status_str, payload_json, now_iso(), job_id),
+            )
             
             # Reset errors on success
             if job_id in self._system_errors:
@@ -393,8 +198,11 @@ class UnifiedWorkerManager:
                 
         except Exception as e:
             err_str = str(e)
-            if err_str.startswith("PAUSED_FOR_HITL:"):
-                msg = err_str.split(":", 1)[1].strip() if ":" in err_str else err_str
+            # HitlPaused carries a .reason attr; check type instead of string
+            # prefix matching (the old approach was brittle — see Pushback).
+            from tools.base import HitlPaused
+            if isinstance(e, HitlPaused):
+                msg = e.reason if hasattr(e, 'reason') else str(e)
                 log.dual_log(tag="Worker:Job:Paused", message="Job paused for HITL", level="WARNING", payload={"job_id": job_id, "reason": msg})
                 enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("PAUSED_FOR_HITL", now_iso(), job_id))
             else:
@@ -409,6 +217,11 @@ class UnifiedWorkerManager:
                     enqueue_write("UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?", ("INTERRUPTED", now_iso(), job_id))
             
         finally:
+            # Clean up HITL registry state so /resume doesn't deliver to a dead worker.
+            try:
+                hitl_registry.clear(job_id)
+            except Exception:
+                pass
             # Export job logs to file for any terminal failure state. We must wait
             # briefly for the asynchronous logs writer queue to drain so that the
             # final fatal log entries are persisted before we snapshot them.

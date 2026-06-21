@@ -12,6 +12,18 @@ from typing import Any, Optional
 from enum import Enum
 from dataclasses import dataclass, field
 
+class HitlPaused(Exception):
+    """Raised by tools to signal Human-in-the-Loop pause.
+
+    MUST be re-raised by run_tool_safely (not converted to ToolResult) so the
+    worker can transition jobs.status to PAUSED_FOR_HITL. Carries an optional
+    `reason` string for SSE clients.
+    """
+    def __init__(self, reason: str = "HITL pause requested"):
+        self.reason = reason
+        super().__init__(reason)
+
+
 class FailureSeverity(str, Enum):
     TRANSIENT = "transient"
     PERMANENT = "permanent"

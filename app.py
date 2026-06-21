@@ -23,17 +23,6 @@ import config as config_module
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
 
-async def verify_api_key(api_key: str = Security(api_key_header)):
-    """
-    Dependency injected into all /api/ routes.
-    Compares the header against the secret loaded in config.py.
-    """
-    if api_key != config_module.API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API Key. Unauthorized access."
-        )
-    return api_key
 
 from utils.logger.core import get_dual_logger
 
@@ -42,6 +31,13 @@ log = get_dual_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize SSE registries on the running event loop. MUST happen before
+    # any SSE route is hit. Ref:
+    # https://docs.python.org/3/library/asyncio-sync.html#asyncio.Event
+    from api.sse import shutdown, log_notify
+    shutdown.init_shutdown_registry(asyncio.get_running_loop())
+    log_notify.init_log_notify_bus(asyncio.get_running_loop())
+
     # Enforce single-process execution to protect manifest integrity
     if int(os.environ.get("WEB_CONCURRENCY", "1")) > 1:
         raise RuntimeError("CRITICAL: AnythingTools must be run with workers=1 to prevent manifest corruption.")
@@ -51,11 +47,33 @@ async def lifespan(app: FastAPI):
         from utils.startup import run_startup
         await run_startup(app)
         log.dual_log(tag="App:Lifecycle:StartupSuccess", message="Startup completed successfully", level="INFO", payload={"status": "success"})
+
+        # Retire legacy PENDING_CALLBACK rows AFTER DB init but BEFORE the
+        # worker manager starts picking up jobs. Per Pushback 3: standalone
+        # data mutation, NOT routed through DualDBMigrationCoordinator.
+        try:
+            from database.sse_retire_pending_callback import retire_pending_callback_jobs
+            retired = retire_pending_callback_jobs()
+            if retired:
+                log.dual_log(tag="App:Lifecycle:RetiredPcb", message=f"Retired {retired} PENDING_CALLBACK job(s)", level="INFO", payload={"retired_count": retired})
+        except Exception as e:
+            log.dual_log(tag="App:Lifecycle:RetirePcbError", message=f"PENDING_CALLBACK retirement failed: {e}", level="WARNING", payload={"error": str(e)})
         yield
     except Exception as e:
         log.dual_log(tag="App:Lifecycle:StartupFailed", message=f"Startup aborted: {e}", level="CRITICAL", payload={"error": str(e), "startup_failed": True})
         startup_failed = True
     finally:
+        # Signal SSE projectors to emit `server shutting down` BEFORE the
+        # 60s _active_jobs drain. Per Pushback 6: os._exit(1) at line 125
+        # would otherwise kill generators without a final event.
+        try:
+            from api.sse import shutdown as sse_shutdown
+            sse_shutdown.signal_shutdown()
+            # Give projectors ~3s to emit final events and close connections.
+            await asyncio.sleep(3.0)
+        except Exception:
+            pass
+
         log.dual_log(tag="App:Lifecycle:ShutdownStarted", message="Initiating shutdown sequence...", level="INFO", payload={"phase": "init", "startup_failed": startup_failed})
         
         try:

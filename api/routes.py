@@ -1,6 +1,7 @@
 # api/routes.py
-from fastapi import APIRouter, HTTPException, status, Request, BackgroundTasks, Query
+from fastapi import APIRouter, HTTPException, status, Request, BackgroundTasks, Query, Header
 from typing import Dict, Any, Optional
+from typing_extensions import Annotated
 import threading
 import asyncio
 import importlib
@@ -8,7 +9,7 @@ import json
 from datetime import datetime, timezone
 
 import config
-from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry, ResumeResponse, BackupMetricsResponse
+from api.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse, JobLogEntry, ResumeResponse, BackupMetricsResponse, ResumeRequest
 from tools.registry import REGISTRY
 from utils.logger.core import get_dual_logger
 from utils.id_generator import ULID
@@ -18,6 +19,8 @@ from database.logs_writer import logs_enqueue_write
 from database.diagnostics import get_queue_metrics
 from utils.artifact_manager import artifact_url_from_request
 from bot.engine.worker import get_manager
+from utils.hitl_resolution import hitl_registry, VALID_DECISIONS
+from api.sse.projector import stream_job
 from pydantic import ValidationError
 
 log = get_dual_logger(__name__)
@@ -147,9 +150,37 @@ async def diagnostics():
     return metrics
 
 
+@router.get("/jobs/{job_id}/stream")
+async def stream_job_events(
+    job_id: str,
+    request: Request,
+    last_event_id: Annotated[Optional[str], Header(alias="Last-Event-ID")] = None,
+):
+    """SSE stream for a job's execution events.
+
+    Emits 4 phase events: started, running, paused, completed. Ref:
+    https://fastapi.tiangolo.com/tutorial/server-sent-events/
+    https://html.spec.whatwg.org/multipage/server-sent-events.html
+    """
+    try:
+        conn = DatabaseManager.get_read_connection()
+        row = conn.execute("SELECT job_id FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    except Exception:
+        row = None
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    from fastapi.sse import EventSourceResponse
+    return EventSourceResponse(stream_job(job_id, last_event_id))
+
+
 @router.post("/jobs/{job_id}/resume", response_model=ResumeResponse)
-async def resume_job(job_id: str):
-    """Resume an INTERRUPTED, FAILED, or PARTIAL job safely."""
+async def resume_job(job_id: str, body: ResumeRequest = ResumeRequest()):
+    """Resume a PAUSED_FOR_HITL, INTERRUPTED, FAILED, or PARTIAL job.
+
+    For INTERRUPTED/FAILED/PARTIAL: re-queues the job and starts the worker.
+    Bypasses MAX_RESUME_ATTEMPTS for HITL resumes (operator-driven, not doom loop).
+    """
     conn = DatabaseManager.get_read_connection()
     row = conn.execute("SELECT tool_name, status, args_json, resume_count FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
 
@@ -159,12 +190,28 @@ async def resume_job(job_id: str):
     current_status = row["status"]
     tool_name = row["tool_name"]
 
-    # 409 Conflict check for active local console locks
+    TERMINAL_STATUSES = ("COMPLETED", "ABANDONED", "SKIPPED")
+    if current_status == "CANCELLING":
+        raise HTTPException(status_code=409, detail=f"Job is being cancelled (status={current_status}). Cannot resume.")
+    if current_status in TERMINAL_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Job is terminal (status={current_status}). Cannot resume.")
+
     if current_status == "PAUSED_FOR_HITL":
-        raise HTTPException(
-            status_code=409,
-            detail="Job is currently awaiting local console input."
-        )
+        decision = body.decision if body.decision in VALID_DECISIONS else "proceed"
+        delivered = hitl_registry.set_decision(job_id, decision)
+        if not delivered:
+            log.dual_log(tag="API:Job:Resume:HITLFallthrough", message=f"PAUSED_FOR_HITL job {job_id} has no waiting worker; falling through to re-queue.", level="WARNING", payload={"job_id": job_id})
+        else:
+            log.dual_log(tag="API:Job:Resume:HITL", message=f"HITL decision delivered for {job_id}", payload={"job_id": job_id, "decision": decision})
+            return ResumeResponse(
+                job_id=job_id,
+                tool_name=tool_name,
+                status="RUNNING",
+                items_completed=0,
+                items_pending=0,
+                message=f"HITL decision '{decision}' delivered. Reconnect to /stream.",
+                details={"decision": decision, "resume_path": "hitl"},
+            )
 
     try:
         args = json.loads(row["args_json"] or "{}")
@@ -181,10 +228,11 @@ async def resume_job(job_id: str):
     if not report.resumable:
         raise HTTPException(status_code=400, detail=report.message)
 
-    resume_count = row["resume_count"] if row["resume_count"] is not None else 0
-    if resume_count >= getattr(config, "MAX_RESUME_ATTEMPTS", 3):
-        enqueue_write("UPDATE jobs SET status = 'FAILED', updated_at = ? WHERE job_id = ?", (now_iso(), job_id))
-        raise HTTPException(status_code=400, detail="Maximum resume attempts exceeded (Poison pill protection).")
+    if current_status != "PAUSED_FOR_HITL":
+        resume_count = row["resume_count"] if row["resume_count"] is not None else 0
+        if resume_count >= getattr(config, "MAX_RESUME_ATTEMPTS", 3):
+            enqueue_write("UPDATE jobs SET status = 'FAILED', updated_at = ? WHERE job_id = ?", (now_iso(), job_id))
+            raise HTTPException(status_code=400, detail="Maximum resume attempts exceeded (Poison pill protection).")
 
     enqueue_write(
         "UPDATE jobs SET status = 'QUEUED', resume_count = resume_count + 1, updated_at = ? WHERE job_id = ?",

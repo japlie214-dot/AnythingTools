@@ -87,12 +87,11 @@ GOOGLE_API_KEY: str | None = os.getenv("GOOGLE_API_KEY")
 # Logger agent / debugger configuration removed — drifting legacy values.
 # LOGGER_TRUNCATION_LIMIT is still honored by log formatters via getattr on _log_config.
 
-# --- AnythingLLM Integration ---
-ANYTHINGLLM_API_KEY: str | None = os.getenv("ANYTHINGLLM_API_KEY")
-ANYTHINGLLM_BASE_URL: str = os.getenv("ANYTHINGLLM_BASE_URL", "http://localhost:3001")
-ANYTHINGLLM_WORKSPACE_SLUG: str = os.getenv("ANYTHINGLLM_WORKSPACE_SLUG", "my-workspace")
-ANYTHINGLLM_CALLBACK_TIMEOUT: int = int(os.getenv("ANYTHINGLLM_CALLBACK_TIMEOUT", "120"))
-ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS: int = int(os.getenv("ANYTHINGLLM_CALLBACK_RETRY_DELAY_SECONDS", "30"))
+# --- SSE Streaming ---
+# Poll interval fallback when no LogNotifyBus event arrives within the window.
+SSE_POLL_FALLBACK_SECONDS: float = float(os.getenv("SSE_POLL_FALLBACK_SECONDS", "1.0"))
+# Cap historical log replay to prevent OOM on long-running jobs.
+SSE_MAX_HISTORY_ROWS: int = int(os.getenv("SSE_MAX_HISTORY_ROWS", "5000"))
 
 # --- Telegram Destination Routing ---
 TELEGRAM_BRIEFING_CHAT_ID: str | None = os.getenv("TELEGRAM_BRIEFING_CHAT_ID")
