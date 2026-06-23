@@ -4,7 +4,7 @@ import sqlite3
 from typing import Any
 from pydantic import BaseModel, Field
 
-from tools.base import BaseTool, HealthCheckPayload
+from tools.base import BaseTool, HealthCheckPayload, ToolExecutionError, ToolValidationError
 from database.connection import DatabaseManager
 from utils.logger import get_dual_logger
 import config
@@ -31,25 +31,30 @@ class BatchReaderTool(BaseTool):
         )
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
-        def _fail(summary: str, next_steps: str) -> str:
-            return f"**Error:** {summary}\n\n{next_steps}"
+        def _fail(summary: str, next_steps: str) -> None:
+            raise ToolExecutionError(
+                summary,
+                tool_name=self.name,
+                job_id=kwargs.get("job_id"),
+                next_steps=next_steps,
+            )
 
         batch_id = args.get("batch_id")
         query = args.get("query")
         limit = min(int(args.get("limit", 5)), 50)
         
         if not batch_id or not query:
-            return _fail("batch_id and query are required.", "Provide both 'batch_id' and 'query' parameters.")
+            _fail("batch_id and query are required.", "Provide both 'batch_id' and 'query' parameters.")
             
         from database.broadcast.queries import get_batch_info, get_batch_article_ids
         
         batch_info = get_batch_info(batch_id)
         if not batch_info:
-            return _fail("Batch not found.", "Verify the batch_id is valid. If lost, use the `scraper` tool to generate a new batch.")
+            _fail("Batch not found.", "Verify the batch_id is valid. If lost, use the `scraper` tool to generate a new batch.")
             
         valid_ulids = get_batch_article_ids(batch_id)
         if not valid_ulids:
-            return _fail("No valid articles found in batch.", "The batch is empty or corrupted. Scrape a new batch.")
+            _fail("No valid articles found in batch.", "The batch is empty or corrupted. Scrape a new batch.")
 
         # 3. Execute Hybrid Search
         w_vec = getattr(config, 'BATCH_READER_VECTOR_WEIGHT', 0.6)

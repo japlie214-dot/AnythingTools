@@ -4,12 +4,20 @@
 Refactored from TTY-bound input() to API-addressable HitlResolutionRegistry.
 The worker thread blocks on threading.Event.wait(); POST /api/jobs/{id}/resume
 with {decision: "proceed"|"skip"|"cancel"} unblocks it.
+
+CRITICAL: Before blocking, we resolve the JobCompletionRegistry future so the
+sync API's `await future` unblocks and returns {status: PAUSED_FOR_HITL} to the
+LLM agent. Without this, the API hangs forever (per Pushback 1). The LLM then
+calls POST /api/jobs/{id}/resume, which registers a NEW future; after the worker
+unblocks and the tool finishes, the worker resolves the new future with the
+terminal state.
 """
 import threading
 from enum import Enum
 from datetime import datetime, timezone
 
 from utils.hitl_resolution import hitl_registry
+from bot.engine.completion_registry import job_completion_registry
 from utils.logger import get_dual_logger
 
 log = get_dual_logger(__name__)
@@ -39,6 +47,9 @@ class HITLState:
         Returns "proceed" | "skip" | "cancel". The job's status is transitioned
         to PAUSED_FOR_HITL via enqueue_write; the SSE projector observes this
         via logs.status_state and emits the `paused` event.
+
+        BEFORE blocking, resolves the JobCompletionRegistry future with
+        {status: PAUSED_FOR_HITL, url, reason} so the sync API unblocks.
         """
         with self.lock:
             self.pending_url = url
@@ -78,6 +89,21 @@ class HITLState:
             status_state="PAUSED_FOR_HITL",
             payload={"url": url, "reason": reason, "job_id": job_id},
         )
+
+        # CRITICAL: Resolve the completion registry BEFORE blocking.
+        # The sync API's `await future` unblocks and returns PAUSED_FOR_HITL
+        # to the LLM agent. The LLM then calls POST /api/jobs/{id}/resume,
+        # which registers a NEW future for the terminal state.
+        if job_id:
+            job_completion_registry.resolve(job_id, {
+                "job_id": job_id,
+                "status": "PAUSED_FOR_HITL",
+                "result": None,
+                "error": None,
+                "tool_name": "scraper",
+                "hitl_url": url,
+                "hitl_reason": reason,
+            })
 
         # Block on the registry. POST /resume calls hitl_registry.set_decision().
         # No timeout: the worker stays paused indefinitely until the operator

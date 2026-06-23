@@ -1,27 +1,12 @@
 # api/schemas.py
+"""Pydantic schemas for the agent-native sync execution API.
 
-from pydantic import BaseModel
-
-class HealthCheckRequest(BaseModel):
-    """Request body for POST /api/health-check/{tool_name}.
-    Empty body — the tool's health_check_payload() provides the args.
-    """
-    pass
-
-
-class HealthCheckResponse(BaseModel):
-    """Initial response for POST /api/health-check/{tool_name}.
-    Returns the job_id and a stream URL for SSE consumption.
-    """
-    job_id: str
-    tool_name: str
-    stream_url: str
-    timeout_seconds: int
-
-from pydantic import BaseModel
+The sync model: POST /api/jobs holds the HTTP connection open until the
+job reaches a terminal state (COMPLETED, FAILED, ABANDONED, PARTIAL, SKIPPED)
+or PAUSED_FOR_HITL. The response body IS the terminal state.
+"""
 from pydantic import BaseModel, Field
-from typing import Literal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 from enum import Enum
 
 
@@ -34,12 +19,39 @@ class ResumeRequest(BaseModel):
     decision: Literal["proceed", "skip", "cancel"] = "proceed"
 
 
+class SyncJobRequest(BaseModel):
+    """Request body for POST /api/jobs."""
+    tool_name: str = Field(..., description="The tool to execute.")
+    args: Dict[str, Any] = Field(default_factory=dict, description="Tool input arguments.")
+    client_metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata (idempotency key, etc.).")
+
+
+class SyncJobResponse(BaseModel):
+    """Response for POST /api/jobs and POST /api/jobs/{id}/resume.
+
+    The `status` field is the terminal state (or PAUSED_FOR_HITL).
+    `result` is the tool's output (any JSON-serializable).
+    `error` is the full, untruncated exception message if status is FAILED.
+    `logs_pointer` tells the LLM where to query for more context.
+    """
+    job_id: str
+    status: str
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    tool_name: Optional[str] = None
+    logs_pointer: Optional[str] = None
+    hitl_url: Optional[str] = None
+    hitl_reason: Optional[str] = None
+
+
+# Legacy schemas — kept for backward compat with POST /api/tools/{tool_name}
 class JobCreateRequest(BaseModel):
     args: Dict[str, Any] = {}
     client_metadata: Optional[Dict[str, Any]] = None
 
 
 class JobCreateResponse(BaseModel):
+    """Deprecated: use SyncJobResponse via POST /api/jobs."""
     job_id: str
     status: str
 
@@ -53,6 +65,7 @@ class JobLogEntry(BaseModel):
 
 
 class JobStatusResponse(BaseModel):
+    """Response for GET /api/jobs/{id}/status."""
     job_id: str
     status: str
     job_logs: List[JobLogEntry]
@@ -60,6 +73,7 @@ class JobStatusResponse(BaseModel):
 
 
 class ResumeResponse(BaseModel):
+    """Deprecated: POST /api/jobs/{id}/resume now returns SyncJobResponse."""
     job_id: str
     tool_name: str
     status: str
@@ -67,6 +81,21 @@ class ResumeResponse(BaseModel):
     items_pending: int
     message: str
     details: Optional[Dict[str, Any]] = None
+
+
+class HealthCheckRequest(BaseModel):
+    pass
+
+
+class HealthCheckResponse(BaseModel):
+    """Response for POST /api/health-check/{tool_name}.
+
+    No longer returns stream_url — the sync API returns the full result.
+    """
+    job_id: str
+    tool_name: str
+    timeout_seconds: int
+    final_result: Optional[SyncJobResponse] = None
 
 
 class EngineMetrics(BaseModel):

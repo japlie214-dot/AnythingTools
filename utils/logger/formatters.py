@@ -233,26 +233,6 @@ def _serialize_payload(payload: Any, depth: int = 0, event_id: str | None = None
     return _redact_and_handle_size(rendered, event_id)
 
 
-# Retained for backward compatibility — existing callers (if any) still work.
-# This function is now a thin wrapper around _redact_and_handle_size.
-# NOTE: This function does NOT spool; it only truncates. It is kept solely
-# for backward compatibility with any external caller. New code should use
-# _redact_and_handle_size instead.
-def _mask_payload_if_large(payload: Any) -> Any:
-    """Legacy safety valve — truncates instead of spooling.
-
-    Kept for backward compatibility. New code should call
-    _redact_and_handle_size, which spools instead of truncating.
-    """
-    if payload is None:
-        return None
-    if isinstance(payload, (bytes, bytearray)):
-        if len(payload) > _MAX_PAYLOAD_CHARS:
-            return f"[MASKED: Binary Data | {len(payload)} bytes]"
-    if isinstance(payload, str):
-        if len(payload) > _MAX_PAYLOAD_CHARS:
-            return payload[:_MAX_PAYLOAD_CHARS] + f"...[TRUNCATED: {len(payload) - _MAX_PAYLOAD_CHARS} more chars]"
-    return payload
 
 
 class ConsoleFormatter(logging.Formatter):

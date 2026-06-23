@@ -16,7 +16,7 @@ from database.writer import enqueue_write
 from database.job_queue import add_job_item, update_item_status
 from utils.artifact_manager import write_artifact
 
-from tools.base import BaseTool, HealthCheckPayload
+from tools.base import BaseTool, HealthCheckPayload, ToolExecutionError, ToolValidationError
 from tools.scraper.prompts import SCRAPER_SYS_PROMPT, CURATION_SYS_PROMPT
 from tools.scraper.targets import VALID_TARGET_NAMES, TARGET_SITE_MAP
 
@@ -53,7 +53,12 @@ class ScraperTool(BaseTool):
         cancellation_flag = cancellation_flag or threading.Event()
         
         if browser_lock.locked():
-            return "**Error:** System busy: another browser task is running.\n\nTry again later."
+            raise ToolExecutionError(
+                "System busy: another browser task is running.",
+                tool_name=self.name,
+                job_id=job_id,
+                next_steps="Try again later."
+            )
             
         browser_lock.acquire()
         try:
@@ -83,12 +88,7 @@ class ScraperTool(BaseTool):
                 "description": description
             })
 
-        def _fail_internal(summary: str, next_steps: str) -> str:
-            payload = {
-                "tool_name": self.name,
-                "batch_id": batch_id,
-                "input_args": args,
-            }
+        def _fail_internal(summary: str, next_steps: str) -> None:
             try:
                 log.dual_log(
                     tag="Scraper:Validation:Failed",
@@ -99,7 +99,12 @@ class ScraperTool(BaseTool):
                 )
             except Exception:
                 pass
-            return f"**Error:** {summary}\n\n{next_steps}"
+            raise ToolExecutionError(
+                summary,
+                tool_name=self.name,
+                job_id=job_id,
+                next_steps=next_steps,
+            )
 
         def _merge_completed_articles(results: dict, job_id: str | None) -> dict:
             if not job_id:
@@ -153,10 +158,10 @@ class ScraperTool(BaseTool):
         if dry_run is None:
             dry_run = config.TELEMETRY_DRY_RUN
         if dry_run:
-            return _fail_internal("[DRY RUN] Scraper tool execution skipped.", "Disable dry run to execute.")
+            _fail_internal("[DRY RUN] Scraper tool execution skipped.", "Disable dry run to execute.")
 
         if not target_site:
-            return _fail_internal("Error: target_site argument is required.", "Provide a valid 'target_site' argument.")
+            _fail_internal("Error: target_site argument is required.", "Provide a valid 'target_site' argument.")
 
         if target_site not in VALID_TARGET_NAMES:
             valid_list = ", ".join(sorted(VALID_TARGET_NAMES))
@@ -166,7 +171,7 @@ class ScraperTool(BaseTool):
                 level="ERROR",
                 payload={"received": target_site, "valid_options": list(VALID_TARGET_NAMES)},
             )
-            return _fail_internal(f"Error: '{target_site}' is not a valid target site. Valid options: {valid_list}", f"Use one of the valid options: {valid_list}")
+            _fail_internal(f"Error: '{target_site}' is not a valid target site. Valid options: {valid_list}", f"Use one of the valid options: {valid_list}")
 
         # Scout initialization (legacy ledger removed) — log for auditing
         if job_id and session_id != "0":

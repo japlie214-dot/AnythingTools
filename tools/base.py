@@ -20,6 +20,58 @@ from typing import Any, Optional
 from enum import Enum
 from dataclasses import dataclass, field
 
+class ToolError(Exception):
+    """Base for all tool-raised errors. Carries full diagnostic context.
+
+    Tools MUST raise this (or a subclass) on failure instead of returning
+    a markdown error string. The worker catches it, marks the job FAILED,
+    and propagates the full message to the LLM agent via the sync API response.
+
+    The message is NEVER truncated — it is the LLM's diagnostic lifeline.
+    Ref: https://docs.python.org/3/tutorial/errors.html#raising-exceptions
+    """
+    def __init__(
+        self,
+        message: str,
+        *,
+        tool_name: str | None = None,
+        job_id: str | None = None,
+        cause: Exception | None = None,
+        next_steps: str | None = None,
+    ) -> None:
+        # Compose a fully self-contained message. Length is not a concern —
+        # the requirement explicitly states "exception message should contain
+        # all information needed, length isn't an issue".
+        parts = [message]
+        if tool_name:
+            parts.append(f"tool_name={tool_name}")
+        if job_id:
+            parts.append(f"job_id={job_id}")
+        if next_steps:
+            parts.append(f"next_steps={next_steps}")
+        if cause:
+            # Include the cause's repr AND traceback so the LLM can self-diagnose
+            # without querying logs.db. Per Python exception chaining docs:
+            # https://docs.python.org/3/tutorial/errors.html#exception-chaining
+            import traceback as _tb
+            cause_tb = "".join(_tb.format_exception(type(cause), cause, cause.__traceback__))
+            parts.append(f"cause_type={type(cause).__name__}")
+            parts.append(f"cause_message={cause}")
+            parts.append(f"cause_traceback={cause_tb}")
+        super().__init__(" | ".join(parts))
+        self.tool_name = tool_name
+        self.job_id = job_id
+        self.cause = cause
+        self.next_steps = next_steps
+
+
+class ToolValidationError(ToolError):
+    """Raised when tool input fails validation. Maps to HTTP 422 semantics."""
+
+
+class ToolExecutionError(ToolError):
+    """Raised when a tool fails at runtime. Maps to job status FAILED."""
+
 
 class FailureSeverity(str, Enum):
     TRANSIENT = "transient"

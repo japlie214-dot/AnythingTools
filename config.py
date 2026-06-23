@@ -113,19 +113,19 @@ BATCH_READER_KEYWORD_WEIGHT: float = float(os.getenv("BATCH_READER_KEYWORD_WEIGH
 # --- Context Limits & Truncation ---
 LLM_CONTEXT_CHAR_LIMIT: int = int(os.getenv("LLM_CONTEXT_CHAR_LIMIT", "800000"))
 
-# --- SSE Configuration ---
-# SSE keep-alive interval in seconds. The HTML spec recommends emitting a
-# comment line every 15 seconds to prevent proxy idle-timeout closes.
-# Ref: https://html.spec.whatwg.org/multipage/server-sent-events.html#authoring-notes
-SSE_KEEPALIVE_INTERVAL_SECONDS: float = float(os.getenv("SSE_KEEPALIVE_INTERVAL_SECONDS", "15.0"))
+# --- Sync API Configuration ---
+# Maximum wall-clock seconds for a sync API request before returning 504.
+# Set to 290 (10s under Cloud Run's default 300s timeout) to give the
+# client headroom to receive the 504 response.
+# Ref: https://docs.cloud.google.com/run/docs/configuring/request-timeout
+SYNC_API_TIMEOUT_SECONDS: int = int(os.getenv("SYNC_API_TIMEOUT_SECONDS", "290"))
 
-# Maximum number of concurrent SSE subscribers per job. Excess subscribers
-# receive a 429 Too Many Requests.
-SSE_MAX_SUBSCRIBERS_PER_JOB: int = int(os.getenv("SSE_MAX_SUBSCRIBERS_PER_JOB", "20"))
+# Maximum concurrent sync-held connections. Prevents resource exhaustion
+# under WEB_CONCURRENCY=1. Ref: https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore
+SYNC_MAX_CONCURRENT_JOBS: int = int(os.getenv("SYNC_MAX_CONCURRENT_JOBS", "20"))
 
-# Slow-consumer drop policy: if a subscriber's queue exceeds this size,
-# the subscriber is disconnected to prevent memory exhaustion.
-SSE_SUBSCRIBER_QUEUE_MAXSIZE: int = int(os.getenv("SSE_SUBSCRIBER_QUEUE_MAXSIZE", "100"))
+# Enable inline runtime health checkers. When false, checkers are no-ops.
+SYNC_HEALTH_CHECKER_ENABLED: bool = os.getenv("SYNC_HEALTH_CHECKER_ENABLED", "true").lower() in ("true", "1", "yes", "on")
 
 # --- Health Check Configuration ---
 # Maximum wall-clock seconds for a health-check job before it is marked

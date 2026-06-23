@@ -25,12 +25,11 @@ log = get_dual_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize SSE registries on the running event loop. MUST happen before
-    # any SSE route is hit. Ref:
-    # https://docs.python.org/3/library/asyncio-sync.html#asyncio.Event
-    from utils.sse import get_global_broker
-    broker = get_global_broker()
-    await broker.start_tailer()
+    # Bind the JobCompletionRegistry to the running event loop.
+    # MUST happen before any sync API route is hit. Ref:
+    # https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.call_soon_threadsafe
+    from bot.engine.completion_registry import job_completion_registry
+    job_completion_registry.bind_loop(asyncio.get_running_loop())
 
     # Enforce single-process execution to protect manifest integrity
     if int(os.environ.get("WEB_CONCURRENCY", "1")) > 1:
@@ -42,32 +41,11 @@ async def lifespan(app: FastAPI):
         await run_startup(app)
         log.dual_log(tag="App:Lifecycle:StartupSuccess", message="Startup completed successfully", level="INFO", payload={"status": "success"})
 
-        # Retire legacy PENDING_CALLBACK rows AFTER DB init but BEFORE the
-        # worker manager starts picking up jobs. Per Pushback 3: standalone
-        # data mutation, NOT routed through DualDBMigrationCoordinator.
-        try:
-            from database.sse_retire_pending_callback import retire_pending_callback_jobs
-            retired = retire_pending_callback_jobs()
-            if retired:
-                log.dual_log(tag="App:Lifecycle:RetiredPcb", message=f"Retired {retired} PENDING_CALLBACK job(s)", level="INFO", payload={"retired_count": retired})
-        except Exception as e:
-            log.dual_log(tag="App:Lifecycle:RetirePcbError", message=f"PENDING_CALLBACK retirement failed: {e}", level="WARNING", payload={"error": str(e)})
         yield
     except Exception as e:
         log.dual_log(tag="App:Lifecycle:StartupFailed", message=f"Startup aborted: {e}", level="CRITICAL", payload={"error": str(e), "startup_failed": True})
         startup_failed = True
     finally:
-        # Signal SSE projectors to emit `server shutting down` BEFORE the
-        # 60s _active_jobs drain. Per Pushback 6: os._exit(1) at line 125
-        # would otherwise kill generators without a final event.
-        try:
-            from utils.sse import get_global_broker
-            broker = get_global_broker()
-            await broker.stop_tailer()
-            await asyncio.sleep(1.0)
-        except Exception:
-            pass
-
         log.dual_log(tag="App:Lifecycle:ShutdownStarted", message="Initiating shutdown sequence...", level="INFO", payload={"phase": "init", "startup_failed": startup_failed})
         
         try:

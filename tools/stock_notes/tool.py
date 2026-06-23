@@ -1,7 +1,7 @@
 # tools/stock_notes/tool.py
 import json
 from typing import Any
-from tools.base import BaseTool, HealthCheckPayload
+from tools.base import BaseTool, HealthCheckPayload, ToolExecutionError, ToolValidationError
 from .models import StockNotesInput
 from utils.logger import get_dual_logger
 from utils.artifact_manager import write_artifact
@@ -36,8 +36,13 @@ class StockNotesTool(BaseTool):
         cmd = args.get("command", "").lower().strip()
         job_id = kwargs.get("job_id", "")
         
-        def _fail(summary: str, next_steps: str) -> str:
-            return f"**Error:** {summary}\n\n{next_steps}"
+        def _fail(summary: str, next_steps: str) -> None:
+            raise ToolExecutionError(
+                summary,
+                tool_name=self.name,
+                job_id=kwargs.get("job_id"),
+                next_steps=next_steps,
+            )
             
         def _success(summary: str, details: dict = None, artifacts: list = None) -> str:
             return summary
@@ -47,7 +52,7 @@ class StockNotesTool(BaseTool):
             try:
                 instructions = json.loads(raw_inst)
             except Exception:
-                return _fail("Invalid instructions payload", "The instructions parameter must be a valid JSON object.")
+                _fail("Invalid instructions payload", "The instructions parameter must be a valid JSON object.")
         else:
             instructions = raw_inst
 
@@ -61,11 +66,11 @@ class StockNotesTool(BaseTool):
 
         if cmd == "discover":
             from .extractor import discover_filings
-            if not ticker: return _fail("Missing ticker", "Provide a ticker symbol in the instructions payload.")
+            if not ticker: _fail("Missing ticker", "Provide a ticker symbol in the instructions payload.")
             form_types = [f.strip() for f in forms.split(",") if f.strip()]
             filings = await to_thread_with_context(discover_filings, ticker, form_types=form_types, limit=40)
             
-            if not filings: return _fail(f"No filings found for {ticker}", "Verify the ticker.")
+            if not filings: _fail(f"No filings found for {ticker}", "Verify the ticker.")
             
             lines = [f"# Filings for {ticker} ({len(filings)} found, newest first)\n"]
             lines.append("| # | Form | Filing Date | Period | Quarter | Accession No |")
@@ -84,7 +89,7 @@ class StockNotesTool(BaseTool):
             from .detail_manager import build_concept_catalog, get_date_range_for_filing
             from database.connection import DatabaseManager
             
-            if not accession_no: return _fail("Missing accession_no", "Provide an accession number in the instructions payload.")
+            if not accession_no: _fail("Missing accession_no", "Provide an accession number in the instructions payload.")
             
             force_refresh = instructions.get("force_refresh", False)
             conn = DatabaseManager.get_read_connection()
@@ -103,7 +108,7 @@ class StockNotesTool(BaseTool):
                     await wait_for_writes(timeout=30.0)
                     conn = DatabaseManager.get_read_connection()
                 except Exception as e:
-                    return _fail(f"Extraction failed: {e}", "Ensure valid accession_no and EDGAR connectivity.")
+                    _fail(f"Extraction failed: {e}", "Ensure valid accession_no and EDGAR connectivity.")
             
             if note_number is not None:
                 # Check if this specific note has been processed (exists in sn_notes)
@@ -153,7 +158,7 @@ class StockNotesTool(BaseTool):
                 return _success("\n".join(lines), {"notes_count": len(notes), "accession_no": accession_no})
             
             note_row = conn.execute("SELECT note_number, title, short_name, narrative_text, expands, expands_statements, table_count, details_count, quarterly_status FROM sn_notes WHERE accession_no=? AND note_number=?", (accession_no, note_number)).fetchone()
-            if not note_row: return _fail(f"Note {note_number} not found", "Check available notes.")
+            if not note_row: _fail(f"Note {note_number} not found", "Check available notes.")
             
             (n_num, n_title, n_short, n_narrative, n_expands, n_expands_stmts, n_tbl_count, n_dt_count, n_q_status) = note_row
             dts = conn.execute("SELECT detail_table_name, source_title, role_or_type, available_concepts FROM sn_detail_registry WHERE source_accession_no=? AND source_note_number=?", (accession_no, note_number)).fetchall()

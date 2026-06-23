@@ -9,7 +9,7 @@ has been inlined per the requirement to delete that file.
 import json
 import sqlite3
 from typing import Any, List, Dict
-from tools.base import BaseTool, HealthCheckPayload
+from tools.base import BaseTool, HealthCheckPayload, ToolExecutionError, ToolValidationError
 from utils.logger import get_dual_logger
 from utils.context_helpers import to_thread_with_context
 from utils.artifact_manager import write_artifact
@@ -129,14 +129,23 @@ class StockFinancialsTool(BaseTool):
             validated = StockFinancialsInput.model_validate(args)
             inst = validated.resolved_instructions()
         except Exception as e:
-            return f"**Error:** Invalid input: {e}\n\nCheck the command and instructions shape."
+            raise ToolValidationError(
+                f"Invalid input: {e}",
+                tool_name=self.name,
+                job_id=job_id,
+                next_steps="Check the command and instructions shape.",
+            ) from e
 
         cmd = validated.command
         if cmd == "extract": return await self._handle_extract(inst, job_id, telemetry)
         if cmd == "query": return await self._handle_query(inst, job_id, telemetry)
         if cmd == "status": return await self._handle_status(inst, job_id, telemetry)
         if cmd == "catalog": return await self._handle_catalog(inst, job_id, telemetry)
-        return "**Error:** Invalid command. Use extract, query, status, or catalog."
+        raise ToolExecutionError(
+            "Invalid command. Use extract, query, status, or catalog.",
+            tool_name=self.name,
+            job_id=job_id,
+        )
 
     async def _handle_extract(self, inst, job_id: str, telemetry: Any) -> str:
         from database.connection import DatabaseManager
@@ -158,7 +167,12 @@ class StockFinancialsTool(BaseTool):
                 await to_thread_with_context(extract_and_persist, ticker, quarters, refresh, job_id)
             except Exception as e:
                 log.dual_log(tag="StockFin:Extract:Error", message=f"Extraction failed: {e}", level="ERROR", payload={"error": str(e)})
-                return f"**Error:** Extraction failed: {e}\n\nVerify ticker symbol and EDGAR connectivity."
+                raise ToolExecutionError(
+                    f"Extraction failed: {e}",
+                    tool_name=self.name,
+                    job_id=job_id,
+                    next_steps="Verify ticker symbol and EDGAR connectivity.",
+                )
 
         rows = self._fetch_rows(ticker)
         if not rows:

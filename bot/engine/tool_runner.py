@@ -1,16 +1,20 @@
-"""bot/engine/tool_runner.py
+# bot/engine/tool_runner.py
+"""Safe tool execution wrapper.
 
-Safe tool execution wrapper.
+Centralizes error handling for tool executions. Per the agent-native sync
+engine requirement, tools MUST raise Exception on failure (not return
+markdown error strings). This wrapper lets exceptions propagate to the
+worker's 3-strike crash-recovery logic.
 
-Centralizes error handling, exception catching, and error formatting 
-for all tool executions. This replaces the error-handling logic 
-previously embedded in BaseTool.execute().
+HITL pauses do NOT use exceptions — they use hitl_registry.wait() thread
+blocking, with the completion registry signaled BEFORE the block. See
+tools/scraper/hitl.py.
+
+Ref: https://docs.python.org/3/tutorial/errors.html#handling-exceptions
 """
 
-import traceback
-import json
 from typing import Any, Dict
-from tools.base import ToolResult, BaseTool, HitlPaused
+from tools.base import ToolResult, BaseTool
 from utils.logger import get_dual_logger
 from clients.llm import get_llm_client, LLMRequest
 from utils.text_processing import escape_prompt_separators
@@ -20,26 +24,22 @@ log = get_dual_logger(__name__)
 
 
 async def run_tool_safely(tool: BaseTool, args: Dict[str, Any], telemetry: Any, **kwargs) -> ToolResult:
-    """Execute a tool with centralized error handling to return string-based tool results to the LLM."""
+    """Execute a tool. Exceptions propagate to the worker.
+
+    The worker's _run_job except block handles:
+      - ToolError subclasses -> FAILED with the error message
+      - Other Exception -> 3-strike crash recovery (INTERRUPTED / ABANDONED)
+
+    We do NOT catch Exception here because that would mask crashes from
+    the worker's crash-recovery logic. Per the requirement, tools must
+    raise to crash into FAILED.
+
+    Returns ToolResult(success=True) on normal tool return.
+    """
     job_id = kwargs.get("job_id")
-    try:
-        return await tool.execute(args, telemetry, **kwargs)
-    except HitlPaused:
-        # MUST re-raise: the worker's _run_job except block transitions
-        # jobs.status to PAUSED_FOR_HITL. Converting to ToolResult would
-        # hide the pause signal and mark the job as FAILED.
-        raise
-    except Exception as exc:
-        raw_tb = traceback.format_exc()
-        error_msg = f"Tool Execution Failure: {str(exc)}\n\nTraceback:\n{raw_tb}"
-        log.dual_log(
-            tag="Tool:Runner:Error",
-            message=f"Tool execution failed: {exc}",
-            level="ERROR",
-            exc_info=exc,
-            payload={"job_id": job_id, "tool": tool.name, "traceback": raw_tb}
-        )
-        return ToolResult(output=error_msg, success=False)
+    # No try/except: let exceptions propagate.
+    # The worker catches them and applies the 3-strike / FAILED logic.
+    return await tool.execute(args, telemetry, **kwargs)
 
 
 async def run_tool_with_orchestrator(
@@ -49,7 +49,12 @@ async def run_tool_with_orchestrator(
     job_id: str,
     **kwargs,
 ) -> ToolResult:
-    """Execute a tool through the orchestrator for SoM-aware context."""
+    """Execute a tool through the orchestrator for SoM-aware context.
+
+    NOTE: This function has zero callers (grep-verified). It is retained
+    for potential future use. The orchestrator path is not exercised by
+    the sync engine.
+    """
     from bot.orchestrator_core.router import OrchestratorRouter
     from utils.browser_daemon import daemon_manager
 
@@ -67,8 +72,14 @@ async def run_tool_with_orchestrator(
         from tools.registry import REGISTRY
         tool_cls = REGISTRY.get_tool_class(tn)
         if not tool_cls:
-            return ToolResult(output=f"Tool not found: {tn}", success=False)
-
+            # Raise instead of returning a failure ToolResult — per the
+            # new contract, tools must raise on failure.
+            from tools.base import ToolExecutionError
+            raise ToolExecutionError(
+                f"Tool not found: {tn}",
+                tool_name=tn,
+                job_id=job_id,
+            )
         tool_instance = REGISTRY.create_tool_instance(tn)
         return await run_tool_safely(tool_instance, ta, telemetry, **kw)
 
@@ -80,4 +91,3 @@ async def run_tool_with_orchestrator(
         job_id=job_id,
         **kwargs,
     )
-        

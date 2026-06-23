@@ -58,20 +58,6 @@ def logs_write_worker():
                 break
 
             sql, params = task
-            # Extract job_ids touched in this write so the SSE LogNotifyBus
-            # can wake subscribed projectors. The INSERT statement binds
-            # job_id as the 2nd positional param (see utils/logger/core.py:141).
-            # For UPDATE statements, job_id is typically the last param.
-            notified_job_ids: set = set()
-            try:
-                # INSERT INTO logs (...) VALUES (?, ?, ?, ...) — job_id is index 1
-                if sql.startswith("INSERT") and len(params) >= 2 and params[1]:
-                    notified_job_ids.add(str(params[1]))
-                # UPDATE ... WHERE job_id = ? — last param
-                elif sql.startswith("UPDATE") and len(params) >= 1 and params[-1]:
-                    notified_job_ids.add(str(params[-1]))
-            except Exception:
-                pass
 
             try:
                 if sql == "__EXEC_SCRIPT__":
@@ -84,16 +70,6 @@ def logs_write_worker():
                 with _logs_writer_lock:
                     _logs_write_generation += 1
                 consecutive_errors = 0
-
-                # Wake SSE projectors subscribed to these job_ids.
-                # Safe to call from this thread — log_notify.notify uses
-                # call_soon_threadsafe internally.
-                if notified_job_ids:
-                    try:
-                        from api.sse import log_notify
-                        log_notify.notify(notified_job_ids)
-                    except Exception:
-                        pass
             except Exception as e:
                 # Rollback; report to stderr to avoid recursive logging into logs DB
                 try:

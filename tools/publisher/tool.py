@@ -8,7 +8,7 @@ import sqlite3
 from typing import Any
 from pydantic import BaseModel, Field
 
-from tools.base import BaseTool, HealthCheckPayload
+from tools.base import BaseTool, HealthCheckPayload, ToolExecutionError, ToolValidationError
 from database.connection import DatabaseManager
 from utils.telegram.pipeline import PublisherPipeline
 
@@ -44,12 +44,17 @@ class PublisherTool(BaseTool):
         return True
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
-        def _fail(summary: str, next_steps: str) -> str:
-            return f"**Error:** {summary}\n\n{next_steps}"
+        def _fail(summary: str, next_steps: str) -> None:
+            raise ToolExecutionError(
+                summary,
+                tool_name=self.name,
+                job_id=kwargs.get("job_id"),
+                next_steps=next_steps,
+            )
 
         batch_id = args.get("batch_id")
         if not batch_id:
-            return _fail("batch_id is required.", "Provide a valid 'batch_id' parameter.")
+            _fail("batch_id is required.", "Provide a valid 'batch_id' parameter.")
 
         reset = args.get("reset", False)
         finalize = args.get("finalize", False)
@@ -62,7 +67,7 @@ class PublisherTool(BaseTool):
         batch_info = get_batch_info(batch_id)
         
         if not batch_info:
-            return _fail("Batch not found.", "Verify the batch_id is valid. If lost, use the `scraper` tool to generate a new batch.")
+            _fail("Batch not found.", "Verify the batch_id is valid. If lost, use the `scraper` tool to generate a new batch.")
 
         batch_status = batch_info["status"]
         if batch_status == "COMPLETED" and not reset and not finalize:
@@ -85,7 +90,7 @@ class PublisherTool(BaseTool):
 
         if not top_10:
             enqueue_write("UPDATE broadcast_batches SET status = 'FAILED', updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?", (batch_id,))
-            return _fail("Batch aborted: Top-10 is completely depleted.", "Generate a new batch using the Scraper tool.")
+            _fail("Batch aborted: Top-10 is completely depleted.", "Generate a new batch using the Scraper tool.")
 
         log.dual_log(
             tag="Publisher:Inventory:Check",
