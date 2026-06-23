@@ -124,13 +124,19 @@ SYNC_API_TIMEOUT_SECONDS: int = int(os.getenv("SYNC_API_TIMEOUT_SECONDS", "290")
 # under WEB_CONCURRENCY=1. Ref: https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore
 SYNC_MAX_CONCURRENT_JOBS: int = int(os.getenv("SYNC_MAX_CONCURRENT_JOBS", "20"))
 
-# Enable inline runtime health checkers. When false, checkers are no-ops.
-SYNC_HEALTH_CHECKER_ENABLED: bool = os.getenv("SYNC_HEALTH_CHECKER_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+# --- Activity-Driven Observability Configuration ---
+# Per-key character cap for lineage inputs/outputs. Default 50,000 per the
+# convention. Override only with explicit justification.
+# Ref: convention §4.3.d rule #1
+LINEAGE_MAX_STRING_CHARS: int = int(os.getenv("LINEAGE_MAX_STRING_CHARS", "50000"))
 
-# --- Health Check Configuration ---
-# Maximum wall-clock seconds for a health-check job before it is marked
-# as timed out. Browser-based tools (scraper) can take several minutes.
-HEALTH_CHECK_TIMEOUT_SECONDS: int = int(os.getenv("HEALTH_CHECK_TIMEOUT_SECONDS", "300"))
+# Maximum activities recorded per job. Beyond this, activities are dropped
+# with a dropped_count marker in the lineage summary.
+LINEAGE_MAX_ACTIVITIES: int = int(os.getenv("LINEAGE_MAX_ACTIVITIES", "1000"))
+
+# Comma-separated list of additional key names to mask in lineage.
+# Appended to the default blocklist in utils/observability/masking.py.
+LINEAGE_EXTRA_MASK_KEYS: str = os.getenv("LINEAGE_EXTRA_MASK_KEYS", "")
 
 # --- Backup Configuration ---
 # Backup is now fully managed via pydantic-settings in database/backup/settings.py

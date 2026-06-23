@@ -1,25 +1,28 @@
 # tools/stock_financials/tool.py
 """Stock Financials Tool — SEC EDGAR quarterly fact extraction.
 
-Returns plain markdown strings (not _callback_format dicts) for SSE
-consumption. The summary rendering logic previously in summary.py
-has been inlined per the requirement to delete that file.
+Returns plain markdown strings for sync API consumption.
+
+Activity-Driven Observability:
+  The extract and status command paths are decomposed into named activities.
+  See utils/observability/activity_decorator.py.
 """
 
 import json
 import sqlite3
 from typing import Any, List, Dict
-from tools.base import BaseTool, HealthCheckPayload, ToolExecutionError, ToolValidationError
+from tools.base import BaseTool, ToolExecutionError, ToolValidationError
 from utils.logger import get_dual_logger
 from utils.context_helpers import to_thread_with_context
 from utils.artifact_manager import write_artifact
+from utils.observability.activity_decorator import activity
 from .models import StockFinancialsInput, SFFactRecord
 from .extractor import extract_and_persist
 from .query import query_facts, query_concepts
 
 log = get_dual_logger(__name__)
 
-# ─── Presentation constants (inlined from summary.py) ──────────────────
+# ─── Presentation constants ──────────────────────────────────────────────
 
 STATEMENT_TYPES: Dict[str, str] = {
     "income": "Income Statement",
@@ -102,29 +105,11 @@ class StockFinancialsTool(BaseTool):
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return True
 
-    def health_check_payload(self) -> HealthCheckPayload:
-        """Health check: extract AAPL financials (happy) and invalid ticker (error).
+    # --- Activity-decomposed sub-methods ---
 
-        The happy path uses AAPL (a stable, well-known ticker) with a
-        small quarter count to minimize EDGAR API calls. The error path
-        uses an invalid ticker to verify the tool surfaces failures.
-        """
-        return HealthCheckPayload(
-            happy_path_args={
-                "command": "status",
-                "instructions": {"ticker": "AAPL"}
-            },
-            error_path_args={
-                "command": "extract",
-                "instructions": {"ticker": "INVALIDTICKER123", "quarters": 1}
-            },
-            expected_happy_status="COMPLETED",
-            expected_error_status="FAILED",
-            timeout_seconds=120,
-        )
-
-    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
-        job_id = kwargs.get("job_id", "")
+    @activity("Validate StockFinancialsInput")
+    def _validate_input(self, args: dict, job_id: str):
+        """Validate input args against the Pydantic model. Raises on invalid."""
         try:
             validated = StockFinancialsInput.model_validate(args)
             inst = validated.resolved_instructions()
@@ -135,6 +120,72 @@ class StockFinancialsTool(BaseTool):
                 job_id=job_id,
                 next_steps="Check the command and instructions shape.",
             ) from e
+        return validated, inst
+
+    @activity("Check Cache Hit")
+    def _check_cache_hit(self, ticker: str, quarters: int, refresh: bool) -> bool:
+        """Check if the ticker's data is already cached. Returns True on cache hit."""
+        from database.connection import DatabaseManager
+        conn = DatabaseManager.get_read_connection()
+        existing = conn.execute(
+            "SELECT COUNT(DISTINCT quarter) FROM sf_quarterly_facts WHERE ticker=?", (ticker,)
+        ).fetchone()[0]
+        return existing >= quarters and not refresh
+
+    @activity("Extract and Persist Facts")
+    async def _extract_and_persist(self, ticker: str, quarters: int, refresh: bool, job_id: str) -> None:
+        """Call EDGAR and persist facts to DB. Raises on EDGAR failure."""
+        try:
+            await to_thread_with_context(extract_and_persist, ticker, quarters, refresh, job_id)
+        except Exception as e:
+            log.dual_log(tag="StockFin:Extract:Error", message=f"Extraction failed: {e}", level="ERROR", payload={"error": str(e)})
+            raise ToolExecutionError(
+                f"Extraction failed: {e}",
+                tool_name=self.name,
+                job_id=job_id,
+                next_steps="Verify ticker symbol and EDGAR connectivity.",
+            )
+
+    @activity("Fetch Rows")
+    def _fetch_rows_activity(self, ticker: str) -> list:
+        """Read persisted rows from DB."""
+        return self._fetch_rows(ticker)
+
+    @activity("Query Cache Status")
+    def _query_cache_status(self, ticker: str) -> dict:
+        """Query the DB for cached quarter counts per statement type."""
+        from database.connection import DatabaseManager
+        conn = DatabaseManager.get_read_connection()
+        rows = conn.execute(
+            "SELECT statement_type, COUNT(DISTINCT quarter) as q_count, COUNT(*) as r_count, MAX(quarter) as latest "
+            "FROM sf_quarterly_facts WHERE ticker=? GROUP BY statement_type",
+            (ticker,)
+        ).fetchall()
+        return {r["statement_type"]: {"rows": r["r_count"], "quarters": r["q_count"], "latest": r["latest"]} for r in rows}
+
+    @activity("Build Status Markdown")
+    def _build_status_markdown(self, ticker: str, per_statement: dict) -> str:
+        """Build the status markdown summary."""
+        if not per_statement:
+            return f"No cached data for **{ticker}**. Run `extract` first."
+        available_concepts = {stype: query_concepts(ticker, stype) for stype in per_statement.keys()}
+        lines = [f"#### Cache Status for **{ticker}**", "", "| Statement | Rows | Quarters | Latest |", "|---|---|---|---|"]
+        for stype, info in per_statement.items():
+            lines.append(f"| {STATEMENT_TYPES.get(stype, stype)} | {info.get('rows', 0)} | {info.get('quarters', 0)} | `{info.get('latest', '—')}` |")
+        return "\n".join(lines)
+
+    @activity("Build Extract Markdown")
+    def _build_extract_markdown_activity(self, ticker: str, company_name: str, quarters_requested: int, quarters_cached: int, cache_hit: bool, refresh: bool, rows: list, available_concepts: dict) -> str:
+        """Build the extract markdown summary."""
+        return self._build_extract_markdown(ticker, company_name, quarters_requested, quarters_cached, cache_hit, refresh, rows, available_concepts)
+
+    # --- Entry point ---
+
+    async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
+        job_id = kwargs.get("job_id", "")
+
+        # Step 1: Validate input (raises on invalid).
+        validated, inst = self._validate_input(args, job_id)
 
         cmd = validated.command
         if cmd == "extract": return await self._handle_extract(inst, job_id, telemetry)
@@ -158,36 +209,32 @@ class StockFinancialsTool(BaseTool):
 
         await telemetry(self.status(f"Extracting {ticker} financials ({quarters} quarters)..."))
 
-        conn = DatabaseManager.get_read_connection()
-        existing = conn.execute("SELECT COUNT(DISTINCT quarter) FROM sf_quarterly_facts WHERE ticker=?", (ticker,)).fetchone()[0]
-        cache_hit = existing >= quarters and not refresh
+        # Step 2: Check cache hit.
+        cache_hit = self._check_cache_hit(ticker, quarters, refresh)
 
+        # Step 3: Extract and persist (skipped on cache hit, raises on failure).
         if not cache_hit:
-            try:
-                await to_thread_with_context(extract_and_persist, ticker, quarters, refresh, job_id)
-            except Exception as e:
-                log.dual_log(tag="StockFin:Extract:Error", message=f"Extraction failed: {e}", level="ERROR", payload={"error": str(e)})
-                raise ToolExecutionError(
-                    f"Extraction failed: {e}",
-                    tool_name=self.name,
-                    job_id=job_id,
-                    next_steps="Verify ticker symbol and EDGAR connectivity.",
-                )
+            await self._extract_and_persist(ticker, quarters, refresh, job_id)
 
-        rows = self._fetch_rows(ticker)
+        # Step 4: Fetch rows.
+        rows = self._fetch_rows_activity(ticker)
         if not rows:
             return f"No data extracted for **{ticker}**."
 
         company_name = self._fetch_company_name(ticker) or ticker
         available_concepts = {stype: query_concepts(ticker, stype) for stype in ["income", "balance", "cashflow"]}
 
-        # Write CSV artifact
+        # Write CSV artifact (not an activity — pure I/O, no business logic).
         import pandas as pd
         df = pd.DataFrame(rows)
         csv_path = write_artifact(self.name, job_id, f"{ticker}_financials", "csv", df.to_csv(index=False))
 
-        # Build markdown summary (inlined from summary.py)
-        md = self._build_extract_markdown(ticker, company_name, quarters, len({r["quarter"] for r in rows}), cache_hit, refresh, rows, available_concepts)
+        # Step 5: Build extract markdown.
+        md = self._build_extract_markdown_activity(
+            ticker, company_name, quarters,
+            len({r["quarter"] for r in rows}),
+            cache_hit, refresh, rows, available_concepts
+        )
 
         await telemetry(self.status("Extraction complete", "COMPLETED"))
         return md
@@ -196,7 +243,6 @@ class StockFinancialsTool(BaseTool):
         action = "cache hit:" if cache_hit else ("Refreshed" if refresh else "Extracted")
         lines = [f"**{ticker}** ({company_name}) — {action} {quarters_cached} quarters.\n"]
 
-        # Coverage table
         import pandas as pd
         df = pd.DataFrame(rows)
         if "statement_type" in df.columns:
@@ -206,7 +252,6 @@ class StockFinancialsTool(BaseTool):
                 if sdf.empty: continue
                 lines.append(f"| {STATEMENT_TYPES.get(stype, stype)} | {len(sdf)} | {int(sdf['quarter'].nunique())} | `{str(sdf['quarter'].max()) if not sdf.empty else '—'}` |")
 
-        # Key metrics
         for stype in ["income", "balance", "cashflow"]:
             sdf = df[df["statement_type"] == stype] if "statement_type" in df.columns else df.iloc[0:0]
             if sdf.empty: continue
@@ -262,16 +307,13 @@ class StockFinancialsTool(BaseTool):
         from database.connection import DatabaseManager
         from .query import query_concepts
         await telemetry(self.status(f"Checking cache status for {inst.ticker}..."))
-        conn = DatabaseManager.get_read_connection()
-        rows = conn.execute("SELECT statement_type, COUNT(DISTINCT quarter) as q_count, COUNT(*) as r_count, MAX(quarter) as latest FROM sf_quarterly_facts WHERE ticker=? GROUP BY statement_type", (inst.ticker,)).fetchall()
-        per_statement = {r["statement_type"]: {"rows": r["r_count"], "quarters": r["q_count"], "latest": r["latest"]} for r in rows}
-        if not per_statement:
-            return f"No cached data for **{inst.ticker}**. Run `extract` first."
-        available_concepts = {stype: query_concepts(inst.ticker, stype) for stype in per_statement.keys()}
-        lines = [f"#### Cache Status for **{inst.ticker}**", "", "| Statement | Rows | Quarters | Latest |", "|---|---|---|---|"]
-        for stype, info in per_statement.items():
-            lines.append(f"| {STATEMENT_TYPES.get(stype, stype)} | {info.get('rows', 0)} | {info.get('quarters', 0)} | `{info.get('latest', '—')}` |")
-        return "\n".join(lines)
+
+        # Step 2: Query cache status (activity-decorated).
+        per_statement = self._query_cache_status(inst.ticker)
+
+        # Step 3: Build status markdown (activity-decorated).
+        md = self._build_status_markdown(inst.ticker, per_statement)
+        return md
 
     async def _handle_catalog(self, inst, job_id: str, telemetry: Any) -> str:
         from .query import query_concepts

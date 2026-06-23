@@ -16,7 +16,7 @@ from database.writer import enqueue_write
 from database.job_queue import add_job_item, update_item_status
 from utils.artifact_manager import write_artifact
 
-from tools.base import BaseTool, HealthCheckPayload, ToolExecutionError, ToolValidationError
+from tools.base import BaseTool, ToolExecutionError, ToolValidationError
 from tools.scraper.prompts import SCRAPER_SYS_PROMPT, CURATION_SYS_PROMPT
 from tools.scraper.targets import VALID_TARGET_NAMES, TARGET_SITE_MAP
 
@@ -32,20 +32,6 @@ class ScraperTool(BaseTool):
     description = "Scrape and curate top articles from a target site. Returns a curated top 10 list enriched with insights."
     input_model = None  # Dynamic validation in execute()
 
-    def health_check_payload(self) -> HealthCheckPayload:
-        """Health check: scrape a stable target (happy) and invalid target (error).
-
-        The happy path uses a well-known stable target site. The error
-        path uses an invalid target name to verify validation.
-        Browser-based tools get a longer timeout.
-        """
-        return HealthCheckPayload(
-            happy_path_args={"target_site": "hackernews"},
-            error_path_args={"target_site": "INVALID_SITE_NAME_123"},
-            expected_happy_status="COMPLETED",
-            expected_error_status="FAILED",
-            timeout_seconds=300,
-        )
 
     async def run(self, args: dict[str, Any], telemetry: Any, job_id: str | None = None, session_id: str | None = None, cancellation_flag: threading.Event | None = None, dry_run: bool | None = None, **kwargs) -> str:
         """Execute the full scraper pipeline including extraction, curation, artifacts, and backup."""

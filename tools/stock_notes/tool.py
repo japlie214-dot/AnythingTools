@@ -1,7 +1,7 @@
 # tools/stock_notes/tool.py
 import json
 from typing import Any
-from tools.base import BaseTool, HealthCheckPayload, ToolExecutionError, ToolValidationError
+from tools.base import BaseTool, ToolExecutionError, ToolValidationError
 from .models import StockNotesInput
 from utils.logger import get_dual_logger
 from utils.artifact_manager import write_artifact
@@ -14,20 +14,6 @@ class StockNotesTool(BaseTool):
     name = "stock_notes"
     INPUT_MODEL = StockNotesInput
 
-    def health_check_payload(self) -> HealthCheckPayload:
-        return HealthCheckPayload(
-            happy_path_args={
-                "command": "discover",
-                "instructions": {"ticker": "AAPL", "forms": "10-K,10-Q"}
-            },
-            error_path_args={
-                "command": "note",
-                "instructions": {"accession_no": "INVALID-ACCESSION-12345"}
-            },
-            expected_happy_status="COMPLETED",
-            expected_error_status="FAILED",
-            timeout_seconds=120,
-        )
 
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return True

@@ -8,7 +8,7 @@ import sqlite3
 from typing import Any
 from pydantic import BaseModel, Field
 
-from tools.base import BaseTool, HealthCheckPayload, ToolExecutionError, ToolValidationError
+from tools.base import BaseTool, ToolExecutionError, ToolValidationError
 from database.connection import DatabaseManager
 from utils.telegram.pipeline import PublisherPipeline
 
@@ -26,19 +26,6 @@ class PublisherTool(BaseTool):
     
     name = "publisher"
 
-    def health_check_payload(self) -> HealthCheckPayload:
-        """Health check: publish a test batch (happy) and missing batch (error).
-
-        The happy path requires a pre-existing test batch in staging.
-        The error path uses a non-existent batch ID.
-        """
-        return HealthCheckPayload(
-            happy_path_args={"batch_id": "HEALTH_CHECK_TEST_BATCH", "finalize": True},
-            error_path_args={"batch_id": "NONEXISTENT_BATCH_ID_12345"},
-            expected_happy_status="COMPLETED",
-            expected_error_status="FAILED",
-            timeout_seconds=180,
-        )
 
     def is_resumable(self, args: dict[str, Any]) -> bool:
         return True

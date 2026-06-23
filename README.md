@@ -15,7 +15,7 @@ The system provides a managed, asynchronous execution environment for long-runni
 The system implements a **Producer-Consumer** pattern centered around a SQLite-backed job queue with strict single-writer database constraints.
 
 ### Major Components
-- **API (`api/`)**: FastAPI interface for job enqueueing, status polling, SSE event streaming, resumption, and system observability.
+- **API (`api/`)**: FastAPI interface for job enqueueing, status polling, SSE event streaming, resumption, and system observability. Supports `capture_lineage` requests to retrieve detailed tool execution traces.
 - **Unified Worker Manager (`bot/engine/worker.py`)**: A singleton daemon that polls the `jobs` table and spawns isolated threads for tool execution.
 - **Tool Registry (`tools/registry.py`)**: A dynamic discovery system that instantiates `BaseTool` subclasses.
 - **Orchestrator (`bot/orchestrator_core/`)**: Middleware that enhances browser interaction by injecting a Semantic Object Model (SoM) into the DOM before LLM evaluation.
@@ -38,7 +38,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - `api/`: REST endpoints (`routes.py`) and Pydantic validation schemas (`schemas.py`).
     - `sse/`: SSE streaming logic including `projector.py` (async generator), `envelope.py` (wire-format), `phases.py` (state mapping), and `log_notify.py` (async wakeup bus).
 - `bot/`:
-    - `engine/`: The core polling loop (`worker.py`) and safety wrappers (`tool_runner.py`).
+    - `engine/`: The core polling loop (`worker.py`) and safety wrappers (`tool_runner.py`). Manages the lifecycle of `ActivityAccumulator` for observability.
     - `orchestrator_core/`: Logic for SoM markers and context budget eviction.
 - `clients/`: External integrations (LLM clients for Azure/Chutes, Snowflake client for native embedding generation).
 - `database/`: 
@@ -58,6 +58,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
     - `stock_notes/`: SEC EDGAR footnote extraction, tidy-format transformation, and concept cataloging.
     - `batch_reader/`: Hybrid semantic + keyword search across batches.
 - `utils/`: Cross-cutting utilities (logging, artifact management, browser daemon, SoM Javascript injection, rate limiters, text sanitization).
+    - `observability/`: Activity-driven observability framework providing the `@activity` decorator and `LineageReport` generation.
     - `hitl_resolution.py`: Process-wide registry for resolving HITL pauses via API.
     - `sse_health/`: Embedded health checkers for SSE functionality.
 - `scripts/`: Operational utilities, including `logs_query.py` for read-only inspection of the logs database.
@@ -69,6 +70,7 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - **SoM (Semantic Object Model)**: Injection of `data-ai-id` attributes into the DOM (via JS) to provide the LLM with deterministic element references, bypassing fragile CSS selectors.
 - **Resume Mechanism**: Tool-specific logic (`ResumeHandler`) that queries domain tables (e.g., `job_items`) to determine the exact point of resumption after a crash or HITL pause.
 - **SseProjector**: An async generator that maintains a dedicated read-only SQLite connection to `logs.db` and projects events based on `event_id` monotonicity.
+- **LineageReport**: A detailed execution trace comprising ordered `ActivityRecord`s, providing a deterministic audit of tool internal logic for a specific job.
 - **2-Tier Sync**: A synchronization model that treats the Operational DB as the source of truth and Snowflake as the durable cloud mirror. It uses a `sync_ledger` for watermarking and a 2-way `DiffEngine` for conflict detection.
 
 ### Invariants
@@ -179,31 +181,3 @@ python -m uvicorn app:app --port 8000
 - **Schema Changes**: Any change to `database/schemas/` requires a corresponding migration. The `SchemaReconciler` will detect mismatches and may trigger a table recreation.
 - **Tool Interface**: Modifying `INPUT_MODEL` in a tool changes the API contract and the `manifest` exposed to the LLM.
 - **Snowflake DDL**: Changes to the cloud schema must be managed via `BackupSchemaRegistry` and the override registry to ensure `sqlglot` transpilation remains consistent.
-
-## 13. Changes (Evolutionary Analysis from Current Code)
-
-### Transition from HTTP Callbacks to SSE Streaming
-- **Pain Point Addressed**: The prior state relied on HTTP callbacks to notify the calling system of job completion. This was fragile, required the caller to maintain an open endpoint, and provided no real-time visibility into the execution process (logs were polled).
-- **Solution Implemented**: A full SSE (Server-Sent Events) subsystem was implemented. This includes the `SseProjector` in `api/sse/projector.py`, which tails `logs.db` in real-time, and a `LogNotifyBus` in `api/sse/log_notify.py` that uses `asyncio.Event` to wake projectors immediately upon database commits.
-- **Impact & Evidence**: 
-    - *Architectural:* Shift from a "push" (callback) to a "pull/stream" (SSE) model. The `_do_callback_with_logging` method was removed from `bot/engine/worker.py`.
-    - *Behavioral:* Clients now receive a live stream of events (`started` $\rightarrow$ `running` $\rightarrow$ `completed`) via `GET /api/jobs/{job_id}/stream`.
-    - *Developer Experience:* The `utils/sse_health/check_sse_stream.py` utility allows for automated validation of the streaming lifecycle.
-    - *Confidence Level:* **High** (Directly evidenced by the creation of the `api/sse/` directory and the major refactor of `bot/engine/worker.py` to remove callback logic).
-
-### Refactor of HITL Escalation from TTY to API
-- **Pain Point Addressed**: Human-in-the-Loop (HITL) pauses previously relied on `input()` calls in `tools/scraper/hitl.py`, which blocked the worker thread on STDIN. This made the system unusable in headless/deployed environments where STDIN is closed, leading to automatic job cancellations.
-- **Solution Implemented**: A process-wide `HitlResolutionRegistry` in `utils/hitl_resolution.py` was created. Tools now raise a `HitlPaused` exception, and the worker blocks on a `threading.Event` managed by the registry. Decisions are delivered via `POST /api/jobs/{job_id}/resume`.
-- **Impact & Evidence**:
-    - *Architectural:* Decoupled the human decision process from the worker's execution thread.
-    - *Behavioral:* Jobs can now be paused in a deployed environment and resumed by an operator via the API.
-    - *Developer Experience:* `tools/scraper/hitl.py` no longer contains `input()` or `print()` calls.
-    - *Confidence Level:* **High** (Directly evidenced by `utils/hitl_resolution.py` and the refactor of `tools/scraper/hitl.py`).
-
-### Abolishment of API Key Authentication
-- **Pain Point Addressed**: The system previously required an API key for all `/api/` routes via `verify_api_key`. This created unnecessary friction for internal tool orchestration and caused failures when `config.API_KEY` was missing or mismatched.
-- **Solution Implemented**: The `verify_api_key` dependency was removed from `app.py`, effectively making the API public within its operational network.
-- **Impact & Evidence**:
-    - *Architectural:* Simplification of the request pipeline by removing the security dependency.
-    - *Behavioral:* Routes no longer return 401 Unauthorized errors based on key mismatches.
-    - *Confidence Level:* **High** (Directly evidenced by the removal of the function from `app.py`).

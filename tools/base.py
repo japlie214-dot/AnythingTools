@@ -3,11 +3,10 @@
 
 Each tool must inherit from ``BaseTool`` and implement:
   - ``run(args, telemetry, **kwargs) -> str``  — the tool's execution logic
-  - ``health_check_payload()``                 — returns inputs for E2E health checks
 
 The ``run`` method must return a plain string (markdown). The previous
 ``_callback_format: structured`` dict pattern has been removed in favor
-of SSE-streamed events. Tools that need to emit intermediate progress
+of sync API responses. Tools that need to emit intermediate progress
 can call ``telemetry(self.status(message, state))`` which the SSE broker
 intercepts and forwards to subscribers.
 """
@@ -98,36 +97,6 @@ class StatusOverride:
         }
 
 
-@dataclass
-class HealthCheckPayload:
-    """Describes the inputs for a tool's health check.
-
-    A health check runs the tool end-to-end against the staging database
-    (DATABASE_STAGING_ENABLED=true). Both happy and error paths are
-    exercised to validate the tool's full execution surface.
-
-    Attributes:
-        happy_path_args: Input args that should result in a successful
-            execution (status=COMPLETED). This validates the tool's
-            primary workflow.
-        error_path_args: Input args that should trigger a controlled
-            failure (status=FAILED). This validates the tool's error
-            handling and that failures are surfaced (not silently
-            swallowed).
-        expected_happy_status: The expected terminal status for the
-            happy path. Usually "COMPLETED" but some tools (e.g.,
-            publisher with an empty batch) may legitimately end in
-            "PARTIAL" or "FAILED".
-        expected_error_status: The expected terminal status for the
-            error path. Usually "FAILED".
-        timeout_seconds: Override for HEALTH_CHECK_TIMEOUT_SECONDS.
-            Set higher for browser-based tools (scraper).
-    """
-    happy_path_args: dict[str, Any]
-    error_path_args: dict[str, Any]
-    expected_happy_status: str = "COMPLETED"
-    expected_error_status: str = "FAILED"
-    timeout_seconds: int | None = None
 
 
 @dataclass
@@ -175,11 +144,26 @@ class ToolResult:
 class BaseTool(abc.ABC):
     """Abstract base class for all tools.
 
-    Subclasses must set ``name`` and implement both ``run`` and
-    ``health_check_payload``.
+    Subclasses must set ``name`` and implement ``run``.
     """
 
     name: str
+
+    def __init_subclass__(cls, **kwargs):
+        """Reject subclasses that still define health_check_payload().
+
+        Per the eradication mandate: health_check_payload() has been removed.
+        Subclasses that define it are rejected at class creation time to
+        prevent silent dead-interface inheritance.
+        Ref: https://docs.python.org/3/reference/datamodel.html#object.__init_subclass__
+        """
+        super().__init_subclass__(**kwargs)
+        if "health_check_payload" in cls.__dict__:
+            raise TypeError(
+                f"{cls.__name__} defines health_check_payload() which has been removed. "
+                f"Use the @activity decorator on run() sub-methods for observability. "
+                f"See utils/observability/activity_decorator.py."
+            )
 
     def is_resumable(self, args: dict[str, Any]) -> bool:
         """Return True if this tool supports mid-run resume for the given args."""
@@ -223,19 +207,6 @@ class BaseTool(abc.ABC):
         """
         raise NotImplementedError
 
-    @abc.abstractmethod
-    def health_check_payload(self) -> HealthCheckPayload:
-        """Return inputs for end-to-end health checking.
-
-        The health check enqueues a real job using these args against
-        the staging database. Both happy and error paths are exercised.
-
-        Tools that require external resources (EDGAR, browser, Telegram)
-        must ensure their health-check payloads use safe, non-destructive
-        inputs (e.g., a well-known stable ticker like AAPL, a test batch
-        ID, a dry-run flag).
-        """
-        raise NotImplementedError
 
     async def execute(
         self,

@@ -24,6 +24,12 @@ class SyncJobRequest(BaseModel):
     tool_name: str = Field(..., description="The tool to execute.")
     args: Dict[str, Any] = Field(default_factory=dict, description="Tool input arguments.")
     client_metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata (idempotency key, etc.).")
+    capture_lineage: bool = Field(
+        False,
+        description="When true, the response's result field is wrapped as "
+                    "{business_response_snapshot, lineage, summary}. Requires "
+                    "DATABASE_STAGING_ENABLED=true."
+    )
 
 
 class SyncJobResponse(BaseModel):
@@ -83,19 +89,6 @@ class ResumeResponse(BaseModel):
     details: Optional[Dict[str, Any]] = None
 
 
-class HealthCheckRequest(BaseModel):
-    pass
-
-
-class HealthCheckResponse(BaseModel):
-    """Response for POST /api/health-check/{tool_name}.
-
-    No longer returns stream_url — the sync API returns the full result.
-    """
-    job_id: str
-    tool_name: str
-    timeout_seconds: int
-    final_result: Optional[SyncJobResponse] = None
 
 
 class EngineMetrics(BaseModel):

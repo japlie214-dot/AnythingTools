@@ -19,7 +19,7 @@ import config
 from api.schemas import (
     SyncJobRequest, SyncJobResponse, JobCreateRequest, JobCreateResponse,
     JobStatusResponse, JobLogEntry, ResumeResponse, ResumeRequest,
-    BackupMetricsResponse, HealthCheckRequest, HealthCheckResponse,
+    BackupMetricsResponse,
 )
 from tools.registry import REGISTRY
 from utils.logger.core import get_dual_logger
@@ -131,7 +131,7 @@ async def _await_job_completion(job_id: str, request: Request) -> Dict[str, Any]
     raise HTTPException(status_code=500, detail="Unexpected await state")
 
 
-def _enqueue_job(tool_name: str, args: dict, request: Request) -> str:
+def _enqueue_job(tool_name: str, args: dict, request: Request, capture_lineage: bool = False) -> str:
     """Validate input, scan URLs, insert QUEUED row, start worker. Returns job_id."""
     meta = REGISTRY._tools.get(tool_name)
     if not meta:
@@ -154,9 +154,17 @@ def _enqueue_job(tool_name: str, args: dict, request: Request) -> str:
     job_id = ULID.generate()
     session_id = get_session_id(request)
 
+    # When capture_lineage is true, embed the flag in args_json so the worker
+    # thread (which cannot receive the ContextVar from the API handler — see
+    # the threading model diagram in the implementation plan) can read it
+    # and instantiate the ActivityAccumulator.
+    args_with_flag = dict(args)
+    if capture_lineage:
+        args_with_flag["_capture_lineage"] = True
+
     enqueue_write(
         "INSERT INTO jobs (job_id, session_id, tool_name, args_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (job_id, session_id, tool_name, json.dumps(args), "QUEUED", now_iso(), now_iso())
+        (job_id, session_id, tool_name, json.dumps(args_with_flag), "QUEUED", now_iso(), now_iso())
     )
 
     _ensure_writer_running()
@@ -177,8 +185,15 @@ async def create_job_sync(req: SyncJobRequest, request: Request):
     or PAUSED_FOR_HITL. On timeout, returns 504 with a fallback pointer.
     On client disconnect, returns 499.
     """
+    # Lineage capture requires staging mode to protect production memory.
+    if req.capture_lineage and not getattr(config, "DATABASE_STAGING_ENABLED", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Lineage capture requires DATABASE_STAGING_ENABLED=true to protect production data."
+        )
+
     async with _sync_semaphore:
-        job_id = _enqueue_job(req.tool_name, req.args, request)
+        job_id = _enqueue_job(req.tool_name, req.args, request, capture_lineage=req.capture_lineage)
 
         log.dual_log(
             tag="API:Job:Sync:Enqueue",
@@ -191,10 +206,23 @@ async def create_job_sync(req: SyncJobRequest, request: Request):
         # Cleanup the registry entry.
         job_completion_registry.cleanup(job_id)
 
+        # When capture_lineage was requested, wrap the result per the
+        # convention's LineageReport shape (§4.3.e):
+        # {business_response_snapshot, lineage, summary}
+        lineage_report = terminal.get("lineage")
+        if req.capture_lineage and lineage_report is not None:
+            result_payload = {
+                "business_response_snapshot": terminal.get("result"),
+                "lineage": lineage_report.get("lineage", []),
+                "summary": lineage_report.get("summary", {}),
+            }
+        else:
+            result_payload = terminal.get("result")
+
         return SyncJobResponse(
             job_id=terminal.get("job_id", job_id),
             status=terminal.get("status", "UNKNOWN"),
-            result=terminal.get("result"),
+            result=result_payload,
             error=terminal.get("error"),
             tool_name=terminal.get("tool_name", req.tool_name),
             logs_pointer=f"GET /api/jobs/{job_id}/status" if terminal.get("status") in ("FAILED", "ABANDONED") else None,
@@ -209,6 +237,13 @@ async def resume_job(job_id: str, body: ResumeRequest, request: Request):
 
     For INTERRUPTED/FAILED/PARTIAL: re-queues the job and awaits.
     """
+    # Lineage capture on resume requires staging mode.
+    if getattr(config, "DATABASE_STAGING_ENABLED", False) == False:
+        # Read the original capture_lineage flag from args_json to determine
+        # if the /resume caller wants lineage. For MVP, /resume does NOT
+        # accept capture_lineage — it inherits from the original job.
+        pass
+
     conn = DatabaseManager.get_read_connection()
     row = conn.execute("SELECT tool_name, status, args_json, resume_count FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
 
@@ -265,10 +300,21 @@ async def resume_job(job_id: str, body: ResumeRequest, request: Request):
         terminal = await _await_job_completion(job_id, request)
         job_completion_registry.cleanup(job_id)
 
+        # Wrap result if lineage is present (same as create_job_sync).
+        lineage_report = terminal.get("lineage")
+        if lineage_report is not None:
+            result_payload = {
+                "business_response_snapshot": terminal.get("result"),
+                "lineage": lineage_report.get("lineage", []),
+                "summary": lineage_report.get("summary", {}),
+            }
+        else:
+            result_payload = terminal.get("result")
+
         return SyncJobResponse(
             job_id=terminal.get("job_id", job_id),
             status=terminal.get("status", "UNKNOWN"),
-            result=terminal.get("result"),
+            result=result_payload,
             error=terminal.get("error"),
             tool_name=terminal.get("tool_name", tool_name),
             logs_pointer=f"GET /api/jobs/{job_id}/status" if terminal.get("status") in ("FAILED", "ABANDONED") else None,
@@ -362,7 +408,7 @@ async def diagnostics():
 # Kept for backward compat; new code should use POST /api/jobs.
 @router.post("/tools/{tool_name}", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
 async def enqueue_tool(tool_name: str, req: JobCreateRequest, request: Request):
-    job_id = _enqueue_job(tool_name, req.args, request)
+    job_id = _enqueue_job(tool_name, req.args, request, capture_lineage=False)
     return {"job_id": job_id, "status": "QUEUED"}
 
 
@@ -409,75 +455,3 @@ async def trigger_restore():
     return {"status": "RESTORE_QUEUED", "job_id": job_id}
 
 
-@router.post("/health-check/{tool_name}", response_model=HealthCheckResponse)
-async def health_check_tool(tool_name: str, request: Request):
-    """Enqueue a health-check job and await its terminal state synchronously."""
-    if not getattr(config, "DATABASE_STAGING_ENABLED", False):
-        raise HTTPException(
-            status_code=403,
-            detail="Health checks require DATABASE_STAGING_ENABLED=true to protect production data."
-        )
-
-    meta = REGISTRY._tools.get(tool_name)
-    if not meta:
-        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
-
-    tool_cls = meta.get("cls")
-    if not tool_cls or not hasattr(tool_cls, "health_check_payload"):
-        raise HTTPException(
-            status_code=501,
-            detail=f"Tool '{tool_name}' does not implement health_check_payload()."
-        )
-
-    tool_instance = REGISTRY.create_tool_instance(tool_name)
-    if not tool_instance:
-        raise HTTPException(status_code=500, detail=f"Failed to instantiate tool '{tool_name}'")
-
-    payload = tool_instance.health_check_payload()
-
-    path = request.query_params.get("path", "happy")
-    if path == "error":
-        args = payload.error_path_args
-        expected_status = payload.expected_error_status
-    else:
-        args = payload.happy_path_args
-        expected_status = payload.expected_happy_status
-
-    timeout = payload.timeout_seconds or config.HEALTH_CHECK_TIMEOUT_SECONDS
-
-    job_id = _enqueue_job(tool_name, args, request)
-
-    log.dual_log(
-        tag="HealthCheck:Enqueued",
-        message=f"Health check enqueued for {tool_name} (path={path})",
-        payload={
-            "job_id": job_id, "tool_name": tool_name, "path": path,
-            "expected_status": expected_status, "timeout_seconds": timeout,
-        },
-    )
-
-    # Use a longer timeout for health checks.
-    async with _sync_semaphore:
-        future = job_completion_registry.register(job_id)
-        try:
-            terminal = await asyncio.wait_for(future, timeout=float(timeout + 30))
-        except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=504,
-                detail=f"Health check timed out after {timeout}s",
-            )
-        finally:
-            job_completion_registry.cleanup(job_id)
-
-    return HealthCheckResponse(
-        job_id=job_id,
-        tool_name=tool_name,
-        timeout_seconds=timeout,
-        final_result=SyncJobResponse(
-            job_id=terminal.get("job_id", job_id),
-            status=terminal.get("status", "UNKNOWN"),
-            result=terminal.get("result"),
-            error=terminal.get("error"),
-            tool_name=tool_name,
-        ),
-    )

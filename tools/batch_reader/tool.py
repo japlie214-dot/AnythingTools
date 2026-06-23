@@ -4,7 +4,7 @@ import sqlite3
 from typing import Any
 from pydantic import BaseModel, Field
 
-from tools.base import BaseTool, HealthCheckPayload, ToolExecutionError, ToolValidationError
+from tools.base import BaseTool, ToolExecutionError, ToolValidationError
 from database.connection import DatabaseManager
 from utils.logger import get_dual_logger
 import config
@@ -21,14 +21,6 @@ class BatchReaderTool(BaseTool):
     name = "batch_reader"
     INPUT_MODEL = BatchReaderInput
 
-    def health_check_payload(self) -> HealthCheckPayload:
-        return HealthCheckPayload(
-            happy_path_args={"batch_id": "HEALTH_CHECK_TEST_BATCH", "query": "test", "limit": 3},
-            error_path_args={"batch_id": "NONEXISTENT_BATCH_ID_12345", "query": "test"},
-            expected_happy_status="COMPLETED",
-            expected_error_status="FAILED",
-            timeout_seconds=30,
-        )
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         def _fail(summary: str, next_steps: str) -> None:

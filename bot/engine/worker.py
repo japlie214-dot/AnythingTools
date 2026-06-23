@@ -136,6 +136,27 @@ class UnifiedWorkerManager:
         The completion registry is resolved on EVERY terminal state, including
         FAILED and ABANDONED, so the sync API never hangs.
         """
+        # --- Activity-Driven Observability ---
+        # Read the capture_lineage flag from args_json. The flag was embedded
+        # by _enqueue_job in api/routes.py because the ContextVar cannot
+        # cross the API-handler → polling-thread boundary (the polling thread
+        # is spawned via plain threading.Thread at worker.py:63, which does
+        # NOT copy context).
+        capture_lineage = args.pop("_capture_lineage", False) and getattr(config, "DATABASE_STAGING_ENABLED", False)
+
+        accumulator = None
+        token = None
+        if capture_lineage:
+            from utils.observability.accumulator import ActivityAccumulator
+            from utils.observability.context import bind_accumulator
+            max_activities = getattr(config, "LINEAGE_MAX_ACTIVITIES", 1000)
+            max_chars = getattr(config, "LINEAGE_MAX_STRING_CHARS", 50000)
+            accumulator = ActivityAccumulator(
+                job_id, tool_name,
+                max_activities=max_activities,
+                max_chars=max_chars,
+            )
+            token = bind_accumulator(accumulator)
         # Initialize res to None so the attachments check below is safe
         # (per Pushback 6: if tool_instance is None, res is never assigned).
         res = None
@@ -275,6 +296,16 @@ class UnifiedWorkerManager:
             if job_id in self._system_errors:
                 del self._system_errors[job_id]
 
+            # --- Finalize the lineage report (if capture was enabled) ---
+            lineage_report = None
+            if accumulator is not None:
+                lineage_report = accumulator.finalize(
+                    business_response=normal.get("result")
+                )
+                # Convert to plain dict for JSON serialization across the
+                # completion registry boundary.
+                lineage_report = lineage_report.model_dump()
+
             # Resolve the completion registry future so the sync API unblocks.
             # This is the CRITICAL line that was missing in the original plan.
             job_completion_registry.resolve(job_id, {
@@ -283,23 +314,24 @@ class UnifiedWorkerManager:
                 "result": normal.get("result"),
                 "error": normal.get("error"),
                 "tool_name": tool_name,
+                "lineage": lineage_report,
             })
 
         except ToolValidationError as e:
             # Input validation failure — terminal FAILED, no retry.
             log.dual_log(tag="Worker:Job:ValidationError", message=f"Job {job_id} validation failed", level="WARNING", exc_info=e, payload={"job_id": job_id, "error": str(e)})
-            self._commit_failed(job_id, tool_name, str(e))
+            self._commit_failed(job_id, tool_name, str(e), accumulator)
 
         except ToolError as e:
             # Tool execution failure — terminal FAILED, no retry.
             log.dual_log(tag="Worker:Job:ToolError", message=f"Job {job_id} tool error", level="ERROR", exc_info=e, payload={"job_id": job_id, "error": str(e)})
-            self._commit_failed(job_id, tool_name, str(e))
+            self._commit_failed(job_id, tool_name, str(e), accumulator)
 
         except StateTransitionViolation as e:
             # Health checker caught an invariant breach — terminal FAILED.
             # Per Pushback 4: fail fast, do not continue.
             log.dual_log(tag="Worker:Job:StateViolation", message=f"Job {job_id} state transition violation", level="CRITICAL", exc_info=e, payload={"job_id": job_id, "error": str(e)})
-            self._commit_failed(job_id, tool_name, str(e))
+            self._commit_failed(job_id, tool_name, str(e), accumulator)
 
         except Exception as e:
             # Unhandled crash — 3-strike crash recovery.
@@ -310,14 +342,19 @@ class UnifiedWorkerManager:
             self._system_errors[job_id] += 1
             if self._system_errors[job_id] >= 3:
                 log.dual_log(tag="Worker:Job:Abandoned", message=f"Job {job_id} ABANDONED after 3 consecutive system errors", level="CRITICAL", payload={"job_id": job_id, "error": str(e)})
-                self._commit_status(job_id, tool_name, "ABANDONED", str(e))
+                self._commit_status(job_id, tool_name, "ABANDONED", str(e), accumulator)
                 del self._system_errors[job_id]
             else:
                 log.dual_log(tag="Worker:Job:Crashed", message=f"Job {job_id} crashed", level="ERROR", exc_info=e, payload={"job_id": job_id, "attempt": self._system_errors[job_id], "error": str(e)})
                 time.sleep(10)
-                self._commit_status(job_id, tool_name, "INTERRUPTED", str(e))
+                self._commit_status(job_id, tool_name, "INTERRUPTED", str(e), accumulator)
 
         finally:
+            # Unbind the accumulator to prevent context leaks across jobs.
+            if token is not None:
+                from utils.observability.context import unbind_accumulator
+                unbind_accumulator(token)
+
             try:
                 final_status = None
                 try:
@@ -344,50 +381,60 @@ class UnifiedWorkerManager:
 
             if job_id in self._active_jobs:
                 del self._active_jobs[job_id]
+def _commit_failed(self, job_id: str, tool_name: str, error_msg: str, accumulator=None) -> None:
+    """Commit FAILED status and resolve the completion registry."""
+    normal = {"status": "FAILED", "error": error_msg, "result": None}
+    payload_json = json.dumps(normal, ensure_ascii=False, default=str)
+    receipt = enqueue_write(
+        "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
+        ("FAILED", payload_json, now_iso(), job_id),
+        track=True,
+    )
+    if receipt is not None:
+        receipt.wait(timeout=45.0)
+    from database.logs_writer import logs_enqueue_write
+    logs_enqueue_write(
+        "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (ULID.generate(), job_id, "Worker:Job:Failed", "ERROR", "FAILED",
+          f"Job failed: {error_msg[:200]}",
+          json.dumps({"error_len": len(error_msg)}),
+          ULID.generate(), json.dumps({"error": error_msg}, ensure_ascii=False), now_iso()),
+    )
 
-    def _commit_failed(self, job_id: str, tool_name: str, error_msg: str) -> None:
-        """Commit FAILED status and resolve the completion registry."""
-        normal = {"status": "FAILED", "error": error_msg, "result": None}
-        payload_json = json.dumps(normal, ensure_ascii=False, default=str)
-        receipt = enqueue_write(
-            "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
-            ("FAILED", payload_json, now_iso(), job_id),
-            track=True,
-        )
-        if receipt is not None:
-            receipt.wait(timeout=45.0)
-        from database.logs_writer import logs_enqueue_write
-        logs_enqueue_write(
-            "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (ULID.generate(), job_id, "Worker:Job:Failed", "ERROR", "FAILED",
-             f"Job failed: {error_msg[:200]}",
-             json.dumps({"error_len": len(error_msg)}),
-             ULID.generate(), json.dumps({"error": error_msg}, ensure_ascii=False), now_iso()),
-        )
-        job_completion_registry.resolve(job_id, {
-            "job_id": job_id,
-            "status": "FAILED",
-            "result": None,
-            "error": error_msg,
-            "tool_name": tool_name,
-        })
+    lineage_report = None
+    if accumulator is not None:
+        lineage_report = accumulator.finalize(business_response=None).model_dump()
 
-    def _commit_status(self, job_id: str, tool_name: str, status: str, error_msg: str) -> None:
-        """Commit a non-FAILED terminal status (ABANDONED / INTERRUPTED) and resolve."""
-        normal = {"status": status, "error": error_msg, "result": None}
-        payload_json = json.dumps(normal, ensure_ascii=False, default=str)
-        enqueue_write(
-            "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
-            (status, payload_json, now_iso(), job_id),
-        )
-        job_completion_registry.resolve(job_id, {
-            "job_id": job_id,
-            "status": status,
-            "result": None,
-            "error": error_msg,
-            "tool_name": tool_name,
-        })
+    job_completion_registry.resolve(job_id, {
+        "job_id": job_id,
+        "status": "FAILED",
+        "result": None,
+        "error": error_msg,
+        "tool_name": tool_name,
+        "lineage": lineage_report,
+    })
+def _commit_status(self, job_id: str, tool_name: str, status: str, error_msg: str, accumulator=None) -> None:
+    """Commit a non-FAILED terminal status (ABANDONED / INTERRUPTED) and resolve."""
+    normal = {"status": status, "error": error_msg, "result": None}
+    payload_json = json.dumps(normal, ensure_ascii=False, default=str)
+    enqueue_write(
+        "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
+        (status, payload_json, now_iso(), job_id),
+    )
+
+    lineage_report = None
+    if accumulator is not None:
+        lineage_report = accumulator.finalize(business_response=None).model_dump()
+
+    job_completion_registry.resolve(job_id, {
+        "job_id": job_id,
+        "status": status,
+        "result": None,
+        "error": error_msg,
+        "tool_name": tool_name,
+        "lineage": lineage_report,
+    })
 
 
 _manager = UnifiedWorkerManager()
