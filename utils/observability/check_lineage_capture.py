@@ -282,16 +282,269 @@ async def check_lineage_guard_403() -> dict:
     return result
 
 
-async def run_all() -> dict:
-    """Run all lineage capture checks and return a structured result.
+async def check_batch_reader_happy() -> dict:
+    """Branch: batch_reader happy path (using non-existent batch to test failure point).
 
-    Returns: {status, branches_evaluated, all_branches_passed}
+    Expected lineage:
+      1. "Validate BatchReader Input" PASSED
+      2. "Fetch Batch Article IDs" FAILED
     """
+    result = {"name": "batch_reader_happy", "status": "unknown", "checks": [], "raw": []}
+    try:
+        resp = await _post_job_with_lineage(
+            "batch_reader",
+            {"batch_id": "NONEXISTENT_BATCH_ID", "query": "test query", "limit": 5},
+            timeout=30.0,
+        )
+        result["raw"].append(f"POST /api/jobs status: {resp['status_code']}")
+        if resp["status_code"] != 200:
+            result["checks"].append({"check": "http_200", "pass": False, "detail": f"got {resp['status_code']}"})
+            result["status"] = "unhealthy"
+            return result
+        result["checks"].append({"check": "http_200", "pass": True})
+
+        body = resp["body"]
+        result["raw"].append(f"response status: {body.get('status')}")
+        if body.get("status") == "FAILED":
+            result["checks"].append({"check": "job_failed", "pass": True})
+        else:
+            result["checks"].append({"check": "job_failed", "pass": False, "detail": f"got {body.get('status')}"})
+
+        lineage = _extract_lineage(body)
+        result["raw"].append(f"lineage activities: {len(lineage)}")
+
+        checks = _assert_lineage_shape(
+            "batch_reader_not_found",
+            lineage,
+            expected_activity_names=["Validate BatchReader Input", "Fetch Batch Article IDs"],
+            expected_statuses=["PASSED", "FAILED"],
+        )
+        result["checks"].extend(checks)
+
+        result["status"] = "healthy" if all(c.get("pass") for c in result["checks"]) else "unhealthy"
+    except Exception as e:
+        result["status"] = "unhealthy"
+        result["error"] = str(e)
+    return result
+
+
+async def check_batch_reader_validation_error() -> dict:
+    """Branch: batch_reader missing batch_id.
+
+    Expected lineage:
+      1. "Validate BatchReader Input" FAILED
+    """
+    result = {"name": "batch_reader_validation_error", "status": "unknown", "checks": [], "raw": []}
+    try:
+        resp = await _post_job_with_lineage(
+            "batch_reader",
+            {"query": "test"},
+            timeout=30.0,
+        )
+        result["raw"].append(f"POST /api/jobs status: {resp['status_code']}")
+        if resp["status_code"] != 200:
+            result["checks"].append({"check": "http_200", "pass": False, "detail": f"got {resp['status_code']}"})
+            result["status"] = "unhealthy"
+            return result
+        result["checks"].append({"check": "http_200", "pass": True})
+
+        body = resp["body"]
+        lineage = _extract_lineage(body)
+        result["raw"].append(f"lineage activities: {len(lineage)}")
+
+        checks = _assert_lineage_shape(
+            "batch_reader_validation_error",
+            lineage,
+            expected_activity_names=["Validate BatchReader Input"],
+            expected_statuses=["FAILED"],
+        )
+        result["checks"].extend(checks)
+
+        result["status"] = "healthy" if all(c.get("pass") for c in result["checks"]) else "unhealthy"
+    except Exception as e:
+        result["status"] = "unhealthy"
+        result["error"] = str(e)
+    return result
+
+
+async def check_publisher_validation_error() -> dict:
+    """Branch: publisher missing batch_id.
+
+    Expected lineage:
+      1. "Validate Publisher Input" FAILED
+    """
+    result = {"name": "publisher_validation_error", "status": "unknown", "checks": [], "raw": []}
+    try:
+        resp = await _post_job_with_lineage(
+            "publisher",
+            {},
+            timeout=30.0,
+        )
+        result["raw"].append(f"POST /api/jobs status: {resp['status_code']}")
+        if resp["status_code"] != 200:
+            result["checks"].append({"check": "http_200", "pass": False, "detail": f"got {resp['status_code']}"})
+            result["status"] = "unhealthy"
+            return result
+        result["checks"].append({"check": "http_200", "pass": True})
+
+        body = resp["body"]
+        lineage = _extract_lineage(body)
+        result["raw"].append(f"lineage activities: {len(lineage)}")
+
+        checks = _assert_lineage_shape(
+            "publisher_validation_error",
+            lineage,
+            expected_activity_names=["Validate Publisher Input"],
+            expected_statuses=["FAILED"],
+        )
+        result["checks"].extend(checks)
+
+        result["status"] = "healthy" if all(c.get("pass") for c in result["checks"]) else "unhealthy"
+    except Exception as e:
+        result["status"] = "unhealthy"
+        result["error"] = str(e)
+    return result
+
+
+async def check_publisher_not_found() -> dict:
+    """Branch: publisher with nonexistent batch_id.
+
+    Expected lineage:
+      1. "Validate Publisher Input" PASSED
+      2. "Fetch Batch Info" FAILED
+    """
+    result = {"name": "publisher_not_found", "status": "unknown", "checks": [], "raw": []}
+    try:
+        resp = await _post_job_with_lineage(
+            "publisher",
+            {"batch_id": "NONEXISTENT_BATCH_ID"},
+            timeout=30.0,
+        )
+        result["raw"].append(f"POST /api/jobs status: {resp['status_code']}")
+        if resp["status_code"] != 200:
+            result["checks"].append({"check": "http_200", "pass": False, "detail": f"got {resp['status_code']}"})
+            result["status"] = "unhealthy"
+            return result
+        result["checks"].append({"check": "http_200", "pass": True})
+
+        body = resp["body"]
+        lineage = _extract_lineage(body)
+        result["raw"].append(f"lineage activities: {len(lineage)}")
+
+        checks = _assert_lineage_shape(
+            "publisher_not_found",
+            lineage,
+            expected_activity_names=["Validate Publisher Input", "Fetch Batch Info"],
+            expected_statuses=["PASSED", "FAILED"],
+        )
+        result["checks"].extend(checks)
+
+        result["status"] = "healthy" if all(c.get("pass") for c in result["checks"]) else "unhealthy"
+    except Exception as e:
+        result["status"] = "unhealthy"
+        result["error"] = str(e)
+    return result
+
+
+async def check_stock_notes_validation_error() -> dict:
+    """Branch: stock_notes invalid command.
+
+    Expected lineage:
+      1. "Validate StockNotes Input" FAILED
+    """
+    result = {"name": "stock_notes_validation_error", "status": "unknown", "checks": [], "raw": []}
+    try:
+        resp = await _post_job_with_lineage(
+            "stock_notes",
+            {"command": "invalid_command"},
+            timeout=30.0,
+        )
+        result["raw"].append(f"POST /api/jobs status: {resp['status_code']}")
+        if resp["status_code"] != 200:
+            result["checks"].append({"check": "http_200", "pass": False, "detail": f"got {resp['status_code']}"})
+            result["status"] = "unhealthy"
+            return result
+        result["checks"].append({"check": "http_200", "pass": True})
+
+        body = resp["body"]
+        lineage = _extract_lineage(body)
+        result["raw"].append(f"lineage activities: {len(lineage)}")
+
+        checks = _assert_lineage_shape(
+            "stock_notes_validation_error",
+            lineage,
+            expected_activity_names=["Validate StockNotes Input"],
+            expected_statuses=["FAILED"],
+        )
+        result["checks"].extend(checks)
+
+        result["status"] = "healthy" if all(c.get("pass") for c in result["checks"]) else "unhealthy"
+    except Exception as e:
+        result["status"] = "unhealthy"
+        result["error"] = str(e)
+    return result
+
+
+async def check_stock_notes_discover_no_ticker() -> dict:
+    """Branch: stock_notes discover without ticker.
+
+    Expected lineage:
+      1. "Validate StockNotes Input" PASSED
+      2. (job fails at the missing-ticker check — this is a raise inside run(),
+         not an activity, so lineage only shows the validation activity)
+    """
+    result = {"name": "stock_notes_discover_no_ticker", "status": "unknown", "checks": [], "raw": []}
+    try:
+        resp = await _post_job_with_lineage(
+            "stock_notes",
+            {"command": "discover", "instructions": {}},
+            timeout=30.0,
+        )
+        result["raw"].append(f"POST /api/jobs status: {resp['status_code']}")
+        if resp["status_code"] != 200:
+            result["checks"].append({"check": "http_200", "pass": False, "detail": f"got {resp['status_code']}"})
+            result["status"] = "unhealthy"
+            return result
+        result["checks"].append({"check": "http_200", "pass": True})
+
+        body = resp["body"]
+        result["raw"].append(f"response status: {body.get('status')}")
+        lineage = _extract_lineage(body)
+        result["raw"].append(f"lineage activities: {len(lineage)}")
+
+        checks = _assert_lineage_shape(
+            "stock_notes_discover_no_ticker",
+            lineage,
+            expected_activity_names=["Validate StockNotes Input"],
+            expected_statuses=["PASSED"],
+        )
+        result["checks"].extend(checks)
+
+        if body.get("status") == "FAILED":
+            result["checks"].append({"check": "job_failed", "pass": True})
+        else:
+            result["checks"].append({"check": "job_failed", "pass": False, "detail": f"got {body.get('status')}"})
+
+        result["status"] = "healthy" if all(c.get("pass") for c in result["checks"]) else "unhealthy"
+    except Exception as e:
+        result["status"] = "unhealthy"
+        result["error"] = str(e)
+    return result
+
+
+async def run_all() -> dict:
+    """Run all lineage capture checks and return a structured result."""
     branches = await asyncio.gather(
         check_stock_financials_status_happy(),
         check_stock_financials_extract_error(),
         check_draft_editor_validation_error(),
         check_lineage_guard_403(),
+        check_batch_reader_happy(),
+        check_batch_reader_validation_error(),
+        check_publisher_validation_error(),
+        check_publisher_not_found(),
+        check_stock_notes_validation_error(),
+        check_stock_notes_discover_no_ticker(),
         return_exceptions=True,
     )
 

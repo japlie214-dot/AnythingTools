@@ -234,7 +234,12 @@ class BaseTool(abc.ABC):
                 message=f"Execution of {self.name} completed",
                 payload={"job_id": job_id, "success": True, "output_len": len(result) if result else 0}
             )
-            return ToolResult(output=result or "", success=True)
+            # Propagate attachment_paths set by tools during execution.
+            # Tools like scraper set self._last_artifacts to absolute paths
+            # of produced files. The worker reads ToolResult.attachment_paths
+            # to include them in the sync API response.
+            # Ref: https://docs.python.org/3/reference/datamodel.html#object.__getattribute__
+            return ToolResult(output=result or "", success=True, attachment_paths=getattr(self, '_last_artifacts', None))
         finally:
             try:
                 from utils.logger.core import flush_tool_buffer_to_job_logs

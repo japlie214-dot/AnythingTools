@@ -1,4 +1,18 @@
 # tools/scraper/tool.py
+"""Scraper Tool - Scrape and curate top articles from a target site.
+
+Returns plain markdown with curated article summaries.
+Artifact files (raw JSON, slim candidates, top 10 JSON) are attached via
+ToolResult.attachment_paths (propagated by BaseTool.execute).
+
+Activity-Driven Observability:
+  Decomposed into named activities. The Botasaurus runner is treated as a
+  single opaque activity because it runs in a thread pool via
+  asyncio.to_thread (no ContextVar propagation). Internal Botasaurus
+  instrumentation is out of scope.
+  See utils/observability/activity_decorator.py.
+"""
+
 import json
 import threading
 import asyncio
@@ -19,6 +33,7 @@ from utils.artifact_manager import write_artifact
 from tools.base import BaseTool, ToolExecutionError, ToolValidationError
 from tools.scraper.prompts import SCRAPER_SYS_PROMPT, CURATION_SYS_PROMPT
 from tools.scraper.targets import VALID_TARGET_NAMES, TARGET_SITE_MAP
+from utils.observability.activity_decorator import activity
 
 log = get_dual_logger(__name__)
 
@@ -26,12 +41,129 @@ log = get_dual_logger(__name__)
 from clients.llm.factory import get_llm_client, LLMRequest
 
 
-
 class ScraperTool(BaseTool):
     name = "scraper"
     description = "Scrape and curate top articles from a target site. Returns a curated top 10 list enriched with insights."
     input_model = None  # Dynamic validation in execute()
 
+    # --- Activity-decomposed sub-methods ---
+
+    @activity("Validate Scraper Input")
+    def _validate_scraper_input(self, args: dict, job_id: str, dry_run: bool | None) -> str:
+        """Validate target_site and dry_run. Returns target_site or raises."""
+        target_site = args.get("target_site")
+        if dry_run is None:
+            dry_run = config.TELEMETRY_DRY_RUN
+        if dry_run:
+            raise ToolExecutionError(
+                "[DRY RUN] Scraper tool execution skipped.",
+                tool_name=self.name,
+                job_id=job_id,
+                next_steps="Disable dry run to execute.",
+            )
+        if not target_site:
+            raise ToolExecutionError(
+                "Error: target_site argument is required.",
+                tool_name=self.name,
+                job_id=job_id,
+                next_steps="Provide a valid 'target_site' argument.",
+            )
+        if target_site not in VALID_TARGET_NAMES:
+            valid_list = ", ".join(sorted(VALID_TARGET_NAMES))
+            log.dual_log(
+                tag="Scraper:Validation:Rejected",
+                message=f"Invalid target_site rejected: {target_site}",
+                level="ERROR",
+                payload={"received": target_site, "valid_options": list(VALID_TARGET_NAMES)},
+            )
+            raise ToolExecutionError(
+                f"Error: '{target_site}' is not a valid target site. Valid options: {valid_list}",
+                tool_name=self.name,
+                job_id=job_id,
+                next_steps=f"Use one of the valid options: {valid_list}",
+            )
+        return target_site
+
+    @activity("Execute Botasaurus Scraping")
+    async def _run_botasaurus_activity(self, _scrape_driver, scrape_args: dict, job_id: str) -> dict:
+        """Run the Botasaurus scraper in a thread. Treated as a single opaque unit.
+
+        Uses asyncio.to_thread (not to_thread_with_context) because Botasaurus
+        runs its own thread pool internally. ContextVar propagation would be
+        lost inside Botasaurus anyway. The @activity wrapper records the
+        scrape_args as inputs and the results dict as outputs.
+        """
+        from tools.scraper.task import _run_botasaurus_scraper as _run_scraper
+        return await asyncio.to_thread(_run_scraper, _scrape_driver, scrape_args)
+
+    @activity("Curate Top 10 Articles")
+    async def _curate_top10(self, slim_list: list, telemetry: Any, batch_id: str) -> tuple:
+        """Run the LLM curation sub-agent. Returns (top_10_list, target_count, fallback_used)."""
+        from tools.scraper.curation import Top10Curator
+        curator = Top10Curator()
+        curation_result = await curator.curate(slim_list, telemetry, batch_id=batch_id)
+        return curation_result.curated_list, curation_result.target_count, curation_result.fallback_used
+
+    @activity("Persist Broadcast Data")
+    def _persist_broadcast(self, batch_id: str, target_site: str, top_10_list: list, valid_results: dict, job_id: str) -> None:
+        """Write batch and detail rows to broadcast tables."""
+        from database.broadcast.writer import create_broadcast_batch, add_broadcast_details_bulk
+        top10_ids = {item.get("ulid") for item in top_10_list if item.get("ulid")}
+        all_success_articles = [
+            _res for _url, _res in valid_results.items()
+            if _res.get("status") == "SUCCESS" and _res.get("ulid")
+        ]
+        create_broadcast_batch(
+            batch_id=batch_id,
+            target_site=target_site,
+            article_count=len(all_success_articles),
+            top10_count=len(top10_ids),
+            source_job_id=job_id,
+        )
+        add_broadcast_details_bulk(
+            batch_id=batch_id,
+            articles=all_success_articles,
+            top10_list=top_10_list,
+        )
+
+    @activity("Build Scraper Markdown")
+    def _build_scraper_markdown(
+        self, target_site: str, batch_id: str, top_10_list: list,
+        valid_results: dict, artifacts_written: list,
+    ) -> str:
+        """Build the enriched markdown summary for the agent."""
+        summary_parts = [
+            f"Scraped and curated top {len(top_10_list)} articles from {target_site} "
+            f"(Batch ID: {batch_id}).\nSorted based on potential global impact."
+        ]
+        if top_10_list:
+            summary_parts.append("\n### Top 10 Curated Articles")
+            for idx, article in enumerate(top_10_list, 1):
+                ulid = article.get("ulid", "unknown")
+                title = article.get("title", "Untitled")
+                conclusion = article.get("conclusion", "")
+                summary_text = article.get("summary", "")
+                summary_parts.append(
+                    f"\n**{idx}. [{ulid}] {title}**\n"
+                    f"Conclusion: {conclusion}\nSummary: {summary_text}"
+                )
+
+        top10_ulid_set = {item.get("ulid") for item in top_10_list}
+        rest_articles = [
+            res for res in valid_results.values()
+            if res.get("status") == "SUCCESS" and res.get("ulid")
+            and res.get("ulid") not in top10_ulid_set
+        ]
+        if rest_articles:
+            summary_parts.append("\n\n### Other Articles")
+            for idx, article in enumerate(rest_articles, 1):
+                ulid = article.get("ulid", "unknown")
+                title = article.get("title", "Untitled")
+                if len(title) > 120:
+                    title = title[:117] + "..."
+                summary_parts.append(f"{idx}. [{ulid}] {title}")
+
+        return "\n".join(summary_parts)
 
     async def run(self, args: dict[str, Any], telemetry: Any, job_id: str | None = None, session_id: str | None = None, cancellation_flag: threading.Event | None = None, dry_run: bool | None = None, **kwargs) -> str:
         """Execute the full scraper pipeline including extraction, curation, artifacts, and backup."""
@@ -56,13 +188,10 @@ class ScraperTool(BaseTool):
         """Internal implementation with full pipeline."""
         from utils.logger.structured import granular_log
         
-        # ── ARCHITECTURE RULE: ARTIFACT-AS-RECEIPT ──────────────────────────
-        # Artifact files written below are RECEIPTS for audit/debug only.
-        # Operational data lives in broadcast_batches + broadcast_details + scraped_articles.
-        # ─────────────────────────────────────────────────────────────────────
-
         session_id = str(session_id or kwargs.get("chat_id", "0"))
-        target_site = args.get("target_site")
+        
+        # Step 1: Validate Input
+        target_site = self._validate_scraper_input(args, job_id, dry_run)
         
         batch_id = ULID.generate()
         artifacts_written = []
@@ -74,6 +203,7 @@ class ScraperTool(BaseTool):
                 "description": description
             })
 
+        # Internal helper for failures
         def _fail_internal(summary: str, next_steps: str) -> None:
             try:
                 log.dual_log(
@@ -92,6 +222,7 @@ class ScraperTool(BaseTool):
                 next_steps=next_steps,
             )
 
+        # Merge logic
         def _merge_completed_articles(results: dict, job_id: str | None) -> dict:
             if not job_id:
                 return results
@@ -141,25 +272,6 @@ class ScraperTool(BaseTool):
                     })
             return s_list
 
-        if dry_run is None:
-            dry_run = config.TELEMETRY_DRY_RUN
-        if dry_run:
-            _fail_internal("[DRY RUN] Scraper tool execution skipped.", "Disable dry run to execute.")
-
-        if not target_site:
-            _fail_internal("Error: target_site argument is required.", "Provide a valid 'target_site' argument.")
-
-        if target_site not in VALID_TARGET_NAMES:
-            valid_list = ", ".join(sorted(VALID_TARGET_NAMES))
-            log.dual_log(
-                tag="Scraper:Validation:Rejected",
-                message=f"Invalid target_site rejected: {target_site}",
-                level="ERROR",
-                payload={"received": target_site, "valid_options": list(VALID_TARGET_NAMES)},
-            )
-            _fail_internal(f"Error: '{target_site}' is not a valid target site. Valid options: {valid_list}", f"Use one of the valid options: {valid_list}")
-
-        # Scout initialization (legacy ledger removed) — log for auditing
         if job_id and session_id != "0":
             msg = f"The Scout: Starting extraction for {target_site}."
             log.dual_log(tag="Scraper:Lifecycle:Init", level="INFO", message=msg, payload={"job_id": job_id, "session_id": session_id, "batch_id": batch_id})
@@ -167,7 +279,6 @@ class ScraperTool(BaseTool):
         loop = asyncio.get_running_loop()
         
         def sync_telemetry(msg: str, state: str = "RUNNING"):
-            """Synchronous telemetry wrapper."""
             try:
                 fut = asyncio.run_coroutine_threadsafe(telemetry(self.status(msg, state)), loop)
                 fut.result(timeout=5)
@@ -175,7 +286,6 @@ class ScraperTool(BaseTool):
                 pass
 
         def sync_llm_chat(messages, response_format=None, call_context=None):
-            """Synchronous LLM wrapper for curation."""
             async def _call():
                 llm = get_llm_client("azure")
                 return await llm.complete_chat(LLMRequest(
@@ -196,29 +306,22 @@ class ScraperTool(BaseTool):
             await telemetry(self.status(f"Launching headful scraper for {target_site}..."))
 
         try:
-            # Run Botasaurus pipeline
+            # Step 2: Execute Botasaurus Scraping
             from utils.browser_daemon import get_or_create_driver
             _scrape_driver = get_or_create_driver()
             
-            with granular_log("Scraper:Botasaurus:Run", target_site=target_site, job_id=job_id):
-                from tools.scraper.task import _run_botasaurus_scraper as _run_scraper
-                results = await asyncio.to_thread(
-                _run_scraper,
-                _scrape_driver,
-                {
-                    "sync_telemetry": sync_telemetry,
-                    "sync_llm_chat": sync_llm_chat,
-                    "cancellation_flag": cancellation_flag,
-                    "target_site": target_site,
-                    "job_id": job_id,
-                },
-            )
+            scrape_args = {
+                "sync_telemetry": sync_telemetry,
+                "sync_llm_chat": sync_llm_chat,
+                "cancellation_flag": cancellation_flag,
+                "target_site": target_site,
+                "job_id": job_id,
+            }
             
-            # Browser lock must cover the entire job lifecycle per GOLDEN RULE 2.
-            # Do not release the browser lock early; it will be released in the outer run() finally block.
+            results = await self._run_botasaurus_activity(_scrape_driver, scrape_args, job_id)
             results = _merge_completed_articles(results, job_id)
 
-            # Persist raw results to artifacts directory
+            # Artifacts for raw results
             raw_filepath = None
             try:
                 raw_filepath = write_artifact(
@@ -229,32 +332,13 @@ class ScraperTool(BaseTool):
                     content=json.dumps(results, indent=2, ensure_ascii=False)
                 )
                 _record_artifact(raw_filepath, "json", f"Raw scraper output for {target_site}")
-                if job_id:
-                    log.dual_log(
-                        tag="Scraper:Extraction:Complete",
-                        message=f"Extracted {len(results)} items",
-                        level="INFO",
-                        status_state="COMPLETED",
-                        payload={"count": len(results), "batch_id": batch_id, "target_site": target_site, "job_id": job_id}
-                    )
             except Exception as e:
-                log.dual_log(
-                    tag="Scraper:Artifact:Error",
-                    message=f"Failed writing raw artifact: {e}",
-                    level="WARNING",
-                    payload={"error": str(e), "artifact_type": "raw_json", "target_site": target_site}
-                )
+                log.dual_log(tag="Scraper:Artifact:Error", message=f"Failed writing raw artifact: {e}", level="WARNING", payload={"error": str(e), "artifact_type": "raw_json", "target_site": target_site})
 
-
-
-            # Extraction Step
+            # Extraction Validation
             extraction_meta = make_metadata("extract", batch_id)
             await telemetry(self.status("Validating extraction...", "RUNNING"))
             if job_id: add_job_item(job_id, extraction_meta, json.dumps({"target_site": target_site}))
-            
-            # results is a dict containing URLs mapped to article data, plus internal keys like _stats
-            _stats = results.get("_stats", {})
-            _job_final_status = results.get("_job_final_status", "COMPLETED")
             
             valid_results = {k: v for k, v in results.items() if not k.startswith("_")}
             if not valid_results:
@@ -262,15 +346,13 @@ class ScraperTool(BaseTool):
                 return _fail_internal("No results extracted.", "Check target site validity and network connectivity.")
             if job_id: update_item_status(job_id, extraction_meta, "COMPLETED", json.dumps({"count": len(valid_results), "batch_id": batch_id}))
 
-            # Slim List Step
+            # Slim List
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before processing candidate list.", "Job canceled.")
-
             slim_meta = make_metadata("slim", batch_id)
             await telemetry(self.status("Extracting article links...", "RUNNING"))
             if job_id: add_job_item(job_id, slim_meta, json.dumps({"target_site": target_site}))
             
             slim_list = _build_slim_list(valid_results)
-            
             try:
                 slim_path = write_artifact(
                     tool_name="scraper", job_id=job_id or batch_id, artifact_type="slim_candidates", ext="json",
@@ -282,9 +364,8 @@ class ScraperTool(BaseTool):
 
             if job_id: update_item_status(job_id, slim_meta, "COMPLETED", json.dumps({"slim_count": len(slim_list), "batch_id": batch_id}))
 
-            # Curation Step
+            # Step 3: Curate Top 10 Articles
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before curation.", "Job canceled.")
-            
             curate_meta = make_metadata("curate", batch_id)
             if job_id: add_job_item(job_id, curate_meta, "{}")
             
@@ -294,13 +375,7 @@ class ScraperTool(BaseTool):
             
             if slim_list:
                 try:
-                    from tools.scraper.curation import Top10Curator
-                    curator = Top10Curator()
-                    curation_result = await curator.curate(slim_list, telemetry, batch_id=batch_id)
-                    top_10_list = curation_result.curated_list
-                    target_curated_count = curation_result.target_count
-                    fallback_used = curation_result.fallback_used
-                    
+                    top_10_list, target_curated_count, fallback_used = await self._curate_top10(slim_list, telemetry, batch_id)
                     if job_id:
                         update_item_status(job_id, curate_meta, "COMPLETED", json.dumps({
                             "top_10": top_10_list,
@@ -308,26 +383,17 @@ class ScraperTool(BaseTool):
                             "fallback_used": fallback_used
                         }))
                 except Exception as _ce:
-                    log.dual_log(
-                        tag="Scraper:Curation:Execute",
-                        message=f"Curation sub-agent crashed; falling back to first 10: {_ce}",
-                        level="ERROR",
-                        exc_info=_ce
-                    )
+                    log.dual_log(tag="Scraper:Curation:Execute", message=f"Curation sub-agent crashed; falling back to first 10: {_ce}", level="ERROR", exc_info=_ce)
                     top_10_list = slim_list[:10]
                     target_curated_count = min(10, len(slim_list))
                     fallback_used = True
                     if job_id:
                         update_item_status(job_id, curate_meta, "COMPLETED", json.dumps({
-                            "top_10": top_10_list,
-                            "target_count": target_curated_count,
-                            "fallback_used": True,
-                            "error": str(_ce)
+                            "top_10": top_10_list, "target_count": target_curated_count, "fallback_used": True, "error": str(_ce)
                         }))
 
-            # Save Top 10 Artifact
+            # Top 10 Artifact
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before artifact generation.", "Job canceled.")
-            
             art_meta = make_metadata("artifacts", batch_id)
             if job_id: add_job_item(job_id, art_meta, "{}")
             try:
@@ -339,98 +405,36 @@ class ScraperTool(BaseTool):
                 _record_artifact(top_10_path, "json", f"Curated Top {target_curated_count} articles")
                 if job_id: update_item_status(job_id, art_meta, "COMPLETED", json.dumps({"path": str(top_10_path)}))
             except Exception as e:
-                log.dual_log(
-                    tag="Scraper:Artifact:Error",
-                    message=f"Failed: {e}",
-                    level="WARNING",
-                    payload={"error": str(e), "artifact_type": "top10_json", "target_site": target_site}
-                )
+                log.dual_log(tag="Scraper:Artifact:Error", message=f"Failed: {e}", level="WARNING", payload={"error": str(e), "artifact_type": "top10_json", "target_site": target_site})
                 top_10_path = raw_filepath if raw_filepath else ""
                 if job_id: update_item_status(job_id, art_meta, "FAILED", "{}")
 
-            # Backup Sync Step - Acknowledgment
+            # Step 4: Persist Broadcast Data
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before backup acknowledgment.", "Job canceled.")
-            
-            log.dual_log(
-                tag="Scraper:Backup:Inline",
-                level="INFO",
-                message="Article + embedding cloud backup triggered inline via ArticleStore.upsert_article()",
-                payload={"batch_id": batch_id, "article_count": len(top_10_list), "cloud_sync": "enabled"}
-            )
-            bak_res = None
+            self._persist_broadcast(batch_id, target_site, top_10_list, valid_results, job_id)
 
-            # Finalization
+            # Step 5: Build Scraper Markdown
             if cancellation_flag.is_set(): return _fail_internal("Scraper canceled before finalization.", "Job canceled.")
-
-            # ── Persist to broadcast tables ─────────────────────────────────────
-            try:
-                from database.broadcast.writer import create_broadcast_batch, add_broadcast_details_bulk
-                top10_ids = {item.get("ulid") for item in top_10_list if item.get("ulid")}
-                all_success_articles = [_res for _url, _res in valid_results.items() if _res.get("status") == "SUCCESS" and _res.get("ulid")]
-
-                create_broadcast_batch(
-                    batch_id=batch_id,
-                    target_site=target_site,
-                    article_count=len(all_success_articles),
-                    top10_count=len(top10_ids),
-                    source_job_id=job_id,
-                )
-                add_broadcast_details_bulk(
-                    batch_id=batch_id,
-                    articles=all_success_articles,
-                    top10_list=top_10_list,
-                )
-            except Exception as e:
-                log.dual_log(tag="Scraper:Broadcast:WriteError", message=f"Failed to write broadcast tables: {e}", level="ERROR", exc_info=e, payload={"batch_id": batch_id, "error": str(e)})
-
-            # ── Build enriched summary ──────────────────────────────────────────
-            summary_parts = [f"Scraped and curated top {len(top_10_list)} articles from {target_site} (Batch ID: {batch_id}).\nSorted based on potential global impact."]
-            
-            if top_10_list:
-                summary_parts.append("\n### Top 10 Curated Articles")
-                for idx, article in enumerate(top_10_list, 1):
-                    ulid = article.get("ulid", "unknown")
-                    title = article.get("title", "Untitled")
-                    conclusion = article.get("conclusion", "")
-                    summary_text = article.get("summary", "")
-                    summary_parts.append(f"\n**{idx}. [{ulid}] {title}**\nConclusion: {conclusion}\nSummary: {summary_text}")
-                    
-            top10_ulid_set = {item.get("ulid") for item in top_10_list}
-            rest_articles = [res for res in valid_results.values() if res.get("status") == "SUCCESS" and res.get("ulid") and res.get("ulid") not in top10_ulid_set]
-            if rest_articles:
-                summary_parts.append("\n\n### Other Articles")
-                for idx, article in enumerate(rest_articles, 1):
-                    ulid = article.get("ulid", "unknown")
-                    title = article.get("title", "Untitled")
-                    if len(title) > 120: title = title[:117] + "..."
-                    summary_parts.append(f"{idx}. [{ulid}] {title}")
-                    
-            enriched_summary = "\n".join(summary_parts)
+            enriched_summary = self._build_scraper_markdown(target_site, batch_id, top_10_list, valid_results, artifacts_written)
 
             final_meta = make_metadata("finalize", batch_id)
             if job_id: add_job_item(job_id, final_meta, "{}")
+            
+            # For backward compatibility in job logs, we still update status with a payload
             result_payload = {
-                "_callback_format": "structured",
-                "tool_name": self.name,
-                "status": "COMPLETED",
-                "summary": enriched_summary,
-                "details": {
-                    "target_site": target_site,
-                    "batch_id": batch_id,
-                    "extracted_count": len(results),
-                    "slim_count": len(slim_list),
-                    "curated_count": len(top_10_list),
-                    "target_curated_count": target_curated_count,
-                    "fallback_used": fallback_used if 'fallback_used' in locals() else False,
-                    "artifacts_written": artifacts_written,
-                    "artifacts_directory": "scraper",
-                },
-                "artifacts": artifacts_written,
-                "backup_status": (bak_res.model_dump() if hasattr(bak_res, "model_dump") else bak_res.dict()) if bak_res else {"success": True, "message": "Disabled or skipped"}
+                "target_site": target_site,
+                "batch_id": batch_id,
+                "extracted_count": len(results),
+                "slim_count": len(slim_list),
+                "curated_count": len(top_10_list),
+                "target_curated_count": target_curated_count,
+                "fallback_used": fallback_used if 'fallback_used' in locals() else False,
+                "artifacts_written": artifacts_written,
             }
             if job_id: update_item_status(job_id, final_meta, "COMPLETED", json.dumps(result_payload))
-            await telemetry(self.status("Completed", "COMPLETED", payload=result_payload))
-            return json.dumps(result_payload, ensure_ascii=False)
+            
+            await telemetry(self.status("Completed", "COMPLETED"))
+            return enriched_summary
 
         except Exception as e:
             log.dual_log(
@@ -445,6 +449,3 @@ class ScraperTool(BaseTool):
     @property
     def last_artifacts(self) -> list[str]:
         return getattr(self, "_last_artifacts", [])
-
-
-

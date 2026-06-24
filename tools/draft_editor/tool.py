@@ -181,18 +181,10 @@ class DraftEditorTool(BaseTool):
         # Step 6: Build summary.
         summary = self._build_summary(batch_id, top_10, operations)
 
-        payload = {
-            "_callback_format": "structured",
-            "tool_name": self.name,
-            "status": "COMPLETED",
-            "summary": summary,
-            "details": {"batch_id": batch_id, "new_top10_ulids": [a["ulid"] for a in top_10]},
-            "status_overrides": {
-                "COMPLETED": {
-                    "description": "The Top 10 list has been successfully reordered/swapped.",
-                    "next_steps": f"You can now publish this edited batch using the `publisher` tool.",
-                    "rerunnable": True
-                }
-            }
-        }
-        return json.dumps(payload, ensure_ascii=False)
+        # Append guidance section — preserves old status_overrides.COMPLETED.next_steps.
+        guidance = (
+            f"\n---\n### Status Guidance\n"
+            f"**State: COMPLETED** — The Top 10 list has been successfully reordered/swapped.\n\n"
+            f"**Next Steps:** You can now publish this edited batch using the `publisher` tool."
+        )
+        return summary + guidance
