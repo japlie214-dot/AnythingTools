@@ -1,6 +1,7 @@
 # database/backup/engine/schema_manager.py
 import sqlite3
 import time
+import re
 from sqlalchemy import text
 from database.backup.staging import staging_table_name
 from database.backup.schema_registry import BackupSchemaRegistry
@@ -14,6 +15,47 @@ from utils.logger import get_dual_logger
 from database.backup.engine.type_normalizer import types_match, normalize_snowflake_type
 
 log = get_dual_logger(__name__)
+
+from database.backup.settings import Vec0BackupSettings as _Vec0Settings
+_vec0_settings = _Vec0Settings()
+
+
+def _rewrite_table_name_in_ddl(raw_ddl: str, old_name: str, new_name: str) -> str:
+    """Rewrite the first 'TABLE <old_name>' occurrence in raw_ddl to 'TABLE <new_name>'.
+
+    Uses a case-insensitive regex with word boundaries. The pattern
+    optionally consumes 'IF NOT EXISTS' between TABLE and the name, because
+    the codebase's DDLs are of the form 'CREATE TABLE IF NOT EXISTS name (...)'
+    (verified at database/schemas/stock_notes.py:8 and
+    database/backup/schema_registry.py:50).
+
+    Word boundaries (\\b) prevent partial matches: \\bsn_notes\\b does NOT match
+    the 'sn_notes' substring of 'sn_note_details' because _ is a word char
+    and there is no word boundary between 'sn_notes' and '_details'.
+    Ref: https://docs.python.org/3/library/re.html (regular expression syntax)
+
+    Raises RuntimeError if zero substitutions are made — fail loud, because
+    silent no-op is the exact bug we are fixing. The per-table try/except
+    RuntimeError in reconcile() (schema_manager.py:60-77) catches this and
+    continues with the next table.
+    """
+    # re.escape(old_name) escapes any regex metacharacters in the table name.
+    # For typical names like 'sn_filings', re.escape returns 'sn_filings'
+    # unchanged (_ is not a metacharacter). Ref: https://docs.python.org/3/library/re.html#re.escape
+    pattern = rf"\\bTABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?{re.escape(old_name)}\\b"
+    new_ddl, count = re.subn(
+        pattern,
+        f"TABLE {new_name}",
+        raw_ddl,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if count == 0:
+        raise RuntimeError(
+            f"DDL rewrite failed: pattern {pattern!r} did not match in DDL "
+            f"(first 200 chars): {raw_ddl[:200]!r}"
+        )
+    return new_ddl
 
 from database.backup.settings import Vec0BackupSettings as _Vec0Settings
 _vec0_settings = _Vec0Settings()
@@ -49,7 +91,7 @@ class SnowflakeSchemaManager:
                     # in startup prevents serving.
                     try:
                         raw_ddl = BackupSchemaRegistry.get_snowflake_ddl(t_name)
-                        sf_ddl = raw_ddl.replace(f"TABLE {t_name} ", f"TABLE {snowflake_t_name} ", 1)
+                        sf_ddl = _rewrite_table_name_in_ddl(raw_ddl, t_name, snowflake_t_name)
                         conn.execute(text(sf_ddl))
                         log.dual_log(
                             tag="Backup:Cloud:Schema",
@@ -316,7 +358,7 @@ class SnowflakeSchemaManager:
                 stn = staging_table_name(plan.table_name)
                 conn.execute(text(f"DROP TABLE IF EXISTS {schema_name}.{stn}"))
                 # Use a modified DDL that targets the staging table
-                new_ddl_staging = plan.new_ddl.replace(f"TABLE {plan.table_name} ", f"TABLE {stn} ", 1)
+                new_ddl_staging = _rewrite_table_name_in_ddl(plan.new_ddl, plan.table_name, stn)
                 conn.execute(text(new_ddl_staging))
             except Exception as ddl_err:
                 # Log the full DDL that failed so operators can diagnose

@@ -63,7 +63,7 @@ class StagingWipeService:
 
         Returns {table_name: rows_deleted}. Failures are logged WARNING.
         """
-        from database.connection import get_staging_write_connection
+        from database.connection import DatabaseManager
         from config import DATABASE_STAGING_ENABLED
 
         if not DATABASE_STAGING_ENABLED:
@@ -71,7 +71,13 @@ class StagingWipeService:
 
         results: dict[str, int] = {}
         try:
-            conn = get_staging_write_connection()
+            # DatabaseManager.create_write_connection() returns a sqlite3.Connection
+            # to DB_PATH, which is staging-aware via _resolve_db_path() at
+            # database/connection.py:92-110 (diverts to data/staging/sumanal.db
+            # when DATABASE_STAGING_ENABLED=true). The connection sets WAL mode,
+            # foreign keys, synchronous=NORMAL, and a 5-second busy timeout —
+            # the correct pragmas for a write connection.
+            conn = DatabaseManager.create_write_connection()
         except Exception as e:
             log.dual_log(
                 tag="Staging:Wipe:SQLite:Failed",
@@ -117,6 +123,20 @@ class StagingWipeService:
         Ref: https://docs.snowflake.com/en/sql-reference/sql/truncate-table
         """
         from config import DATABASE_STAGING_ENABLED
+        # Resolve the schema name from the CloudEngine's settings. Per
+        # Snowflake identifier-resolution rules, an unqualified TRUNCATE TABLE
+        # resolves against the session's current schema — which is
+        # non-deterministic across connect attempts. Prefixing with the
+        # configured schema makes the target unambiguous.
+        # Ref: https://docs.snowflake.com/en/sql-reference/sql/truncate-table
+        schema_name = getattr(getattr(cloud_engine, "settings", None), "schema_name", None)
+        if not schema_name:
+            log.dual_log(
+                tag="Staging:Wipe:Snowflake:NoSchema",
+                message="CloudEngine.settings.schema_name is empty — skipping Snowflake staging wipe (would target non-deterministic schema)",
+                level="WARNING",
+            )
+            return {"_all": "skipped:no_schema"}
 
         if not DATABASE_STAGING_ENABLED:
             return {}
@@ -147,7 +167,7 @@ class StagingWipeService:
 
             try:
                 with engine.begin() as conn:
-                    conn.execute(text(f"TRUNCATE TABLE {staging_name}"))
+                    conn.execute(text(f"TRUNCATE TABLE {schema_name}.{staging_name}"))
                 results[staging_name] = "ok"
                 log.dual_log(
                     tag="Staging:Wipe:Snowflake",

@@ -1,5 +1,8 @@
-# bot/engine/health.py
-"""Inline runtime health checkers for the worker pipeline.
+# bot/engine/state_guard.py
+"""Inline runtime state guards for the worker pipeline.
+
+Formerly `bot/engine/health.py::InlineHealthChecker` — renamed to align with
+the observability principle that runtime guards are not "health checkers".
 
 These validators run INSIDE worker._run_job at three seams:
   1. check_state_transition — before each enqueue_write("UPDATE jobs SET status")
@@ -57,8 +60,8 @@ TERMINAL_STATUSES: frozenset[str] = frozenset({
 })
 
 
-class InlineHealthChecker:
-    """Runtime validator injected into UnifiedWorkerManager.
+class InlineStateGuard:
+    """Runtime state guard injected into UnifiedWorkerManager.
 
     Methods raise StateTransitionViolation on breach. The worker does NOT
     catch these silently — they propagate to the worker's except block,

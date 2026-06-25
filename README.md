@@ -60,7 +60,6 @@ The system implements a **Producer-Consumer** pattern centered around a SQLite-b
 - `utils/`: Cross-cutting utilities (logging, artifact management, browser daemon, SoM Javascript injection, rate limiters, text sanitization).
     - `observability/`: Activity-driven observability framework providing the `@activity` decorator and `LineageReport` generation.
     - `hitl_resolution.py`: Process-wide registry for resolving HITL pauses via API.
-    - `sse_health/`: Embedded health checkers for SSE functionality.
 - `scripts/`: Operational utilities, including `logs_query.py` for read-only inspection of the logs database.
 - `deprecated/`: Legacy logic (e.g., `tools/finance/`) that has been superseded by the current modular tool architecture.
 
@@ -169,7 +168,7 @@ python -m uvicorn app:app --port 8000
 - **`tests/test_backup.py`**: Validates the `SyncEngine`'s ability to detect and resolve drifts, composite PK detection, and session recovery logic.
 - **`tests/test_inspect_notes.py`**: Live SEC EDGAR contract test for the edgartools API surface.
 - **`tests/test_browser_e2e.py`**: E2E validation of the scraper tool's browser-orchestrator loop.
-- **`utils/sse_health/check_sse_stream.py`**: Embedded health checker that exercises the full SSE flow (Happy Path, Reconnect, Terminal 409s) against the staging DB.
+- Observability is provided by the Activity-Driven framework in `utils/observability/`. See the Developer Contract in `utils/observability/__init__.py`.
 
 ## 11. Known Limitations & Non-Goals
 - **SQLite Locking**: While the single-writer pattern mitigates locking, extremely high write volumes may still cause contention.

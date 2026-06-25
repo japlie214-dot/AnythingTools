@@ -1,7 +1,7 @@
 # utils/observability/activity_decorator.py
 """The @activity decorator — wraps functions to auto-record their execution.
 
-Per convention §4.3.b: the wrapper does three things:
+Per Developer Contract in utils/observability/__init__.py §4.3.b: the wrapper does three things:
 1. Binds the activity's declared inputs by name.
 2. Calls the underlying logic.
 3. On success records the output; on failure records the error and re-raises.
@@ -66,9 +66,9 @@ def activity(name: Optional[str] = None) -> Callable[[F], F]:
             - On exception: records error (NEVER truncated), status=FAILED, then RE-RAISES.
         - Sync and async functions supported (dispatch via inspect.iscoroutinefunction).
 
-    Per convention Developer Rule #2: "Pass the accumulator forward." The
+    Per Developer Contract in utils/observability/__init__.py §4.3.b: "Pass the accumulator forward." The
     decorator reads the accumulator from the ContextVar, not from kwargs.
-    Per convention Developer Rule #3: "The wrapper never swallows exceptions."
+    Per Developer Contract in utils/observability/__init__.py §4.3.b: "The wrapper never swallows exceptions."
     """
     def decorator(func: F) -> F:
         activity_name = name or func.__name__

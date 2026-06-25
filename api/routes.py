@@ -207,7 +207,7 @@ async def create_job_sync(req: SyncJobRequest, request: Request):
         job_completion_registry.cleanup(job_id)
 
         # When capture_lineage was requested, wrap the result per the
-        # convention's LineageReport shape (§4.3.e):
+        # Developer Contract's LineageReport shape (§4.3.e, in utils/observability/__init__.py):
         # {business_response_snapshot, lineage, summary}
         lineage_report = terminal.get("lineage")
         if req.capture_lineage and lineage_report is not None:

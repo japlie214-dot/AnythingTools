@@ -72,8 +72,20 @@ async def _init_backup_step() -> None:
 async def _staging_wipe_step() -> None:
     """Wipe staging tables on startup when staging mode is on.
 
-    Runs before any migrations or sync operations so that staging
-    starts clean. Best-effort: failures are logged WARNING, never block startup.
+    Runs BEFORE _init_backup_step (which calls CloudEngine.startup() →
+    reconcile_types() → rebuild_table(), the last of which REPOPULATES
+    staging tables from SQLite). Wiping AFTER _init_backup_step would
+    TRUNCATE the freshly-repopulated rows — destructive. The wipe MUST
+    stay before _init_backup_step.
+
+    The Snowflake wipe uses a discrete, locally-constructed CloudEngine
+    (disposed after the wipe) because the global _global_sync_engine is
+    not yet initialized at this point in the startup sequence. Constructing
+    a fresh CloudEngine from BackupSettings() is the idiomatic way to
+    obtain a short-lived Snowflake connection pool.
+    Ref: https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-connect
+
+    Best-effort: failures are logged WARNING, never block startup.
     """
     from config import DATABASE_STAGING_ENABLED, DATABASE_STAGING_WIPE_ON_STARTUP
     from utils.logger import get_dual_logger
@@ -84,7 +96,10 @@ async def _staging_wipe_step() -> None:
 
     from database.backup.staging import StagingWipeService
 
-    # Wipe SQLite staging tables
+    # ─── SQLite wipe ───────────────────────────────────────────────────
+    # SQLite wipe runs first. The connection is staging-aware (diverts to
+    # data/staging/sumanal.db when DATABASE_STAGING_ENABLED=true) via
+    # DatabaseManager.create_write_connection() → _resolve_db_path().
     sqlite_result = StagingWipeService.wipe_sqlite()
     log.dual_log(
         tag="Startup:StagingWipe:SQLite",
@@ -93,17 +108,56 @@ async def _staging_wipe_step() -> None:
         payload=sqlite_result,
     )
 
-    # Wipe Snowflake staging tables (if CloudEngine is initialized)
+    # ─── Snowflake wipe ────────────────────────────────────────────────
+    # Construct a discrete CloudEngine locally. The global _global_sync_engine
+    # is NOT yet initialized (this step runs before _init_backup_step).
+    # The local engine is disposed after the wipe to release the Snowflake
+    # connection pool. _init_backup_step will construct its own CloudEngine
+    # later — acceptable startup cost.
+    #
+    # We construct via BackupSettings() (not CloudBackupSettings directly)
+    # because BackupSettings reads env vars with the BACKUP_ prefix and
+    # composes the cloud + sync settings the CloudEngine constructor expects.
+    # Ref: database/backup/settings.py:40-56 (BackupSettings composes cloud + sync)
+    # Ref: database/backup/engine/cloud_engine.py:31-33 (CloudEngine.__init__ takes cloud + cb_settings)
     try:
-        from database.backup.engine.cloud_engine import _global_cloud_engine
-        if _global_cloud_engine and _global_cloud_engine.engine:
-            sf_result = StagingWipeService.wipe_snowflake(_global_cloud_engine)
+        from config import DATABASE_INTEGRATION_ENABLED
+        if not getattr(DATABASE_INTEGRATION_ENABLED, "__bool__", lambda: True)() or not DATABASE_INTEGRATION_ENABLED:
+            # Cloud integration disabled — skip Snowflake wipe.
             log.dual_log(
-                tag="Startup:StagingWipe:Snowflake",
-                message=f"Snowflake staging wipe complete: {len(sf_result)} tables",
+                tag="Startup:StagingWipe:Snowflake:Skipped",
+                message="DATABASE_INTEGRATION_ENABLED=false — skipping Snowflake staging wipe",
                 level="INFO",
-                payload=sf_result,
             )
+        else:
+            from database.backup.settings import BackupSettings
+            from database.backup.engine.cloud_engine import CloudEngine
+            settings = BackupSettings()
+            if not settings.cloud.enabled:
+                log.dual_log(
+                    tag="Startup:StagingWipe:Snowflake:Skipped",
+                    message="BACKUP_CLOUD_ENABLED=false — skipping Snowflake staging wipe",
+                    level="INFO",
+                )
+            else:
+                # Construct a short-lived CloudEngine. The constructor
+                # initializes the SQLAlchemy engine pool, loads the private
+                # key, and registers session-recovery listeners — same as
+                # the global one constructed later in _init_backup_step.
+                cloud_engine = CloudEngine(settings.cloud, settings.sync)
+                try:
+                    if cloud_engine.engine is not None:
+                        sf_result = StagingWipeService.wipe_snowflake(cloud_engine)
+                        log.dual_log(
+                            tag="Startup:StagingWipe:Snowflake",
+                            message=f"Snowflake staging wipe complete: {len(sf_result)} tables",
+                            level="INFO",
+                            payload=sf_result,
+                        )
+                finally:
+                    # Release the Snowflake connection pool. _init_backup_step
+                    # will construct its own CloudEngine; this one is not reused.
+                    cloud_engine.shutdown()
     except Exception as e:
         log.dual_log(
             tag="Startup:StagingWipe:Snowflake:Failed",

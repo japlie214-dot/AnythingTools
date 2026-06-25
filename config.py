@@ -130,8 +130,8 @@ SYNC_MAX_CONCURRENT_JOBS: int = int(os.getenv("SYNC_MAX_CONCURRENT_JOBS", "20"))
 
 # --- Activity-Driven Observability Configuration ---
 # Per-key character cap for lineage inputs/outputs. Default 50,000 per the
-# convention. Override only with explicit justification.
-# Ref: convention §4.3.d rule #1
+# Developer Contract. Override only with explicit justification.
+# Ref: Developer Contract in utils/observability/__init__.py §4.3.d
 LINEAGE_MAX_STRING_CHARS: int = int(os.getenv("LINEAGE_MAX_STRING_CHARS", "50000"))
 
 # Maximum activities recorded per job. Beyond this, activities are dropped

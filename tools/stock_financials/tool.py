@@ -275,22 +275,13 @@ class StockFinancialsTool(BaseTool):
         if not records:
             return json.dumps({"error": f"No records found for {inst.ticker} {inst.statement_type}."}, ensure_ascii=False, default=str)
         typed = [SFFactRecord.model_validate(r) for r in records]
-        
         facts = [r.model_dump() for r in typed]
-        md_content = self._build_query_markdown(inst.ticker, inst.statement_type, inst.concept, typed)
-        try:
-            art_path = write_artifact(self.name, job_id, "query_result", "md", md_content)
-            markdown_path = str(art_path)
-            self._last_artifacts = [markdown_path]
-        except Exception:
-            markdown_path = None
 
         return json.dumps({
             "ticker": inst.ticker,
             "statement_type": inst.statement_type,
             "concept_filter": inst.concept,
             "facts": facts,
-            "markdown_path": markdown_path,
         }, ensure_ascii=False, default=str)
 
 

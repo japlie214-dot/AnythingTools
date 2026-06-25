@@ -27,7 +27,7 @@ from utils.id_generator import ULID
 from utils.context_helpers import spawn_thread_with_context
 from tools.registry import REGISTRY
 from tools.base import ToolError, ToolValidationError
-from bot.engine.health import InlineHealthChecker, StateTransitionViolation, TERMINAL_STATUSES
+from bot.engine.state_guard import InlineStateGuard, StateTransitionViolation, TERMINAL_STATUSES
 from bot.engine.completion_registry import job_completion_registry
 
 log = get_dual_logger(__name__)
@@ -43,7 +43,7 @@ class UnifiedWorkerManager:
     def __init__(
         self,
         poll_interval: float = 1.0,
-        health_checker: InlineHealthChecker | None = None,
+        state_guard: InlineStateGuard | None = None,
     ):
         import collections
         self.poll_interval = poll_interval
@@ -52,9 +52,9 @@ class UnifiedWorkerManager:
         self._active_jobs: Dict[str, threading.Thread] = {}
         self._system_errors = collections.defaultdict(int)
         self.cancellation_flags: Dict[str, threading.Event] = {}
-        # Inline health checker — validates state transitions and result
+        # Inline state guard — validates state transitions and result
         # payloads at runtime. Exceptions propagate (fail fast).
-        self._health = health_checker or InlineHealthChecker()
+        self._state_guard = state_guard or InlineStateGuard()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -96,7 +96,7 @@ class UnifiedWorkerManager:
                     args = {}
 
                 # Validate QUEUED -> RUNNING transition BEFORE writing.
-                self._health.check_state_transition(job_id, status, "RUNNING")
+                self._state_guard.check_state_transition(job_id, status, "RUNNING")
 
                 ts = now_iso()
                 enqueue_write(
@@ -214,10 +214,10 @@ class UnifiedWorkerManager:
 
             # Validate terminal result BEFORE committing.
             # Per Pushback 4: validator exceptions propagate (fail fast).
-            self._health.check_terminal_result(job_id, normal)
+            self._state_guard.check_terminal_result(job_id, normal)
 
             # Validate RUNNING -> terminal transition.
-            self._health.check_state_transition(job_id, "RUNNING", status_str)
+            self._state_guard.check_state_transition(job_id, "RUNNING", status_str)
 
             # Serialize. Exception messages are NEVER truncated — they are
             # the LLM's diagnostic lifeline. SQLite TEXT has no length limit.
@@ -281,7 +281,7 @@ class UnifiedWorkerManager:
             # Validate the log entry's payload signature.
             # Per Pushback 2: real I/O inspection, not pure assertion.
             try:
-                self._health.check_log_payload(job_id, terminal_log_entry)
+                self._state_guard.check_log_payload(job_id, terminal_log_entry)
             except StateTransitionViolation:
                 # Log payload validation failure is non-fatal (the job is
                 # already terminal). Log at ERROR but don't change the status.
@@ -432,10 +432,10 @@ class UnifiedWorkerManager:
             "job_id": job_id,
             "status": status,
             "result": None,
-        "error": error_msg,
-        "tool_name": tool_name,
-        "lineage": lineage_report,
-    })
+            "error": error_msg,
+            "tool_name": tool_name,
+            "lineage": lineage_report,
+        })
 
 
 _manager = UnifiedWorkerManager()

@@ -26,7 +26,7 @@ from utils.observability.masking import serialize_safe, DEFAULT_MAX_CHARS
 class ActivityRecord(BaseModel):
     """A single activity's record in the lineage.
 
-    Per convention §4.3.a:
+    Per Developer Contract in utils/observability/__init__.py §4.3.a:
     - activity_name: verb-phrase (e.g., "Validate StockFinancialsInput")
     - status: PASSED or FAILED
     - inputs: named-parameter-bound inputs, truncated/masked
@@ -44,7 +44,7 @@ class ActivityRecord(BaseModel):
 
 
 class LineageReport(BaseModel):
-    """The verification artifact. Per convention §4.3.e:
+    """The verification artifact. Per Developer Contract in utils/observability/__init__.py §4.3.e:
 
     - summary: overall status + counts
     - lineage: ordered list of ActivityRecords
@@ -147,7 +147,7 @@ class ActivityAccumulator:
         """Explicitly register a failure for activities that catch exceptions
         internally and return a default value.
 
-        Per convention Developer Rule #3: "If an activity catches an exception
+        Per Developer Contract in utils/observability/__init__.py §4.3.b: "If an activity catches an exception
         internally, it must either re-raise it OR register the failure status
         cleanly to the accumulator."
 
@@ -164,7 +164,7 @@ class ActivityAccumulator:
 
         The business_response is the tool's return value (already parsed by
         the worker). It is included as business_response_snapshot per the
-        convention's LineageReport shape.
+        Developer Contract in utils/observability/__init__.py §4.3.e LineageReport shape.
 
         This method NEVER raises.
         """

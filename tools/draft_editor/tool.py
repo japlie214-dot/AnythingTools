@@ -46,7 +46,7 @@ class DraftEditorTool(BaseTool):
     # --- Activity-decomposed sub-methods ---
     # Each method raises on failure (never swallows). The @activity decorator
     # records PASSED on return, FAILED on raise, then re-raises.
-    # Per convention Developer Rule #3: "No catch-all swallowing."
+    # Per Developer Contract in utils/observability/__init__.py §4.3.b: "No catch-all swallowing."
 
     @activity("Validate Batch ID")
     def _validate_batch_id(self, args: dict, job_id: str) -> str:
