@@ -88,24 +88,19 @@ class StockNotesTool(BaseTool):
                 next_steps="Ensure valid accession_no and EDGAR connectivity.",
             ) from e
 
-    @activity("Build Discover Markdown")
-    def _build_discover_markdown(self, ticker: str, filings: list) -> str:
-        """Build the discover results markdown table."""
-        lines = [f"# Filings for {ticker} ({len(filings)} found, newest first)\n"]
-        lines.append("| # | Form | Filing Date | Period | Quarter | Accession No |")
-        lines.append("|---|------|-------------|--------|---------|--------------|")
-        for i, f in enumerate(filings):
-            quarter_str = f"Q{f['quarter']} FY{f['year']}" if f.get("quarter") else "N/A"
-            lines.append(
-                f"| {i+1} | {f['form']} | {f['filing_date']} | "
-                f"{f.get('period_of_report', 'N/A')} | {quarter_str} | {f['accession_no']} |"
-            )
-        lines.append(f"\nUse `note` command with instructions `{{\"accession_no\": \"<accession_no>\"}}` to list notes.")
-        return "\n".join(lines)
+    @activity("Build Discover Payload")
+    def _build_discover_payload(self, ticker: str, filings: list) -> dict:
+        """Build JSON payload for discover command."""
+        return {
+            "ticker": ticker,
+            "count": len(filings),
+            "filings": filings,
+            "next_step_hint": 'Use "note" command with instructions {"accession_no": "<accession_no>"}.',
+        }
 
-    @activity("Build Note Markdown")
-    def _build_note_markdown(self, accession_no: str, filing_row: tuple, note_number: int | None, conn) -> str:
-        """Build the note listing or detail markdown. Returns markdown string."""
+    @activity("Build Note Payload")
+    def _build_note_payload(self, accession_no: str, filing_row: tuple, note_number: int | None, conn, job_id: str) -> dict:
+        """Build JSON payload for note command."""
         f_ticker, f_form, f_company, f_period, f_quarter, f_year, f_fye = filing_row
         from .detail_manager import build_concept_catalog, get_date_range_for_filing
 
@@ -116,14 +111,9 @@ class StockNotesTool(BaseTool):
                 (accession_no,),
             ).fetchall()
             if not notes:
-                return f"No notes found in filing {accession_no}."
+                return {"error": f"No notes found in filing {accession_no}."}
 
-            lines = [
-                f"# Notes in {f_form} Filing: {f_company} ({f_ticker})",
-                f"**Accession:** {accession_no} | **Period:** {f_period} | Q{f_quarter} FY{f_year}\n",
-                "| Note# | Title | Tables | Details | Q Status | Concepts Preview |",
-                "|-------|-------|--------|---------|----------|------------------|",
-            ]
+            notes_list = []
             for n in notes:
                 concept_str = ""
                 if n[4] > 0:
@@ -135,10 +125,16 @@ class StockNotesTool(BaseTool):
                     ).fetchall()
                     if concepts:
                         concept_str = ", ".join(c[0].replace("us-gaap:", "") for c in concepts)
-                lines.append(f"| {n[0]} | {n[1]} | {n[3]} | {n[4]} | {n[5]} | {concept_str} |")
-            return "\n".join(lines)
+                notes_list.append({
+                    "number": n[0], "title": n[1], "short_name": n[2],
+                    "tables": n[3], "details": n[4], "status": n[5], "concepts_preview": concept_str
+                })
+            return {
+                "ticker": f_ticker, "company": f_company, "accession": accession_no,
+                "form": f_form, "period": f_period, "quarter": f_quarter, "year": f_year,
+                "notes": notes_list
+            }
 
-        # Specific note detail
         note_row = conn.execute(
             "SELECT note_number, title, short_name, narrative_text, expands, expands_statements, "
             "table_count, details_count, quarterly_status "
@@ -149,7 +145,7 @@ class StockNotesTool(BaseTool):
             raise ToolExecutionError(
                 f"Note {note_number} not found",
                 tool_name=self.name,
-                job_id=self.job_id if hasattr(self, 'job_id') else None,
+                job_id=job_id,
                 next_steps="Check available notes.",
             )
 
@@ -161,64 +157,65 @@ class StockNotesTool(BaseTool):
             (accession_no, note_number),
         ).fetchall()
 
-        lines = [
-            f"# Note {n_num}: {n_title}",
-            f"**Company:** {f_company} ({f_ticker})",
-            f"**Accession:** {accession_no} | **Form:** {f_form}",
-            f"**Quarter:** Q{f_quarter} FY{f_year} | **Status:** {n_q_status}",
-            f"**Tables:** {n_tbl_count} | **Details:** {n_dt_count} | **Detail Tables:** {len(dts)}",
-        ]
-        if n_expands:
-            try:
-                expands = json.loads(n_expands)
-                if expands:
-                    lines.append(f"**Expands:** {', '.join(str(e) for e in expands[:5])}")
-            except Exception:
-                pass
+        narrative_path = None
         if n_narrative:
-            display_narrative = n_narrative if len(n_narrative) <= 200000 else n_narrative[:200000] + "\n\n...[Truncated. See Artifact for full text]."
-            lines.append(f"\n## Narrative\n\n{display_narrative}")
-        else:
-            lines.append("\n*No narrative content available.*")
+            try:
+                art_path = write_artifact(self.name, job_id, "narrative", "md", n_narrative)
+                narrative_path = str(art_path)
+                self._last_artifacts = [narrative_path]
+            except Exception as e:
+                log.dual_log(tag="StockNotes:NarrativeArtifact:Failed", message=f"Failed to write narrative artifact: {e}", level="WARNING", payload={"error": str(e)})
 
+        catalog = None
         if dts:
             catalog = build_concept_catalog(f_ticker, accession_no, note_number)
-            start_date, end_date = get_date_range_for_filing(accession_no)
-            if catalog:
-                lines.append(f"\n## Concept Catalog ({len(catalog)} queryable concepts)\n")
-                lines.append("| # | Concept | Label | Axis | Member | Periods | Range |")
-                lines.append("|---|---------|-------|------|--------|---------|-------|")
-                for ci, entry in enumerate(catalog, 1):
-                    axis_short = entry.get("dimension_axis", "").replace("us-gaap:", "").replace("Axis", "") if entry.get("dimension_axis") else "\u2014"
-                    member = entry.get("dimension_member_label") or "\u2014"
-                    er = entry.get("earliest_period", "")[:7] if entry.get("earliest_period") else "?"
-                    lr = entry.get("latest_period", "")[:7] if entry.get("latest_period") else "?"
-                    pc = entry.get("period_count", "?")
-                    lines.append(f"| {ci} | `{entry['concept']}` | {entry['label']} | {axis_short} | {member} | {pc} | {er} \u2192 {lr} |")
-            else:
-                lines.append("\n*No queryable concepts found in this note.*")
-        else:
-            lines.append("\n*No detail concepts found for this note.*")
 
-        return "\n".join(lines)
+        return {
+            "note": {
+                "number": n_num, "title": n_title, "short_name": n_short,
+                "narrative_path": narrative_path, "expands": n_expands,
+                "tables": n_tbl_count, "details": n_dt_count, "status": n_q_status
+            },
+            "company": f_company, "ticker": f_ticker, "accession": accession_no,
+            "form": f_form, "quarter": f_quarter, "year": f_year,
+            "concept_catalog": catalog,
+            "detail_tables": [d[0] for d in dts]
+        }
 
     @activity("Query Concept Details")
     def _query_concept_details(self, ticker: str, concept: str, start_date: str | None, end_date: str | None) -> list:
         """Query tidy table for concept details. Returns records or raises ValueError."""
         from .detail_manager import query_tidy_table
-        return query_tidy_table(ticker, concept, start_date, end_date)
+        try:
+            return query_tidy_table(ticker, concept, start_date, end_date)
+        except ValueError as e:
+            raise ToolExecutionError(
+                f"Invalid date format in details query: {e}",
+                tool_name=self.name,
+                next_steps="Use YYYY-MM format for start_date and end_date (e.g., '2023-01').",
+            ) from e
 
-    @activity("Build Details Markdown")
-    def _build_details_markdown(self, concept: str, ticker: str, records: list, start_date: str | None, end_date: str | None, job_id: str) -> str:
-        """Build the concept details markdown table."""
+    @activity("Build Details Payload")
+    def _build_details_payload(self, concept: str, ticker: str, records: list, start_date: str | None, end_date: str | None, job_id: str) -> dict:
+        """Build JSON payload for details command."""
         from .detail_manager import format_as_markdown_table
         md_table = format_as_markdown_table(records, f"Time Series: {concept}")
-        art_path = write_artifact(self.name, job_id, "detail_table", "md", md_table)
-        lines = [f"# Concept Details: {concept} ({ticker})", f"**Records:** {len(records)}"]
-        if start_date and end_date:
-            lines.append(f"**Date range:** {start_date} to {end_date}")
-        lines.extend(["", md_table])
-        return "\n".join(lines)
+        try:
+            art_path = write_artifact(self.name, job_id, "detail_table", "md", md_table)
+            detail_table_path = str(art_path)
+            self._last_artifacts = [detail_table_path]
+        except Exception as e:
+            log.dual_log(tag="StockNotes:DetailArtifact:Failed", message=f"Failed to write detail artifact: {e}", level="WARNING", payload={"error": str(e)})
+            detail_table_path = None
+
+        return {
+            "concept": concept,
+            "ticker": ticker,
+            "records": records,
+            "record_count": len(records),
+            "date_range": {"start": start_date, "end": end_date},
+            "detail_table_path": detail_table_path,
+        }
 
     async def run(self, args: dict[str, Any], telemetry: Any, **kwargs) -> str:
         job_id = kwargs.get("job_id", "")
@@ -244,8 +241,8 @@ class StockNotesTool(BaseTool):
                     job_id=job_id,
                     next_steps="Verify the ticker.",
                 )
-            # Step 3: Build markdown.
-            return self._build_discover_markdown(ticker, filings)
+            # Step 3: Build payload.
+            return json.dumps(self._build_discover_payload(ticker, filings), ensure_ascii=False, default=str)
 
         elif cmd == "note":
             from database.connection import DatabaseManager
@@ -297,8 +294,8 @@ class StockNotesTool(BaseTool):
                     next_steps="Try the discover command first.",
                 )
 
-            # Step 3: Build note markdown.
-            return self._build_note_markdown(accession_no, filing_row, note_number, conn)
+            # Step 3: Build note payload.
+            return json.dumps(self._build_note_payload(accession_no, filing_row, note_number, conn, job_id), ensure_ascii=False, default=str)
 
         elif cmd == "details":
             if not ticker or not concept:
@@ -317,5 +314,5 @@ class StockNotesTool(BaseTool):
                     job_id=job_id,
                     next_steps="Adjust date range or extract notes first.",
                 )
-            # Step 3: Build details markdown.
-            return self._build_details_markdown(concept, ticker, records, start_date, end_date, job_id)
+            # Step 3: Build details payload.
+            return json.dumps(self._build_details_payload(concept, ticker, records, start_date, end_date, job_id), ensure_ascii=False, default=str)

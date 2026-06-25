@@ -15,6 +15,7 @@ import json
 import queue
 import threading
 import time
+from database.backup.staging import staging_table_name
 from dataclasses import dataclass
 from typing import Optional, List, Any, Union, Tuple
 from sqlalchemy import text
@@ -282,12 +283,14 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
                         if pk_vals:
                             placeholders = ",".join([f":p{i}" for i in range(len(pk_vals))])
                             params = {f"p{i}": val for i, val in enumerate(pk_vals)}
-                            conn.execute(text(f"DELETE FROM {schema}.{table_name} WHERE {pk_col} IN ({placeholders})"), params)
+                            stn = staging_table_name(table_name)
+                            conn.execute(text(f"DELETE FROM {schema}.{stn} WHERE {pk_col} IN ({placeholders})"), params)
                     else:
                         for r in records:
                             conds = " AND ".join([f"{c} = :{c}" for c in pk_cols])
                             params = {c: r[c] for c in pk_cols if c in r}
-                            conn.execute(text(f"DELETE FROM {schema}.{table_name} WHERE {conds}"), params)
+                            stn = staging_table_name(table_name)
+                            conn.execute(text(f"DELETE FROM {schema}.{stn} WHERE {conds}"), params)
                     BackupMetricsCollector.record_flush(True)
                     continue
 
@@ -354,8 +357,9 @@ def _flush_batch(cloud_engine, batch_buffer: dict, _retry_depth: int = 0):
                     merge_on = " AND ".join([f"t.{c} = s.{c}" for c in pk_cols])
                     update_set = ", ".join([f"t.{c} = s.{c}" for c in columns if c not in pk_cols])
                     
+                    stn = staging_table_name(table_name)
                     merge_sql = f"""
-                    MERGE INTO {schema}.{table_name} t
+                    MERGE INTO {schema}.{stn} t
                     USING {schema}.{stage_table} s
                     ON {merge_on}
                     WHEN MATCHED THEN UPDATE SET {update_set}

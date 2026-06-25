@@ -69,7 +69,61 @@ async def _init_backup_step() -> None:
 #
 # Keep these semantics in mind when modifying startup/shutdown orchestration.
 
+async def _staging_wipe_step() -> None:
+    """Wipe staging tables on startup when staging mode is on.
+
+    Runs before any migrations or sync operations so that staging
+    starts clean. Best-effort: failures are logged WARNING, never block startup.
+    """
+    from config import DATABASE_STAGING_ENABLED, DATABASE_STAGING_WIPE_ON_STARTUP
+    from utils.logger import get_dual_logger
+    log = get_dual_logger(__name__)
+
+    if not DATABASE_STAGING_ENABLED or not DATABASE_STAGING_WIPE_ON_STARTUP:
+        return
+
+    from database.backup.staging import StagingWipeService
+
+    # Wipe SQLite staging tables
+    sqlite_result = StagingWipeService.wipe_sqlite()
+    log.dual_log(
+        tag="Startup:StagingWipe:SQLite",
+        message=f"SQLite staging wipe complete: {len(sqlite_result)} tables",
+        level="INFO",
+        payload=sqlite_result,
+    )
+
+    # Wipe Snowflake staging tables (if CloudEngine is initialized)
+    try:
+        from database.backup.engine.cloud_engine import _global_cloud_engine
+        if _global_cloud_engine and _global_cloud_engine.engine:
+            sf_result = StagingWipeService.wipe_snowflake(_global_cloud_engine)
+            log.dual_log(
+                tag="Startup:StagingWipe:Snowflake",
+                message=f"Snowflake staging wipe complete: {len(sf_result)} tables",
+                level="INFO",
+                payload=sf_result,
+            )
+    except Exception as e:
+        log.dual_log(
+            tag="Startup:StagingWipe:Snowflake:Failed",
+            message=f"Snowflake staging wipe failed (non-blocking): {e}",
+            level="WARNING",
+            payload={"error": str(e)},
+        )
+
 async def _sync_from_backup_step() -> None:
+    from config import DATABASE_STAGING_ENABLED
+    if DATABASE_STAGING_ENABLED:
+        from utils.logger import get_dual_logger
+        log = get_dual_logger(__name__)
+        log.dual_log(
+            tag="Startup:SyncFromBackup:StagingSkip",
+            message="Staging mode — skipping sync_from_backup",
+            level="INFO",
+        )
+        return
+
     from utils.logger import get_dual_logger
     import asyncio
     log = get_dual_logger(__name__)
@@ -113,6 +167,7 @@ async def run_startup(app_instance=None) -> StartupContext:
     ])
 
     # Tier 2: Dependent Database logic (Sequential)
+    orchestrator.add_sequential("staging_wipe", _staging_wipe_step)
     orchestrator.add_sequential("run_db_migrations", run_db_migrations)
     orchestrator.add_sequential("validate_vec0", validate_vec0)
     orchestrator.add_sequential("init_backup", _init_backup_step)

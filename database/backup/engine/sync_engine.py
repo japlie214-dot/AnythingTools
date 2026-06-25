@@ -225,6 +225,15 @@ class SyncEngine:
             )
     
     def sync_startup(self) -> SyncDecision:
+        from config import DATABASE_STAGING_ENABLED
+        if DATABASE_STAGING_ENABLED:
+            log.dual_log(
+                tag="Backup:Sync:StagingSkip",
+                message="Staging mode — skipping sync_startup",
+                level="INFO",
+            )
+            return SyncDecision(action="skip", reason="staging mode - sync disabled")
+
         """Smart startup orchestration.
 
         This routine intentionally runs during process startup and may make
@@ -310,6 +319,15 @@ class SyncEngine:
         return UserConfirmationHandler.hitl_prompt_sync_strategy(metrics)
 
     def sync_all(self, mode: str = "delta") -> dict:
+        from config import DATABASE_STAGING_ENABLED
+        if DATABASE_STAGING_ENABLED:
+            log.dual_log(
+                tag="Backup:Sync:StagingSkip",
+                message="Staging mode — skipping sync_all",
+                level="INFO",
+            )
+            return {"skipped": True, "reason": "staging mode"}
+
         """Sync operational DB directly to Snowflake (no backup.db intermediary)."""
         from database.connection import DB_PATH, DatabaseManager
         

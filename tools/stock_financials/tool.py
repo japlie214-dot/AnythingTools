@@ -60,7 +60,6 @@ KEY_CONCEPTS: Dict[str, Dict[str, str]] = {
 }
 
 SUMMARY_QUARTERS_SHOWN = 4
-SUMMARY_CHAR_BUDGET = 18_000
 
 
 def _extract_currency_code(unit: str) -> str | None:
@@ -163,21 +162,47 @@ class StockFinancialsTool(BaseTool):
         ).fetchall()
         return {r["statement_type"]: {"rows": r["r_count"], "quarters": r["q_count"], "latest": r["latest"]} for r in rows}
 
-    @activity("Build Status Markdown")
-    def _build_status_markdown(self, ticker: str, per_statement: dict) -> str:
-        """Build the status markdown summary."""
-        if not per_statement:
-            return f"No cached data for **{ticker}**. Run `extract` first."
+    @activity("Build Status Payload")
+    def _build_status_payload(self, ticker: str, per_statement: dict) -> dict:
+        """Build JSON payload for status command."""
         available_concepts = {stype: query_concepts(ticker, stype) for stype in per_statement.keys()}
-        lines = [f"#### Cache Status for **{ticker}**", "", "| Statement | Rows | Quarters | Latest |", "|---|---|---|---|"]
-        for stype, info in per_statement.items():
-            lines.append(f"| {STATEMENT_TYPES.get(stype, stype)} | {info.get('rows', 0)} | {info.get('quarters', 0)} | `{info.get('latest', '—')}` |")
-        return "\n".join(lines)
+        return {
+            "ticker": ticker,
+            "per_statement": per_statement,
+            "available_concepts": available_concepts,
+        }
 
-    @activity("Build Extract Markdown")
-    def _build_extract_markdown_activity(self, ticker: str, company_name: str, quarters_requested: int, quarters_cached: int, cache_hit: bool, refresh: bool, rows: list, available_concepts: dict) -> str:
-        """Build the extract markdown summary."""
-        return self._build_extract_markdown(ticker, company_name, quarters_requested, quarters_cached, cache_hit, refresh, rows, available_concepts)
+    @activity("Build Extract Payload")
+    def _build_extract_payload(self, ticker: str, company_name: str, quarters_requested: int, quarters_cached: int, cache_hit: bool, refresh: bool, rows: list, available_concepts: dict) -> dict:
+        """Build JSON payload for extract command."""
+        from collections import defaultdict
+        coverage = defaultdict(lambda: {"rows": 0, "quarters": set(), "latest": None})
+        for row in rows:
+            stype = row.get("statement_type", "unknown")
+            coverage[stype]["rows"] += 1
+            q = row.get("quarter")
+            if q:
+                coverage[stype]["quarters"].add(q)
+                if coverage[stype]["latest"] is None or q > coverage[stype]["latest"]:
+                    coverage[stype]["latest"] = q
+
+        coverage_json = {}
+        for stype, info in coverage.items():
+            coverage_json[stype] = {
+                "rows": info["rows"],
+                "quarters": len(info["quarters"]),
+                "latest": info["latest"],
+            }
+
+        return {
+            "ticker": ticker,
+            "company_name": company_name,
+            "quarters_cached": quarters_cached,
+            "cache_hit": cache_hit,
+            "refresh": refresh,
+            "coverage": coverage_json,
+            "available_concepts": available_concepts,
+        }
 
     # --- Entry point ---
 
@@ -229,102 +254,60 @@ class StockFinancialsTool(BaseTool):
         df = pd.DataFrame(rows)
         csv_path = write_artifact(self.name, job_id, f"{ticker}_financials", "csv", df.to_csv(index=False))
 
-        # Step 5: Build extract markdown.
-        md = self._build_extract_markdown_activity(
+        # Step 5: Build extract payload.
+        payload = self._build_extract_payload(
             ticker, company_name, quarters,
             len({r["quarter"] for r in rows}),
             cache_hit, refresh, rows, available_concepts
         )
+        # Note: CSV artifact is already written via write_artifact at line 230.
+        # We can include the path in the payload for convenience.
+        payload["csv_path"] = csv_path
 
         await telemetry(self.status("Extraction complete", "COMPLETED"))
-        return md
+        return json.dumps(payload, ensure_ascii=False, default=str)
 
-    def _build_extract_markdown(self, ticker: str, company_name: str, quarters_requested: int, quarters_cached: int, cache_hit: bool, refresh: bool, rows: list, available_concepts: dict) -> str:
-        action = "cache hit:" if cache_hit else ("Refreshed" if refresh else "Extracted")
-        lines = [f"**{ticker}** ({company_name}) — {action} {quarters_cached} quarters.\n"]
-
-        import pandas as pd
-        df = pd.DataFrame(rows)
-        if "statement_type" in df.columns:
-            lines.extend(["", "#### Coverage", "| Statement | Rows | Quarters | Latest |", "|---|---|---|---|"])
-            for stype in ["income", "balance", "cashflow"]:
-                sdf = df[df["statement_type"] == stype]
-                if sdf.empty: continue
-                lines.append(f"| {STATEMENT_TYPES.get(stype, stype)} | {len(sdf)} | {int(sdf['quarter'].nunique())} | `{str(sdf['quarter'].max()) if not sdf.empty else '—'}` |")
-
-        for stype in ["income", "balance", "cashflow"]:
-            sdf = df[df["statement_type"] == stype] if "statement_type" in df.columns else df.iloc[0:0]
-            if sdf.empty: continue
-            metrics = KEY_CONCEPTS.get(stype, {})
-            if not metrics: continue
-            lines.extend(["", f"#### Key {STATEMENT_TYPES.get(stype, stype)} Metrics"])
-            all_qs = sorted({q for q in sdf["quarter"]} if "quarter" in sdf.columns else [], reverse=True)[:SUMMARY_QUARTERS_SHOWN]
-            if not all_qs: continue
-            lines.extend(["| Metric | " + " | ".join(f"`{q}`" for q in all_qs) + " |", "|---|" + "|".join(["---"] * len(all_qs)) + "|"])
-            for concept_full, label in metrics.items():
-                c_data = sdf[sdf["concept"] == concept_full] if "concept" in sdf.columns else sdf.iloc[0:0]
-                if c_data.empty: continue
-                unit_val = str(c_data["unit"].iloc[0]) if "unit" in c_data.columns and not c_data["unit"].isna().all() else "USD"
-                row = [label]
-                for q in all_qs:
-                    qd = dict(zip(c_data["quarter"], c_data["numeric_value"])) if "quarter" in c_data.columns else {}
-                    row.append(format_value(qd.get(q), unit_val))
-                lines.append("| " + " | ".join(row) + " |")
-
-        md = "\n".join(lines)
-        return md[:SUMMARY_CHAR_BUDGET - 100] + "\n\n*[Truncated]*" if len(md) > SUMMARY_CHAR_BUDGET else md
 
     async def _handle_query(self, inst, job_id: str, telemetry: Any) -> str:
         from .models import SFFactRecord
         await telemetry(self.status(f"Querying {inst.ticker} {inst.statement_type}..."))
         records = await to_thread_with_context(query_facts, inst.ticker, inst.statement_type, inst.concept, inst.start_quarter, inst.end_quarter, inst.limit)
         if not records:
-            return f"No records found for **{inst.ticker}** `{inst.statement_type}`.\n\nRun `extract` first or use `catalog` to check concept spelling."
+            return json.dumps({"error": f"No records found for {inst.ticker} {inst.statement_type}."}, ensure_ascii=False, default=str)
         typed = [SFFactRecord.model_validate(r) for r in records]
-        md = self._build_query_markdown(inst.ticker, inst.statement_type, inst.concept, typed)
-        art_path = write_artifact(self.name, job_id, f"query_{inst.ticker}_{inst.statement_type}", "md", md)
-        return md
+        
+        facts = [r.model_dump() for r in typed]
+        md_content = self._build_query_markdown(inst.ticker, inst.statement_type, inst.concept, typed)
+        try:
+            art_path = write_artifact(self.name, job_id, "query_result", "md", md_content)
+            markdown_path = str(art_path)
+            self._last_artifacts = [markdown_path]
+        except Exception:
+            markdown_path = None
 
-    def _build_query_markdown(self, ticker: str, statement_type: str, concept_filter: str | None, rows: list) -> str:
-        if not rows:
-            return f"No records found for **{ticker}** `{statement_type}`."
-        lines = [f"Found **{len(rows)}** fact(s) for **{ticker}** ({STATEMENT_TYPES.get(statement_type, statement_type)})."]
-        concepts = list(dict.fromkeys(r.concept for r in rows))
-        quarters = sorted({r.quarter for r in rows}, reverse=True)[:8]
-        lines.extend(["", "| Concept | Label | " + " | ".join(f"`{q}`" for q in quarters) + " |", "|---|---|" + "|".join(["---"] * len(quarters)) + "|"])
-        idx = {(r.concept, r.quarter): r for r in rows}
-        for c in concepts:
-            sample = next((r for r in rows if r.concept == c), None)
-            if not sample: continue
-            row = [f"`{c}`", sample.label]
-            for q in quarters:
-                r = idx.get((c, q))
-                row.append(format_value(r.numeric_value if r else None, r.unit if r else "USD"))
-            lines.append("| " + " | ".join(row) + " |")
-        return "\n".join(lines)
+        return json.dumps({
+            "ticker": inst.ticker,
+            "statement_type": inst.statement_type,
+            "concept_filter": inst.concept,
+            "facts": facts,
+            "markdown_path": markdown_path,
+        }, ensure_ascii=False, default=str)
+
 
     async def _handle_status(self, inst, job_id: str, telemetry: Any) -> str:
-        from database.connection import DatabaseManager
-        from .query import query_concepts
         await telemetry(self.status(f"Checking cache status for {inst.ticker}..."))
-
-        # Step 2: Query cache status (activity-decorated).
         per_statement = self._query_cache_status(inst.ticker)
-
-        # Step 3: Build status markdown (activity-decorated).
-        md = self._build_status_markdown(inst.ticker, per_statement)
-        return md
+        return json.dumps(self._build_status_payload(inst.ticker, per_statement), ensure_ascii=False, default=str)
 
     async def _handle_catalog(self, inst, job_id: str, telemetry: Any) -> str:
         from .query import query_concepts
         await telemetry(self.status(f"Building concept catalog for {inst.ticker}..."))
         concepts = await to_thread_with_context(query_concepts, inst.ticker, inst.statement_type)
-        if not concepts:
-            return f"No concepts found for **{inst.ticker}**.\n\nRun `extract` first."
-        st_label = f" for {STATEMENT_TYPES.get(inst.statement_type, inst.statement_type)}" if inst.statement_type else ""
-        lines = [f"#### Concept Catalog for **{inst.ticker}**{st_label}", f"Found {len(concepts)} available concepts:", "", "`" + "`, `".join(concepts) + "`"]
-        md = "\n".join(lines)
-        return md[:SUMMARY_CHAR_BUDGET - 100] + "\n\n*[Truncated]*" if len(md) > SUMMARY_CHAR_BUDGET else md
+        return json.dumps({
+            "ticker": inst.ticker,
+            "statement_type": inst.statement_type,
+            "concepts": concepts,
+        }, ensure_ascii=False, default=str)
 
     def _fetch_rows(self, ticker: str) -> List[dict]:
         from database.connection import DatabaseManager

@@ -3,6 +3,7 @@ import json
 import struct
 import math
 from typing import List, Dict, Any, Tuple, Optional
+from database.backup.staging import staging_table_name
 from sqlalchemy import text
 from utils.logger import get_dual_logger
 
@@ -132,8 +133,9 @@ class VectorSync:
         ])
         insert_select = ", ".join([f"PARSE_JSON(s.{c})::{VECTOR_TYPE}" if c == "embedding" else f"s.{c}" for c in columns])
 
+        stn = staging_table_name(table_name)
         merge_sql = f"""
-        MERGE INTO {schema}.{table_name} t
+        MERGE INTO {schema}.{stn} t
         USING {schema}.{stage_table} s
         ON t.{pk_col} = s.{pk_col}
         WHEN MATCHED THEN UPDATE SET {update_sets}

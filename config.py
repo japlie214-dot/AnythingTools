@@ -15,6 +15,10 @@ _staging_enabled: bool = os.getenv(
 ).lower() in ("true", "1", "yes", "on")
 
 DATABASE_STAGING_ENABLED: bool = _staging_enabled
+# When true, TRUNCATE staging tables on app startup and shutdown.
+# Default true for local dev. Set false in cloud deployments to avoid
+# concurrent containers truncating each other's staging data.
+DATABASE_STAGING_WIPE_ON_STARTUP: bool = os.getenv("DATABASE_STAGING_WIPE_ON_STARTUP", "true").lower() in ("true", "1", "yes", "on")
 
 # The base operational DB path. If staging is enabled, the actual path
 # is resolved in database/connection.py to data/staging/sumanal.db.

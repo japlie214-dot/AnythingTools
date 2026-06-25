@@ -83,6 +83,37 @@ async def lifespan(app: FastAPI):
             await wait_for_writes()
             shutdown_writer()
 
+            # Staging Wipe on Shutdown
+            from config import DATABASE_STAGING_ENABLED, DATABASE_STAGING_WIPE_ON_STARTUP
+            if DATABASE_STAGING_ENABLED and DATABASE_STAGING_WIPE_ON_STARTUP:
+                from database.backup.staging import StagingWipeService
+                try:
+                    from database.backup.engine.cloud_engine import _global_cloud_engine
+                    if _global_cloud_engine and _global_cloud_engine.engine:
+                        sf_result = await asyncio.to_thread(
+                            StagingWipeService.wipe_snowflake, _global_cloud_engine
+                        )
+                        log.dual_log(
+                            tag="App:Shutdown:StagingWipe:Snowflake",
+                            message="Snowflake staging tables wiped on shutdown",
+                            level="INFO",
+                            payload=sf_result,
+                        )
+                except Exception as e:
+                    log.dual_log(
+                        tag="App:Shutdown:StagingWipe:Snowflake:Failed",
+                        message=f"Snowflake staging wipe on shutdown failed: {e}",
+                        level="WARNING",
+                        payload={"error": str(e)},
+                    )
+                sqlite_result = await asyncio.to_thread(StagingWipeService.wipe_sqlite)
+                log.dual_log(
+                    tag="App:Shutdown:StagingWipe:SQLite",
+                    message="SQLite staging tables wiped on shutdown",
+                    level="INFO",
+                    payload=sqlite_result,
+                )
+
             # Shutdown Backup V2
             try:
                 from utils.startup import _global_sync_engine
@@ -94,15 +125,19 @@ async def lifespan(app: FastAPI):
                     await asyncio.sleep(0.5)
 
                 if _global_sync_engine:
-                    log.dual_log(tag="App:Lifecycle:ShutdownSync", message="Running shutdown sync", level="INFO", payload={"phase": "shutdown_sync"})
-                    try:
-                        sync_result = await asyncio.wait_for(
-                            asyncio.to_thread(_global_sync_engine.sync_all, "delta"),
-                            timeout=30.0
-                        )
-                        log.dual_log(tag="App:Lifecycle:ShutdownSyncComplete", message="Shutdown sync completed", level="INFO", payload=sync_result)
-                    except asyncio.TimeoutError:
-                        log.dual_log(tag="App:Lifecycle:ShutdownSyncTimeout", message="Shutdown sync timed out", level="WARNING", payload={"timeout_s": 30.0})
+                    from config import DATABASE_STAGING_ENABLED
+                    if not DATABASE_STAGING_ENABLED:
+                        log.dual_log(tag="App:Lifecycle:ShutdownSync", message="Running shutdown sync", level="INFO", payload={"phase": "shutdown_sync"})
+                        try:
+                            sync_result = await asyncio.wait_for(
+                                asyncio.to_thread(_global_sync_engine.sync_all, "delta"),
+                                timeout=30.0
+                            )
+                            log.dual_log(tag="App:Lifecycle:ShutdownSyncComplete", message="Shutdown sync completed", level="INFO", payload=sync_result)
+                        except asyncio.TimeoutError:
+                            log.dual_log(tag="App:Lifecycle:ShutdownSyncTimeout", message="Shutdown sync timed out", level="WARNING", payload={"timeout_s": 30.0})
+                    else:
+                        log.dual_log(tag="App:Lifecycle:ShutdownSync", message="Staging mode — skipping shutdown sync", level="INFO", payload={"phase": "shutdown_sync"})
                     
                     _global_sync_engine.shutdown()
             except Exception as e:

@@ -2,6 +2,7 @@
 import sqlite3
 import time
 from sqlalchemy import text
+from database.backup.staging import staging_table_name
 from database.backup.schema_registry import BackupSchemaRegistry
 from database.management.migration_types import TypeMismatchPlan, ColumnMismatch
 from database.management.schema_introspector import (
@@ -33,7 +34,8 @@ class SnowflakeSchemaManager:
 
             expected_tables = BackupSchemaRegistry.get_expected_sqlite_tables()
             for t_name, ddl in expected_tables.items():
-                if t_name not in existing:
+                snowflake_t_name = staging_table_name(t_name)
+                if snowflake_t_name not in existing:
                     # Per Pushback 2: get_snowflake_ddl may raise RuntimeError
                     # if the sqlglot AST rewrite fails. We must NOT let one bad
                     # table abort the entire reconcile loop — the app would fail
@@ -46,13 +48,14 @@ class SnowflakeSchemaManager:
                     # until the lifespan has been run." An unhandled exception
                     # in startup prevents serving.
                     try:
-                        sf_ddl = BackupSchemaRegistry.get_snowflake_ddl(t_name)
+                        raw_ddl = BackupSchemaRegistry.get_snowflake_ddl(t_name)
+                        sf_ddl = raw_ddl.replace(f"TABLE {t_name} ", f"TABLE {snowflake_t_name} ", 1)
                         conn.execute(text(sf_ddl))
                         log.dual_log(
                             tag="Backup:Cloud:Schema",
-                            message=f"Created missing table {t_name}",
+                            message=f"Created missing table {snowflake_t_name}",
                             level="INFO",
-                            payload={"table": t_name},
+                            payload={"table": snowflake_t_name, "source_table": t_name},
                         )
                     except RuntimeError as e:
                         # DDL generation failed for this table. The
@@ -74,11 +77,12 @@ class SnowflakeSchemaManager:
                         continue
                 else:
                     SnowflakeSchemaManager._reconcile_columns(
-                        conn, t_name, ddl, existing[t_name]
+                        conn, t_name, ddl, existing[snowflake_t_name] if snowflake_t_name in existing else {}
                     )
 
     @staticmethod
     def _reconcile_columns(conn, t_name: str, ddl: str, existing_cols: dict):
+        snowflake_t_name = staging_table_name(t_name)
         sqlite_cols = _columns_from_ddl_in_memory(ddl, t_name)
         if sqlite_cols is None:
             if "vec0" in ddl.lower():
@@ -94,16 +98,16 @@ class SnowflakeSchemaManager:
             c_name = col.name.lower()
             desired_col_names.add(c_name)
             if c_name not in existing_cols:
-                SnowflakeSchemaManager._add_column(conn, t_name, c_name, col.type.upper())
+                SnowflakeSchemaManager._add_column(conn, snowflake_t_name, c_name, col.type.upper())
 
         cloud_col_names = set(existing_cols.keys())
         extra_cols = cloud_col_names - desired_col_names
         for c_name in extra_cols:
             try:
-                conn.execute(text(f"ALTER TABLE {t_name} DROP COLUMN {c_name}"))
-                log.dual_log(tag="Backup:Cloud:DropColumn", level="WARNING", message=f"Dropped unexpected column {c_name} from {t_name}", payload={"table": t_name, "column": c_name})
+                conn.execute(text(f"ALTER TABLE {snowflake_t_name} DROP COLUMN {c_name}"))
+                log.dual_log(tag="Backup:Cloud:DropColumn", level="WARNING", message=f"Dropped unexpected column {c_name} from {snowflake_t_name}", payload={"table": snowflake_t_name, "column": c_name})
             except Exception as e:
-                log.dual_log(tag="Backup:Cloud:DropColumnFailed", level="WARNING", message=f"Failed to drop column {c_name} from {t_name}: {e}", payload={"table": t_name, "column": c_name, "error": str(e)})
+                log.dual_log(tag="Backup:Cloud:DropColumnFailed", level="WARNING", message=f"Failed to drop column {c_name} from {snowflake_t_name}: {e}", payload={"table": snowflake_t_name, "column": c_name, "error": str(e)})
 
     @staticmethod
     def _add_column(conn, t_name: str, c_name: str, sqlite_type: str):
@@ -117,8 +121,9 @@ class SnowflakeSchemaManager:
             c_type = "BINARY"
         else:
             c_type = "NUMBER"
-        conn.execute(text(f"ALTER TABLE {t_name} ADD COLUMN {c_name} {c_type}"))
-        log.dual_log(tag="Backup:Cloud:Schema", message=f"Added column {c_name} to {t_name}", level="INFO", payload={"table": t_name, "column": c_name})
+        snowflake_t_name = staging_table_name(t_name)
+        conn.execute(text(f"ALTER TABLE {snowflake_t_name} ADD COLUMN {c_name} {c_type}"))
+        log.dual_log(tag="Backup:Cloud:Schema", message=f"Added column {c_name} to {snowflake_t_name}", level="INFO", payload={"table": snowflake_t_name, "column": c_name})
 
     @staticmethod
     def reconcile_types(engine, schema_name: str) -> list:
@@ -160,7 +165,8 @@ class SnowflakeSchemaManager:
 
             expected_tables = BackupSchemaRegistry.get_expected_sqlite_tables()
             for t_name, ddl in expected_tables.items():
-                if t_name not in existing:
+                snowflake_t_name = staging_table_name(t_name)
+                if snowflake_t_name not in existing:
                     continue
                 desired_cols = _columns_from_ddl_in_memory(ddl, t_name)
                 if not desired_cols:
@@ -189,7 +195,7 @@ class SnowflakeSchemaManager:
                         c_name,
                         sqlite_type_to_snowflake(col.type),
                     )
-                    actual_sf_type = existing[t_name].get(c_name, "").upper()
+                    actual_sf_type = existing[snowflake_t_name].get(c_name, "").upper()
                     # Use types_match() which normalizes both sides to the
                     # base type name, so VECTOR(FLOAT, 1024) matches VECTOR.
                     # Ref: https://docs.snowflake.com/en/sql-reference/data-types-structured
@@ -307,8 +313,11 @@ class SnowflakeSchemaManager:
 
         with engine.begin() as conn:
             try:
-                conn.execute(text(f"DROP TABLE IF EXISTS {schema_name}.{plan.table_name}"))
-                conn.execute(text(plan.new_ddl))
+                stn = staging_table_name(plan.table_name)
+                conn.execute(text(f"DROP TABLE IF EXISTS {schema_name}.{stn}"))
+                # Use a modified DDL that targets the staging table
+                new_ddl_staging = plan.new_ddl.replace(f"TABLE {plan.table_name} ", f"TABLE {stn} ", 1)
+                conn.execute(text(new_ddl_staging))
             except Exception as ddl_err:
                 # Log the full DDL that failed so operators can diagnose
                 # without re-running. This is critical for cases like the
@@ -394,8 +403,9 @@ class SnowflakeSchemaManager:
                         else:
                             select_expressions.append(c)
 
+                    stn = staging_table_name(plan.table_name)
                     repopulate_sql = f"""
-                        INSERT INTO {schema_name}.{plan.table_name} ({col_names})
+                        INSERT INTO {schema_name}.{stn} ({col_names})
                         SELECT {', '.join(select_expressions)}
                         FROM {schema_name}.{stage_table}
                     """

@@ -381,56 +381,57 @@ class UnifiedWorkerManager:
 
             if job_id in self._active_jobs:
                 del self._active_jobs[job_id]
-def _commit_failed(self, job_id: str, tool_name: str, error_msg: str, accumulator=None) -> None:
-    """Commit FAILED status and resolve the completion registry."""
-    normal = {"status": "FAILED", "error": error_msg, "result": None}
-    payload_json = json.dumps(normal, ensure_ascii=False, default=str)
-    receipt = enqueue_write(
-        "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
-        ("FAILED", payload_json, now_iso(), job_id),
-        track=True,
-    )
-    if receipt is not None:
-        receipt.wait(timeout=45.0)
-    from database.logs_writer import logs_enqueue_write
-    logs_enqueue_write(
-        "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (ULID.generate(), job_id, "Worker:Job:Failed", "ERROR", "FAILED",
-          f"Job failed: {error_msg[:200]}",
-          json.dumps({"error_len": len(error_msg)}),
-          ULID.generate(), json.dumps({"error": error_msg}, ensure_ascii=False), now_iso()),
-    )
+    def _commit_failed(self, job_id: str, tool_name: str, error_msg: str, accumulator=None) -> None:
+        """Commit FAILED status and resolve the completion registry."""
+        normal = {"status": "FAILED", "error": error_msg, "result": None}
+        payload_json = json.dumps(normal, ensure_ascii=False, default=str)
+        receipt = enqueue_write(
+            "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
+            ("FAILED", payload_json, now_iso(), job_id),
+            track=True,
+        )
+        if receipt is not None:
+            receipt.wait(timeout=45.0)
+        from database.logs_writer import logs_enqueue_write
+        logs_enqueue_write(
+            "INSERT INTO logs (id, job_id, tag, level, status_state, message, payload_json, event_id, error_json, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ULID.generate(), job_id, "Worker:Job:Failed", "ERROR", "FAILED",
+              f"Job failed: {error_msg[:200]}",
+              json.dumps({"error_len": len(error_msg)}),
+              ULID.generate(), json.dumps({"error": error_msg}, ensure_ascii=False), now_iso()),
+        )
 
-    lineage_report = None
-    if accumulator is not None:
-        lineage_report = accumulator.finalize(business_response=None).model_dump()
+        lineage_report = None
+        if accumulator is not None:
+            lineage_report = accumulator.finalize(business_response=None).model_dump()
 
-    job_completion_registry.resolve(job_id, {
-        "job_id": job_id,
-        "status": "FAILED",
-        "result": None,
-        "error": error_msg,
-        "tool_name": tool_name,
-        "lineage": lineage_report,
-    })
-def _commit_status(self, job_id: str, tool_name: str, status: str, error_msg: str, accumulator=None) -> None:
-    """Commit a non-FAILED terminal status (ABANDONED / INTERRUPTED) and resolve."""
-    normal = {"status": status, "error": error_msg, "result": None}
-    payload_json = json.dumps(normal, ensure_ascii=False, default=str)
-    enqueue_write(
-        "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
-        (status, payload_json, now_iso(), job_id),
-    )
+        job_completion_registry.resolve(job_id, {
+            "job_id": job_id,
+            "status": "FAILED",
+            "result": None,
+            "error": error_msg,
+            "tool_name": tool_name,
+            "lineage": lineage_report,
+        })
 
-    lineage_report = None
-    if accumulator is not None:
-        lineage_report = accumulator.finalize(business_response=None).model_dump()
+    def _commit_status(self, job_id: str, tool_name: str, status: str, error_msg: str, accumulator=None) -> None:
+        """Commit a non-FAILED terminal status (ABANDONED / INTERRUPTED) and resolve."""
+        normal = {"status": status, "error": error_msg, "result": None}
+        payload_json = json.dumps(normal, ensure_ascii=False, default=str)
+        enqueue_write(
+            "UPDATE jobs SET status = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
+            (status, payload_json, now_iso(), job_id),
+        )
 
-    job_completion_registry.resolve(job_id, {
-        "job_id": job_id,
-        "status": status,
-        "result": None,
+        lineage_report = None
+        if accumulator is not None:
+            lineage_report = accumulator.finalize(business_response=None).model_dump()
+
+        job_completion_registry.resolve(job_id, {
+            "job_id": job_id,
+            "status": status,
+            "result": None,
         "error": error_msg,
         "tool_name": tool_name,
         "lineage": lineage_report,
