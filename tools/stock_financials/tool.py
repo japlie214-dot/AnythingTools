@@ -1,10 +1,10 @@
 # tools/stock_financials/tool.py
 """Stock Financials Tool — SEC EDGAR quarterly fact extraction.
 
-Returns plain markdown strings for sync API consumption.
+Returns JSON strings for sync API consumption.
 
 Activity-Driven Observability:
-  The extract and status command paths are decomposed into named activities.
+  The extract, query, and status command paths are decomposed into named activities.
   See utils/observability/activity_decorator.py.
 """
 
@@ -253,6 +253,12 @@ class StockFinancialsTool(BaseTool):
         import pandas as pd
         df = pd.DataFrame(rows)
         csv_path = write_artifact(self.name, job_id, f"{ticker}_financials", "csv", df.to_csv(index=False))
+        # Propagate the artifact path to ToolResult.attachment_paths via _last_artifacts.
+        # BaseTool.execute() reads self._last_artifacts at tools/base.py:242 and passes
+        # it as attachment_paths in the ToolResult. Without this, the CSV path is only
+        # in the JSON payload but not attached as a file to the sync API response.
+        # Pattern follows stock_notes/tool.py:206.
+        self._last_artifacts = [str(csv_path)]
 
         # Step 5: Build extract payload.
         payload = self._build_extract_payload(
@@ -260,7 +266,7 @@ class StockFinancialsTool(BaseTool):
             len({r["quarter"] for r in rows}),
             cache_hit, refresh, rows, available_concepts
         )
-        # Note: CSV artifact is already written via write_artifact at line 230.
+        # Note: CSV artifact is already written via write_artifact at line 255.
         # We can include the path in the payload for convenience.
         payload["csv_path"] = csv_path
 
@@ -268,21 +274,132 @@ class StockFinancialsTool(BaseTool):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-    async def _handle_query(self, inst, job_id: str, telemetry: Any) -> str:
-        from .models import SFFactRecord
-        await telemetry(self.status(f"Querying {inst.ticker} {inst.statement_type}..."))
-        records = await to_thread_with_context(query_facts, inst.ticker, inst.statement_type, inst.concept, inst.start_quarter, inst.end_quarter, inst.limit)
-        if not records:
-            return json.dumps({"error": f"No records found for {inst.ticker} {inst.statement_type}."}, ensure_ascii=False, default=str)
-        typed = [SFFactRecord.model_validate(r) for r in records]
-        facts = [r.model_dump() for r in typed]
+    # --- Query command activities ---
 
-        return json.dumps({
-            "ticker": inst.ticker,
-            "statement_type": inst.statement_type,
-            "concept_filter": inst.concept,
-            "facts": facts,
-        }, ensure_ascii=False, default=str)
+    @activity("Fetch Query Facts")
+    async def _fetch_query_facts(
+        self, ticker: str, statement_type: str, concept: str | None,
+        start_quarter: str | None, end_quarter: str | None, limit: int,
+    ) -> list[dict]:
+        """Fetch and validate facts from the operational DB.
+
+        Returns a list of validated fact dicts (SFFactRecord.model_dump()).
+        Raises ToolExecutionError on validation failure.
+
+        NOTE on Lineage masking: If the returned list serializes to >50,000 chars,
+        _cap_top_level_value (utils/observability/masking.py:213-220) replaces the
+        entire list output in the Lineage with [MASKED: list-cap-exceeded - N chars, M items].
+        This is expected and acceptable — the full data is preserved in the JSON artifact
+        written by _write_facts_artifact. The Lineage is a trace, not a data store
+        (Developer Contract utils/observability/__init__.py:46-49).
+        """
+        from .models import SFFactRecord
+        records = await to_thread_with_context(
+            query_facts, ticker, statement_type, concept,
+            start_quarter, end_quarter, limit,
+        )
+        # Validate each record against the Pydantic model. Raises ValidationError
+        # if a record has an unexpected shape — the @activity decorator records
+        # FAILED and re-raises (never swallows, per §4.3.b).
+        typed = [SFFactRecord.model_validate(r) for r in records]
+        return [r.model_dump() for r in typed]
+
+    @activity("Write Facts Artifact")
+    def _write_facts_artifact(
+        self, ticker: str, statement_type: str, facts: list[dict], job_id: str,
+    ) -> str | None:
+        """Offload the facts list to a JSON artifact file.
+
+        Returns the absolute path string on success, None on failure (graceful
+        degradation — the query still returns a payload with fact_count; only
+        the artifact_path is None). Pattern follows stock_notes/tool.py:203-209.
+
+        JSON (not markdown) per the convention: structured records belong in JSON,
+        not prose. Ref: Pushback 4 in the plan review.
+        """
+        artifact_content = json.dumps(facts, ensure_ascii=False, default=str)
+        artifact_type = f"{ticker}_{statement_type}_facts"
+        try:
+            art_path = write_artifact(self.name, job_id, artifact_type, "json", artifact_content)
+            path_str = str(art_path)
+            # Propagate to ToolResult.attachment_paths so the worker attaches
+            # the JSON file to the sync API response. Ref: tools/base.py:242.
+            self._last_artifacts = [path_str]
+            return path_str
+        except Exception as e:
+            # Graceful degradation: log WARNING, return None. The payload still
+            # carries fact_count so the LLM knows data exists; only the file
+            # attachment is missing. Ref: stock_notes/tool.py:207-209.
+            log.dual_log(
+                tag="StockFin:QueryArtifact:Failed",
+                message=f"Failed to write facts artifact: {e}",
+                level="WARNING",
+                payload={"error": str(e), "ticker": ticker, "statement_type": statement_type},
+            )
+            return None
+
+    @activity("Build Query Payload")
+    def _build_query_payload(
+        self, ticker: str, statement_type: str, concept: str | None,
+        facts: list[dict], artifact_path: str | None,
+    ) -> dict:
+        """Build the JSON summary payload for the query command.
+
+        Returns a metadata dict — NOT the raw facts. The full facts are in the
+        JSON artifact (artifact_path). This follows the Developer Contract:
+        "For payloads larger than 50,000 chars per top-level key, write an
+        artifact via write_artifact(...) and return the path"
+        (utils/observability/__init__.py:46-49).
+        """
+        # Extract lightweight metadata for the LLM: distinct quarters and concepts
+        # give the agent enough context to decide whether to read the artifact,
+        # without bloating the payload. These are derived from the facts list
+        # and are small (quarter strings are ~7 chars, concept strings ~30 chars).
+        quarters = sorted({f.get("quarter") for f in facts if f.get("quarter")})
+        concepts = sorted({f.get("concept") for f in facts if f.get("concept")})
+        return {
+            "ticker": ticker,
+            "statement_type": statement_type,
+            "concept_filter": concept,
+            "fact_count": len(facts),
+            "artifact_path": artifact_path,
+            "quarters": quarters,
+            "concepts": concepts,
+        }
+
+    async def _handle_query(self, inst, job_id: str, telemetry: Any) -> str:
+        """Entry-point orchestrator for the query command.
+
+        Decomposes into three named Activities (per §4.3 of the Developer Contract):
+          1. Fetch Query Facts — read + validate from DB
+          2. Write Facts Artifact — offload to JSON file
+          3. Build Query Payload — assemble the metadata summary
+
+        The Accumulator is created and bound by bot/engine/worker.py::_run_job
+        when capture_lineage=true (Developer Contract utils/observability/__init__.py:51-53).
+        The @activity decorator reads it from contextvars — no explicit threading
+        needed in tool code (§4.3.c).
+        """
+        await telemetry(self.status(f"Querying {inst.ticker} {inst.statement_type}..."))
+
+        facts = await self._fetch_query_facts(
+            inst.ticker, inst.statement_type, inst.concept,
+            inst.start_quarter, inst.end_quarter, inst.limit,
+        )
+        if not facts:
+            return json.dumps(
+                {"error": f"No records found for {inst.ticker} {inst.statement_type}."},
+                ensure_ascii=False, default=str,
+            )
+
+        artifact_path = self._write_facts_artifact(
+            inst.ticker, inst.statement_type, facts, job_id,
+        )
+        payload = self._build_query_payload(
+            inst.ticker, inst.statement_type, inst.concept,
+            facts, artifact_path,
+        )
+        return json.dumps(payload, ensure_ascii=False, default=str)
 
 
     async def _handle_status(self, inst, job_id: str, telemetry: Any) -> str:

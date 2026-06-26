@@ -122,12 +122,18 @@ async def _staging_wipe_step() -> None:
     # Ref: database/backup/engine/cloud_engine.py:31-33 (CloudEngine.__init__ takes cloud + cb_settings)
     try:
         from config import DATABASE_INTEGRATION_ENABLED
-        if not getattr(DATABASE_INTEGRATION_ENABLED, "__bool__", lambda: True)() or not DATABASE_INTEGRATION_ENABLED:
+        # Simplified from: not getattr(DATABASE_INTEGRATION_ENABLED, "__bool__", lambda: True)() or not DATABASE_INTEGRATION_ENABLED
+        # The original expression reduced to `not bool(x) or not x` == `not x` — inert complexity.
+        # getattr(x, "__bool__") does NOT raise AttributeError (it returns a bound method-wrapper);
+        # the refactor is justified purely on complexity removal.
+        # Ref: https://docs.python.org/3/reference/datamodel.html#special-method-lookup
+        if not DATABASE_INTEGRATION_ENABLED:
             # Cloud integration disabled — skip Snowflake wipe.
             log.dual_log(
                 tag="Startup:StagingWipe:Snowflake:Skipped",
                 message="DATABASE_INTEGRATION_ENABLED=false — skipping Snowflake staging wipe",
                 level="INFO",
+                payload={"action": "skip", "reason": "database_integration_disabled"},
             )
         else:
             from database.backup.settings import BackupSettings
@@ -138,6 +144,7 @@ async def _staging_wipe_step() -> None:
                     tag="Startup:StagingWipe:Snowflake:Skipped",
                     message="BACKUP_CLOUD_ENABLED=false — skipping Snowflake staging wipe",
                     level="INFO",
+                    payload={"action": "skip", "reason": "cloud_disabled"},
                 )
             else:
                 # Construct a short-lived CloudEngine. The constructor
@@ -175,6 +182,10 @@ async def _sync_from_backup_step() -> None:
             tag="Startup:SyncFromBackup:StagingSkip",
             message="Staging mode — skipping sync_from_backup",
             level="INFO",
+            # FATAL FIX: dual_log requires a non-empty dict payload (utils/logger/core.py:54-55).
+            # Without this, DATABASE_STAGING_ENABLED=true crashes startup with TypeError here
+            # (this call is NOT inside a try/except — it runs before the try block at line 190).
+            payload={"action": "skip", "reason": "staging_mode"},
         )
         return
 

@@ -198,6 +198,19 @@ def _cap_top_level_value(value: Any, max_chars: int = DEFAULT_MAX_CHARS) -> Any:
         if isinstance(value, dict):
             result = {}
             for k, v in value.items():
+                # Strings are already capped to max_chars + a short truncation suffix
+                # by truncate_and_mask (line 159: value[:max_chars] + "... [TRUNCATED N CHARS]").
+                # Running them through json.dumps here adds 2 chars (the JSON quotes) plus
+                # the suffix length, which pushes just-truncated strings (e.g. a 50,030-char
+                # truncated string → 50,032 serialized) over max_chars and causes incorrect
+                # full masking via the per-key-cap-exceeded placeholder.
+                # Bypass the cap check for strings, but still assign result[k] = v —
+                # a bare `continue` would silently drop the key from the Lineage payload,
+                # destroying lineage data. Per Pushback 3 in the plan review.
+                # Ref: https://docs.python.org/3/library/json.html#json.dumps
+                if isinstance(v, str):
+                    result[k] = v
+                    continue
                 try:
                     serialized = json.dumps(v, default=str, ensure_ascii=False)
                     if len(serialized) > max_chars:

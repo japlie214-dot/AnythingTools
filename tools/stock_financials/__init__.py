@@ -59,8 +59,26 @@ Step 2: Query Financial Data
       (e.g., `us-gaap:Revenue`). This matches the canonical FASB US-GAAP taxonomy
       and the format used by the `stock_notes` tool.
       Reference: https://xbrl.org/guidance/xbrl-glossary
-    *Results:* Returns a pivot table with concepts as rows and quarters as columns,
-      with intelligent formatting for large numbers ($1.2B, 14.9B shares).
+    *Results:* Returns a JSON summary object (NOT an inline pivot table). The full
+      fact records are offloaded to a JSON artifact file; the return value contains
+      metadata so you can decide whether to read the artifact. Shape:
+      {
+        "ticker": "NVDA",
+        "statement_type": "income",
+        "concept_filter": "us-gaap:Revenues" | null,
+        "fact_count": 8,
+        "artifact_path": "/abs/path/to/stock_financials/<job_id>/NVDA_income_facts.json" | null,
+        "quarters": ["2024-Q1", "2024-Q2", ...],
+        "concepts": ["us-gaap:Revenues", ...]
+      }
+      - fact_count: number of fact records matching the query.
+      - artifact_path: absolute path to the JSON file containing the full fact
+        records (array of objects with ticker, statement_type, concept, quarter,
+        value, unit, etc.). null if the artifact write failed — use fact_count
+        to confirm data exists.
+      - quarters: sorted list of distinct quarters in the result set.
+      - concepts: sorted list of distinct concepts in the result set.
+      If no records match, returns {"error": "No records found for <ticker> <statement_type>."}.
 
 Step 3: Check Extraction Status
     Check what quarters are currently stored in the operational database.

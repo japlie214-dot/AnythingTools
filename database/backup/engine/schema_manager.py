@@ -57,9 +57,6 @@ def _rewrite_table_name_in_ddl(raw_ddl: str, old_name: str, new_name: str) -> st
         )
     return new_ddl
 
-from database.backup.settings import Vec0BackupSettings as _Vec0Settings
-_vec0_settings = _Vec0Settings()
-
 class SnowflakeSchemaManager:
     @staticmethod
     def reconcile(engine, schema_name: str):
